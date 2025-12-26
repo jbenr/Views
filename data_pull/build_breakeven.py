@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Build md.headline table from md.ust_eod and auctioned_securities.
+Build md.breakeven table from md.headline.
 
-Labels each bond as current (c), single-old (o), double-old (oo), etc.
-for headline tenors: 2Y, 3Y, 5Y, 7Y, 10Y, 20Y, 30Y nominals + 5Y, 10Y, 20Y, 30Y TIPS.
+Calculates inflation breakeven levels (TIPS yield - nominal yield) for
+matching tenors: 5Y, 10Y, 20Y, 30Y.
 
 Usage:
-    python build_headline.py          # incremental (append new dates)
-    python build_headline.py --rebuild # full rebuild from scratch
+    python build_breakeven.py          # incremental (append new dates)
+    python build_breakeven.py --rebuild # full rebuild from scratch
 """
 
 from __future__ import annotations
@@ -23,15 +23,8 @@ import psycopg
 
 DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets")
 
-HEADLINE_TENORS = (
-    "2-Year",
-    "3-Year",
-    "5-Year",
-    "7-Year",
-    "10-Year",
-    "20-Year",
-    "30-Year",
-)
+# Tenors that have both nominals and TIPS
+BREAKEVEN_TENORS = ("5-Year", "10-Year", "20-Year", "30-Year")
 
 
 # ---------------------------------------------------------------------------
@@ -43,89 +36,58 @@ def get_conn():
     return psycopg.connect(DB_DSN)
 
 
-def ensure_headline_table(conn) -> None:
-    """Create md.headline if it doesn't exist."""
+def ensure_breakeven_table(conn) -> None:
+    """Create md.breakeven if it doesn't exist."""
     with conn.cursor() as cur:
         cur.execute("CREATE SCHEMA IF NOT EXISTS md;")
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS md.headline (
+            CREATE TABLE IF NOT EXISTS md.breakeven (
                 ts              DATE NOT NULL,
                 tenor           TEXT NOT NULL,
-                asset_class     TEXT NOT NULL,
-                cusip           TEXT NOT NULL,
                 status          TEXT NOT NULL,
-                px_last         DOUBLE PRECISION,
-                yld_ytm_mid     DOUBLE PRECISION,
-                PRIMARY KEY (ts, tenor, asset_class, status)
+                nominal_cusip   TEXT,
+                tips_cusip      TEXT,
+                nominal_yield   DOUBLE PRECISION,
+                tips_yield      DOUBLE PRECISION,
+                breakeven       DOUBLE PRECISION,
+                PRIMARY KEY (ts, tenor, status)
             );
             """
         )
         # Index for faster lookups by date
         cur.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_headline_ts 
-            ON md.headline (ts);
-            """
-        )
-        # Index for cusip lookups
-        cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_headline_cusip 
-            ON md.headline (cusip);
+            CREATE INDEX IF NOT EXISTS idx_breakeven_ts 
+            ON md.breakeven (ts);
             """
         )
     conn.commit()
 
 
 # ---------------------------------------------------------------------------
-# Core SQL for headline generation
+# Core SQL for breakeven generation
 # ---------------------------------------------------------------------------
 
-HEADLINE_SQL = """
-WITH first_auction AS (
-    SELECT 
-        cusip, 
-        MIN(auction_date) AS auction_date,
-        MAX(maturity_date) AS maturity_date,
-        original_security_term,
-        inflation_index_security
-    FROM auctioned_securities
-    WHERE security_type IN ('Note', 'Bond')
-      AND original_security_term = ANY(%s)
-    GROUP BY cusip, original_security_term, inflation_index_security
-),
-ranked AS (
-    SELECT 
-        d.ts,
-        d.cusip,
-        d.px_last,
-        d.yld_ytm_mid,
-        c.original_security_term AS tenor,
-        CASE WHEN c.inflation_index_security = 'Yes' THEN 'tips' ELSE 'nominal' END AS asset_class,
-        ROW_NUMBER() OVER (
-            PARTITION BY d.ts, c.original_security_term, c.inflation_index_security
-            ORDER BY c.auction_date DESC
-        ) AS rank
-    FROM md.ust_eod d
-    JOIN first_auction c ON d.cusip = c.cusip
-    WHERE d.ts >= c.auction_date
-      AND d.ts < c.maturity_date
-      {date_filter}
-)
+BREAKEVEN_SQL = """
 SELECT 
-    ts, tenor, asset_class, cusip,
-    CASE rank
-        WHEN 1 THEN 'c'
-        WHEN 2 THEN 'o'
-        WHEN 3 THEN 'oo'
-        WHEN 4 THEN 'ooo'
-        WHEN 5 THEN 'oooo'
-    END AS status,
-    px_last, 
-    yld_ytm_mid
-FROM ranked
-WHERE rank <= 5
+    n.ts,
+    n.tenor,
+    n.status,
+    n.cusip AS nominal_cusip,
+    t.cusip AS tips_cusip,
+    n.yld_ytm_mid AS nominal_yield,
+    t.yld_ytm_mid AS tips_yield,
+    t.yld_ytm_mid - n.yld_ytm_mid AS breakeven
+FROM md.headline n
+JOIN md.headline t 
+    ON n.ts = t.ts 
+    AND n.tenor = t.tenor 
+    AND n.status = t.status
+WHERE n.asset_class = 'nominal'
+  AND t.asset_class = 'tips'
+  AND n.tenor = ANY(%s)
+  {date_filter}
 """
 
 
@@ -134,63 +96,71 @@ WHERE rank <= 5
 # ---------------------------------------------------------------------------
 
 
+def get_max_breakeven_date(conn):
+    """Get the max date currently in md.breakeven, or None if empty."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT MAX(ts) FROM md.breakeven;")
+        row = cur.fetchone()
+    return row[0] if row and row[0] else None
+
+
 def get_max_headline_date(conn):
-    """Get the max date currently in md.headline, or None if empty."""
+    """Get the max date in md.headline."""
     with conn.cursor() as cur:
         cur.execute("SELECT MAX(ts) FROM md.headline;")
         row = cur.fetchone()
     return row[0] if row and row[0] else None
 
 
-def get_max_eod_date(conn):
-    """Get the max date in md.ust_eod."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT MAX(ts) FROM md.ust_eod;")
-        row = cur.fetchone()
-    return row[0] if row and row[0] else None
-
-
-def rebuild_headline(conn) -> int:
-    """Truncate and rebuild md.headline from scratch."""
-    sql = HEADLINE_SQL.format(date_filter="")
+def rebuild_breakeven(conn) -> int:
+    """Truncate and rebuild md.breakeven from scratch."""
+    sql = BREAKEVEN_SQL.format(date_filter="")
 
     with conn.cursor() as cur:
-        cur.execute("TRUNCATE md.headline;")
+        cur.execute("TRUNCATE md.breakeven;")
         cur.execute(
-            f"INSERT INTO md.headline (ts, tenor, asset_class, cusip, status, px_last, yld_ytm_mid) {sql}",
-            (list(HEADLINE_TENORS),),
+            f"""
+            INSERT INTO md.breakeven 
+                (ts, tenor, status, nominal_cusip, tips_cusip, nominal_yield, tips_yield, breakeven) 
+            {sql}
+            """,
+            (list(BREAKEVEN_TENORS),),
         )
         row_count = cur.rowcount
     conn.commit()
     return row_count
 
 
-def incremental_headline(conn) -> int:
-    """Append only new dates to md.headline."""
+def incremental_breakeven(conn) -> int:
+    """Append only new dates to md.breakeven."""
+    max_breakeven = get_max_breakeven_date(conn)
     max_headline = get_max_headline_date(conn)
-    max_eod = get_max_eod_date(conn)
-
-    if max_eod is None:
-        print("No data in md.ust_eod. Nothing to do.")
-        return 0
 
     if max_headline is None:
-        # Table is empty, do full rebuild
-        print("md.headline is empty. Running full rebuild...")
-        return rebuild_headline(conn)
-
-    if max_headline >= max_eod:
-        print(f"md.headline is up to date (max date: {max_headline}).")
+        print("No data in md.headline. Run build_headline.py first.")
         return 0
 
-    # Only process dates after max_headline
-    date_filter = "AND d.ts > %s"
-    sql = HEADLINE_SQL.format(date_filter=date_filter)
+    if max_breakeven is None:
+        # Table is empty, do full rebuild
+        print("md.breakeven is empty. Running full rebuild...")
+        return rebuild_breakeven(conn)
+
+    if max_breakeven >= max_headline:
+        print(f"md.breakeven is up to date (max date: {max_breakeven}).")
+        return 0
+
+    # Only process dates after max_breakeven
+    date_filter = "AND n.ts > %s"
+    sql = BREAKEVEN_SQL.format(date_filter=date_filter)
 
     with conn.cursor() as cur:
         cur.execute(
-            f"INSERT INTO md.headline (ts, tenor, asset_class, cusip, status, px_last, yld_ytm_mid) {sql}",
-            (list(HEADLINE_TENORS), max_headline),
+            f"""
+            INSERT INTO md.breakeven 
+                (ts, tenor, status, nominal_cusip, tips_cusip, nominal_yield, tips_yield, breakeven) 
+            {sql}
+            """,
+            (list(BREAKEVEN_TENORS), max_breakeven),
         )
         row_count = cur.rowcount
     conn.commit()
@@ -203,7 +173,7 @@ def incremental_headline(conn) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build md.headline table")
+    parser = argparse.ArgumentParser(description="Build md.breakeven table")
     parser.add_argument(
         "--rebuild",
         action="store_true",
@@ -213,17 +183,17 @@ def main() -> None:
 
     print(f"Connecting to Postgres: {DB_DSN}")
     with get_conn() as conn:
-        ensure_headline_table(conn)
+        ensure_breakeven_table(conn)
 
         if args.rebuild:
-            print("Rebuilding md.headline from scratch...")
-            rows = rebuild_headline(conn)
-            print(f"✅ Inserted {rows:,} rows into md.headline")
+            print("Rebuilding md.breakeven from scratch...")
+            rows = rebuild_breakeven(conn)
+            print(f"✅ Inserted {rows:,} rows into md.breakeven")
         else:
             print("Running incremental update...")
-            rows = incremental_headline(conn)
+            rows = incremental_breakeven(conn)
             if rows > 0:
-                print(f"✅ Inserted {rows:,} new rows into md.headline")
+                print(f"✅ Inserted {rows:,} new rows into md.breakeven")
 
 
 if __name__ == "__main__":
