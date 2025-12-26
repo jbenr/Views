@@ -92,7 +92,7 @@ WITH first_auction AS (
         inflation_index_security
     FROM auctioned_securities
     WHERE security_type IN ('Note', 'Bond')
-      AND original_security_term IN %(tenors)s
+      AND original_security_term = ANY(%s)
     GROUP BY cusip, original_security_term, inflation_index_security
 ),
 ranked AS (
@@ -158,7 +158,7 @@ def rebuild_headline(conn) -> int:
         cur.execute("TRUNCATE md.headline;")
         cur.execute(
             f"INSERT INTO md.headline (ts, tenor, asset_class, cusip, status, px_last, yld_ytm_mid) {sql}",
-            {"tenors": HEADLINE_TENORS},
+            (list(HEADLINE_TENORS),),
         )
         row_count = cur.rowcount
     conn.commit()
@@ -184,13 +184,13 @@ def incremental_headline(conn) -> int:
         return 0
 
     # Only process dates after max_headline
-    date_filter = "AND d.ts > %(max_date)s"
+    date_filter = "AND d.ts > %s"
     sql = HEADLINE_SQL.format(date_filter=date_filter)
 
     with conn.cursor() as cur:
         cur.execute(
             f"INSERT INTO md.headline (ts, tenor, asset_class, cusip, status, px_last, yld_ytm_mid) {sql}",
-            {"tenors": HEADLINE_TENORS, "max_date": max_headline},
+            (list(HEADLINE_TENORS), max_headline),
         )
         row_count = cur.rowcount
     conn.commit()
