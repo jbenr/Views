@@ -70,64 +70,67 @@ def ensure_breakeven_table(conn) -> None:
 # ---------------------------------------------------------------------------
 
 BREAKEVEN_SQL = """
-WITH tips_info AS (
-    -- Get unique TIPS bonds with their maturity dates
-    SELECT DISTINCT
+WITH tips_data AS (
+    -- Get TIPS headline data with maturity
+    SELECT 
+        h.ts,
         h.tenor,
+        h.status,
         h.cusip,
+        h.yld_ytm_mid,
         a.maturity_date
     FROM md.headline h
     JOIN auctioned_securities a ON h.cusip = a.cusip
     WHERE h.asset_class = 'tips'
       AND h.tenor = ANY(%s)
       AND h.status IN ('c', 'o', 'oo')
+      {date_filter}
 ),
-nominal_info AS (
-    -- Get unique nominal bonds with their maturity dates (from auctioned_securities, not headline)
-    SELECT DISTINCT
+nominal_data AS (
+    -- Get all nominal EOD data with maturity
+    SELECT 
+        e.ts,
         a.original_security_term AS tenor,
-        a.cusip,
+        e.cusip,
+        e.yld_ytm_mid,
         a.maturity_date
-    FROM auctioned_securities a
+    FROM md.ust_eod e
+    JOIN auctioned_securities a ON e.cusip = a.cusip
     WHERE a.security_type IN ('Note', 'Bond')
       AND a.inflation_index_security = 'No'
       AND a.original_security_term = ANY(%s)
+      AND e.yld_ytm_mid IS NOT NULL
 ),
-tips_nominal_pairs AS (
-    -- For each TIPS, find the nominal in same tenor with closest maturity
+matched AS (
+    -- For each TIPS on each date, find the nominal with closest maturity that has data
     SELECT 
+        t.ts,
         t.tenor,
+        t.status,
         t.cusip AS tips_cusip,
-        t.maturity_date AS tips_maturity,
+        t.yld_ytm_mid AS tips_yield,
         n.cusip AS nominal_cusip,
-        n.maturity_date AS nominal_maturity,
+        n.yld_ytm_mid AS nominal_yield,
         ROW_NUMBER() OVER (
-            PARTITION BY t.cusip
+            PARTITION BY t.ts, t.cusip
             ORDER BY ABS(EXTRACT(EPOCH FROM (t.maturity_date - n.maturity_date)))
         ) AS rn
-    FROM tips_info t
-    JOIN nominal_info n 
-        ON t.tenor = n.tenor
+    FROM tips_data t
+    JOIN nominal_data n 
+        ON t.ts = n.ts
+        AND t.tenor = n.tenor
 )
 SELECT 
-    ht.ts,
-    p.tenor,
-    ht.status,
-    p.nominal_cusip,
-    p.tips_cusip,
-    en.yld_ytm_mid AS nominal_yield,
-    ht.yld_ytm_mid AS tips_yield,
-    en.yld_ytm_mid - ht.yld_ytm_mid AS breakeven
-FROM tips_nominal_pairs p
-JOIN md.headline ht 
-    ON ht.cusip = p.tips_cusip
-    AND ht.asset_class = 'tips'
-    AND ht.status IN ('c', 'o', 'oo')
-JOIN md.ust_eod en 
-    ON en.cusip = p.nominal_cusip 
-    AND en.ts = ht.ts
-WHERE p.rn = 1
-  {date_filter}
+    ts,
+    tenor,
+    status,
+    nominal_cusip,
+    tips_cusip,
+    nominal_yield,
+    tips_yield,
+    nominal_yield - tips_yield AS breakeven
+FROM matched
+WHERE rn = 1
 """
 
 
@@ -190,7 +193,7 @@ def incremental_breakeven(conn) -> int:
         return 0
 
     # Only process dates after max_breakeven
-    date_filter = "AND ht.ts > %s"
+    date_filter = "AND h.ts > %s"
     sql = BREAKEVEN_SQL.format(date_filter=date_filter)
 
     with conn.cursor() as cur:
