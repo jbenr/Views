@@ -127,7 +127,7 @@ SELECT
     tips_cusip,
     nominal_yield,
     tips_yield,
-    tips_yield - nominal_yield AS breakeven
+    nominal_yield - tips_yield AS breakeven
 FROM matched
 WHERE rn = 1
 """
