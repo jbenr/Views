@@ -112,7 +112,7 @@ matched AS (
         n.maturity_date AS nominal_maturity,
         ROW_NUMBER() OVER (
             PARTITION BY t.ts, t.tenor, t.status
-            ORDER BY ABS(t.maturity_date - n.maturity_date)
+            ORDER BY ABS(EXTRACT(EPOCH FROM (t.maturity_date - n.maturity_date)))
         ) AS rn
     FROM tips_with_dates t
     JOIN nominals_with_dates n 
