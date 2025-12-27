@@ -96,7 +96,7 @@ nominal_info AS (
       AND h.tenor = ANY(%s)
 ),
 tips_nominal_pairs AS (
-    -- For each TIPS, find the nominal with closest maturity that existed when TIPS was issued
+    -- For each TIPS, find the nominal in same tenor with closest maturity
     SELECT 
         t.tenor,
         t.cusip AS tips_cusip,
@@ -110,7 +110,6 @@ tips_nominal_pairs AS (
     FROM tips_info t
     JOIN nominal_info n 
         ON t.tenor = n.tenor
-        AND n.issue_date <= t.issue_date  -- nominal must exist when TIPS issued
 )
 SELECT 
     ht.ts,
