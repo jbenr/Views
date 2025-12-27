@@ -70,24 +70,66 @@ def ensure_breakeven_table(conn) -> None:
 # ---------------------------------------------------------------------------
 
 BREAKEVEN_SQL = """
+WITH tips_with_dates AS (
+    SELECT 
+        h.ts,
+        h.tenor,
+        h.status,
+        h.cusip,
+        h.yld_ytm_mid,
+        a.issue_date,
+        a.maturity_date
+    FROM md.headline h
+    JOIN auctioned_securities a ON h.cusip = a.cusip
+    WHERE h.asset_class = 'tips'
+      AND h.tenor = ANY(%s)
+      AND h.status IN ('c', 'o', 'oo')
+      {date_filter}
+),
+nominals_with_dates AS (
+    SELECT 
+        h.ts,
+        h.tenor,
+        h.cusip,
+        h.yld_ytm_mid,
+        a.issue_date,
+        a.maturity_date
+    FROM md.headline h
+    JOIN auctioned_securities a ON h.cusip = a.cusip
+    WHERE h.asset_class = 'nominal'
+      AND h.tenor = ANY(%s)
+),
+matched AS (
+    SELECT 
+        t.ts,
+        t.tenor,
+        t.status,
+        t.cusip AS tips_cusip,
+        t.yld_ytm_mid AS tips_yield,
+        t.maturity_date AS tips_maturity,
+        n.cusip AS nominal_cusip,
+        n.yld_ytm_mid AS nominal_yield,
+        n.maturity_date AS nominal_maturity,
+        ROW_NUMBER() OVER (
+            PARTITION BY t.ts, t.tenor, t.status
+            ORDER BY ABS(t.maturity_date - n.maturity_date)
+        ) AS rn
+    FROM tips_with_dates t
+    JOIN nominals_with_dates n 
+        ON t.ts = n.ts 
+        AND t.tenor = n.tenor
+)
 SELECT 
-    n.ts,
-    n.tenor,
-    n.status,
-    n.cusip AS nominal_cusip,
-    t.cusip AS tips_cusip,
-    n.yld_ytm_mid AS nominal_yield,
-    t.yld_ytm_mid AS tips_yield,
-    t.yld_ytm_mid - n.yld_ytm_mid AS breakeven
-FROM md.headline n
-JOIN md.headline t 
-    ON n.ts = t.ts 
-    AND n.tenor = t.tenor 
-    AND n.status = t.status
-WHERE n.asset_class = 'nominal'
-  AND t.asset_class = 'tips'
-  AND n.tenor = ANY(%s)
-  {date_filter}
+    ts,
+    tenor,
+    status,
+    nominal_cusip,
+    tips_cusip,
+    nominal_yield,
+    tips_yield,
+    tips_yield - nominal_yield AS breakeven
+FROM matched
+WHERE rn = 1
 """
 
 
@@ -124,7 +166,7 @@ def rebuild_breakeven(conn) -> int:
                 (ts, tenor, status, nominal_cusip, tips_cusip, nominal_yield, tips_yield, breakeven) 
             {sql}
             """,
-            (list(BREAKEVEN_TENORS),),
+            (list(BREAKEVEN_TENORS), list(BREAKEVEN_TENORS)),
         )
         row_count = cur.rowcount
     conn.commit()
@@ -150,7 +192,7 @@ def incremental_breakeven(conn) -> int:
         return 0
 
     # Only process dates after max_breakeven
-    date_filter = "AND n.ts > %s"
+    date_filter = "AND h.ts > %s"
     sql = BREAKEVEN_SQL.format(date_filter=date_filter)
 
     with conn.cursor() as cur:
@@ -160,7 +202,7 @@ def incremental_breakeven(conn) -> int:
                 (ts, tenor, status, nominal_cusip, tips_cusip, nominal_yield, tips_yield, breakeven) 
             {sql}
             """,
-            (list(BREAKEVEN_TENORS), max_breakeven),
+            (list(BREAKEVEN_TENORS), max_breakeven, list(BREAKEVEN_TENORS)),
         )
         row_count = cur.rowcount
     conn.commit()
