@@ -71,11 +71,10 @@ def ensure_breakeven_table(conn) -> None:
 
 BREAKEVEN_SQL = """
 WITH tips_info AS (
-    -- Get unique TIPS bonds with their issue/maturity dates
+    -- Get unique TIPS bonds with their maturity dates
     SELECT DISTINCT
         h.tenor,
         h.cusip,
-        a.issue_date,
         a.maturity_date
     FROM md.headline h
     JOIN auctioned_securities a ON h.cusip = a.cusip
@@ -84,16 +83,15 @@ WITH tips_info AS (
       AND h.status IN ('c', 'o', 'oo')
 ),
 nominal_info AS (
-    -- Get unique nominal bonds with their issue/maturity dates
+    -- Get unique nominal bonds with their maturity dates (from auctioned_securities, not headline)
     SELECT DISTINCT
-        h.tenor,
-        h.cusip,
-        a.issue_date,
+        a.original_security_term AS tenor,
+        a.cusip,
         a.maturity_date
-    FROM md.headline h
-    JOIN auctioned_securities a ON h.cusip = a.cusip
-    WHERE h.asset_class = 'nominal'
-      AND h.tenor = ANY(%s)
+    FROM auctioned_securities a
+    WHERE a.security_type IN ('Note', 'Bond')
+      AND a.inflation_index_security = 'No'
+      AND a.original_security_term = ANY(%s)
 ),
 tips_nominal_pairs AS (
     -- For each TIPS, find the nominal in same tenor with closest maturity
@@ -117,18 +115,17 @@ SELECT
     ht.status,
     p.nominal_cusip,
     p.tips_cusip,
-    hn.yld_ytm_mid AS nominal_yield,
+    en.yld_ytm_mid AS nominal_yield,
     ht.yld_ytm_mid AS tips_yield,
-    hn.yld_ytm_mid - ht.yld_ytm_mid AS breakeven
+    en.yld_ytm_mid - ht.yld_ytm_mid AS breakeven
 FROM tips_nominal_pairs p
 JOIN md.headline ht 
     ON ht.cusip = p.tips_cusip
     AND ht.asset_class = 'tips'
     AND ht.status IN ('c', 'o', 'oo')
-JOIN md.headline hn 
-    ON hn.cusip = p.nominal_cusip 
-    AND hn.ts = ht.ts
-    AND hn.asset_class = 'nominal'
+JOIN md.ust_eod en 
+    ON en.cusip = p.nominal_cusip 
+    AND en.ts = ht.ts
 WHERE p.rn = 1
   {date_filter}
 """
