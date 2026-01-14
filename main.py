@@ -6,13 +6,13 @@ from utils import pdf, format_tsy_price
 if __name__ == '__main__':
     bbg = Bbg()
 
-    # 1) Reference snapshot
-    ref = bbg.bdp(["IBM US Equity", "SPY US Equity"], ["PX_LAST", "CUR_MKT_CAP"])
-    pdf(ref)
+    # # 1) Reference snapshot
+    # ref = bbg.bdp(["IBM US Equity", "SPY US Equity"], ["PX_LAST", "CUR_MKT_CAP"])
+    # pdf(ref)
 
     # 2) Bulk field
-    # members = bbg.bds(["SPX Index"], "INDX_MEMBERS")  # dict: security -> DataFrame
-    # print(members)
+    members = bbg.bds(["TUH6 Comdty"], "DELIVERY")  # dict: security -> DataFrame
+    print(members)
 
     # 3) Historical
     hist = bbg.bdh(["TY1 Comdty"], ["PX_LAST"], start="20240101", end="20241031")

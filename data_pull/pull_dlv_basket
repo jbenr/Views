@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""
+Populate deliverable basket data for Treasury futures contracts.
+Fetches FUT_DLVRBLE_BNDS_CUSIPS from Bloomberg and stores in sec.fut_contracts.
+"""
+
+import os
+import json
+import psycopg
+import sys
+sys.path.append(os.path.expanduser("~/werk/Views"))
+from data_pull.berg import Bbg
+
+DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@localhost:5432/markets")
+
+
+def ensure_dlv_basket_column(conn):
+    """Add dlv_basket column if it doesn't exist."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_schema = 'sec' 
+              AND table_name = 'fut_contracts' 
+              AND column_name = 'dlv_basket'
+        """)
+        if cur.fetchone() is None:
+            print("Adding dlv_basket column...")
+            cur.execute("ALTER TABLE sec.fut_contracts ADD COLUMN dlv_basket JSONB")
+            conn.commit()
+            print("Column added.")
+        else:
+            print("dlv_basket column already exists.")
+
+
+def get_contracts_missing_basket(conn):
+    """Get contracts where dlv_basket is NULL."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT contract 
+            FROM sec.fut_contracts 
+            WHERE dlv_basket IS NULL
+            ORDER BY contract_month DESC
+        """)
+        return [row[0] for row in cur.fetchall()]
+
+
+def fetch_deliverable_baskets(bbg: Bbg, contracts: list[str]) -> dict[str, list[dict]]:
+    """
+    Fetch deliverable baskets from Bloomberg for multiple contracts.
+    Returns dict: contract -> list of {cusip, conversion_factor}
+    """
+    tickers = [f"{c} Comdty" for c in contracts]
+    
+    # bds returns dict: ticker -> DataFrame
+    result = bbg.bds(tickers, "FUT_DLVRBLE_BNDS_CUSIPS")
+    
+    out = {}
+    for contract, ticker in zip(contracts, tickers):
+        if ticker not in result:
+            out[contract] = None
+            continue
+            
+        df = result[ticker]
+        
+        if df.empty or 'error' in df.columns:
+            out[contract] = None
+            continue
+        
+        basket = []
+        for _, row in df.iterrows():
+            cusip_raw = row.get('Deliverable Bond CUSIP and Yellow Key', '')
+            cf = row.get('Conversion Factor', 0)
+            
+            # Extract just the CUSIP (remove " Govt" suffix)
+            cusip = str(cusip_raw).replace(' Govt', '').strip()
+            
+            basket.append({
+                'cusip': cusip,
+                'conversion_factor': float(cf)
+            })
+        
+        out[contract] = basket if basket else None
+    
+    return out
+
+
+def update_dlv_basket(conn, contract: str, basket: list[dict]):
+    """Update the dlv_basket column for a contract."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE sec.fut_contracts 
+            SET dlv_basket = %s, updated_at = NOW()
+            WHERE contract = %s
+        """, (json.dumps({'deliverables': basket}), contract))
+    conn.commit()
+
+
+def main():
+    conn = psycopg.connect(DB_DSN)
+    
+    # Step 1: Ensure column exists
+    ensure_dlv_basket_column(conn)
+    
+    # Step 2: Get contracts missing basket data
+    contracts = get_contracts_missing_basket(conn)
+    print(f"\nFound {len(contracts)} contracts missing deliverable basket data.")
+    
+    if not contracts:
+        print("Nothing to do.")
+        conn.close()
+        return
+    
+    # Step 3: Initialize Bloomberg
+    print("Connecting to Bloomberg...")
+    bbg = Bbg()
+    
+    # Step 4: Fetch in batches (Bloomberg can handle multiple at once)
+    BATCH_SIZE = 50
+    success = 0
+    no_data = 0
+    
+    for i in range(0, len(contracts), BATCH_SIZE):
+        batch = contracts[i:i + BATCH_SIZE]
+        print(f"\nFetching batch {i // BATCH_SIZE + 1} ({len(batch)} contracts)...")
+        
+        baskets = fetch_deliverable_baskets(bbg, batch)
+        
+        for contract, basket in baskets.items():
+            if basket is None:
+                print(f"  {contract}: No data")
+                no_data += 1
+            else:
+                update_dlv_basket(conn, contract, basket)
+                print(f"  {contract}: OK ({len(basket)} deliverables)")
+                success += 1
+    
+    print(f"\nDone. Success: {success}, No data: {no_data}")
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()

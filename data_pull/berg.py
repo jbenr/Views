@@ -259,6 +259,66 @@ class Bbg:
         msgs = self._send_request(_APIFLDS_SVC, "FieldInfoRequest", build)
         return _parse_field_info(msgs)
 
+    def field_search(self, search_spec: str, *,
+        max_results: int = 100,
+        include: Dict[str, Any] | None = None,
+        exclude: Dict[str, Any] | None = None,
+        return_field_documentation: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Search FLDS universe (//blp/apiflds FieldSearchRequest) for fields matching `search_spec`.
+
+        Note: Some Bloomberg schemas do NOT support request.maxResults (yours doesn't).
+            In that case we limit client-side via df.head(max_results).
+        """
+
+        def build(r: blpapi.Request) -> None:
+            r.set("searchSpec", search_spec)
+
+            # Optional flags – only set if present in your schema
+            _safe_set(r, "returnFieldDocumentation", bool(return_field_documentation))
+
+            # Some schemas have maxResults; yours doesn't. Safe-set avoids exceptions.
+            _safe_set(r, "maxResults", int(max_results))
+
+            # Optional include/exclude filters (only if those elements exist)
+            if include and r.asElement().hasElement("include"):
+                inc = r.getElement("include")
+                for k, v in include.items():
+                    try:
+                        # some keys are scalars (productType/fieldType), some can be arrays (category)
+                        if isinstance(v, (list, tuple)):
+                            el = inc.getElement(k)
+                            for item in v:
+                                el.appendValue(item)
+                        else:
+                            inc.setElement(k, v)
+                    except Exception:
+                        pass
+
+            if exclude and r.asElement().hasElement("exclude"):
+                exc = r.getElement("exclude")
+                for k, v in exclude.items():
+                    try:
+                        if isinstance(v, (list, tuple)):
+                            el = exc.getElement(k)
+                            for item in v:
+                                el.appendValue(item)
+                        else:
+                            exc.setElement(k, v)
+                    except Exception:
+                        pass
+
+        msgs = self._send_request(_APIFLDS_SVC, "FieldSearchRequest", build)
+        df = _parse_field_search(msgs)
+
+        # Client-side cap (covers schemas without request.maxResults)
+        if max_results and len(df) > max_results:
+            df = df.head(max_results).reset_index(drop=True)
+
+        return df
+
+
     # ────────────────────────────────────────────────────────────────────────
     # Live subscriptions (very small helper)
     # ────────────────────────────────────────────────────────────────────────
@@ -277,6 +337,17 @@ class Bbg:
 # ────────────────────────────────────────────────────────────────────────────────
 # Builders & parsers
 # ────────────────────────────────────────────────────────────────────────────────
+def _safe_set(req: blpapi.Request, name: str, value: Any) -> bool:
+    """Set req[name]=value only if the element exists in the schema. Returns True if set."""
+    try:
+        if req.asElement().hasElement(name):
+            req.set(name, value)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _as_date_obj(x: Any) -> dt.date:
     # normalize blpapi.Datetime | datetime | date -> date
     if isinstance(x, dt.datetime):
@@ -530,6 +601,49 @@ def _parse_field_info(msgs: List[blpapi.Message]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _parse_field_search(msgs: List[blpapi.Message]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+
+    for msg in msgs:
+        root = msg.asElement()
+
+        if not root.hasElement("fieldData"):
+            continue
+
+        arr = msg.getElement("fieldData")
+        for i in range(arr.numValues()):
+            fd = arr.getValueAsElement(i)
+
+            row: Dict[str, Any] = {}
+            if fd.hasElement("id"):
+                row["id"] = fd.getElementAsString("id")
+
+            # Most useful stuff is inside fieldInfo
+            if fd.hasElement("fieldInfo"):
+                info = fd.getElement("fieldInfo")
+                for key in ("mnemonic", "description", "datatype", "categoryName", "ftype"):
+                    if info.hasElement(key):
+                        try:
+                            row[key] = info.getElementAsString(key)
+                        except Exception:
+                            row[key] = info.getElement(key).getValue()
+
+                # If you asked for docs, there can be extra fields — capture generically
+                for j in range(info.numElements()):
+                    sub = info.getElement(j)
+                    k = str(sub.name())
+                    if k not in row:
+                        try:
+                            row[k] = sub.getValue()
+                        except Exception:
+                            pass
+
+            if row:
+                rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Live feed helper
@@ -661,8 +775,8 @@ if __name__ == "__main__":
     print("BDP example:\n", bbg.bdp(["IBM US Equity", "SPY US Equity"], ["PX_LAST", "CUR_MKT_CAP"]))
 
     # BDS: bulk field
-    members = bbg.bds(["SPX Index"], "INDX_MEMBERS")
-    print("\nBDS example (first rows):\n", members["SPX Index"].head())
+    members = bbg.bds(["TUH6 Comdty","TUM6 Comdty"], "FUT_DLVRBLE_BNDS_CUSIPS")
+    print("\nBDS example (first rows):\n", members)
 
     # BDH: historical
     h = bbg.bdh(["9127934G8 Govt"], ["PX_LAST"], start=dt.date(2025,1,1), end=dt.date(2025,3,31))
@@ -670,17 +784,18 @@ if __name__ == "__main__":
 
     # Intraday bars
     endt = dt.datetime.now().replace(microsecond=0) - dt.timedelta(minutes=1)
-    startt = endt - dt.timedelta(hours=1)
-    bars = bbg.intraday_bars("SPY US Equity", startt, endt, event_type="TRADE", interval_minutes=5)
-    print("\nIntraday bars:\n", bars.tail())
+    startt = endt - dt.timedelta(hours=8)
+    # bars = bbg.intraday_bars("SPY US Equity", startt, endt, event_type="TRADE", interval_minutes=5)
+    # print("\nIntraday bars:\n", bars.tail())
 
     # Intraday ticks
-    ticks = bbg.intraday_ticks("SPY US Equity", startt, endt, event_types=["TRADE", "BID", "ASK"])
-    print("\nIntraday ticks (head):\n", ticks.head())
+    # ticks = bbg.intraday_ticks("SPY US Equity", startt, endt, event_types=["TRADE", "BID", "ASK"])
+    # print("\nIntraday ticks (head):\n", ticks.head())
 
     # Discovery
-    print("\nSecurity search for 'UST 10Y':\n", bbg.security_search("UST 10Y").head())
-    print("\nField info for PX_* fields:\n", bbg.field_info(["PX_LAST", "PX_OPEN"]))
+    print("\nSecurity search for 'UST 10Y':\n", bbg.security_search("TUH6 Comdty").head())
+    print("\nField info for PX_* fields:\n", bbg.field_info(["DELIVERY", "PX_OPEN"]))
+    print("\nField search for DELIV* :\n", bbg.field_search("DLV", max_results=50))
 
     # Live subscription (prints 5 updates then exits)
     ct = {"n": 0}
