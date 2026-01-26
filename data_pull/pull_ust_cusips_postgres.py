@@ -30,7 +30,7 @@ FISCAL_URL = (
 )
 
 DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@localhost:5432/markets")
-TABLE = "auctioned_securities"
+TABLE = "sec.auctioned_securities"
 PAGE_SIZE = 10_000  # Fiscal Data API max is typically 10k per page
 
 
