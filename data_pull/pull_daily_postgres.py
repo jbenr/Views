@@ -95,36 +95,29 @@ def get_cusips(conn) -> List[str]:
     return [r[0] for r in rows]
 
 
-def get_date_range(conn) -> tuple[dt.date, dt.date]:
+def get_date_range(conn, force_start: dt.date = None) -> tuple[dt.date, dt.date]:
+    today = dt.date.today()
+    
+    if force_start:
+        return (force_start, today)
+    
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT min(ts)::date, max(ts)::date
+            SELECT max(ts)::date
             FROM md.ust_eod;
         """)
         row = cur.fetchone()
 
-    today = dt.date.today()
-
     if row is None or row[0] is None:
-        # No data yet → pull from historical start
         return (dt.date(1990, 1, 1), today)
 
-    start, end = row
+    max_date = row[0]
+    if isinstance(max_date, dt.datetime):
+        max_date = max_date.date()
 
-    # Ensure both are `date` objects
-    if isinstance(start, dt.datetime):
-        start = start.date()
-    if isinstance(end, dt.datetime):
-        end = end.date()
-
-    # Don’t allow future start
+    start = max_date + dt.timedelta(days=1)
     if start > today:
-        start = today
-
-    # Start from day after last saved date to avoid duplicate pull
-    start = end + dt.timedelta(days=1)
-    if start > today:
-        start = today
+        return (None, None)  # fully caught up
 
     return (start, today)
 
@@ -281,7 +274,12 @@ def main() -> None:
             print("No CUSIPs found in auctioned_securities (Note/Bond). Nothing to do.")
             return
 
-        start, end = get_date_range(conn)
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--backfill", type=str, help="Force start date (YYYY-MM-DD)")
+        args = parser.parse_args()
+
+        force_start = dt.datetime.strptime(args.backfill, "%Y-%m-%d").date() if args.backfill else None
+        start, end = get_date_range(conn, force_start)
         if start is None or end is None:
             print("No new dates to pull. You're up to date.")
             return
