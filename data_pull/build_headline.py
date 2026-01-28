@@ -93,7 +93,9 @@ WITH first_auction AS (
     FROM auctioned_securities
     WHERE security_type IN ('Note', 'Bond')
       AND original_security_term = ANY(%s)
+      AND floating_rate = 'No'
     GROUP BY cusip, original_security_term, inflation_index_security
+),
 ),
 ranked AS (
     SELECT 
