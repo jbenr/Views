@@ -84,7 +84,7 @@ def get_cusips(conn) -> List[str]:
     """Distinct UST Note/Bond CUSIPs from auctioned_securities."""
     sql = """
         SELECT DISTINCT cusip
-        FROM auctioned_securities
+        FROM sec.auctioned_securities
         WHERE cusip IS NOT NULL
           AND security_type IN ('Note', 'Bond')
         ORDER BY cusip;
