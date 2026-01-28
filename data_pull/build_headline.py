@@ -90,12 +90,11 @@ WITH first_auction AS (
         MAX(maturity_date) AS maturity_date,
         original_security_term,
         inflation_index_security
-    FROM auctioned_securities
+    FROM sec.auctioned_securities
     WHERE security_type IN ('Note', 'Bond')
       AND original_security_term = ANY(%s)
       AND floating_rate = 'No'
     GROUP BY cusip, original_security_term, inflation_index_security
-),
 ),
 ranked AS (
     SELECT 

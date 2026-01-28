@@ -36,7 +36,7 @@ BBG_FIELDS = [
     "YLD_YTM_ASK",
 ]
 
-BATCH_SIZE = 5  # number of CUSIPs per BDH request
+BATCH_SIZE = 100  # number of CUSIPs per BDH request
 
 
 # ---------------------------------------------------------------------------
