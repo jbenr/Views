@@ -17,7 +17,7 @@ from typing import List, Tuple
 import pandas as pd
 import psycopg  # pip install "psycopg[binary]"
 from tqdm import tqdm
-
+import argparse
 from berg import Bbg  # adjust if you put Bbg somewhere else
 
 # ---------------------------------------------------------------------------
@@ -279,7 +279,7 @@ def main() -> None:
         args = parser.parse_args()
 
         force_start = dt.datetime.strptime(args.backfill, "%Y-%m-%d").date() if args.backfill else None
-        start, end = get_date_range(conn, force_start)
+        start, end = get_date_range(conn, '2020-01-01')
         if start is None or end is None:
             print("No new dates to pull. You're up to date.")
             return
