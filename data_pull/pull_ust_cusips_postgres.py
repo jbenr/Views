@@ -1,42 +1,51 @@
 #!/usr/bin/env python3
 # pull_ust_cusips_postgres.py
 #
-# Full + incremental loader for Treasury Securities Auctions Data
-# using the Fiscal Data API only.
+# Full + incremental loader for Treasury Securities Auctions Data (Fiscal Data API)
+# -> loads into Postgres (schema-qualified table), supports full refresh + incremental updates.
 
 import os
 import sys
-import json
-from typing import Any, Dict, List
-
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 import requests
 import pandas as pd
 
 try:
     import psycopg  # type: ignore
+    _PSYCOPG_V3 = True
 except ImportError:
     import psycopg2 as psycopg  # type: ignore
+    _PSYCOPG_V3 = False
 
 
-# -----------------------------------------------------------------------------#
+# ────────────────────────────────────────────────────────────────────────────────
 # Config
-# -----------------------------------------------------------------------------#
+# ────────────────────────────────────────────────────────────────────────────────
 
 FISCAL_URL = (
     "https://api.fiscaldata.treasury.gov/"
     "services/api/fiscal_service/v1/accounting/od/auctions_query"
 )
-
 DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@localhost:5432/markets")
-TABLE = "sec.auctioned_securities"
-PAGE_SIZE = 10_000  # Fiscal Data API max is typically 10k per page
+TABLE = os.getenv("AUCTIONS_TABLE", "sec.auctioned_securities")  # schema.table
+PAGE_SIZE = 10_000  # Fiscal Data API max page size is typically 10k
+
+# Split schema + table safely, and build a properly-quoted qualified name.
+if "." not in TABLE:
+    raise ValueError(f"TABLE must be schema-qualified like 'sec.auctioned_securities', got: {TABLE!r}")
+SCHEMA, TABLE_NAME = TABLE.split(".", 1)
 
 
-# -----------------------------------------------------------------------------#
-# Helpers
-# -----------------------------------------------------------------------------#
+def qname() -> str:
+    """Quoted schema-qualified table name: "sec"."auctioned_securities"."""
+    return f'"{SCHEMA}"."{TABLE_NAME}"'
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# DB helpers
+# ────────────────────────────────────────────────────────────────────────────────
 
 def get_conn():
     return psycopg.connect(DB_DSN)
@@ -54,11 +63,103 @@ def _pg_type(dtype) -> str:
     return "TEXT"
 
 
+def _ensure_schema_and_indexes(conn, df: pd.DataFrame) -> None:
+    """Create schema/table (columns inferred from df) + a few useful indexes."""
+    cols = [f'"{name}" {_pg_type(dtype)}' for name, dtype in df.dtypes.items()]
+    ddl_schema = f'CREATE SCHEMA IF NOT EXISTS "{SCHEMA}";'
+    ddl_table = f'CREATE TABLE IF NOT EXISTS {qname()} ({", ".join(cols)});'
+
+    with conn.cursor() as cur:
+        cur.execute(ddl_schema)
+        cur.execute(ddl_table)
+
+        # Index names should avoid dots; use schema_table prefix.
+        idx_prefix = f"{SCHEMA}_{TABLE_NAME}"
+
+        if {"cusip", "auction_date"}.issubset(df.columns):
+            cur.execute(
+                f'CREATE UNIQUE INDEX IF NOT EXISTS idx_{idx_prefix}_cusip_auction_date '
+                f'ON {qname()}("cusip","auction_date");'
+            )
+        if "cusip" in df.columns:
+            cur.execute(
+                f'CREATE INDEX IF NOT EXISTS idx_{idx_prefix}_cusip '
+                f'ON {qname()}("cusip");'
+            )
+        if "auction_date" in df.columns:
+            cur.execute(
+                f'CREATE INDEX IF NOT EXISTS idx_{idx_prefix}_auction_date '
+                f'ON {qname()}("auction_date");'
+            )
+
+    conn.commit()
+
+
+def _get_db_columns(conn) -> List[str]:
+    """List columns in the target table using schema+table filters (correct for schema-qualified names)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (SCHEMA, TABLE_NAME),
+        )
+        return [r[0] for r in cur.fetchall()]
+
+
+def _insert_dataframe(conn, df: pd.DataFrame) -> int:
+    """
+    Insert rows from df into the target table.
+    - Only inserts columns that exist in DB (ignores extras).
+    - Uses ON CONFLICT (cusip, auction_date) DO NOTHING when possible.
+    Returns rows inserted (best-effort; rowcount can be driver-dependent).
+    """
+    if df.empty:
+        return 0
+
+    db_cols = _get_db_columns(conn)
+    cols = [c for c in db_cols if c in df.columns]
+    if not cols:
+        return 0
+
+    df = df[cols]
+    col_list = ", ".join(f'"{c}"' for c in cols)
+    placeholders = "(" + ",".join(["%s"] * len(cols)) + ")"
+
+    conflict = ""
+    if {"cusip", "auction_date"}.issubset(cols):
+        conflict = ' ON CONFLICT ("cusip","auction_date") DO NOTHING'
+
+    sql = f"INSERT INTO {qname()} ({col_list}) VALUES {placeholders}{conflict};"
+
+    rows = [tuple(None if pd.isna(v) else v for v in row) for row in df.to_numpy()]
+
+    with conn.cursor() as cur:
+        cur.executemany(sql, rows)
+        inserted = cur.rowcount  # may be -1 in some drivers; still okay as a signal
+    conn.commit()
+    return inserted
+
+
+def _get_max_auction_date(conn) -> Optional[datetime]:
+    """Max auction_date in table; None if table empty or missing column."""
+    with conn.cursor() as cur:
+        cur.execute(f'SELECT max("auction_date") FROM {qname()};')
+        row = cur.fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# API helpers
+# ────────────────────────────────────────────────────────────────────────────────
+
 def _normalize(df: pd.DataFrame) -> pd.DataFrame:
-    """Minimal normalization: parse dates & key numerics, but keep column names as-is."""
+    """Parse known date/numeric fields; keep original column names."""
     df = df.copy()
 
-    # Date-like fields in auctions_query
     for col in (
         "record_date",
         "auction_date",
@@ -72,7 +173,6 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    # Some important numeric fields; you can add more if you care
     for col in (
         "total_accepted",
         "total_tendered",
@@ -88,19 +188,13 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def fetch_all_auctions(extra_params: Dict[str, Any] | None = None) -> pd.DataFrame:
-    """
-    Pull all pages from the Fiscal Data auctions_query endpoint.
-    If extra_params is given, merge into the request params (e.g. filters).
-    """
+def fetch_all_auctions(extra_params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    """Pull all pages from Fiscal Data auctions_query endpoint (optionally filtered)."""
     rows: List[Dict[str, Any]] = []
     page = 1
 
     while True:
-        params: Dict[str, Any] = {
-            "page[size]": PAGE_SIZE,
-            "page[number]": page,
-        }
+        params: Dict[str, Any] = {"page[size]": PAGE_SIZE, "page[number]": page}
         if extra_params:
             params.update(extra_params)
 
@@ -111,222 +205,108 @@ def fetch_all_auctions(extra_params: Dict[str, Any] | None = None) -> pd.DataFra
         data = payload.get("data", [])
         if not data:
             break
-
         rows.extend(data)
 
-        links = payload.get("links", {})
-        if not links.get("next"):
-            # No more pages
+        if not payload.get("links", {}).get("next"):
             break
-
         page += 1
 
-    if not rows:
-        return pd.DataFrame()
-
-    return _normalize(pd.DataFrame(rows))
+    return _normalize(pd.DataFrame(rows)) if rows else pd.DataFrame()
 
 
-def _ensure_schema_and_indexes(conn, df: pd.DataFrame) -> None:
-    """
-    Ensure table exists with columns based on df (if not already there),
-    and that useful indexes exist.
-    """
-    cols = [f'"{name}" {_pg_type(dtype)}' for name, dtype in df.dtypes.items()]
-    ddl = f'CREATE TABLE IF NOT EXISTS "{TABLE}" ({", ".join(cols)});'
-
-    with conn.cursor() as cur:
-        cur.execute(ddl)
-
-        # Unique index on (cusip, auction_date) enables ON CONFLICT DO NOTHING
-        if {"cusip", "auction_date"}.issubset(df.columns):
-            cur.execute(
-                f'CREATE UNIQUE INDEX IF NOT EXISTS '
-                f'idx_{TABLE}_cusip_auction_date '
-                f'ON "{TABLE}"("cusip","auction_date");'
-            )
-
-        if "cusip" in df.columns:
-            cur.execute(
-                f'CREATE INDEX IF NOT EXISTS idx_{TABLE}_cusip '
-                f'ON "{TABLE}"("cusip");'
-            )
-
-        if "auction_date" in df.columns:
-            cur.execute(
-                f'CREATE INDEX IF NOT EXISTS idx_{TABLE}_auction_date '
-                f'ON "{TABLE}"("auction_date");'
-            )
-
-    conn.commit()
-
-
-def _insert_dataframe(conn, df: pd.DataFrame) -> int:
-    """
-    Insert rows from df into TABLE.
-    - Aligns df to existing DB columns: ignores extra columns that DB doesn't have.
-    - Uses ON CONFLICT (cusip, auction_date) DO NOTHING when those columns exist.
-    Returns number of rows actually inserted.
-    """
+def _dedupe(df: pd.DataFrame) -> pd.DataFrame:
+    """Best-effort dedupe: prefer latest row per (cusip, auction_date) or cusip."""
     if df.empty:
-        return 0
-
-    # Discover DB schema
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = %s
-            """,
-            (TABLE,),
-        )
-        db_cols = [row[0] for row in cur.fetchall()]
-
-    # Keep only columns that exist in the DB
-    cols = [c for c in db_cols if c in df.columns]
-    if not cols:
-        return 0
-
-    df = df[cols]
-
-    col_list = ", ".join(f'"{c}"' for c in cols)
-    placeholders = "(" + ",".join(["%s"] * len(cols)) + ")"
-
-    conflict_clause = ""
-    if {"cusip", "auction_date"}.issubset(cols):
-        conflict_clause = ' ON CONFLICT ("cusip","auction_date") DO NOTHING'
-
-    sql = f'INSERT INTO "{TABLE}" ({col_list}) VALUES {placeholders}{conflict_clause};'
-
-    rows = [
-        tuple(None if pd.isna(v) else v for v in row)
-        for row in df.to_numpy()
-    ]
-
-    with conn.cursor() as cur:
-        cur.executemany(sql, rows)
-        inserted = cur.rowcount
-    conn.commit()
-
-    return inserted
+        return df
+    if {"cusip", "auction_date"}.issubset(df.columns):
+        return df.sort_values(["cusip", "auction_date"]).drop_duplicates(["cusip", "auction_date"], keep="last")
+    if "cusip" in df.columns:
+        return df.sort_values("cusip").drop_duplicates(["cusip"], keep="last")
+    return df
 
 
-def _get_max_auction_date(conn) -> datetime | None:
-    """Return the max auction_date currently in the table, or None if empty/missing."""
-    with conn.cursor() as cur:
-        cur.execute(f'SELECT max("auction_date") FROM "{TABLE}";')
-        row = cur.fetchone()
-    return row[0] if row and row[0] is not None else None
-
-
-# -----------------------------------------------------------------------------#
+# ────────────────────────────────────────────────────────────────────────────────
 # Modes
-# -----------------------------------------------------------------------------#
+# ────────────────────────────────────────────────────────────────────────────────
 
 def full_refresh() -> None:
-    """
-    Full historical load: hit the Fiscal Data API for all auctions and
-    rebuild the table from scratch.
-    """
+    """Fetch full history and rebuild table contents."""
     print("📡 Fetching full auctions history from Fiscal Data API…")
     df = fetch_all_auctions()
-
     if df.empty:
         print("No data returned from API for full refresh.", file=sys.stderr)
         sys.exit(1)
 
     before = len(df)
-    if {"cusip", "auction_date"}.issubset(df.columns):
-        df = df.sort_values(["cusip", "auction_date"]).drop_duplicates(
-            ["cusip", "auction_date"], keep="last"
-        )
-    elif "cusip" in df.columns:
-        df = df.sort_values("cusip").drop_duplicates(["cusip"], keep="last")
+    df = _dedupe(df)
     after = len(df)
 
     with get_conn() as conn:
         _ensure_schema_and_indexes(conn, df)
         with conn.cursor() as cur:
-            cur.execute(f'TRUNCATE TABLE "{TABLE}";')
+            cur.execute(f"TRUNCATE TABLE {qname()};")
         conn.commit()
-
         inserted = _insert_dataframe(conn, df)
 
     print(
-        f"✅ Full refresh complete.\n"
+        "✅ Full refresh complete.\n"
         f"   API rows: {before}\n"
         f"   After dedupe: {after}\n"
-        f"   Inserted into {TABLE}: {inserted}"
+        f"   Inserted into {SCHEMA}.{TABLE_NAME}: {inserted}"
     )
 
 
 def incremental_update() -> None:
     """
-    Incremental update:
-    - Look up max(auction_date) in DB.
-    - Ask API only for auctions with auction_date > that.
-    - Insert with ON CONFLICT DO NOTHING.
+    Incremental:
+    - get max(auction_date) from DB
+    - fetch API rows with auction_date > max
+    - insert (ON CONFLICT DO NOTHING)
     """
     with get_conn() as conn:
-        max_dt = _get_max_auction_date(conn)
+        try:
+            max_dt = _get_max_auction_date(conn)
+        except Exception:
+            # First run / table not created yet → bootstrap with full refresh.
+            max_dt = None
 
-        # If table empty / doesn't exist yet, just do full refresh
         if max_dt is None:
-            print("No existing data found. Running full refresh instead.")
-            conn.close()
+            print("No existing data found (or table missing). Running full refresh instead.")
             full_refresh()
             return
 
         cutoff = max_dt.date().isoformat()
         print(f"📡 Fetching auctions with auction_date > {cutoff} …")
-
-        df = fetch_all_auctions(
-            extra_params={
-                "filter": f"auction_date:gt:{cutoff}",
-            }
-        )
+        df = fetch_all_auctions(extra_params={"filter": f"auction_date:gt:{cutoff}"})
 
         if df.empty:
-            print(
-                "✅ No new auctions returned by API.\n"
-                f"   Database is up to date as of auction_date {cutoff}."
-            )
+            print(f"✅ No new auctions returned by API. Up to date as of auction_date {cutoff}.")
             return
 
         api_rows = len(df)
-        if {"cusip", "auction_date"}.issubset(df.columns):
-            df = df.sort_values(["cusip", "auction_date"]).drop_duplicates(
-                ["cusip", "auction_date"], keep="last"
-            )
-        elif "cusip" in df.columns:
-            df = df.sort_values("cusip").drop_duplicates(["cusip"], keep="last")
+        df = _dedupe(df)
         deduped_rows = len(df)
 
         _ensure_schema_and_indexes(conn, df)
         inserted = _insert_dataframe(conn, df)
 
     print(
-        f"✅ Incremental update complete.\n"
+        "✅ Incremental update complete.\n"
         f"   API rows returned: {api_rows}\n"
         f"   After dedupe: {deduped_rows}\n"
-        f"   New rows inserted into {TABLE}: {inserted}"
+        f"   New rows inserted into {SCHEMA}.{TABLE_NAME}: {inserted}"
     )
 
 
-# -----------------------------------------------------------------------------#
+# ────────────────────────────────────────────────────────────────────────────────
 # Entry point
-# -----------------------------------------------------------------------------#
+# ────────────────────────────────────────────────────────────────────────────────
 
-def main():
+def main() -> None:
     mode = "incremental"
     if len(sys.argv) > 1 and sys.argv[1].lower() in {"full", "all", "refresh"}:
         mode = "full"
-
-    if mode == "full":
-        full_refresh()
-    else:
-        incremental_update()
+    (full_refresh if mode == "full" else incremental_update)()
 
 
 if __name__ == "__main__":
