@@ -28,6 +28,31 @@ import matplotlib.pyplot as plt
 class Viz:
     """Time series visualization toolkit for rates analysis."""
 
+    # -------------------------------------------------------------------------
+    # Bloomberg/PrismFP style configuration
+    # -------------------------------------------------------------------------
+    
+    # Color palette matching the chart
+    COLORS = [
+        '#E67E22',  # Orange (TU)
+        '#F4D03F',  # Yellow (FV) 
+        '#27AE60',  # Green (TY)
+        '#3498DB',  # Blue (US)
+        '#9B59B6',  # Purple
+        '#E74C3C',  # Red
+        '#1ABC9C',  # Teal
+        '#95A5A6',  # Gray
+    ]
+    
+    # Font settings
+    FONT_FAMILY = 'Arial, Helvetica, sans-serif'
+    FONT_SIZE = 11
+    TITLE_SIZE = 13
+    
+    # Background colors
+    BG_COLOR = '#F8F8F8'
+    GRID_COLOR = '#E0E0E0'
+    
     def __init__(self, style: str = 'plotly'):
         """
         Initialize visualizer.
@@ -36,10 +61,58 @@ class Viz:
             style: 'plotly' or 'seaborn' (default plotting backend)
         """
         self.style = style
-        self.colors = px.colors.qualitative.Set2
+        self.colors = self.COLORS
         
         # Seaborn defaults
         sns.set_theme(style='whitegrid')
+        
+    def _base_layout(self, title: str = None, xaxis_title: str = None, yaxis_title: str = None):
+        """Return base layout matching PrismFP style."""
+        return dict(
+            title=dict(
+                text=title.upper() if title else None,
+                font=dict(family=self.FONT_FAMILY, size=self.TITLE_SIZE, color='#333'),
+                x=0.5,
+                xanchor='center',
+            ),
+            font=dict(family=self.FONT_FAMILY, size=self.FONT_SIZE, color='#333'),
+            plot_bgcolor=self.BG_COLOR,
+            paper_bgcolor='white',
+            xaxis=dict(
+                title=xaxis_title.upper() if xaxis_title else None,
+                showgrid=True,
+                gridcolor=self.GRID_COLOR,
+                gridwidth=1,
+                showline=True,
+                linewidth=1,
+                linecolor='#333',
+                tickfont=dict(size=10),
+                tickformat='%m/%d/%y %H:%M' if xaxis_title == 'Date' else None,
+            ),
+            yaxis=dict(
+                title=yaxis_title.upper() if yaxis_title else None,
+                showgrid=True,
+                gridcolor=self.GRID_COLOR,
+                gridwidth=1,
+                showline=True,
+                linewidth=1,
+                linecolor='#333',
+                tickfont=dict(size=10),
+            ),
+            legend=dict(
+                orientation='h',
+                yanchor='bottom',
+                y=1.02,
+                xanchor='left',
+                x=0,
+                font=dict(size=10),
+                bgcolor='rgba(255,255,255,0.8)',
+                bordercolor='#ccc',
+                borderwidth=1,
+            ),
+            margin=dict(l=60, r=40, t=80, b=60),
+            hovermode='x unified',
+        )
         
     # -------------------------------------------------------------------------
     # Centered Date Chart
@@ -134,14 +207,14 @@ class Viz:
                 y=data[col],
                 mode='lines',
                 name=col,
-                line=dict(color=self.colors[i % len(self.colors)], width=2),
+                line=dict(color=self.colors[i % len(self.colors)], width=1.5),
             ))
         
         # Add vertical line at center
-        fig.add_vline(x=0, line_dash='dash', line_color='gray', opacity=0.5)
+        fig.add_vline(x=0, line_dash='dash', line_color='#666', line_width=1, opacity=0.7)
         
         # Add horizontal line at 0
-        fig.add_hline(y=0, line_dash='dash', line_color='gray', opacity=0.5)
+        fig.add_hline(y=0, line_dash='dash', line_color='#666', line_width=1, opacity=0.7)
         
         ylabel = {
             'level': 'Change (bps)',
@@ -149,36 +222,40 @@ class Viz:
             'pct': 'Change (%)',
         }.get(normalize, 'Value')
         
-        fig.update_layout(
-            title=title or f"Centered on {center_date.strftime('%Y-%m-%d')}",
+        default_title = f"Centered on {center_date.strftime('%m/%d/%y')}"
+        
+        layout = self._base_layout(
+            title=title or default_title,
             xaxis_title='Days from Event',
             yaxis_title=ylabel,
-            hovermode='x unified',
-            template='plotly_white',
-            legend=dict(orientation='h', yanchor='bottom', y=1.02),
         )
+        fig.update_layout(**layout)
         
         return fig
     
     def _centered_seaborn(self, data, cols, center_date, normalize, title):
-        fig, ax = plt.subplots(figsize=(12, 6))
+        fig, ax = plt.subplots(figsize=(12, 6), facecolor='white')
+        ax.set_facecolor(self.BG_COLOR)
         
-        for col in cols:
-            ax.plot(data.index, data[col], label=col, linewidth=2)
+        for i, col in enumerate(cols):
+            ax.plot(data.index, data[col], label=col, linewidth=1.5, 
+                   color=self.colors[i % len(self.colors)])
         
-        ax.axvline(0, color='gray', linestyle='--', alpha=0.5)
-        ax.axhline(0, color='gray', linestyle='--', alpha=0.5)
+        ax.axvline(0, color='#666', linestyle='--', alpha=0.7, linewidth=1)
+        ax.axhline(0, color='#666', linestyle='--', alpha=0.7, linewidth=1)
         
         ylabel = {
-            'level': 'Change (bps)',
-            'change': 'Cumulative Change',
-            'pct': 'Change (%)',
-        }.get(normalize, 'Value')
+            'level': 'CHANGE (BPS)',
+            'change': 'CUMULATIVE CHANGE',
+            'pct': 'CHANGE (%)',
+        }.get(normalize, 'VALUE')
         
-        ax.set_xlabel('Days from Event')
-        ax.set_ylabel(ylabel)
-        ax.set_title(title or f"Centered on {center_date.strftime('%Y-%m-%d')}")
-        ax.legend(loc='upper left', bbox_to_anchor=(0, 1.15), ncol=len(cols))
+        ax.set_xlabel('DAYS FROM EVENT', fontsize=self.FONT_SIZE, fontfamily=self.FONT_FAMILY)
+        ax.set_ylabel(ylabel, fontsize=self.FONT_SIZE, fontfamily=self.FONT_FAMILY)
+        ax.set_title((title or f"Centered on {center_date.strftime('%m/%d/%y')}").upper(), 
+                    fontsize=self.TITLE_SIZE, fontfamily=self.FONT_FAMILY)
+        ax.legend(loc='upper left', bbox_to_anchor=(0, 1.12), ncol=len(cols), fontsize=10)
+        ax.grid(True, color=self.GRID_COLOR, linewidth=1)
         
         plt.tight_layout()
         return fig, ax
@@ -213,7 +290,7 @@ class Viz:
             df = df.copy()
             df.index = pd.to_datetime(df.index)
         
-        labels = labels or [str(e) for e in events]
+        labels = labels or [pd.to_datetime(e).strftime('%m/%d/%y') for e in events]
         
         fig = go.Figure()
         
@@ -247,19 +324,18 @@ class Viz:
                 y=data[col],
                 mode='lines',
                 name=label,
-                line=dict(color=self.colors[i % len(self.colors)], width=2),
+                line=dict(color=self.colors[i % len(self.colors)], width=1.5),
             ))
         
-        fig.add_vline(x=0, line_dash='dash', line_color='gray', opacity=0.5)
-        fig.add_hline(y=0, line_dash='dash', line_color='gray', opacity=0.5)
+        fig.add_vline(x=0, line_dash='dash', line_color='#666', line_width=1, opacity=0.7)
+        fig.add_hline(y=0, line_dash='dash', line_color='#666', line_width=1, opacity=0.7)
         
-        fig.update_layout(
+        layout = self._base_layout(
             title=title or f"Event Comparison: {col}",
             xaxis_title='Days from Event',
             yaxis_title='Change (bps)' if normalize == 'level' else 'Change (%)',
-            hovermode='x unified',
-            template='plotly_white',
         )
+        fig.update_layout(**layout)
         
         return fig
 
@@ -304,17 +380,17 @@ class Viz:
                 x=tenors,
                 y=values,
                 mode='lines+markers',
-                name=date.strftime('%Y-%m-%d'),
-                line=dict(color=self.colors[i % len(self.colors)], width=2),
+                name=date.strftime('%m/%d/%y'),
+                line=dict(color=self.colors[i % len(self.colors)], width=1.5),
+                marker=dict(size=6),
             ))
         
-        fig.update_layout(
+        layout = self._base_layout(
             title=title or 'Yield Curve Snapshots',
             xaxis_title='Tenor',
             yaxis_title='Yield (%)',
-            hovermode='x unified',
-            template='plotly_white',
         )
+        fig.update_layout(**layout)
         
         return fig
 
@@ -339,18 +415,18 @@ class Viz:
             x=corr.index,
             y=corr,
             mode='lines',
-            name=f'{window}d Correlation',
-            line=dict(color=self.colors[0], width=2),
+            name=f'{window}d Corr',
+            line=dict(color=self.colors[0], width=1.5),
         ))
         
-        fig.add_hline(y=0, line_dash='dash', line_color='gray', opacity=0.5)
+        fig.add_hline(y=0, line_dash='dash', line_color='#666', line_width=1, opacity=0.7)
         
-        fig.update_layout(
+        layout = self._base_layout(
             title=title or f'Rolling {window}d Correlation: {col1} vs {col2}',
             xaxis_title='Date',
             yaxis_title='Correlation',
-            template='plotly_white',
         )
+        fig.update_layout(**layout)
         
         return fig
     
@@ -373,20 +449,20 @@ class Viz:
             y=zscore,
             mode='lines',
             name=f'{col} Z-Score',
-            line=dict(color=self.colors[0], width=2),
+            line=dict(color=self.colors[0], width=1.5),
         ))
         
         # Add bands
-        fig.add_hline(y=2, line_dash='dash', line_color='red', opacity=0.5)
-        fig.add_hline(y=-2, line_dash='dash', line_color='red', opacity=0.5)
-        fig.add_hline(y=0, line_dash='dash', line_color='gray', opacity=0.5)
+        fig.add_hline(y=2, line_dash='dash', line_color='#E74C3C', line_width=1, opacity=0.7)
+        fig.add_hline(y=-2, line_dash='dash', line_color='#E74C3C', line_width=1, opacity=0.7)
+        fig.add_hline(y=0, line_dash='dash', line_color='#666', line_width=1, opacity=0.7)
         
-        fig.update_layout(
+        layout = self._base_layout(
             title=title or f'Rolling {window}d Z-Score: {col}',
             xaxis_title='Date',
             yaxis_title='Z-Score',
-            template='plotly_white',
         )
+        fig.update_layout(**layout)
         
         return fig
 
@@ -416,19 +492,18 @@ class Viz:
                 zmid=0,
                 text=corr.round(2).values,
                 texttemplate='%{text}',
-                textfont=dict(size=10),
+                textfont=dict(size=10, family=self.FONT_FAMILY),
             ))
             
-            fig.update_layout(
-                title=title or 'Correlation Matrix',
-                template='plotly_white',
-            )
+            layout = self._base_layout(title=title or 'Correlation Matrix')
+            fig.update_layout(**layout)
             
             return fig
         else:
-            fig, ax = plt.subplots(figsize=(10, 8))
+            fig, ax = plt.subplots(figsize=(10, 8), facecolor='white')
             sns.heatmap(corr, annot=True, fmt='.2f', cmap='RdBu_r', center=0, ax=ax)
-            ax.set_title(title or 'Correlation Matrix')
+            ax.set_title((title or 'Correlation Matrix').upper(), 
+                        fontsize=self.TITLE_SIZE, fontfamily=self.FONT_FAMILY)
             plt.tight_layout()
             return fig, ax
 
@@ -460,14 +535,15 @@ class Viz:
             y=changes.index.strftime('%Y-%m'),
             colorscale='RdBu_r',
             zmid=0,
+            textfont=dict(family=self.FONT_FAMILY),
         ))
         
-        fig.update_layout(
+        layout = self._base_layout(
             title=title or f'{freq} Changes Heatmap',
             xaxis_title='Tenor',
             yaxis_title='Period',
-            template='plotly_white',
         )
+        fig.update_layout(**layout)
         
         return fig
 
@@ -499,17 +575,18 @@ class Viz:
                 y=loadings[col],
                 mode='lines+markers',
                 name=col,
-                line=dict(color=self.colors[i], width=2),
+                line=dict(color=self.colors[i], width=1.5),
+                marker=dict(size=6),
             ))
         
-        fig.add_hline(y=0, line_dash='dash', line_color='gray', opacity=0.5)
+        fig.add_hline(y=0, line_dash='dash', line_color='#666', line_width=1, opacity=0.7)
         
-        fig.update_layout(
+        layout = self._base_layout(
             title=title or 'PCA Loadings by Tenor',
             xaxis_title='Tenor',
             yaxis_title='Loading',
-            template='plotly_white',
         )
+        fig.update_layout(**layout)
         
         return fig
     
@@ -548,18 +625,17 @@ class Viz:
                 y=cumulative * 100,
                 mode='lines+markers',
                 name='Cumulative',
-                line=dict(color=self.colors[1], width=2),
+                line=dict(color=self.colors[1], width=1.5),
+                marker=dict(size=6),
             ),
             secondary_y=True,
         )
         
-        fig.update_layout(
-            title=title or 'PCA Explained Variance',
-            template='plotly_white',
-        )
+        layout = self._base_layout(title=title or 'PCA Explained Variance')
+        fig.update_layout(**layout)
         
-        fig.update_yaxes(title_text='Variance (%)', secondary_y=False)
-        fig.update_yaxes(title_text='Cumulative (%)', secondary_y=True)
+        fig.update_yaxes(title_text='VARIANCE (%)', secondary_y=False)
+        fig.update_yaxes(title_text='CUMULATIVE (%)', secondary_y=True)
         
         return fig
 
@@ -572,27 +648,55 @@ class Viz:
         df: pd.DataFrame,
         cols: Optional[List[str]] = None,
         title: Optional[str] = None,
+        show_avg: bool = False,
     ):
-        """Simple line chart."""
+        """
+        Simple line chart.
+        
+        Args:
+            df: DataFrame with DatetimeIndex
+            cols: Columns to plot
+            title: Chart title
+            show_avg: If True, add horizontal dashed lines for column averages (like the PrismFP chart)
+        """
         cols = cols or df.select_dtypes(include=[np.number]).columns.tolist()
         
         fig = go.Figure()
         
         for i, col in enumerate(cols):
+            color = self.colors[i % len(self.colors)]
+            
             fig.add_trace(go.Scatter(
                 x=df.index,
                 y=df[col],
                 mode='lines',
                 name=col,
-                line=dict(color=self.colors[i % len(self.colors)], width=2),
+                line=dict(color=color, width=1.5),
             ))
+            
+            # Add average line like in the reference chart
+            if show_avg:
+                avg = df[col].mean()
+                fig.add_hline(
+                    y=avg, 
+                    line_dash='dash', 
+                    line_color=color, 
+                    line_width=1, 
+                    opacity=0.7,
+                    annotation_text=f"{col} avg = {avg:.1f}",
+                    annotation_position="right",
+                    annotation_font=dict(size=9, color=color),
+                )
         
-        fig.update_layout(
+        layout = self._base_layout(
             title=title,
-            hovermode='x unified',
-            template='plotly_white',
-            legend=dict(orientation='h', yanchor='bottom', y=1.02),
+            xaxis_title='Date',
+            yaxis_title='Value',
         )
+        fig.update_layout(**layout)
+        
+        # Date format like the reference: MM/DD/YY HH:MM
+        fig.update_xaxes(tickformat='%m/%d/%y\n%H:%M')
         
         return fig
     
@@ -611,7 +715,51 @@ class Viz:
             y=y,
             color=color,
             title=title,
-            template='plotly_white',
+        )
+        
+        layout = self._base_layout(title=title, xaxis_title=x, yaxis_title=y)
+        fig.update_layout(**layout)
+        
+        return fig
+    
+    # -------------------------------------------------------------------------
+    # Annotation helper (for event markers like "NFP RELEASE")
+    # -------------------------------------------------------------------------
+    
+    def add_event_annotation(
+        self,
+        fig,
+        x,
+        text: str,
+        y_position: str = 'top',
+    ):
+        """
+        Add an event annotation to an existing figure (like "NFP RELEASE @ 09JAN 08:30 ET").
+        
+        Args:
+            fig: Plotly figure
+            x: X position (date/datetime)
+            text: Annotation text
+            y_position: 'top' or 'bottom'
+        """
+        fig.add_vline(
+            x=x, 
+            line_dash='dot', 
+            line_color='#333', 
+            line_width=1,
+        )
+        
+        fig.add_annotation(
+            x=x,
+            y=1.0 if y_position == 'top' else 0.0,
+            yref='paper',
+            text=text,
+            showarrow=False,
+            font=dict(size=9, family=self.FONT_FAMILY, color='#333'),
+            bgcolor='rgba(255,255,255,0.8)',
+            bordercolor='#ccc',
+            borderwidth=1,
+            borderpad=3,
         )
         
         return fig
@@ -640,3 +788,6 @@ def rolling_zscore(*args, **kwargs):
 
 def corr_heatmap(*args, **kwargs):
     return _viz.corr_heatmap(*args, **kwargs)
+
+def line(*args, **kwargs):
+    return _viz.line(*args, **kwargs)

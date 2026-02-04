@@ -76,7 +76,7 @@ WITH tips_first_issue AS (
         cusip,
         original_security_term AS tenor,
         MIN(auction_date) AS first_auction_date
-    FROM auctioned_securities
+    FROM sec.auctioned_securities
     WHERE inflation_index_security = 'Yes'
       AND security_type IN ('Note', 'Bond')
       AND original_security_term = ANY(%s)
