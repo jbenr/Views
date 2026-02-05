@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
 Visualization and time series analysis helpers for rates/fixed income work.
-PrismFP/Bloomberg style formatting.
+PrismFP/Bloomberg style formatting with interactive time navigation.
 
 Usage:
-    from viz import Viz
-    
+    from utils.viz import Viz
+
     v = Viz()
-    v.centered_chart(df, center_date='2025-06-15', window=30, cols=['2Y', '10Y'])
-    v.curve_snapshot(df, dates=['2025-01-01', '2025-06-01'])
+    v.line(df, title='UST Yields', yaxis_title='Yield (%)')
     v.rolling_corr(df, col1='2Y', col2='10Y', window=60)
 """
 
@@ -16,14 +15,15 @@ from __future__ import annotations
 
 import pandas as pd
 import numpy as np
-from typing import List, Optional, Union, Dict
+from typing import List, Optional, Union
 from datetime import datetime, timedelta
 
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
-import seaborn as sns
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+
+import ipywidgets as widgets
+from IPython.display import display, clear_output
 
 
 class Viz:
@@ -32,11 +32,10 @@ class Viz:
     # -------------------------------------------------------------------------
     # PrismFP style configuration
     # -------------------------------------------------------------------------
-    
-    # Color palette matching PrismFP exactly
+
     COLORS = [
         '#D35400',  # Dark Orange (TU)
-        '#F1C40F',  # Yellow/Gold (FV) 
+        '#F1C40F',  # Yellow/Gold (FV)
         '#27AE60',  # Green (TY)
         '#2980B9',  # Blue (US)
         '#8E44AD',  # Purple
@@ -44,139 +43,219 @@ class Viz:
         '#16A085',  # Teal
         '#7F8C8D',  # Gray
     ]
-    
-    # Font settings
-    FONT_FAMILY = 'Arial, Helvetica, sans-serif'
+
     FONT_SIZE = 10
     TITLE_SIZE = 11
-    
-    # Background colors
     BG_COLOR = '#F5F5F5'
     GRID_COLOR = '#FFFFFF'
-    
-    def __init__(self, style: str = 'plotly'):
-        """
-        Initialize visualizer.
-        
-        Args:
-            style: 'plotly' or 'seaborn' (default plotting backend)
-        """
-        self.style = style
+
+    TIME_NAV_BUTTONS = [
+        dict(count=1, label="1M", unit="month"),
+        dict(count=3, label="3M", unit="month"),
+        dict(count=6, label="6M", unit="month"),
+        dict(label="YTD"),
+        dict(count=1, label="1Y", unit="year"),
+        dict(count=2, label="2Y", unit="year"),
+        dict(count=5, label="5Y", unit="year"),
+        dict(count=10, label="10Y", unit="year"),
+        dict(label="ALL"),
+    ]
+
+    def __init__(self):
         self.colors = self.COLORS
-        
-        # Seaborn defaults
-        sns.set_theme(style='whitegrid')
-    
-    def _format_title(
-        self, 
-        main_title: str, 
-        start_date: datetime = None, 
-        end_date: datetime = None,
-        interval: str = None,
-    ) -> str:
-        """Format multi-line title like PrismFP."""
-        lines = [main_title.upper()]
-        
-        if start_date and end_date:
-            date_line = f"{start_date.strftime('%m/%d/%y %H:%M')} ET TO {end_date.strftime('%m/%d/%y %H:%M')} ET"
-            if interval:
-                date_line += f", {interval.upper()}"
-            lines.append(date_line)
-        
-        return '<br>'.join(lines)
-    
+        sns.set_theme(style='whitegrid', rc={
+            'font.family': 'sans-serif',
+            'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans'],
+            'font.size': self.FONT_SIZE,
+            'axes.facecolor': self.BG_COLOR,
+            'figure.facecolor': 'white',
+        })
+
+    # -------------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------------
+
     def _format_legend_name(self, name: str, avg: float = None, unit: str = '') -> str:
-        """Format legend entry like 'TU 1mth = 58.9 nv'."""
         if avg is not None:
             return f"{name} = {avg:.1f} {unit}".strip()
         return name
-        
-    def _base_layout(
-        self, 
-        title: str = None, 
-        xaxis_title: str = None, 
-        yaxis_title: str = None,
-        show_source: bool = True,
-        source_text: str = "SOURCE: Custom Analysis",
-    ):
-        """Return base layout matching PrismFP style."""
-        layout = dict(
-            title=dict(
-                text=title,
-                font=dict(family=self.FONT_FAMILY, size=self.TITLE_SIZE, color='#333'),
-                x=0.5,
-                xanchor='center',
-            ),
-            font=dict(family=self.FONT_FAMILY, size=self.FONT_SIZE, color='#333'),
-            plot_bgcolor=self.BG_COLOR,
-            paper_bgcolor='white',
-            xaxis=dict(
-                title=dict(
-                    text=xaxis_title.upper() if xaxis_title else None,
-                    font=dict(size=self.FONT_SIZE),
-                ),
-                showgrid=True,
-                gridcolor=self.GRID_COLOR,
-                gridwidth=1,
-                showline=True,
-                linewidth=1,
-                linecolor='#333',
-                tickfont=dict(size=9),
-                ticks='outside',
-                ticklen=4,
-            ),
-            yaxis=dict(
-                title=dict(
-                    text=yaxis_title.upper() if yaxis_title else None,
-                    font=dict(size=self.FONT_SIZE),
-                ),
-                showgrid=True,
-                gridcolor=self.GRID_COLOR,
-                gridwidth=1,
-                showline=True,
-                linewidth=1,
-                linecolor='#333',
-                tickfont=dict(size=9),
-                ticks='outside',
-                ticklen=4,
-            ),
-            legend=dict(
-                orientation='h',
-                yanchor='bottom',
-                y=1.02,
-                xanchor='left',
-                x=0,
-                font=dict(size=9),
-                bgcolor='rgba(255,255,255,0)',
-                borderwidth=0,
-                itemsizing='constant',
-            ),
-            margin=dict(l=60, r=120, t=80, b=60),
-            hovermode='x unified',
+
+    def _style_ax(self, ax, title=None, yaxis_title=None, xaxis_title=None):
+        """Apply PrismFP / 3fiftyseven styling to a matplotlib axes."""
+        ax.set_facecolor(self.BG_COLOR)
+        if title:
+            ax.set_title(title.upper(), fontsize=self.TITLE_SIZE, color='#333',
+                         pad=10, loc='left')
+        if yaxis_title:
+            ax.set_ylabel(yaxis_title.upper(), fontsize=self.FONT_SIZE, color='#333')
+        if xaxis_title:
+            ax.set_xlabel(xaxis_title.upper(), fontsize=self.FONT_SIZE, color='#333')
+        ax.yaxis.tick_right()
+        ax.yaxis.set_label_position('right')
+        ax.tick_params(labelsize=9, colors='#333')
+        ax.grid(True, color=self.GRID_COLOR, linewidth=1)
+        for spine in ax.spines.values():
+            spine.set_color('#333')
+            spine.set_linewidth(1)
+
+    def _format_dates(self, ax):
+        """Auto-format date axis."""
+        locator = mdates.AutoDateLocator()
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        ax.xaxis.get_offset_text().set_visible(False)
+
+    def _legend(self, ax):
+        """Standard legend in lower left."""
+        ax.legend(loc='lower left', fontsize=9, framealpha=0.85,
+                  edgecolor='none', fancybox=True)
+
+    def _add_hover(self, fig, ax):
+        """Add crosshair + value tooltip on hover. Requires %matplotlib widget."""
+        # Save limits before adding hover elements (xy=0 would blow out the axis)
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+
+        vline = ax.axvline(x=0, color='#ccc', linewidth=0.8)
+        vline.set_visible(False)
+        annot = ax.annotate('', xy=(0, 0), xytext=(15, 15),
+                            textcoords='offset points', fontsize=9,
+                            bbox=dict(boxstyle='round,pad=0.4', fc='white', ec='#ccc'),
+                            zorder=10)
+        annot.set_visible(False)
+
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+
+        # data lines only (skip dashed avg/ref lines)
+        plot_lines = [l for l in ax.get_lines()
+                      if l.get_linestyle() == '-' and l.get_visible()
+                      and len(l.get_xdata()) > 2]
+
+        def on_move(event):
+            if event.inaxes != ax or not plot_lines:
+                if annot.get_visible():
+                    annot.set_visible(False)
+                    vline.set_visible(False)
+                    fig.canvas.draw_idle()
+                return
+
+            xdata = plot_lines[0].get_xdata()
+            if len(xdata) == 0:
+                return
+            idx = np.argmin(np.abs(xdata - event.xdata))
+            snap_x = xdata[idx]
+
+            date_str = mdates.num2date(snap_x).strftime('%b %d, %Y')
+            parts = [date_str]
+            for line in plot_lines:
+                yd = line.get_ydata()
+                if idx < len(yd):
+                    parts.append(f'{line.get_label()}: {yd[idx]:.2f}')
+
+            annot.set_text('\n'.join(parts))
+            annot.xy = (snap_x, event.ydata)
+            annot.set_visible(True)
+            vline.set_xdata([snap_x, snap_x])
+            vline.set_visible(True)
+            fig.canvas.draw_idle()
+
+        fig.canvas.mpl_connect('motion_notify_event', on_move)
+
+    # -------------------------------------------------------------------------
+    # Interactive time navigation
+    # -------------------------------------------------------------------------
+
+    def _make_time_nav(self, df, render_fn, title=None):
+        """Build date pickers + range buttons, wire them to render_fn(start, end)."""
+        _updating = False
+
+        start_picker = widgets.DatePicker(
+            description='Start:',
+            value=df.index.min().date(),
+            layout=widgets.Layout(width='220px'),
         )
-        
-        # Add source annotation
-        if show_source:
-            layout['annotations'] = [
-                dict(
-                    text=source_text,
-                    xref='paper',
-                    yref='paper',
-                    x=1.0,
-                    y=0.02,
-                    xanchor='right',
-                    yanchor='bottom',
-                    font=dict(size=8, color='#666', family=self.FONT_FAMILY),
-                    showarrow=False,
-                )
-            ]
-        
-        return layout
-        
+        end_picker = widgets.DatePicker(
+            description='End:',
+            value=df.index.max().date(),
+            layout=widgets.Layout(width='220px'),
+        )
+
+        btn_layout = widgets.Layout(width='42px', height='26px', padding='0px')
+        btn_widgets = []
+        for b_def in self.TIME_NAV_BUTTONS:
+            b = widgets.Button(description=b_def['label'], layout=btn_layout)
+            btn_widgets.append(b)
+        btn_widgets[-1].button_style = 'warning'  # ALL starts active
+
+        output = widgets.Output()
+
+        def update_range(start, end):
+            with output:
+                clear_output(wait=True)
+                render_fn(start, end)
+
+        def on_btn_click(b):
+            nonlocal _updating
+            if _updating:
+                return
+            _updating = True
+
+            for btn in btn_widgets:
+                btn.button_style = ''
+            b.button_style = 'warning'
+
+            end = df.index.max()
+            label = b.description
+            if label == 'ALL':
+                start = df.index.min()
+            elif label == 'YTD':
+                start = pd.Timestamp(end.year, 1, 1)
+            elif label.endswith('M'):
+                start = end - pd.DateOffset(months=int(label[:-1]))
+            else:
+                start = end - pd.DateOffset(years=int(label[:-1]))
+            start = max(start, df.index.min())
+
+            start_picker.value = start.date()
+            end_picker.value = end.date()
+            _updating = False
+            update_range(pd.Timestamp(start.date()), pd.Timestamp(end.date()))
+
+        def on_date_change(change):
+            nonlocal _updating
+            if _updating:
+                return
+            if not start_picker.value or not end_picker.value:
+                return
+            for btn in btn_widgets:
+                btn.button_style = ''
+            update_range(pd.Timestamp(start_picker.value),
+                         pd.Timestamp(end_picker.value))
+
+        for b in btn_widgets:
+            b.on_click(on_btn_click)
+        start_picker.observe(on_date_change, names='value')
+        end_picker.observe(on_date_change, names='value')
+
+        btn_row = widgets.HBox(btn_widgets, layout=widgets.Layout(gap='2px'))
+        controls = widgets.HBox(
+            [start_picker, end_picker, btn_row],
+            layout=widgets.Layout(gap='8px', align_items='center'),
+        )
+        title_widget = widgets.HTML(
+            value=f'<b style="font-size:13px; color:#333;">{title.upper()}</b>' if title else ''
+        )
+        container = widgets.VBox([title_widget, controls, output])
+
+        # initial render
+        update_range(df.index.min(), df.index.max())
+        return container
+
     # -------------------------------------------------------------------------
-    # Main line chart (PrismFP style)
+    # Line chart (interactive)
     # -------------------------------------------------------------------------
-    
+
     def line(
         self,
         df: pd.DataFrame,
@@ -184,104 +263,58 @@ class Viz:
         title: Optional[str] = None,
         subtitle: Optional[str] = None,
         yaxis_title: Optional[str] = None,
-        show_avg: bool = True,
+        show_avg: bool = False,
         avg_unit: str = '',
         interval: str = None,
-        source: str = "SOURCE: Custom Analysis",
         show_endpoint_marker: bool = True,
     ):
-        """
-        Line chart matching PrismFP style.
-        
-        Args:
-            df: DataFrame with DatetimeIndex
-            cols: Columns to plot
-            title: Main chart title
-            subtitle: Optional subtitle (date range auto-generated if None)
-            yaxis_title: Y-axis label
-            show_avg: If True, add horizontal dashed lines for averages with legend labels
-            avg_unit: Unit to show after average value in legend (e.g., 'nv', 'bps')
-            interval: Interval description (e.g., '10MIN INTERVALS')
-            source: Source text for bottom right
-            show_endpoint_marker: Show 'x' marker at end of each line
-        """
+        """Line chart with interactive time navigation."""
         cols = cols or df.select_dtypes(include=[np.number]).columns.tolist()
-        
-        # Ensure datetime index
         if not isinstance(df.index, pd.DatetimeIndex):
             df = df.copy()
             df.index = pd.to_datetime(df.index)
-        
-        fig = go.Figure()
-        
-        for i, col in enumerate(cols):
-            color = self.colors[i % len(self.colors)]
-            avg = df[col].mean() if show_avg else None
-            
-            # Main line
-            fig.add_trace(go.Scatter(
-                x=df.index,
-                y=df[col],
-                mode='lines',
-                name=self._format_legend_name(col, avg, avg_unit) if show_avg else col,
-                line=dict(color=color, width=1.5),
-                legendgroup=col,
-            ))
-            
-            # Endpoint marker (x)
-            if show_endpoint_marker and not df[col].empty:
-                last_idx = df[col].last_valid_index()
-                if last_idx is not None:
-                    fig.add_trace(go.Scatter(
-                        x=[last_idx],
-                        y=[df.loc[last_idx, col]],
-                        mode='markers',
-                        marker=dict(symbol='x', size=8, color=color, line=dict(width=2)),
-                        showlegend=False,
-                        legendgroup=col,
-                        hoverinfo='skip',
-                    ))
-            
-            # Average line
-            if show_avg and avg is not None:
-                fig.add_trace(go.Scatter(
-                    x=[df.index.min(), df.index.max()],
-                    y=[avg, avg],
-                    mode='lines',
-                    line=dict(color=color, width=1, dash='dash'),
-                    showlegend=False,
-                    legendgroup=col,
-                    hoverinfo='skip',
-                ))
-        
-        # Format title
-        full_title = self._format_title(
-            title or 'Time Series',
-            start_date=df.index.min() if len(df) > 0 else None,
-            end_date=df.index.max() if len(df) > 0 else None,
-            interval=interval,
-        )
-        
-        layout = self._base_layout(
-            title=full_title,
-            xaxis_title='Date',
-            yaxis_title=yaxis_title or 'Value',
-            source_text=source,
-        )
-        fig.update_layout(**layout)
-        
-        # X-axis date format
-        fig.update_xaxes(
-            tickformat='%m/%d/%y\n%H:%M',
-            dtick=86400000 * 2,  # Every 2 days in milliseconds
-        )
-        
-        return fig
+
+        def render(start, end):
+            plt.close('all')
+            subset = df.loc[start:end, cols]
+            fig, ax = plt.subplots(figsize=(12, 5))
+
+            for i, col in enumerate(cols):
+                color = self.colors[i % len(self.colors)]
+                series = subset[col].dropna()
+                if series.empty:
+                    continue
+                avg = series.mean() if show_avg else None
+                label = self._format_legend_name(col, avg, avg_unit) if show_avg else col
+                ax.plot(series.index, series, color=color, linewidth=1.5, label=label)
+
+                if show_endpoint_marker and len(series) > 0:
+                    last_val = series.iloc[-1]
+                    ax.annotate(f'{last_val:.2f}',
+                                xy=(series.index[-1], last_val),
+                                fontsize=8, color='white', fontweight='bold',
+                                bbox=dict(boxstyle='round,pad=0.3', facecolor=color,
+                                          edgecolor='none', alpha=0.9),
+                                ha='left', va='center',
+                                xytext=(5, 0), textcoords='offset points',
+                                zorder=5)
+
+                if show_avg and avg is not None:
+                    ax.axhline(y=avg, color=color, linestyle='--', linewidth=1, alpha=0.7)
+
+            self._style_ax(ax, yaxis_title=yaxis_title)
+            self._format_dates(ax)
+            self._legend(ax)
+            self._add_hover(fig, ax)
+            plt.tight_layout()
+            plt.show()
+
+        return self._make_time_nav(df, render, title=title)
 
     # -------------------------------------------------------------------------
-    # Centered Date Chart
+    # Centered Date Chart (static)
     # -------------------------------------------------------------------------
-    
+
     def centered_chart(
         self,
         df: pd.DataFrame,
@@ -292,42 +325,29 @@ class Viz:
         title: Optional[str] = None,
         yaxis_title: Optional[str] = None,
         show_avg: bool = False,
-        source: str = "SOURCE: Custom Analysis",
     ):
-        """
-        Plot time series centered around a specific date.
-        
-        X-axis shows days relative to center_date (e.g., -30 to +30).
-        Y-axis shows change from the center_date value.
-        """
-        # Ensure datetime index
+        """Plot time series centered around a specific date."""
         if not isinstance(df.index, pd.DatetimeIndex):
             df = df.copy()
             df.index = pd.to_datetime(df.index)
-        
+
         center_date = pd.to_datetime(center_date)
-        
-        # Select columns
         if cols is None:
             cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        
-        # Filter to window
+
         start = center_date - timedelta(days=window)
         end = center_date + timedelta(days=window)
-        mask = (df.index >= start) & (df.index <= end)
-        data = df.loc[mask, cols].copy()
-        
+        data = df.loc[(df.index >= start) & (df.index <= end), cols].copy()
+
         if data.empty:
             raise ValueError(f"No data in window around {center_date}")
-        
-        # Get center values
+
         if center_date not in data.index:
             idx = data.index.get_indexer([center_date], method='nearest')[0]
             center_date = data.index[idx]
-        
+
         center_values = data.loc[center_date]
-        
-        # Normalize
+
         if normalize == 'level':
             data = data - center_values
         elif normalize == 'change':
@@ -335,63 +355,39 @@ class Viz:
             data = data - data.loc[center_date]
         elif normalize == 'pct':
             data = (data / center_values - 1) * 100
-        
-        # Convert index to days from center
+
         data['days'] = (data.index - center_date).days
         data = data.set_index('days')
-        
-        fig = go.Figure()
-        
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+
         for i, col in enumerate(cols):
             color = self.colors[i % len(self.colors)]
             avg = data[col].mean() if show_avg else None
-            
-            fig.add_trace(go.Scatter(
-                x=data.index,
-                y=data[col],
-                mode='lines',
-                name=self._format_legend_name(col, avg, 'bps') if show_avg else col,
-                line=dict(color=color, width=1.5),
-            ))
-            
+            label = self._format_legend_name(col, avg, 'bps') if show_avg else col
+            ax.plot(data.index, data[col], color=color, linewidth=1.5, label=label)
+
             if show_avg and avg is not None:
-                fig.add_trace(go.Scatter(
-                    x=[data.index.min(), data.index.max()],
-                    y=[avg, avg],
-                    mode='lines',
-                    line=dict(color=color, width=1, dash='dash'),
-                    showlegend=False,
-                    hoverinfo='skip',
-                ))
-        
-        # Reference lines
-        fig.add_vline(x=0, line_dash='dash', line_color='#666', line_width=1, opacity=0.7)
-        fig.add_hline(y=0, line_dash='dash', line_color='#666', line_width=1, opacity=0.7)
-        
+                ax.axhline(y=avg, color=color, linestyle='--', linewidth=1, alpha=0.7)
+
+        ax.axvline(x=0, color='#666', linestyle='--', linewidth=1, alpha=0.7)
+        ax.axhline(y=0, color='#666', linestyle='--', linewidth=1, alpha=0.7)
+
         ylabel = yaxis_title or {
-            'level': 'Change (bps)',
-            'change': 'Cumulative Change',
-            'pct': 'Change (%)',
+            'level': 'Change (bps)', 'change': 'Cumulative Change', 'pct': 'Change (%)',
         }.get(normalize, 'Value')
-        
-        full_title = self._format_title(
-            title or f"Centered on {center_date.strftime('%m/%d/%y')}",
-        )
-        
-        layout = self._base_layout(
-            title=full_title,
-            xaxis_title='Days from Event',
-            yaxis_title=ylabel,
-            source_text=source,
-        )
-        fig.update_layout(**layout)
-        
-        return fig
+
+        self._style_ax(ax, title=title or f"Centered on {center_date.strftime('%m/%d/%y')}",
+                       yaxis_title=ylabel, xaxis_title='Days from Event')
+        self._legend(ax)
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)
 
     # -------------------------------------------------------------------------
-    # Multi-Event Overlay
+    # Multi-Event Overlay (static)
     # -------------------------------------------------------------------------
-    
+
     def event_overlay(
         self,
         df: pd.DataFrame,
@@ -401,118 +397,91 @@ class Viz:
         labels: Optional[List[str]] = None,
         normalize: str = 'level',
         title: Optional[str] = None,
-        source: str = "SOURCE: Custom Analysis",
     ):
         """Overlay multiple events on the same chart to compare reactions."""
         if not isinstance(df.index, pd.DatetimeIndex):
             df = df.copy()
             df.index = pd.to_datetime(df.index)
-        
+
         labels = labels or [pd.to_datetime(e).strftime('%m/%d/%y') for e in events]
-        
-        fig = go.Figure()
-        
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+
         for i, (event, label) in enumerate(zip(events, labels)):
             event = pd.to_datetime(event)
             start = event - timedelta(days=window)
             end = event + timedelta(days=window)
-            
-            mask = (df.index >= start) & (df.index <= end)
-            data = df.loc[mask, [col]].copy()
-            
+
+            data = df.loc[(df.index >= start) & (df.index <= end), [col]].copy()
             if data.empty:
                 continue
-            
+
             if event not in data.index:
                 idx = data.index.get_indexer([event], method='nearest')[0]
                 event = data.index[idx]
-            
+
             center_val = data.loc[event, col]
-            
             if normalize == 'level':
                 data[col] = data[col] - center_val
             elif normalize == 'pct':
                 data[col] = (data[col] / center_val - 1) * 100
-            
+
             data['days'] = (data.index - event).days
-            
             color = self.colors[i % len(self.colors)]
-            
-            fig.add_trace(go.Scatter(
-                x=data['days'],
-                y=data[col],
-                mode='lines',
-                name=label,
-                line=dict(color=color, width=1.5),
-            ))
-        
-        fig.add_vline(x=0, line_dash='dash', line_color='#666', line_width=1, opacity=0.7)
-        fig.add_hline(y=0, line_dash='dash', line_color='#666', line_width=1, opacity=0.7)
-        
-        layout = self._base_layout(
-            title=self._format_title(title or f"Event Comparison: {col}"),
-            xaxis_title='Days from Event',
-            yaxis_title='Change (bps)' if normalize == 'level' else 'Change (%)',
-            source_text=source,
-        )
-        fig.update_layout(**layout)
-        
-        return fig
+            ax.plot(data['days'], data[col], color=color, linewidth=1.5, label=label)
+
+        ax.axvline(x=0, color='#666', linestyle='--', linewidth=1, alpha=0.7)
+        ax.axhline(y=0, color='#666', linestyle='--', linewidth=1, alpha=0.7)
+
+        self._style_ax(ax, title=title or f"Event Comparison: {col}",
+                       xaxis_title='Days from Event',
+                       yaxis_title='Change (bps)' if normalize == 'level' else 'Change (%)')
+        self._legend(ax)
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)
 
     # -------------------------------------------------------------------------
-    # Curve Snapshots
+    # Curve Snapshots (static)
     # -------------------------------------------------------------------------
-    
+
     def curve_snapshot(
         self,
         df: pd.DataFrame,
         dates: List[Union[str, datetime]],
         tenors: Optional[List[str]] = None,
         title: Optional[str] = None,
-        source: str = "SOURCE: Custom Analysis",
     ):
         """Plot yield curves for specific dates."""
         if not isinstance(df.index, pd.DatetimeIndex):
             df = df.copy()
             df.index = pd.to_datetime(df.index)
-        
+
         tenors = tenors or df.columns.tolist()
-        
-        fig = go.Figure()
-        
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
         for i, date in enumerate(dates):
             date = pd.to_datetime(date)
-            
             if date not in df.index:
                 idx = df.index.get_indexer([date], method='nearest')[0]
                 date = df.index[idx]
-            
             values = df.loc[date, tenors]
             color = self.colors[i % len(self.colors)]
-            
-            fig.add_trace(go.Scatter(
-                x=tenors,
-                y=values,
-                mode='lines+markers',
-                name=date.strftime('%m/%d/%y'),
-                line=dict(color=color, width=1.5),
-                marker=dict(size=6),
-            ))
-        
-        layout = self._base_layout(
-            title=self._format_title(title or 'Yield Curve Snapshots'),
-            xaxis_title='Tenor',
-            yaxis_title='Yield (%)',
-            source_text=source,
-        )
-        fig.update_layout(**layout)
-        
-        return fig
+            ax.plot(tenors, values, color=color, linewidth=1.5,
+                    marker='o', markersize=6, label=date.strftime('%m/%d/%y'))
+
+        self._style_ax(ax, title=title or 'Yield Curve Snapshots',
+                       xaxis_title='Tenor', yaxis_title='Yield (%)')
+        self._legend(ax)
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)
 
     # -------------------------------------------------------------------------
-    # Rolling Statistics
+    # Rolling Statistics (interactive)
     # -------------------------------------------------------------------------
-    
+
     def rolling_corr(
         self,
         df: pd.DataFrame,
@@ -520,103 +489,94 @@ class Viz:
         col2: str,
         window: int = 60,
         title: Optional[str] = None,
-        source: str = "SOURCE: Custom Analysis",
     ):
         """Plot rolling correlation between two series."""
-        corr = df[col1].rolling(window).corr(df[col2])
-        
-        fig = go.Figure()
-        
-        fig.add_trace(go.Scatter(
-            x=corr.index,
-            y=corr,
-            mode='lines',
-            name=f'{window}d Corr',
-            line=dict(color=self.colors[0], width=1.5),
-        ))
-        
-        fig.add_hline(y=0, line_dash='dash', line_color='#666', line_width=1, opacity=0.7)
-        
-        layout = self._base_layout(
-            title=self._format_title(title or f'Rolling {window}d Correlation: {col1} vs {col2}'),
-            xaxis_title='Date',
-            yaxis_title='Correlation',
-            source_text=source,
-        )
-        fig.update_layout(**layout)
-        
-        return fig
-    
+        corr = df[col1].rolling(window).corr(df[col2]).dropna()
+        corr_df = corr.to_frame(name='corr')
+
+        def render(start, end):
+            plt.close('all')
+            subset = corr.loc[start:end]
+            fig, ax = plt.subplots(figsize=(12, 5))
+            ax.plot(subset.index, subset, color=self.colors[0], linewidth=1.5,
+                    label=f'{window}d Corr')
+            ax.axhline(y=0, color='#666', linestyle='--', linewidth=1, alpha=0.7)
+
+            self._style_ax(ax, yaxis_title='Correlation')
+            self._format_dates(ax)
+            self._legend(ax)
+            self._add_hover(fig, ax)
+            plt.tight_layout()
+            plt.show()
+
+        return self._make_time_nav(corr_df, render,
+                                   title=title or f'Rolling {window}d Correlation: {col1} vs {col2}')
+
     def rolling_zscore(
         self,
-        df: pd.DataFrame,
-        col: str,
+        data: Union[pd.DataFrame, pd.Series],
+        col: Optional[str] = None,
         window: int = 60,
         title: Optional[str] = None,
-        source: str = "SOURCE: Custom Analysis",
     ):
-        """Plot rolling z-score of a series."""
-        mean = df[col].rolling(window).mean()
-        std = df[col].rolling(window).std()
-        zscore = (df[col] - mean) / std
-        
-        fig = go.Figure()
-        
-        fig.add_trace(go.Scatter(
-            x=zscore.index,
-            y=zscore,
-            mode='lines',
-            name=f'{col} Z-Score',
-            line=dict(color=self.colors[0], width=1.5),
-        ))
-        
-        fig.add_hline(y=2, line_dash='dash', line_color='#C0392B', line_width=1, opacity=0.7)
-        fig.add_hline(y=-2, line_dash='dash', line_color='#C0392B', line_width=1, opacity=0.7)
-        fig.add_hline(y=0, line_dash='dash', line_color='#666', line_width=1, opacity=0.7)
-        
-        layout = self._base_layout(
-            title=self._format_title(title or f'Rolling {window}d Z-Score: {col}'),
-            xaxis_title='Date',
-            yaxis_title='Z-Score',
-            source_text=source,
-        )
-        fig.update_layout(**layout)
-        
-        return fig
+        """Plot rolling z-score. Accepts DataFrame+col or a bare Series."""
+        if isinstance(data, pd.Series):
+            col_name = data.name or 'value'
+            series = data
+        else:
+            col_name = col
+            series = data[col]
+
+        if not isinstance(series.index, pd.DatetimeIndex):
+            series = series.copy()
+            series.index = pd.to_datetime(series.index)
+
+        mean = series.rolling(window).mean()
+        std = series.rolling(window).std()
+        zscore = ((series - mean) / std).dropna()
+        zscore_df = zscore.to_frame(name='z')
+
+        def render(start, end):
+            plt.close('all')
+            subset = zscore.loc[start:end]
+            fig, ax = plt.subplots(figsize=(12, 5))
+            ax.plot(subset.index, subset, color=self.colors[0], linewidth=1.5,
+                    label=f'{col_name} Z-Score')
+            ax.axhline(y=2, color='#C0392B', linestyle='--', linewidth=1, alpha=0.7)
+            ax.axhline(y=-2, color='#C0392B', linestyle='--', linewidth=1, alpha=0.7)
+            ax.axhline(y=0, color='#666', linestyle='--', linewidth=1, alpha=0.7)
+
+            self._style_ax(ax, yaxis_title='Z-Score')
+            self._format_dates(ax)
+            self._legend(ax)
+            self._add_hover(fig, ax)
+            plt.tight_layout()
+            plt.show()
+
+        return self._make_time_nav(zscore_df, render,
+                                   title=title or f'Rolling {window}d Z-Score: {col_name}')
 
     # -------------------------------------------------------------------------
-    # Heatmaps
+    # Heatmaps (static)
     # -------------------------------------------------------------------------
-    
+
     def corr_heatmap(
         self,
         df: pd.DataFrame,
         cols: Optional[List[str]] = None,
         title: Optional[str] = None,
-        source: str = "SOURCE: Custom Analysis",
     ):
         """Correlation heatmap."""
         cols = cols or df.select_dtypes(include=[np.number]).columns.tolist()
         corr = df[cols].corr()
-        
-        fig = go.Figure(data=go.Heatmap(
-            z=corr.values,
-            x=corr.columns,
-            y=corr.index,
-            colorscale='RdBu_r',
-            zmid=0,
-            text=corr.round(2).values,
-            texttemplate='%{text}',
-            textfont=dict(size=10, family=self.FONT_FAMILY),
-        ))
-        
-        layout = self._base_layout(
-            title=self._format_title(title or 'Correlation Matrix'),
-            source_text=source,
-        )
-        fig.update_layout(**layout)
-        
-        return fig
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        sns.heatmap(corr, annot=True, fmt='.2f', cmap='RdBu_r', center=0,
+                    ax=ax, square=True, linewidths=0.5, cbar_kws={'shrink': 0.8})
+        self._style_ax(ax, title=title or 'Correlation Matrix')
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)
 
     def changes_heatmap(
         self,
@@ -624,162 +584,94 @@ class Viz:
         cols: Optional[List[str]] = None,
         freq: str = 'M',
         title: Optional[str] = None,
-        source: str = "SOURCE: Custom Analysis",
     ):
         """Heatmap of periodic changes."""
         cols = cols or df.select_dtypes(include=[np.number]).columns.tolist()
-        
         resampled = df[cols].resample(freq).last()
         changes = resampled.diff()
-        
-        fig = go.Figure(data=go.Heatmap(
-            z=changes.values,
-            x=changes.columns,
-            y=changes.index.strftime('%Y-%m'),
-            colorscale='RdBu_r',
-            zmid=0,
-            textfont=dict(family=self.FONT_FAMILY),
-        ))
-        
-        layout = self._base_layout(
-            title=self._format_title(title or f'{freq} Changes Heatmap'),
-            xaxis_title='Tenor',
-            yaxis_title='Period',
-            source_text=source,
-        )
-        fig.update_layout(**layout)
-        
-        return fig
+
+        fig, ax = plt.subplots(figsize=(12, max(6, len(changes) * 0.3)))
+        sns.heatmap(changes, cmap='RdBu_r', center=0, ax=ax, linewidths=0.5,
+                    yticklabels=[d.strftime('%Y-%m') for d in changes.index],
+                    cbar_kws={'shrink': 0.8})
+        self._style_ax(ax, title=title or f'{freq} Changes Heatmap')
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)
 
     # -------------------------------------------------------------------------
-    # PCA Visualization
+    # PCA Visualization (static)
     # -------------------------------------------------------------------------
-    
+
     def pca_loadings(
         self,
         loadings: pd.DataFrame,
         n_components: int = 3,
         title: Optional[str] = None,
-        source: str = "SOURCE: Custom Analysis",
     ):
         """Plot PCA loadings (eigenvectors)."""
-        fig = go.Figure()
-        
+        fig, ax = plt.subplots(figsize=(10, 6))
         cols = loadings.columns[:n_components]
-        
+
         for i, col in enumerate(cols):
-            fig.add_trace(go.Scatter(
-                x=loadings.index,
-                y=loadings[col],
-                mode='lines+markers',
-                name=col,
-                line=dict(color=self.colors[i], width=1.5),
-                marker=dict(size=6),
-            ))
-        
-        fig.add_hline(y=0, line_dash='dash', line_color='#666', line_width=1, opacity=0.7)
-        
-        layout = self._base_layout(
-            title=self._format_title(title or 'PCA Loadings by Tenor'),
-            xaxis_title='Tenor',
-            yaxis_title='Loading',
-            source_text=source,
-        )
-        fig.update_layout(**layout)
-        
-        return fig
-    
+            ax.plot(loadings.index, loadings[col], color=self.colors[i],
+                    linewidth=1.5, marker='o', markersize=6, label=col)
+
+        ax.axhline(y=0, color='#666', linestyle='--', linewidth=1, alpha=0.7)
+        self._style_ax(ax, title=title or 'PCA Loadings by Tenor',
+                       xaxis_title='Tenor', yaxis_title='Loading')
+        self._legend(ax)
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)
+
     def pca_variance(
         self,
         explained_variance: np.ndarray,
         title: Optional[str] = None,
-        source: str = "SOURCE: Custom Analysis",
     ):
         """Plot explained variance by component (scree plot)."""
         cumulative = np.cumsum(explained_variance)
         components = [f'PC{i+1}' for i in range(len(explained_variance))]
-        
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        
-        fig.add_trace(
-            go.Bar(
-                x=components,
-                y=explained_variance * 100,
-                name='Individual',
-                marker_color=self.colors[0],
-            ),
-            secondary_y=False,
-        )
-        
-        fig.add_trace(
-            go.Scatter(
-                x=components,
-                y=cumulative * 100,
-                mode='lines+markers',
-                name='Cumulative',
-                line=dict(color=self.colors[1], width=1.5),
-                marker=dict(size=6),
-            ),
-            secondary_y=True,
-        )
-        
-        layout = self._base_layout(
-            title=self._format_title(title or 'PCA Explained Variance'),
-            source_text=source,
-        )
-        fig.update_layout(**layout)
-        
-        fig.update_yaxes(title_text='VARIANCE (%)', secondary_y=False)
-        fig.update_yaxes(title_text='CUMULATIVE (%)', secondary_y=True)
-        
-        return fig
-    
+
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+        ax1.bar(components, explained_variance * 100, color=self.colors[0],
+                label='Individual', alpha=0.85)
+        ax1.set_ylabel('VARIANCE (%)', fontsize=self.FONT_SIZE, color='#333')
+
+        ax2 = ax1.twinx()
+        ax2.plot(components, cumulative * 100, color=self.colors[1],
+                 linewidth=1.5, marker='o', markersize=6, label='Cumulative')
+        ax2.set_ylabel('CUMULATIVE (%)', fontsize=self.FONT_SIZE, color='#333')
+
+        self._style_ax(ax1, title=title or 'PCA Explained Variance')
+
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right',
+                   fontsize=9, framealpha=0.85, edgecolor='none')
+
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)
+
     # -------------------------------------------------------------------------
     # Event Annotation Helper
     # -------------------------------------------------------------------------
-    
-    def add_event_annotation(
-        self,
-        fig,
-        x,
-        text: str,
-        y_position: float = 0.85,
-    ):
-        """
-        Add event annotation like 'NFP RELEASE @ 09JAN 08:30 ET'.
-        
-        Args:
-            fig: Plotly figure
-            x: X position (date/datetime)
-            text: Annotation text
-            y_position: Y position as fraction of plot (0-1)
-        """
-        fig.add_vline(
-            x=x, 
-            line_dash='dot', 
-            line_color='#333', 
-            line_width=1,
-        )
-        
-        fig.add_annotation(
-            x=x,
-            y=y_position,
-            yref='paper',
-            text=text,
-            showarrow=False,
-            font=dict(size=8, family=self.FONT_FAMILY, color='#333'),
-            bgcolor='rgba(255,255,255,0.9)',
-            bordercolor='#999',
-            borderwidth=1,
-            borderpad=2,
-        )
-        
-        return fig
-    
+
+    def add_event_annotation(self, ax, x, text: str, y_position: float = 0.85):
+        """Add event annotation to a matplotlib axes."""
+        ax.axvline(x=x, linestyle=':', color='#333', linewidth=1)
+        ax.annotate(text, xy=(x, y_position), xycoords=('data', 'axes fraction'),
+                    fontsize=8, color='#333', ha='center',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                              edgecolor='#999', alpha=0.9))
+        return ax
+
     # -------------------------------------------------------------------------
-    # Scatter plot
+    # Scatter plot (static)
     # -------------------------------------------------------------------------
-    
+
     def scatter(
         self,
         df: pd.DataFrame,
@@ -787,29 +679,25 @@ class Viz:
         y: str,
         color: Optional[str] = None,
         title: Optional[str] = None,
-        source: str = "SOURCE: Custom Analysis",
     ):
         """Scatter plot with optional color dimension."""
-        fig = px.scatter(
-            df.reset_index(),
-            x=x,
-            y=y,
-            color=color,
-        )
-        
-        # Update trace colors
-        for i, trace in enumerate(fig.data):
-            trace.marker.color = self.colors[i % len(self.colors)]
-        
-        layout = self._base_layout(
-            title=self._format_title(title) if title else None,
-            xaxis_title=x,
-            yaxis_title=y,
-            source_text=source,
-        )
-        fig.update_layout(**layout)
-        
-        return fig
+        fig, ax = plt.subplots(figsize=(10, 7))
+
+        if color:
+            for i, group in enumerate(df[color].unique()):
+                mask = df[color] == group
+                ax.scatter(df.loc[mask, x], df.loc[mask, y],
+                           color=self.colors[i % len(self.colors)],
+                           label=group, s=30, alpha=0.7)
+        else:
+            ax.scatter(df[x], df[y], color=self.colors[0], s=30, alpha=0.7)
+
+        self._style_ax(ax, title=title, xaxis_title=x, yaxis_title=y)
+        if color:
+            self._legend(ax)
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)
 
 
 # -----------------------------------------------------------------------------
