@@ -112,6 +112,11 @@ class Viz:
 
     def _add_hover(self, fig, ax):
         """Add crosshair + value tooltip on hover. Requires %matplotlib widget."""
+        # Disconnect any previous hover handler
+        if hasattr(fig, '_hover_cid') and fig._hover_cid is not None:
+            fig.canvas.mpl_disconnect(fig._hover_cid)
+            fig._hover_cid = None
+
         # Save limits before adding hover elements (xy=0 would blow out the axis)
         xlim = ax.get_xlim()
         ylim = ax.get_ylim()
@@ -160,14 +165,18 @@ class Viz:
             vline.set_visible(True)
             fig.canvas.draw_idle()
 
-        fig.canvas.mpl_connect('motion_notify_event', on_move)
+        fig._hover_cid = fig.canvas.mpl_connect('motion_notify_event', on_move)
 
     # -------------------------------------------------------------------------
     # Interactive time navigation
     # -------------------------------------------------------------------------
 
     def _make_time_nav(self, df, render_fn, title=None):
-        """Build date pickers + range buttons, wire them to render_fn(start, end)."""
+        """Build date pickers + range buttons, wire them to render_fn(fig, ax, start, end).
+
+        Uses fig.canvas directly as the chart widget for true interactivity (hover, etc).
+        Falls back to Output widget if ipympl backend isn't available.
+        """
         _updating = False
 
         start_picker = widgets.DatePicker(
@@ -188,12 +197,30 @@ class Viz:
             btn_widgets.append(b)
         btn_widgets[-1].button_style = 'warning'  # ALL starts active
 
-        output = widgets.Output()
+        # Create figure once - use canvas directly as widget for interactivity
+        fig, ax = plt.subplots(figsize=(12, 5))
+        plt.close(fig)  # Remove from pyplot manager (prevents double display)
 
-        def update_range(start, end):
-            with output:
-                clear_output(wait=True)
-                render_fn(start, end)
+        # Check if canvas is a widget (ipympl backend) or fallback to Output
+        canvas_is_widget = isinstance(fig.canvas, widgets.Widget)
+
+        if canvas_is_widget:
+            chart_widget = fig.canvas
+
+            def update_range(start, end):
+                ax.clear()
+                render_fn(fig, ax, start, end)
+                fig.canvas.draw_idle()
+        else:
+            # Fallback: use Output widget (no hover, but still works)
+            chart_widget = widgets.Output()
+
+            def update_range(start, end):
+                ax.clear()
+                render_fn(fig, ax, start, end)
+                with chart_widget:
+                    clear_output(wait=True)
+                    display(fig)
 
         def on_btn_click(b):
             nonlocal _updating
@@ -246,7 +273,7 @@ class Viz:
         title_widget = widgets.HTML(
             value=f'<b style="font-size:13px; color:#333;">{title.upper()}</b>' if title else ''
         )
-        container = widgets.VBox([title_widget, controls, output])
+        container = widgets.VBox([title_widget, controls, chart_widget])
 
         # initial render
         update_range(df.index.min(), df.index.max())
@@ -274,10 +301,8 @@ class Viz:
             df = df.copy()
             df.index = pd.to_datetime(df.index)
 
-        def render(start, end):
-            plt.close('all')
+        def render(fig, ax, start, end):
             subset = df.loc[start:end, cols]
-            fig, ax = plt.subplots(figsize=(12, 5))
 
             for i, col in enumerate(cols):
                 color = self.colors[i % len(self.colors)]
@@ -306,8 +331,7 @@ class Viz:
             self._format_dates(ax)
             self._legend(ax)
             self._add_hover(fig, ax)
-            plt.tight_layout()
-            plt.show()
+            fig.tight_layout()
 
         return self._make_time_nav(df, render, title=title)
 
@@ -494,10 +518,8 @@ class Viz:
         corr = df[col1].rolling(window).corr(df[col2]).dropna()
         corr_df = corr.to_frame(name='corr')
 
-        def render(start, end):
-            plt.close('all')
+        def render(fig, ax, start, end):
             subset = corr.loc[start:end]
-            fig, ax = plt.subplots(figsize=(12, 5))
             ax.plot(subset.index, subset, color=self.colors[0], linewidth=1.5,
                     label=f'{window}d Corr')
             ax.axhline(y=0, color='#666', linestyle='--', linewidth=1, alpha=0.7)
@@ -506,8 +528,7 @@ class Viz:
             self._format_dates(ax)
             self._legend(ax)
             self._add_hover(fig, ax)
-            plt.tight_layout()
-            plt.show()
+            fig.tight_layout()
 
         return self._make_time_nav(corr_df, render,
                                    title=title or f'Rolling {window}d Correlation: {col1} vs {col2}')
@@ -536,10 +557,8 @@ class Viz:
         zscore = ((series - mean) / std).dropna()
         zscore_df = zscore.to_frame(name='z')
 
-        def render(start, end):
-            plt.close('all')
+        def render(fig, ax, start, end):
             subset = zscore.loc[start:end]
-            fig, ax = plt.subplots(figsize=(12, 5))
             ax.plot(subset.index, subset, color=self.colors[0], linewidth=1.5,
                     label=f'{col_name} Z-Score')
             ax.axhline(y=2, color='#C0392B', linestyle='--', linewidth=1, alpha=0.7)
@@ -550,8 +569,7 @@ class Viz:
             self._format_dates(ax)
             self._legend(ax)
             self._add_hover(fig, ax)
-            plt.tight_layout()
-            plt.show()
+            fig.tight_layout()
 
         return self._make_time_nav(zscore_df, render,
                                    title=title or f'Rolling {window}d Z-Score: {col_name}')
