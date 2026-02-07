@@ -177,5 +177,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.argv = ['pull_dlv_basket.py', '--all']  # Remove this line for CLI usage
     main()
