@@ -171,12 +171,32 @@ class Viz:
     # Interactive time navigation
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _in_notebook() -> bool:
+        try:
+            from IPython import get_ipython
+            shell = get_ipython()
+            return shell is not None and 'zmqshell' in type(shell).__module__
+        except Exception:
+            return False
+
     def _make_time_nav(self, df, render_fn, title=None):
         """Build date pickers + range buttons, wire them to render_fn(fig, ax, start, end).
 
         Uses fig.canvas directly as the chart widget for true interactivity (hover, etc).
         Falls back to Output widget if ipympl backend isn't available.
+        Plain script mode: just plt.show() with no widgets.
         """
+        # plain script — skip widgets, just show the chart
+        if not self._in_notebook():
+            fig, ax = plt.subplots(figsize=(12, 5))
+            if title:
+                fig.suptitle(title.upper(), fontsize=self.TITLE_SIZE, color='#333',
+                             x=0.01, ha='left')
+            render_fn(fig, ax, df.index.min(), df.index.max())
+            plt.show()
+            return fig
+
         _updating = False
 
         start_picker = widgets.DatePicker(
@@ -294,6 +314,7 @@ class Viz:
         avg_unit: str = '',
         interval: str = None,
         show_endpoint_marker: bool = True,
+        residual: bool = False,
     ):
         """Line chart with interactive time navigation."""
         cols = cols or df.select_dtypes(include=[np.number]).columns.tolist()
@@ -312,6 +333,19 @@ class Viz:
                 avg = series.mean() if show_avg else None
                 label = self._format_legend_name(col, avg, avg_unit) if show_avg else col
                 ax.plot(series.index, series, color=color, linewidth=1.5, label=label)
+
+                if residual and len(cols) == 1:
+                    ax.axhline(y=0, color='#666', linestyle=':', linewidth=1)
+                    ax.fill_between(
+                        series.index, 0, series,
+                        where=series >= 0,
+                        interpolate=True, color='#27AE60', alpha=0.15,
+                    )
+                    ax.fill_between(
+                        series.index, 0, series,
+                        where=series < 0,
+                        interpolate=True, color='#C0392B', alpha=0.15,
+                    )
 
                 if show_endpoint_marker and len(series) > 0:
                     last_val = series.iloc[-1]
