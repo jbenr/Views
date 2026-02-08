@@ -310,38 +310,49 @@ class Viz:
         title: Optional[str] = None,
         subtitle: Optional[str] = None,
         yaxis_title: Optional[str] = None,
+        yaxis_right_title: Optional[str] = None,
+        right: Optional[List[str]] = None,
         show_avg: bool = False,
         avg_unit: str = '',
         interval: str = None,
         show_endpoint_marker: bool = True,
         residual: bool = False,
     ):
-        """Line chart with interactive time navigation."""
+        """Line chart with interactive time navigation.
+
+        right : list of column names to plot on secondary (left) y-axis.
+                Primary axis stays on the right per PrismFP style.
+        """
         cols = cols or df.select_dtypes(include=[np.number]).columns.tolist()
+        right = right or []
         if not isinstance(df.index, pd.DatetimeIndex):
             df = df.copy()
             df.index = pd.to_datetime(df.index)
 
         def render(fig, ax, start, end):
             subset = df.loc[start:end, cols]
+            ax2 = None
+            if right:
+                ax2 = ax.twinx()
 
             for i, col in enumerate(cols):
                 color = self.colors[i % len(self.colors)]
+                target = ax2 if col in right else ax
                 series = subset[col].dropna()
                 if series.empty:
                     continue
                 avg = series.mean() if show_avg else None
                 label = self._format_legend_name(col, avg, avg_unit) if show_avg else col
-                ax.plot(series.index, series, color=color, linewidth=1.5, label=label)
+                target.plot(series.index, series, color=color, linewidth=1.5, label=label)
 
                 if residual and len(cols) == 1:
-                    ax.axhline(y=0, color='#666', linestyle=':', linewidth=1)
-                    ax.fill_between(
+                    target.axhline(y=0, color='#666', linestyle=':', linewidth=1)
+                    target.fill_between(
                         series.index, 0, series,
                         where=series >= 0,
                         interpolate=True, color='#27AE60', alpha=0.15,
                     )
-                    ax.fill_between(
+                    target.fill_between(
                         series.index, 0, series,
                         where=series < 0,
                         interpolate=True, color='#C0392B', alpha=0.15,
@@ -349,7 +360,7 @@ class Viz:
 
                 if show_endpoint_marker and len(series) > 0:
                     last_val = series.iloc[-1]
-                    ax.annotate(f'{last_val:.2f}',
+                    target.annotate(f'{last_val:.2f}',
                                 xy=(series.index[-1], last_val),
                                 fontsize=8, color='white', fontweight='bold',
                                 bbox=dict(boxstyle='round,pad=0.3', facecolor=color,
@@ -359,11 +370,26 @@ class Viz:
                                 zorder=5)
 
                 if show_avg and avg is not None:
-                    ax.axhline(y=avg, color=color, linestyle='--', linewidth=1, alpha=0.7)
+                    target.axhline(y=avg, color=color, linestyle='--', linewidth=1, alpha=0.7)
 
             self._style_ax(ax, yaxis_title=yaxis_title)
+            if ax2:
+                # primary axis (right side per PrismFP), secondary on left
+                ax.yaxis.tick_right()
+                ax.yaxis.set_label_position('right')
+                ax2.yaxis.tick_left()
+                ax2.yaxis.set_label_position('left')
+                if yaxis_right_title:
+                    ax2.set_ylabel(yaxis_right_title.upper(), fontsize=self.FONT_SIZE, color='#333')
+                ax2.tick_params(labelsize=9, colors='#333')
+                # merge legends from both axes
+                h1, l1 = ax.get_legend_handles_labels()
+                h2, l2 = ax2.get_legend_handles_labels()
+                ax.legend(h1 + h2, l1 + l2, loc='lower left', fontsize=9,
+                          framealpha=0.85, edgecolor='none', fancybox=True)
+            else:
+                self._legend(ax)
             self._format_dates(ax)
-            self._legend(ax)
             self._add_hover(fig, ax)
             fig.tight_layout()
 
