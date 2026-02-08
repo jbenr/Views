@@ -109,8 +109,8 @@ def main():
     total_rows = sum(r[3] or 0 for r in results)
     failed = sum(1 for r in results if not r[1])
 
-    out(f"  ⏱️  {total_time:.1f}s total | 📊 {total_rows:,} rows | {'❌ ' + str(failed) + ' failed' if failed else '✅ all ok'}")
-    out(f"  📄 {log_path}\n")
+    out(f"⏱ {total_time:.1f}s total | {total_rows:,} rows | {'❌ ' + str(failed) + ' failed' if failed else '✅ all ok'}")
+    out(f"{log_path}\n")
 
     log.close()
     sys.exit(1 if failed else 0)

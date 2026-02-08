@@ -158,6 +158,7 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     if date_col:
         df["ts"] = pd.to_datetime(df[date_col[0]], format="mixed", dayfirst=False)
         df = df.drop(columns=date_col)
+        df = df.dropna(subset=["ts"])
 
     # Clean contract code and add short_name
     if "cftc_contract_market_code" in df.columns:
