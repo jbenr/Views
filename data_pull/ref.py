@@ -29,6 +29,9 @@ STEPS = [
     ("ust",       "pull_daily_postgres.py",      "md.ust_eod",                True),
     ("fut",       "pull_fut_eod.py",             "md.fut_eod",                True),
     ("dlv",       "pull_dlv_basket.py",          "deliverable baskets",       True),
+    ("strips",    "pull_strips.py",              "md.strips_eod",             True),
+    ("index",     "pull_index_eod.py",           "md.index_eod",              True),
+    ("cftc",      "pull_cftc.py",                "md.cftc",                   False),
     ("headline",  "build_headline.py",           "md.headline",               False),
     ("breakeven", "build_breakeven.py",          "md.breakeven",              False),
 ]
@@ -39,11 +42,14 @@ STEPS = [
 def run(script: str) -> tuple[bool, str, float]:
     """Run script, return (success, output, duration_sec)."""
     start = datetime.now()
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     result = subprocess.run(
         [sys.executable, script],
         cwd=SCRIPT_DIR,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        env=env,
     )
     duration = (datetime.now() - start).total_seconds()
     output = result.stdout + result.stderr
@@ -68,7 +74,7 @@ def main():
 
     ts = datetime.now()
     log_path = LOG_DIR / f"ref_{ts:%Y%m%d_%H%M%S}.log"
-    log = open(log_path, "w")
+    log = open(log_path, "w", encoding="utf-8")
 
     def out(msg):
         print(msg)
