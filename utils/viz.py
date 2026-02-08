@@ -26,6 +26,18 @@ import ipywidgets as widgets
 from IPython.display import display, clear_output
 
 
+class _SquareHandler:
+    """Legend handler that draws a colored square instead of a line."""
+    def legend_artist(self, legend, orig_handle, fontsize, handlebox):
+        from matplotlib.patches import Rectangle
+        x0, y0 = handlebox.xdescent, handlebox.ydescent
+        w, h = handlebox.width, handlebox.height
+        patch = Rectangle((x0, y0), h, h, facecolor=orig_handle.get_color(),
+                           edgecolor='none', transform=handlebox.get_transform())
+        handlebox.add_artist(patch)
+        return patch
+
+
 class Viz:
     """Time series visualization toolkit for rates analysis - PrismFP style."""
 
@@ -63,12 +75,20 @@ class Viz:
 
     def __init__(self):
         self.colors = self.COLORS
-        sns.set_theme(style='whitegrid', rc={
+        plt.ioff()  # prevent auto-display — we control display explicitly
+        plt.rcdefaults()
+        plt.rcParams.update({
             'font.family': 'sans-serif',
             'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans'],
             'font.size': self.FONT_SIZE,
-            'axes.facecolor': self.BG_COLOR,
             'figure.facecolor': 'white',
+            'axes.facecolor': self.BG_COLOR,
+            'axes.axisbelow': True,
+            'axes.grid': True,
+            'grid.color': '#DCDCDC',
+            'grid.linewidth': 0.5,
+            'grid.alpha': 0.6,
+            'toolbar': 'toolbar2',
         })
 
     # -------------------------------------------------------------------------
@@ -81,8 +101,7 @@ class Viz:
         return name
 
     def _style_ax(self, ax, title=None, yaxis_title=None, xaxis_title=None):
-        """Apply PrismFP / 3fiftyseven styling to a matplotlib axes."""
-        ax.set_facecolor(self.BG_COLOR)
+        """Apply PrismFP styling."""
         if title:
             ax.set_title(title.upper(), fontsize=self.TITLE_SIZE, color='#333',
                          pad=10, loc='left')
@@ -93,79 +112,24 @@ class Viz:
         ax.yaxis.tick_right()
         ax.yaxis.set_label_position('right')
         ax.tick_params(labelsize=9, colors='#333')
-        ax.grid(True, color=self.GRID_COLOR, linewidth=1)
         for spine in ax.spines.values():
             spine.set_color('#333')
-            spine.set_linewidth(1)
+            spine.set_linewidth(0.5)
 
     def _format_dates(self, ax):
-        """Auto-format date axis."""
-        locator = mdates.AutoDateLocator()
+        """Auto-format date axis with tighter label spacing."""
+        locator = mdates.AutoDateLocator(minticks=12, maxticks=24)
         ax.xaxis.set_major_locator(locator)
         ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
         ax.xaxis.get_offset_text().set_visible(False)
 
     def _legend(self, ax):
-        """Standard legend in lower left."""
-        ax.legend(loc='lower left', fontsize=9, framealpha=0.85,
-                  edgecolor='none', fancybox=True)
-
-    def _add_hover(self, fig, ax):
-        """Add crosshair + value tooltip on hover. Requires %matplotlib widget."""
-        # Disconnect any previous hover handler
-        if hasattr(fig, '_hover_cid') and fig._hover_cid is not None:
-            fig.canvas.mpl_disconnect(fig._hover_cid)
-            fig._hover_cid = None
-
-        # Save limits before adding hover elements (xy=0 would blow out the axis)
-        xlim = ax.get_xlim()
-        ylim = ax.get_ylim()
-
-        vline = ax.axvline(x=0, color='#ccc', linewidth=0.8)
-        vline.set_visible(False)
-        annot = ax.annotate('', xy=(0, 0), xytext=(15, 15),
-                            textcoords='offset points', fontsize=9,
-                            bbox=dict(boxstyle='round,pad=0.4', fc='white', ec='#ccc'),
-                            zorder=10)
-        annot.set_visible(False)
-
-        ax.set_xlim(xlim)
-        ax.set_ylim(ylim)
-
-        # data lines only (skip dashed avg/ref lines)
-        plot_lines = [l for l in ax.get_lines()
-                      if l.get_linestyle() == '-' and l.get_visible()
-                      and len(l.get_xdata()) > 2]
-
-        def on_move(event):
-            if event.inaxes != ax or not plot_lines:
-                if annot.get_visible():
-                    annot.set_visible(False)
-                    vline.set_visible(False)
-                    fig.canvas.draw_idle()
-                return
-
-            xdata = plot_lines[0].get_xdata()
-            if len(xdata) == 0:
-                return
-            idx = np.argmin(np.abs(xdata - event.xdata))
-            snap_x = xdata[idx]
-
-            date_str = mdates.num2date(snap_x).strftime('%b %d, %Y')
-            parts = [date_str]
-            for line in plot_lines:
-                yd = line.get_ydata()
-                if idx < len(yd):
-                    parts.append(f'{line.get_label()}: {yd[idx]:.2f}')
-
-            annot.set_text('\n'.join(parts))
-            annot.xy = (snap_x, event.ydata)
-            annot.set_visible(True)
-            vline.set_xdata([snap_x, snap_x])
-            vline.set_visible(True)
-            fig.canvas.draw_idle()
-
-        fig._hover_cid = fig.canvas.mpl_connect('motion_notify_event', on_move)
+        """Legend below the chart, left-aligned, with colored squares."""
+        leg = ax.legend(
+            loc='upper left', bbox_to_anchor=(0, -0.08), ncol=4,
+            fontsize=9, frameon=False, handlelength=1, handleheight=1,
+            handler_map={plt.Line2D: _SquareHandler()},
+        )
 
     # -------------------------------------------------------------------------
     # Interactive time navigation
@@ -181,14 +145,10 @@ class Viz:
             return False
 
     def _make_time_nav(self, df, render_fn, title=None):
-        """Build date pickers + range buttons, wire them to render_fn(fig, ax, start, end).
-
-        Uses fig.canvas directly as the chart widget for true interactivity (hover, etc).
-        Falls back to Output widget if ipympl backend isn't available.
-        Plain script mode: just plt.show() with no widgets.
+        """Date pickers + range buttons wired to render_fn(fig, ax, start, end).
+        Falls back to plt.show() outside notebooks.
         """
-        # plain script — skip widgets, just show the chart
-        if not self._in_notebook():
+        def _static_show():
             fig, ax = plt.subplots(figsize=(12, 5))
             if title:
                 fig.suptitle(title.upper(), fontsize=self.TITLE_SIZE, color='#333',
@@ -196,6 +156,9 @@ class Viz:
             render_fn(fig, ax, df.index.min(), df.index.max())
             plt.show()
             return fig
+
+        if not self._in_notebook():
+            return _static_show()
 
         _updating = False
 
@@ -217,30 +180,19 @@ class Viz:
             btn_widgets.append(b)
         btn_widgets[-1].button_style = 'warning'  # ALL starts active
 
-        # Create figure once - use canvas directly as widget for interactivity
         fig, ax = plt.subplots(figsize=(12, 5))
-        plt.close(fig)  # Remove from pyplot manager (prevents double display)
+        plt.close(fig)
 
-        # Check if canvas is a widget (ipympl backend) or fallback to Output
-        canvas_is_widget = isinstance(fig.canvas, widgets.Widget)
+        chart_widget = widgets.Output()
 
-        if canvas_is_widget:
-            chart_widget = fig.canvas
-
-            def update_range(start, end):
-                ax.clear()
-                render_fn(fig, ax, start, end)
-                fig.canvas.draw_idle()
-        else:
-            # Fallback: use Output widget (no hover, but still works)
-            chart_widget = widgets.Output()
-
-            def update_range(start, end):
-                ax.clear()
-                render_fn(fig, ax, start, end)
-                with chart_widget:
-                    clear_output(wait=True)
-                    display(fig)
+        def update_range(start, end):
+            ax.clear()
+            for extra in fig.axes[1:]:
+                extra.remove()
+            render_fn(fig, ax, start, end)
+            with chart_widget:
+                clear_output(wait=True)
+                display(fig)
 
         def on_btn_click(b):
             nonlocal _updating
@@ -343,7 +295,7 @@ class Viz:
                     continue
                 avg = series.mean() if show_avg else None
                 label = self._format_legend_name(col, avg, avg_unit) if show_avg else col
-                target.plot(series.index, series, color=color, linewidth=1.5, label=label)
+                target.plot(series.index, series, color=color, linewidth=1.5, label=label, zorder=3)
 
                 if residual and len(cols) == 1:
                     target.axhline(y=0, color='#666', linestyle=':', linewidth=1)
@@ -367,7 +319,7 @@ class Viz:
                                           edgecolor='none', alpha=0.9),
                                 ha='left', va='center',
                                 xytext=(5, 0), textcoords='offset points',
-                                zorder=5)
+                                zorder=20)
 
                 if show_avg and avg is not None:
                     target.axhline(y=avg, color=color, linestyle='--', linewidth=1, alpha=0.7)
@@ -385,13 +337,16 @@ class Viz:
                 # merge legends from both axes
                 h1, l1 = ax.get_legend_handles_labels()
                 h2, l2 = ax2.get_legend_handles_labels()
-                ax.legend(h1 + h2, l1 + l2, loc='lower left', fontsize=9,
-                          framealpha=0.85, edgecolor='none', fancybox=True)
+                ax.legend(
+                    h1 + h2, l1 + l2,
+                    loc='upper left', bbox_to_anchor=(0, -0.08), ncol=4,
+                    fontsize=9, frameon=False, handlelength=1, handleheight=1,
+                    handler_map={plt.Line2D: _SquareHandler()},
+                )
             else:
                 self._legend(ax)
             self._format_dates(ax)
-            self._add_hover(fig, ax)
-            fig.tight_layout()
+            fig.subplots_adjust(bottom=0.15)
 
         return self._make_time_nav(df, render, title=title)
 
@@ -587,7 +542,6 @@ class Viz:
             self._style_ax(ax, yaxis_title='Correlation')
             self._format_dates(ax)
             self._legend(ax)
-            self._add_hover(fig, ax)
             fig.tight_layout()
 
         return self._make_time_nav(corr_df, render,
@@ -628,7 +582,6 @@ class Viz:
             self._style_ax(ax, yaxis_title='Z-Score')
             self._format_dates(ax)
             self._legend(ax)
-            self._add_hover(fig, ax)
             fig.tight_layout()
 
         return self._make_time_nav(zscore_df, render,
