@@ -97,6 +97,7 @@ class Engine:
         act_arrays: dict[str, list] = {}
         lvl_arrays: dict[str, np.ndarray] = {}
         ts_arrays: dict[str, Optional[np.ndarray]] = {}  # dynamic time stops
+        sz_arrays: dict[str, Optional[np.ndarray]] = {}  # dynamic position sizes
 
         for pipeline in self.pipelines:
             name = pipeline.name
@@ -105,6 +106,7 @@ class Engine:
             act_arrays[name] = sf["action"].to_list()
             lvl_arrays[name] = composite_levels[name].to_numpy()
             ts_arrays[name] = sf["time_stop"].to_numpy() if "time_stop" in sf.columns else None
+            sz_arrays[name] = sf["size"].to_numpy() if "size" in sf.columns else None
 
         # 4. State machine — position management
         all_closed: list[ClosedPosition] = []
@@ -221,12 +223,19 @@ class Engine:
                             if not np.isnan(raw):
                                 dyn_ts = max(1, int(round(raw)))
 
+                        # Capture dynamic size at entry (if provided by signal)
+                        entry_size = 1.0
+                        if sz_arrays[name] is not None:
+                            raw_sz = sz_arrays[name][i]
+                            if not np.isnan(raw_sz) and raw_sz > 0:
+                                entry_size = float(raw_sz)
+
                         pos = Position(
                             trade_def=pipeline.trade_def,
                             entry_date=date,
                             entry_level=level + (slip * direction),
                             direction=direction,
-                            size=1.0,
+                            size=entry_size,
                             entry_signal=float(signal_val),
                             leg_sizes=leg_sizes,
                             dynamic_time_stop=dyn_ts,

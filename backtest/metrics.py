@@ -83,6 +83,7 @@ def trade_log(closed_trades: list) -> pl.DataFrame:
             "entry_date": t.entry_date,
             "exit_date": t.exit_date,
             "direction": "long" if t.direction == 1 else "short",
+            "size": t.size,
             "entry_level": t.entry_level,
             "exit_level": t.exit_level,
             "pnl_bps": t.pnl_bps,

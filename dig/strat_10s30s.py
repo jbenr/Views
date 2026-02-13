@@ -22,13 +22,19 @@ from backtest import (
     equity_curve_pd,
     trade_log,
 )
-from utils import pdf
+from utils import pdf, fix_outliers
 
 # ── config ────────────────────────────────────────────────────────────
 DB_DSN = "postgresql://benjils:snickers@raptor:5432/markets"
-LOOKBACK = 50          # rolling regression window
-Z_ENTRY = 2.5           # enter when |z| > 2
-START = "2000-01-01"
+LOOKBACK = 500          # rolling regression window
+Z_ENTRY = 1.5           # enter when |z| > threshold
+START = "2010-01-01"
+
+# ── signal filters (gate entry — null out signal when conditions fail) ─
+# Permissive defaults = no filtering. Tighten from filter_research.py findings.
+MIN_R2 = 0.0            # minimum R² of rolling regression (0 = off)
+MAX_BETA_CV = 2.0        # maximum beta coefficient of variation (2 = off)
+MIN_HALF_LIFE = 0.0      # minimum rolling half-life in days (0 = off)
 
 # ── pull data ─────────────────────────────────────────────────────────
 conn = psycopg2.connect(DB_DSN)
@@ -79,6 +85,10 @@ otr = (
     .pivot(index="ts", on="tenor", values="yld_ytm_mid")
     .rename({"10-Year": "otr_10Y", "30-Year": "otr_30Y"})
     .sort("ts")
+    .with_columns(
+        fix_outliers(pl.col("otr_10Y"), hi=20).alias("otr_10Y"),
+        fix_outliers(pl.col("otr_30Y"), hi=20).alias("otr_30Y"),
+    )
     .with_columns(pl.col("otr_10Y") * 100, pl.col("otr_30Y") * 100)
 )
 
@@ -113,19 +123,63 @@ trade_10s30s = TradeDef.spread("10s30s", "otr_10Y", "otr_30Y")
 
 
 def signal_fn(d: pl.DataFrame) -> pl.DataFrame:
-    """OU z-score + rolling half-life of the regression residual.
+    """OU z-score + confidence-weighted, vol-scaled sizing.
 
-    Returns DataFrame with 'signal' and 'time_stop' columns so each trade
-    uses only historically-available half-life at entry (no lookahead bias).
-    Signal is masked to null when half-life is null (residual not mean-reverting).
+    Returns: signal, time_stop, size
+    - signal: z-score (masked null when not mean-reverting)
+    - time_stop: rolling half-life at entry (no lookahead)
+    - size: |z|/Z_ENTRY * vol_scale * confidence (continuous, not binary)
     """
-    r = roll_lr(d["gen_10Y"], d["gen_1030"], lookback=LOOKBACK)
-    z = ou_zscore(r["resid"], lookback=LOOKBACK)
-    rhl = roll_half_life(r["resid"], lookback=LOOKBACK)
-    # No valid half-life → not mean-reverting → suppress signal
-    df = pl.DataFrame({"signal": z, "time_stop": rhl})
-    return df.with_columns(
-        pl.when(pl.col("time_stop").is_not_null())
+    reg = roll_lr(d["gen_10Y"], d["gen_1030"], lookback=LOOKBACK)
+    z = ou_zscore(reg["resid"], lookback=LOOKBACK)
+    rhl = roll_half_life(reg["resid"], lookback=LOOKBACK)
+
+    # ── confidence score ──────────────────────────────────────────────
+    # R²: how well regression explains the spread (0–1, higher = better)
+    r2 = reg["r2"].fill_null(0).clip(0, 1)
+
+    # Beta stability: coefficient of variation over trailing window
+    # Low CV = stable relationship = high confidence
+    beta_cv = (
+        reg["beta"].rolling_std(LOOKBACK)
+        / reg["beta"].rolling_mean(LOOKBACK).abs()
+    ).fill_null(2.0).clip(0, 2)
+    beta_conf = 1 - beta_cv / 2  # CV=0 → 1.0, CV≥2 → 0.0
+
+    conf = (r2 * beta_conf).clip(0.05, 1.0)
+
+    # ── vol-scaled sizing ─────────────────────────────────────────────
+    # Signal strength: proportional to |z| (z=Z_ENTRY → 1.0, z=2*Z → 2.0)
+    raw_size = z.abs() / Z_ENTRY
+
+    # Inverse-vol: smaller position when spread vol is elevated
+    resid_vol = reg["resid"].diff().rolling_std(20)
+    vol_target = resid_vol.rolling_mean(252)  # trailing 1yr avg vol
+    vol_scale = (vol_target / resid_vol).fill_null(1.0).clip(0.2, 5.0)
+
+    # Final size = strength × vol_adj × confidence
+    size = (raw_size * vol_scale * conf).clip(0.1, 3.0)
+
+    # ── signal gate ─────────────────────────────────────────────────────
+    # Suppress signal when conditions aren't met (null → engine skips entry)
+    gate = (
+        rhl.is_not_null()                   # must be mean-reverting
+        & (r2 >= MIN_R2)                    # regression must explain enough
+        & (beta_cv <= MAX_BETA_CV)          # relationship must be stable
+        & (rhl >= MIN_HALF_LIFE)            # reversion can't be too fast to trade
+    )
+
+    # ── assemble output ───────────────────────────────────────────────
+    out = pl.DataFrame({
+        "signal": z,
+        "time_stop": rhl,
+        "size": size,
+        "confidence": conf,
+        "vol": resid_vol,
+    })
+
+    return out.with_columns(
+        pl.when(pl.Series(gate))
         .then(pl.col("signal"))
         .otherwise(None)
         .alias("signal")
@@ -166,10 +220,11 @@ if not tlog.is_empty():
     tlog = tlog.with_columns(
         pl.col("entry_date").cast(pl.Date).cast(pl.Utf8),
         pl.col("exit_date").cast(pl.Date).cast(pl.Utf8),
+        pl.col("size").round(2),
         pl.col("pnl_bps").round(2),
         pl.col("pnl_dollar").round(2),
-        pl.col("entry_level").round(1),
-        pl.col("exit_level").round(1),
+        pl.col("entry_level").round(2),
+        pl.col("exit_level").round(2),
         pl.col("entry_signal").round(2),
         pl.col("exit_signal").round(2),
     )

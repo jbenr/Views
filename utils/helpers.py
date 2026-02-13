@@ -16,3 +16,18 @@ def to_pl_df(df: Union[pl.DataFrame, pd.DataFrame]) -> pl.DataFrame:
     if isinstance(df, pd.DataFrame):
         return pl.from_pandas(df)
     return df
+
+
+def fix_outliers(
+    expr: pl.Expr,
+    *,
+    hi: float | None = None,
+    lo: float | None = None,
+) -> pl.Expr:
+    """Replace values outside (lo, hi) with linear interpolation from neighbors."""
+    mask = pl.lit(False)
+    if hi is not None:
+        mask = mask | (expr > hi)
+    if lo is not None:
+        mask = mask | (expr < lo)
+    return pl.when(mask).then(None).otherwise(expr).interpolate()
