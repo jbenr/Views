@@ -472,9 +472,9 @@ if not wf_results.is_empty() and len(oos_sharpes) > 0:
 print(f"\nTotal elapsed: {(time.time() - t0) / 60:.1f} min")
 
 # ── Save results ─────────────────────────────────────────────────────
-results.write_parquet("dig/sweep_10s30s_results.parquet")
+results.write_parquet("sweep_10s30s_results.parquet")
 print(f"\nSaved full-sample results → dig/sweep_10s30s_results.parquet ({results.height} rows)")
 
 if not wf_results.is_empty():
-    wf_results.write_parquet("dig/sweep_10s30s_wf_results.parquet")
+    wf_results.write_parquet("sweep_10s30s_wf_results.parquet")
     print(f"Saved walk-forward results → dig/sweep_10s30s_wf_results.parquet ({wf_results.height} rows)")
