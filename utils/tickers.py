@@ -27,4 +27,4 @@ ag = [f"{a}{b} Comdty" for a in ["C","W","S","KC","SB","CT"] for b in [1,2]]
 ind_met = [f"{a}{b} Comdty" for a in ["HG","LA","LX","LN","TIO"] for b in [1,2]]
 
 
-print(sector)
+# print(sector)
