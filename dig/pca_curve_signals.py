@@ -234,9 +234,8 @@ def scan_structure(
 
     # beta stability
     beta_abs_mean = reg["beta"].abs().rolling(lookback).mean()
-    beta_cv = (reg["beta"].rolling(lookback).std() / beta_abs_mean).replace(
-        [np.inf, -np.inf], np.nan
-    )
+    beta_abs_mean = beta_abs_mean.replace(0, np.nan)
+    beta_cv = reg["beta"].rolling(lookback).std() / beta_abs_mean
     reg["beta_cv"] = beta_cv  # store rolling series for downstream filtering
 
     # mean-reversion strength on OOS residual (full trailing window)
@@ -328,18 +327,45 @@ def print_summary(scan_df: pd.DataFrame, top_n: int = 10):
         print(subset[cols].to_string(index=False, float_format=lambda x: f"{x:+.4f}"))
 
 
-def print_current_signals(scan_df: pd.DataFrame, z_threshold: float = 1.0):
-    """Print structures with active z-score signals right now."""
+def print_current_signals(
+    scan_df: pd.DataFrame,
+    z_threshold: float = 1.0,
+    all_regs: dict | None = None,
+):
+    """Print structures with active z-score signals, sorted by typical Sharpe."""
+    from dig.pca_dash import backtest_signal
+
     active = scan_df[scan_df["ou_z"].abs() >= z_threshold].copy()
     if active.empty:
         print(f"\nNo structures with |z| >= {z_threshold}")
         return
 
-    active = active.sort_values("ou_z", key=abs, ascending=False)
+    # compute typical Sharpe for each active signal
+    sharpes = []
+    for _, row in active.iterrows():
+        if all_regs is not None:
+            key = (row["pc"], row["structure"], int(row["lookback"]))
+            reg = all_regs.get(key)
+            if reg is not None:
+                try:
+                    bt = backtest_signal(reg, entry_z=1.0, exit_z=0.0, lookback=int(row["lookback"]))
+                    pnl = bt["pnl"].dropna()
+                    ann = pnl.mean() * 252
+                    vol = pnl.std() * np.sqrt(252)
+                    sharpes.append(ann / vol if vol > 0 else np.nan)
+                except Exception:
+                    sharpes.append(np.nan)
+            else:
+                sharpes.append(np.nan)
+        else:
+            sharpes.append(np.nan)
+    active["sharpe"] = sharpes
+    active = active.sort_values("sharpe", ascending=False)
+
     print(f"\n{'='*70}")
-    print(f"  ACTIVE SIGNALS (|z| >= {z_threshold})")
+    print(f"  ACTIVE SIGNALS (|z| >= {z_threshold}) — sorted by Sharpe")
     print(f"{'='*70}")
-    cols = ["pc", "structure", "lookback", "ou_z", "resid", "r2_corr", "half_life", "quality"]
+    cols = ["pc", "structure", "lookback", "sharpe", "ou_z", "resid", "r2_corr", "half_life", "quality"]
     cols = [c for c in cols if c in active.columns]
     print(active[cols].to_string(index=False, float_format=lambda x: f"{x:+.4f}"))
 
@@ -462,12 +488,30 @@ def _plot_top_structures(scan_df: pd.DataFrame, all_regs: dict, v):
 
 def _plot_active_signals(scan_df: pd.DataFrame, all_regs: dict, v, z_threshold: float = 1.5):
     """Plot z-score time series for top active signals."""
+    from dig.pca_dash import backtest_signal
+
     active = scan_df[scan_df["ou_z"].abs() >= z_threshold].copy()
     if active.empty:
         return
 
-    # take top 5 by |z|, deduplicate by structure
-    active = active.sort_values("ou_z", key=abs, ascending=False)
+    # sort by Sharpe (not |z|) — more extreme z doesn't mean better trade
+    sharpes = []
+    for _, row in active.iterrows():
+        key = (row["pc"], row["structure"], int(row["lookback"]))
+        reg = all_regs.get(key)
+        if reg is not None:
+            try:
+                bt = backtest_signal(reg, entry_z=1.0, exit_z=0.0, lookback=int(row["lookback"]))
+                pnl = bt["pnl"].dropna()
+                ann = pnl.mean() * 252
+                vol = pnl.std() * np.sqrt(252)
+                sharpes.append(ann / vol if vol > 0 else np.nan)
+            except Exception:
+                sharpes.append(np.nan)
+        else:
+            sharpes.append(np.nan)
+    active["sharpe"] = sharpes
+    active = active.sort_values("sharpe", ascending=False)
     seen = set()
     to_plot = []
     for _, row in active.iterrows():
@@ -548,7 +592,7 @@ def main(curve_set: str = "sofr", do_plot: bool = True) -> dict:
         return {}
 
     print_summary(scan_df, top_n=8)
-    print_current_signals(scan_df, z_threshold=1.0)
+    print_current_signals(scan_df, z_threshold=1.0, all_regs=all_regs)
 
     out = {
         "curve_df": curve_df,

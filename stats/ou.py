@@ -4,6 +4,7 @@ Polars-native. Accepts both polars and pandas inputs.
 """
 
 from __future__ import annotations
+import warnings
 import numpy as np
 import polars as pl
 import pandas as pd
@@ -98,18 +99,20 @@ def roll_half_life(
     phi = reg["beta"]
 
     # half_life = -ln(2) / ln(1 + phi), only valid where phi < 0
-    # Evaluate via DataFrame — pl.when always returns Expr, not Series
-    hl = -_LN2 / (1.0 + phi).log()
-    result = (
-        pl.DataFrame({"phi": phi, "hl": hl})
-        .select(
-            pl.when(pl.col("phi") < 0)
-            .then(pl.col("hl"))
-            .otherwise(None)
-            .alias("half_life")
+    # Polars evaluates all branches before masking, so the numpy divide-by-zero
+    # warning fires even though the result is correctly null. Suppress it.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        result = (
+            pl.DataFrame({"phi": phi})
+            .select(
+                (-_LN2 / (1.0 + pl.when(pl.col("phi") < 0)
+                            .then(pl.col("phi"))
+                            .otherwise(None)).log())
+                .alias("half_life")
+            )
+            .to_series()
         )
-        .to_series()
-    )
 
     # Pad to match input length — roll_lr drops leading nulls internally
     if len(result) < n:

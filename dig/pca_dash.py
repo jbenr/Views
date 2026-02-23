@@ -93,10 +93,13 @@ def backtest_signal(
 
     use_hl_exit = hl_exit_pct > 0
     from stats.ou import roll_half_life
-    # always compute rolling half-life — needed for trade log context
-    hl_series = roll_half_life(df["resid"], lookback=lookback).to_pandas()
-    hl_series.index = df.index[-len(hl_series):]
-    df["roll_hl"] = hl_series
+    # Compute rolling half-life on the FULL residual series (including warmup
+    # data before ou_z is available) so that by the time the first trade can
+    # fire, the half-life has already had enough lookback to produce values.
+    full_resid = reg["resid"].dropna()
+    hl_full = roll_half_life(full_resid, lookback=lookback).to_pandas()
+    hl_full.index = full_resid.index[-len(hl_full):]
+    df["roll_hl"] = hl_full.reindex(df.index)
 
     use_r2_filter = min_r2 > 0
     use_cv_filter = max_beta_cv < 99.0
@@ -237,11 +240,11 @@ def build_trade_log(bt: pd.DataFrame) -> pd.DataFrame:
         p = row["pos"]
         prev_p = bt["pos"].iloc[i - 1] if i > 0 else 0.0
 
-        # new entry
+        # new entry — signal fires at prior close, so entry price is y[i-1]
         if p != 0 and prev_p == 0:
             entry_date = idx
-            entry_price = row["y"]
-            entry_z = row["ou_z"]
+            entry_price = bt["y"].iloc[i - 1] if i > 0 else row["y"]
+            entry_z = bt["ou_z"].iloc[i - 1] if i > 0 else row["ou_z"]
             entry_hl_val = row["entry_hl"] if "entry_hl" in bt.columns else np.nan
             direction = "LONG" if p > 0 else "SHORT"
             trade_pnl = 0.0
@@ -250,10 +253,10 @@ def build_trade_log(bt: pd.DataFrame) -> pd.DataFrame:
         if p != 0 and not np.isnan(row["pnl"]):
             trade_pnl += row["pnl"]
 
-        # exit
+        # exit — last held bar is i-1, so exit price is y[i-1]
         if p == 0 and prev_p != 0 and entry_date is not None:
-            exit_price = row["y"]
-            exit_z = row["ou_z"]
+            exit_price = bt["y"].iloc[i - 1]
+            exit_z = bt["ou_z"].iloc[i - 1]
             duration = (idx - entry_date).days
             trades.append({
                 "entry": entry_date.strftime("%Y-%m-%d"),
@@ -394,28 +397,37 @@ def make_backtest_chart(bt: pd.DataFrame, reg: pd.DataFrame, struct_name: str) -
         line=dict(color=C["text"], width=1.2), name=struct_name, showlegend=False,
     ), row=1, col=1)
 
-    entries_long = bt[(bt["pos"].diff() > 0) & (bt["pos"] > 0)]
-    entries_short = bt[(bt["pos"].diff() < 0) & (bt["pos"] < 0)]
-    exits = bt[(bt["pos"].diff() != 0) & (bt["pos"] == 0)]
+    # Detect position changes — these happen at bar i, but the signal fired
+    # at bar i-1 (prior close). Shift markers back by one bar so they appear
+    # where the signal was actually observed.
+    def _shift_back(mask):
+        """Return bt rows one bar before each True in mask (the signal bar)."""
+        ipos = np.flatnonzero(mask.values) - 1
+        ipos = ipos[ipos >= 0]
+        return bt.iloc[ipos]
 
-    if not entries_long.empty:
-        y_vals = clean["y"].reindex(entries_long.index)
+    sig_long = _shift_back((bt["pos"].diff() > 0) & (bt["pos"] > 0))
+    sig_short = _shift_back((bt["pos"].diff() < 0) & (bt["pos"] < 0))
+    sig_exit = _shift_back((bt["pos"].diff() != 0) & (bt["pos"] == 0))
+
+    if not sig_long.empty:
+        y_vals = clean["y"].reindex(sig_long.index)
         fig.add_trace(go.Scatter(
-            x=entries_long.index, y=y_vals,
+            x=sig_long.index, y=y_vals,
             mode="markers", marker=dict(symbol="triangle-up", size=9, color=C["green"]),
             name="Long", showlegend=True,
         ), row=1, col=1)
-    if not entries_short.empty:
-        y_vals = clean["y"].reindex(entries_short.index)
+    if not sig_short.empty:
+        y_vals = clean["y"].reindex(sig_short.index)
         fig.add_trace(go.Scatter(
-            x=entries_short.index, y=y_vals,
+            x=sig_short.index, y=y_vals,
             mode="markers", marker=dict(symbol="triangle-down", size=9, color=C["red"]),
             name="Short", showlegend=True,
         ), row=1, col=1)
-    if not exits.empty:
-        y_vals = clean["y"].reindex(exits.index)
+    if not sig_exit.empty:
+        y_vals = clean["y"].reindex(sig_exit.index)
         fig.add_trace(go.Scatter(
-            x=exits.index, y=y_vals,
+            x=sig_exit.index, y=y_vals,
             mode="markers", marker=dict(symbol="x", size=7, color=C["muted"]),
             name="Exit", showlegend=True,
         ), row=1, col=1)
@@ -434,15 +446,15 @@ def make_backtest_chart(bt: pd.DataFrame, reg: pd.DataFrame, struct_name: str) -
         fig.add_hline(y=lv, line_dash="dot", line_color=C["muted"],
                       line_width=0.5, row=3, col=1)
 
-    if not entries_long.empty:
+    if not sig_long.empty:
         fig.add_trace(go.Scatter(
-            x=entries_long.index, y=entries_long["ou_z"],
+            x=sig_long.index, y=sig_long["ou_z"],
             mode="markers", marker=dict(symbol="triangle-up", size=7, color=C["green"]),
             name="Long", showlegend=False,
         ), row=3, col=1)
-    if not entries_short.empty:
+    if not sig_short.empty:
         fig.add_trace(go.Scatter(
-            x=entries_short.index, y=entries_short["ou_z"],
+            x=sig_short.index, y=sig_short["ou_z"],
             mode="markers", marker=dict(symbol="triangle-down", size=7, color=C["red"]),
             name="Short", showlegend=False,
         ), row=3, col=1)
@@ -549,7 +561,25 @@ def make_monthly_heatmap(bt: pd.DataFrame) -> go.Figure:
 ENTRY_Z_GRID = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5]
 HL_EXIT_GRID = [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
 R2_GRID = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
-CV_GRID = [99.0, 2.0, 1.75, 1.5, 1.25, 1.0, 0.75, 0.5]
+
+
+def _adaptive_cv_grid(reg: pd.DataFrame, n_bins: int = 7) -> list[float]:
+    """Build a beta_cv filter grid from the empirical distribution of the series.
+
+    Returns [no_filter, p90, p75, p60, p50, p40, p25, p10] — descending so
+    the heatmap y-axis goes from loose (top) to strict (bottom).
+    """
+    if "beta_cv" not in reg.columns:
+        return [99.0]
+    cv = reg["beta_cv"].dropna()
+    if len(cv) < 20:
+        return [99.0]
+    pcts = [90, 75, 60, 50, 40, 25, 10]
+    vals = np.percentile(cv, pcts)
+    # round for display, deduplicate, descending order
+    grid = sorted(set(round(float(v), 3) for v in vals), reverse=True)
+    # prepend 99.0 as "no filter" baseline
+    return [99.0] + grid
 
 
 def optimize_grid(
@@ -601,10 +631,11 @@ def optimize_filters(
     entry_z: float = 1.0,
     hl_exit_pct: float = 0.0,
 ) -> pd.DataFrame:
-    """Grid search over min_r2 x max_beta_cv."""
+    """Grid search over min_r2 x max_beta_cv (adaptive CV grid from data)."""
+    cv_grid = _adaptive_cv_grid(reg)
     rows = []
     for r2 in R2_GRID:
-        for cv in CV_GRID:
+        for cv in cv_grid:
             try:
                 bt = backtest_signal(
                     reg, entry_z=entry_z, exit_z=0.0, hl_exit_pct=hl_exit_pct,
@@ -1114,7 +1145,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--curve", choices=["ust", "sofr"], default="sofr")
     parser.add_argument("--port", type=int, default=8050)
-    parser.add_argument("--start", default="2010-01-01")
+    parser.add_argument("--start", default="2021-01-01")
     args = parser.parse_args()
 
     print("Running PCA scanner...")

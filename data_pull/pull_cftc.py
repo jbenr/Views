@@ -247,7 +247,7 @@ def incremental_update() -> None:
         return
 
     df = normalize(raw)
-    df = df[df["ts"] > max_date]
+    df = df[df["ts"] > pd.Timestamp(max_date)]
 
     if df.empty:
         print("✅ Up to date.")
