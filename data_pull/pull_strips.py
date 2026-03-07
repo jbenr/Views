@@ -336,9 +336,9 @@ def main() -> None:
         if max_date is None:
             start, end = dt.date(2000, 1, 1), dt.date.today()
         else:
-            start = max_date + dt.timedelta(days=1)
+            start = max_date
             end = dt.date.today()
-            if start > end:
+            if start >= end:
                 print("Up to date.")
                 conn.close()
                 return

@@ -538,10 +538,10 @@ def incremental_update() -> None:
             full_refresh()
             return
         
-        start = max_dt + dt.timedelta(days=1)
+        start = max_dt
         end = dt.date.today()
-        
-        if start > end:
+
+        if start >= end:
             print(
                 f"✅ No new dates to pull.\n"
                 f"   Database is up to date as of {max_dt}."

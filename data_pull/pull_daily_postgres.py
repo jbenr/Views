@@ -115,11 +115,7 @@ def get_date_range(conn, force_start: dt.date = None) -> tuple[dt.date, dt.date]
     if isinstance(max_date, dt.datetime):
         max_date = max_date.date()
 
-    start = max_date + dt.timedelta(days=1)
-    if start > today:
-        return (None, None)  # fully caught up
-
-    return (start, today)
+    return (max_date, today)
 
 
 # ---------------------------------------------------------------------------

@@ -90,10 +90,7 @@ def get_date_range(conn, force_start: dt.date | None = None) -> tuple[dt.date | 
     if isinstance(max_date, dt.datetime):
         max_date = max_date.date()
 
-    start = max_date + dt.timedelta(days=1)
-    if start > today:
-        return (None, None)
-    return (start, today)
+    return (max_date, today)
 
 
 def upsert(conn, df: pd.DataFrame) -> int:
