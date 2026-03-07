@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from stats import roll_lr, ou_zscore
+from stats import roll_lr_diff, ou_zscore
 from utils.viz import Viz
 
 DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets")
@@ -78,22 +78,29 @@ def fit_pair(px: pd.DataFrame, y_col: str, x_col: str, lookback: int) -> pd.Data
     if len(pair) < lookback + 10:
         return None
 
-    reg = roll_lr(pair[x_col], pair[y_col], lookback=lookback).to_pandas()
-    reg.index = pair.index
+    raw = roll_lr_diff(pair[x_col], pair[y_col], lookback=lookback).to_pandas()
+    raw.index = pair.index[1:]  # first row lost to diff
+
+    reg = pd.DataFrame(index=raw.index)
+    reg["y"] = raw["y"]
+    reg["x"] = raw["x"]
+    reg["alpha"] = raw["alpha"]
+    reg["beta"] = raw["beta"]
+    reg["resid"] = raw["resid_cum"]
 
     z = ou_zscore(reg["resid"], lookback=lookback).to_pandas()
     z.index = reg.index
     reg["ou_z"] = z
 
-    corr = pair[y_col].rolling(lookback).corr(pair[x_col])
-    reg["r2_corr"] = (corr ** 2).clip(lower=0.0, upper=1.0)
+    # r2 on changes (how well dx explains dy)
+    reg["r2_corr"] = raw["r2"].clip(lower=0.0, upper=1.0)
 
     beta_abs_mean = reg["beta"].abs().rolling(lookback).mean()
     reg["beta_cv"] = (reg["beta"].rolling(lookback).std() / beta_abs_mean).replace(
         [np.inf, -np.inf], np.nan
     )
 
-    reg["fair"] = reg["alpha"] + reg["beta"] * pair[x_col]
+    reg["fair"] = reg["y"] - reg["resid"]
     return reg
 
 

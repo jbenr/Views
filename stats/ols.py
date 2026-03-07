@@ -78,6 +78,51 @@ def roll_lr(
     return df.select("x", "y", "alpha", "beta", "yhat", "resid", "r2")
 
 
+def roll_lr_diff(
+    x: Union[pl.Series, pd.Series, pl.DataFrame, pd.DataFrame],
+    y: Union[pl.Series, pd.Series],
+    lookback: int = 100,
+    min_periods: int = None,
+) -> pl.DataFrame:
+    """Changes-based rolling OLS: dy = alpha + beta*dx.
+
+    Returns polars DataFrame with columns:
+        x, y, dx, dy, alpha, beta, yhat, resid, resid_cum, r2
+
+    - beta is the hedge ratio on daily changes (correct for beta-weighting).
+    - resid is the single-period changes residual.
+    - resid_cum is the cumulative residual in level space (for z-scoring).
+    """
+    if isinstance(x, (pd.DataFrame, pl.DataFrame)):
+        x = x.to_series(0) if isinstance(x, pl.DataFrame) else pl.from_pandas(x.iloc[:, 0])
+    else:
+        x = to_pl_series(x)
+    y = to_pl_series(y)
+
+    levels = pl.DataFrame({"x": x, "y": y}).drop_nulls()
+    levels = levels.with_columns(
+        pl.col("x").diff().alias("dx"),
+        pl.col("y").diff().alias("dy"),
+    )
+
+    # drop first row (null from diff) to match roll_lr output length
+    levels = levels.slice(1)
+
+    reg = roll_lr(levels["dx"], levels["dy"], lookback=lookback, min_periods=min_periods)
+
+    out = levels.select("x", "y").with_columns(
+        reg["x"].alias("dx"),
+        reg["y"].alias("dy"),
+        reg["alpha"],
+        reg["beta"],
+        reg["yhat"],
+        reg["resid"],
+        reg["resid"].cum_sum().alias("resid_cum"),
+        reg["r2"],
+    )
+    return out
+
+
 def roll_beta(x, y, lookback=100):
     return roll_lr(x, y, lookback)["beta"]
 
