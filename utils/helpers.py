@@ -31,3 +31,11 @@ def fix_outliers(
     if lo is not None:
         mask = mask | (expr < lo)
     return pl.when(mask).then(None).otherwise(expr).interpolate()
+
+
+def query_df(conn, sql: str, params: list | tuple | None = None) -> pd.DataFrame:
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        cols = [d.name for d in cur.description]
+    return pd.DataFrame(rows, columns=cols)
