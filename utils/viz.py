@@ -687,6 +687,102 @@ class Viz:
         plt.close(fig)
 
     # -------------------------------------------------------------------------
+    # Residual Distribution (static)
+    # -------------------------------------------------------------------------
+
+    def residual_dist(
+        self,
+        data: Union[pd.DataFrame, pd.Series],
+        cols: Optional[List[str]] = None,
+        title: Optional[str] = None,
+        bins: int = 50,
+        show_stats: bool = True,
+    ):
+        """Histogram + KDE of residual distributions with normal overlay.
+
+        Accepts a DataFrame (plots each column) or a Series.
+        Shows mean, std, skew, kurtosis, and a fitted normal curve.
+        """
+        if isinstance(data, pd.Series):
+            df = data.dropna().to_frame(name=data.name or "resid")
+        else:
+            df = data.copy()
+
+        cols = cols or df.select_dtypes(include=[np.number]).columns.tolist()
+        n_cols = len(cols)
+
+        fig, axes = plt.subplots(
+            1, n_cols, figsize=(5 * n_cols, 5), squeeze=False,
+        )
+
+        for i, col in enumerate(cols):
+            ax = axes[0, i]
+            series = df[col].dropna()
+            if series.empty:
+                continue
+
+            color = self.colors[i % len(self.colors)]
+
+            # Histogram
+            ax.hist(
+                series, bins=bins, density=True, color=color,
+                alpha=0.35, edgecolor=color, linewidth=0.5,
+            )
+
+            # KDE
+            from scipy.stats import gaussian_kde, norm
+            kde = gaussian_kde(series)
+            x_grid = np.linspace(series.min(), series.max(), 200)
+            ax.plot(x_grid, kde(x_grid), color=color, linewidth=2, label="KDE")
+
+            # Normal overlay
+            mu, sigma = series.mean(), series.std()
+            ax.plot(
+                x_grid, norm.pdf(x_grid, mu, sigma),
+                color="#666", linewidth=1.5, linestyle="--", label="Normal",
+            )
+
+            # Current value marker
+            current = float(series.iloc[-1])
+            ax.axvline(
+                x=current, color=color, linewidth=2, linestyle="-",
+                label=f"Current: {current:.2f}",
+            )
+
+            # Stats box
+            if show_stats:
+                from scipy.stats import skew, kurtosis
+                stats_text = (
+                    f"μ = {mu:.2f}\n"
+                    f"σ = {sigma:.2f}\n"
+                    f"skew = {skew(series):.2f}\n"
+                    f"kurt = {kurtosis(series):.2f}\n"
+                    f"n = {len(series)}"
+                )
+                ax.text(
+                    0.97, 0.97, stats_text,
+                    transform=ax.transAxes, fontsize=8,
+                    verticalalignment="top", horizontalalignment="right",
+                    bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+                              edgecolor="#CCC", alpha=0.9),
+                )
+
+            self._style_ax(ax, title=col if n_cols > 1 else None)
+            ax.legend(
+                loc="upper left", fontsize=8, frameon=False,
+                handlelength=1.5,
+            )
+
+        if title:
+            fig.suptitle(
+                title.upper(), fontsize=self.TITLE_SIZE,
+                color="#333", x=0.01, ha="left", y=1.02,
+            )
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)
+
+    # -------------------------------------------------------------------------
     # Event Annotation Helper
     # -------------------------------------------------------------------------
 
@@ -763,3 +859,6 @@ def pca_loadings(*args, **kwargs):
 
 def pca_variance(*args, **kwargs):
     return _viz.pca_variance(*args, **kwargs)
+
+def residual_dist(*args, **kwargs):
+    return _viz.residual_dist(*args, **kwargs)
