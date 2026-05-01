@@ -15,16 +15,9 @@ The project is designed to:
 
 The database is expected to be running locally (e.g. on a Linux tower or workstation), with data ingestion handled separately via dedicated pull scripts.
 
----
-
-## Key Features
-
-- Local **PostgreSQL-backed data storage**
-- Python-first analytics stack (NumPy, Pandas, SciPy, statsmodels)
-- Modular utilities for data access, transformations, and analytics
-- Designed for macro instruments, spreads, curves, and relative value signals
 
 ---
+
 
 ## Project Structure
 

@@ -19,6 +19,7 @@ import sys
 import datetime as dt
 import argparse
 
+import numpy as np
 import pandas as pd
 import psycopg
 from tqdm import tqdm
@@ -159,8 +160,12 @@ def fetch_bdh(
                 if col not in df.columns:
                     df[col] = pd.NA
 
+            for col in expected_cols:
+                if df[col].dtype == object and df[col].isna().all():
+                    df[col] = np.nan
             batch_dfs.append(df[expected_cols])
 
+        batch_dfs = [df for df in batch_dfs if df['px_last'].notna().any()]
         if not batch_dfs:
             continue
 

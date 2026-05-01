@@ -116,9 +116,19 @@ class Viz:
             spine.set_color('#333')
             spine.set_linewidth(0.5)
 
-    def _format_dates(self, ax):
+    def _format_dates(self, ax, start=None, end=None):
         """Auto-format date axis with tighter label spacing."""
-        locator = mdates.AutoDateLocator(minticks=12, maxticks=24)
+        if start is not None and end is not None:
+            span = (end - start).days
+            if span <= 45:
+                minticks, maxticks = 10, 35   # daily ticks for 1M
+            elif span <= 180:
+                minticks, maxticks = 8, 20
+            else:
+                minticks, maxticks = 12, 24
+        else:
+            minticks, maxticks = 12, 24
+        locator = mdates.AutoDateLocator(minticks=minticks, maxticks=maxticks)
         ax.xaxis.set_major_locator(locator)
         ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
         ax.xaxis.get_offset_text().set_visible(False)
@@ -263,20 +273,21 @@ class Viz:
         subtitle: Optional[str] = None,
         yaxis_title: Optional[str] = None,
         yaxis_right_title: Optional[str] = None,
-        right: Optional[List[str]] = None,
+        left: Optional[List[str]] = None,
         show_avg: bool = False,
         avg_unit: str = '',
         interval: str = None,
         show_endpoint_marker: bool = True,
         residual: bool = False,
+        nas: bool = True,
     ):
         """Line chart with interactive time navigation.
 
-        right : list of column names to plot on secondary (left) y-axis.
-                Primary axis stays on the right per PrismFP style.
+        left : list of column names to plot on secondary (left) y-axis.
+               Primary axis stays on the right per PrismFP style.
         """
         cols = cols or df.select_dtypes(include=[np.number]).columns.tolist()
-        right = right or []
+        left = left or []
         if not isinstance(df.index, pd.DatetimeIndex):
             df = df.copy()
             df.index = pd.to_datetime(df.index)
@@ -284,29 +295,45 @@ class Viz:
         def render(fig, ax, start, end):
             subset = df.loc[start:end, cols]
             ax2 = None
-            if right:
+            if left:
                 ax2 = ax.twinx()
+                ax2.grid(False)
 
             for i, col in enumerate(cols):
                 color = self.colors[i % len(self.colors)]
-                target = ax2 if col in right else ax
+                target = ax2 if col in left else ax
                 series = subset[col].dropna()
                 if series.empty:
                     continue
                 avg = series.mean() if show_avg else None
                 label = self._format_legend_name(col, avg, avg_unit) if show_avg else col
-                target.plot(series.index, series, color=color, linewidth=1.5, label=label, zorder=3)
+
+                if not nas:
+                    # dotted connectors across weekend/holiday gaps
+                    for j in range(len(series) - 1):
+                        if (series.index[j + 1] - series.index[j]).days > 1:
+                            target.plot(
+                                [series.index[j], series.index[j + 1]],
+                                [series.iloc[j], series.iloc[j + 1]],
+                                color=color, linewidth=1.2, linestyle=':', alpha=0.6, zorder=2,
+                            )
+                    cal_idx = pd.date_range(series.index[0], series.index[-1], freq='D')
+                    plot_series = series.reindex(cal_idx)
+                else:
+                    plot_series = series
+
+                target.plot(plot_series.index, plot_series, color=color, linewidth=1.5, label=label, zorder=3)
 
                 if residual and len(cols) == 1:
                     target.axhline(y=0, color='#666', linestyle=':', linewidth=1)
                     target.fill_between(
-                        series.index, 0, series,
-                        where=series >= 0,
+                        plot_series.index, 0, plot_series,
+                        where=plot_series >= 0,
                         interpolate=True, color='#27AE60', alpha=0.15,
                     )
                     target.fill_between(
-                        series.index, 0, series,
-                        where=series < 0,
+                        plot_series.index, 0, plot_series,
+                        where=plot_series < 0,
                         interpolate=True, color='#C0392B', alpha=0.15,
                     )
 
@@ -325,7 +352,7 @@ class Viz:
                     target.axhline(y=avg, color=color, linestyle='--', linewidth=1, alpha=0.7)
 
             self._style_ax(ax, yaxis_title=yaxis_title)
-            if ax2:
+            if left:
                 # primary axis (right side per PrismFP), secondary on left
                 ax.yaxis.tick_right()
                 ax.yaxis.set_label_position('right')
@@ -345,7 +372,7 @@ class Viz:
                 )
             else:
                 self._legend(ax)
-            self._format_dates(ax)
+            self._format_dates(ax, start, end)
             fig.subplots_adjust(bottom=0.15)
 
         return self._make_time_nav(df, render, title=title)
@@ -540,7 +567,7 @@ class Viz:
             ax.axhline(y=0, color='#666', linestyle='--', linewidth=1, alpha=0.7)
 
             self._style_ax(ax, yaxis_title='Correlation')
-            self._format_dates(ax)
+            self._format_dates(ax, start, end)
             self._legend(ax)
             fig.tight_layout()
 
@@ -580,7 +607,7 @@ class Viz:
             ax.axhline(y=0, color='#666', linestyle='--', linewidth=1, alpha=0.7)
 
             self._style_ax(ax, yaxis_title='Z-Score')
-            self._format_dates(ax)
+            self._format_dates(ax, start, end)
             self._legend(ax)
             fig.tight_layout()
 

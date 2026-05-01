@@ -582,7 +582,5 @@ def main():
     else:
         incremental_update()
 
-    populate_contracts_from_eod(get_conn(), Bbg())
-
 if __name__ == "__main__":
     main()
