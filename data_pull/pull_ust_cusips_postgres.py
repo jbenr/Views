@@ -171,7 +171,7 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
         "first_int_payment_date",
     ):
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
+            df[col] = pd.to_datetime(df[col], format="ISO8601", errors="coerce")
 
     for col in (
         "total_accepted",

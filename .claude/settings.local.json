@@ -1,7 +1,32 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:www.cftc.gov)"
+      "WebFetch(domain:www.cftc.gov)",
+      "Bash(python3 -c ' *)",
+      "Bash(py -3 -c ' *)",
+      "Read(//usr/**)",
+      "Bash(ls /c/Python*/python.exe)",
+      "Read(//c/Users/benjils/AppData/Local/Programs/**)",
+      "PowerShell(Get-Command python -ErrorAction SilentlyContinue)",
+      "PowerShell(conda env list)",
+      "PowerShell(conda run -n 2s10s python -c \"import json; print\\(json.load\\(open\\(r'C:/Users/benjils/werk/Views/signal/duration/research.ipynb'\\)\\)['nbformat']\\)\")",
+      "PowerShell(conda run -n 2s10s python -c \"from signal.duration import exits_ou; print\\('OK', dir\\(exits_ou\\)\\)\" 2>&1)",
+      "WebFetch(domain:api.fiscaldata.treasury.gov)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('data_pull/pull_strips.py'\\).read\\(\\)\\); print\\('ok'\\)\")",
+      "PowerShell(conda run -n base python -c \"import ast; ast.parse\\(open\\('data_pull/pull_strips.py'\\).read\\(\\)\\); print\\('ok'\\)\")",
+      "PowerShell(conda run -n base python -c \"import ast; ast.parse\\(open\\('data_pull/pull_ust_cusips_postgres.py'\\).read\\(\\)\\); print\\('ok'\\)\")",
+      "PowerShell(conda run -n base python -c \"from data_pull.pull_strips import fetch_strips_universe, normalize_strips; raw = fetch_strips_universe\\(\\); print\\('raw rows:', len\\(raw\\), 'cols:', list\\(raw.columns\\)[:6] if not raw.empty else '<empty>'\\); norm = normalize_strips\\(raw\\); print\\('strips with portion_stripped > 0:', len\\(norm\\)\\); print\\(norm.head\\(3\\).to_string\\(\\)\\)\")",
+      "PowerShell(conda run -n 2s10s python -c \"from data_pull.pull_strips import fetch_strips_universe, normalize_strips; raw = fetch_strips_universe\\(\\); print\\('raw rows:', len\\(raw\\)\\); print\\('cols:', list\\(raw.columns\\) if not raw.empty else '<empty>'\\); norm = normalize_strips\\(raw\\); print\\('strips with portion_stripped > 0:', len\\(norm\\)\\); print\\(norm.head\\(5\\).to_string\\(\\)\\)\")",
+      "PowerShell(conda run -n 2s10s python data_pull/_tmp_inspect2.py)",
+      "PowerShell(conda run -n 2s10s python data_pull/_tmp_bbg_probe.py)",
+      "PowerShell(conda run -n 2s10s python -c \"import ast; ast.parse\\(open\\('data_pull/pull_strips.py'\\).read\\(\\)\\); print\\('ok'\\)\")",
+      "PowerShell(conda run -n 2s10s python data_pull/_tmp_test_coupon.py)",
+      "Bash(jupyter nbconvert *)",
+      "Read(//tmp/**)",
+      "PowerShell(conda run -n 2s10s jupyter nbconvert --to script signal/duration/research.ipynb --output _tmp_research 2>&1)",
+      "PowerShell(conda run -n 2s10s python signal/duration/_tmp_edit_nb.py)",
+      "PowerShell(conda run -n 2s10s jupyter nbconvert --to script signal/duration/research.ipynb --output _verify 2>&1)",
+      "Bash(mamba run *)"
     ]
   }
 }

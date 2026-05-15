@@ -34,14 +34,14 @@ from data_pull.berg import Bbg
 
 DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets")
 
-# Treasury Direct fiscal data API — MSPD STRIPS components
-# NOTE: verify this endpoint returns CUSIP-level STRIPS data. If not, try:
-#   v1/debt/mspd/mspd_table_3_market  (filter for STRIPS)
-#   v2/accounting/od/strips
+# MSPD Table 5 — "Holdings of Treasury Securities in Stripped Form"
+# Each row covers one parent Note/Bond/TIPS with its principal-STRIP CUSIP, the
+# parent's coupon and maturity, outstanding, and how much has been stripped.
 STRIPS_URL = (
     "https://api.fiscaldata.treasury.gov/"
-    "services/api/fiscal_service/v1/debt/mspd/mspd_table_3_market"
+    "services/api/fiscal_service/v1/debt/mspd/mspd_table_5"
 )
+LATEST_DATE_URL = STRIPS_URL  # same endpoint, queried with page size 1
 PAGE_SIZE = 10_000
 
 BBG_FIELDS = ["PX_LAST", "YLD_YTM_MID"]
@@ -69,10 +69,12 @@ def ensure_tables(conn) -> None:
                 strip_type         text,
                 outstanding_amt    double precision,
                 record_date        date,
+                parent_cusip       text,
                 created_at         timestamptz NOT NULL DEFAULT now(),
                 updated_at         timestamptz NOT NULL DEFAULT now()
             );
         """)
+        cur.execute("ALTER TABLE sec.strips ADD COLUMN IF NOT EXISTS parent_cusip text;")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_strips_maturity ON sec.strips (maturity_date);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_strips_type ON sec.strips (strip_type);")
 
@@ -116,19 +118,34 @@ def get_active_strip_cusips(conn) -> list[str]:
 # Treasury Direct: STRIPS universe
 # ---------------------------------------------------------------------------
 
+def _latest_record_date() -> str | None:
+    """Most recent monthly snapshot date in MSPD Table 5 (YYYY-MM-DD)."""
+    resp = requests.get(
+        STRIPS_URL,
+        params={"page[size]": 1, "sort": "-record_date", "fields": "record_date"},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+    return data[0]["record_date"] if data else None
+
+
 def fetch_strips_universe() -> pd.DataFrame:
     """
-    Pull STRIPS data from Treasury Direct fiscal data API.
-    Returns DataFrame with CUSIP-level STRIPS info.
+    Pull the latest snapshot of MSPD Table 5 (Holdings of Treasury Securities in
+    Stripped Form). Returns one row per parent bond with its principal-STRIP CUSIP.
     """
+    record_date = _latest_record_date()
+    if record_date is None:
+        return pd.DataFrame()
+
     rows = []
     page = 1
-
     while True:
         params = {
             "page[size]": PAGE_SIZE,
             "page[number]": page,
-            "filter": "security_class2:eq:Strip",
+            "filter": f"record_date:eq:{record_date}",
         }
         resp = requests.get(STRIPS_URL, params=params, timeout=60)
         resp.raise_for_status()
@@ -139,30 +156,47 @@ def fetch_strips_universe() -> pd.DataFrame:
             break
         rows.extend(data)
 
-        if not payload.get("links", {}).get("next"):
+        meta = payload.get("meta", {})
+        total_pages = (meta.get("pagination") or {}).get("total-pages", page)
+        if page >= total_pages:
             break
         page += 1
 
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 def normalize_strips(df: pd.DataFrame) -> pd.DataFrame:
-    """Minimal normalization of Treasury Direct STRIPS data."""
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    """Coerce MSPD Table 5 fields and project into our schema."""
+    df = df.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
 
-    # Parse dates
-    for col in [c for c in df.columns if "date" in c]:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
+    for col in ("record_date", "maturity_date"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], format="ISO8601", errors="coerce")
 
-    # Parse numeric
-    for col in [c for c in df.columns if "amt" in c or "amount" in c]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ("outstanding_amt", "portion_unstripped_amt",
+                "portion_stripped_amt", "reconstituted_amt", "interest_rate_pct"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    return df
+    out = pd.DataFrame({
+        "cusip":           df.get("cusip"),
+        "parent_cusip":    df.get("security_class2_desc"),
+        "strip_type":      df.get("security_class1_desc"),
+        "maturity_date":   df.get("maturity_date"),
+        "outstanding_amt": df.get("portion_stripped_amt"),  # strip-level, in $K
+        "record_date":     df.get("record_date"),
+    })
+    out["security_desc"] = (
+        out["strip_type"].fillna("").astype(str) + " STRIP "
+        + out["maturity_date"].dt.strftime("%Y-%m-%d").fillna("")
+    ).str.strip()
+
+    # Only keep rows where some portion has actually been stripped — otherwise
+    # the CUSIP won't quote on Bloomberg.
+    out = out[out["outstanding_amt"].fillna(0) > 0]
+    out = out.dropna(subset=["cusip"]).drop_duplicates(subset=["cusip"], keep="last")
+    return out
 
 
 def upsert_strips_metadata(conn, df: pd.DataFrame) -> int:
@@ -170,56 +204,175 @@ def upsert_strips_metadata(conn, df: pd.DataFrame) -> int:
     if df.empty:
         return 0
 
-    # Map whatever columns we got to our table
-    # This is flexible — we take what Treasury Direct gives us
-    col_map = {}
-    for src in df.columns:
-        if "cusip" in src:
-            col_map[src] = "cusip"
-        elif "maturity" in src and "date" in src:
-            col_map[src] = "maturity_date"
-        elif "security_desc" in src or "security_description" in src:
-            col_map[src] = "security_desc"
-        elif src in ("security_class2", "security_class"):
-            col_map[src] = "strip_type"
-        elif "outstanding" in src and "amt" in src:
-            col_map[src] = "outstanding_amt"
-        elif src == "record_date":
-            col_map[src] = "record_date"
-
-    if "cusip" not in col_map.values():
-        print("Warning: no CUSIP column found in STRIPS data", file=sys.stderr)
-        return 0
-
-    mapped = df.rename(columns=col_map)
-    keep = [c for c in ["cusip", "security_desc", "maturity_date", "strip_type",
-                         "outstanding_amt", "record_date"] if c in mapped.columns]
-    mapped = mapped[keep].drop_duplicates(subset=["cusip"], keep="last")
-
     sql = """
     INSERT INTO sec.strips (cusip, security_desc, maturity_date, strip_type,
-                            outstanding_amt, record_date, updated_at)
-    VALUES (%s, %s, %s, %s, %s, %s, now())
+                            outstanding_amt, record_date, parent_cusip, updated_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, now())
     ON CONFLICT (cusip) DO UPDATE SET
       security_desc   = EXCLUDED.security_desc,
       maturity_date   = EXCLUDED.maturity_date,
       strip_type      = EXCLUDED.strip_type,
       outstanding_amt = EXCLUDED.outstanding_amt,
       record_date     = EXCLUDED.record_date,
+      parent_cusip    = EXCLUDED.parent_cusip,
       updated_at      = now();
     """
 
-    rows = []
-    for _, r in mapped.iterrows():
-        rows.append((
-            r.get("cusip"), r.get("security_desc"), r.get("maturity_date"),
-            r.get("strip_type"), r.get("outstanding_amt"), r.get("record_date"),
+    def _clean(v):
+        if v is None:
+            return None
+        try:
+            if pd.isna(v):
+                return None
+        except (TypeError, ValueError):
+            pass
+        return v
+
+    rows = [
+        tuple(_clean(v) for v in (
+            r.cusip, r.security_desc, r.maturity_date, r.strip_type,
+            r.outstanding_amt, r.record_date, r.parent_cusip,
         ))
+        for r in df.itertuples(index=False)
+    ]
 
     with conn.cursor() as cur:
         cur.executemany(sql, rows)
     conn.commit()
     return len(rows)
+
+
+# ---------------------------------------------------------------------------
+# Coupon STRIPS — discover CUSIPs from parent bonds' coupon schedules
+# ---------------------------------------------------------------------------
+#
+# MSPD Table 5 only enumerates principal STRIPS. Coupon STRIPS (TINTs) are
+# fungible across parents — every coupon paid on the same date collapses into
+# one CUSIP — so we derive them as:
+#   1. all stripable Note/Bond parents from sec.auctioned_securities
+#   2. all of their semi-annual coupon payment dates (working back from maturity)
+#   3. ask Bloomberg `S MM/DD/YY Govt` -> ID_CUSIP for each unique date
+# Irregular first-coupon strips (off the standard semi-annual grid) come from
+# the parent's tint_cusip_1 / tint_cusip_2 fields directly.
+
+BDP_BATCH = 500
+
+
+def _generate_coupon_dates(dated: dt.date, maturity: dt.date) -> list[dt.date]:
+    """Semi-annual coupon dates strictly after dated, up to and including maturity.
+
+    Walks backward from maturity in 6-month steps, anchored on the maturity day/month.
+    """
+    out: list[dt.date] = []
+    y, m, d = maturity.year, maturity.month, maturity.day
+    while True:
+        try:
+            cand = dt.date(y, m, d)
+        except ValueError:  # e.g. Feb 30 -> roll to end of month
+            cand = dt.date(y, m, 28)
+        if cand <= dated:
+            break
+        out.append(cand)
+        # step back 6 months
+        m -= 6
+        if m <= 0:
+            m += 12
+            y -= 1
+    return sorted(out)
+
+
+def get_parent_coupon_schedules(conn) -> pd.DataFrame:
+    """Stripable Note/Bond parents with future maturity + their schedule fields."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT ON (cusip)
+                cusip,
+                security_type,
+                dated_date::date     AS dated_date,
+                maturity_date::date  AS maturity_date,
+                first_int_payment_date::date AS first_int_payment_date,
+                int_payment_frequency,
+                corpus_cusip,
+                NULLIF(tint_cusip_1, 'null') AS tint_cusip_1,
+                NULLIF(tint_cusip_2, 'null') AS tint_cusip_2
+            FROM sec.auctioned_securities
+            WHERE security_type IN ('Note', 'Bond')
+              AND maturity_date > CURRENT_DATE
+              AND dated_date IS NOT NULL
+              AND NULLIF(corpus_cusip, 'null') IS NOT NULL
+            ORDER BY cusip, record_date DESC;
+        """)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    return pd.DataFrame(rows, columns=cols)
+
+
+def fetch_coupon_strip_universe(bbg: Bbg, conn) -> pd.DataFrame:
+    """Discover coupon STRIP CUSIPs and return a DataFrame ready for upsert."""
+    parents = get_parent_coupon_schedules(conn)
+    if parents.empty:
+        return pd.DataFrame()
+
+    # Standard semi-annual coupon dates from each parent (future only).
+    today = dt.date.today()
+    all_dates: set[dt.date] = set()
+    for r in parents.itertuples(index=False):
+        all_dates.update(
+            d for d in _generate_coupon_dates(r.dated_date, r.maturity_date)
+            if d >= today
+        )
+
+    dates_sorted = sorted(all_dates)
+    print(f"  Resolving {len(dates_sorted):,} unique coupon dates via Bloomberg…")
+
+    tickers = [f"S {d.strftime('%m/%d/%y')} Govt" for d in dates_sorted]
+    ticker_to_date = dict(zip(tickers, dates_sorted))
+
+    resolved: list[dict] = []
+    for i in tqdm(range(0, len(tickers), BDP_BATCH),
+                  desc="Bloomberg BDP batches", unit="batch"):
+        batch = tickers[i:i + BDP_BATCH]
+        df = bbg.bdp(batch, ["ID_CUSIP", "MATURITY"])
+        if df.empty:
+            continue
+        for ticker, row in df.iterrows():
+            cusip = row.get("ID_CUSIP")
+            if not cusip or (isinstance(cusip, float) and pd.isna(cusip)):
+                continue
+            mat = row.get("MATURITY") or ticker_to_date.get(ticker)
+            resolved.append({
+                "cusip": str(cusip),
+                "maturity_date": pd.to_datetime(mat).date() if mat else ticker_to_date[ticker],
+                "strip_type": "Coupon STRIP",
+                "parent_cusip": None,
+            })
+
+    # Add irregular first-coupon TINT CUSIPs that Treasury publishes directly,
+    # but only when the first coupon hasn't paid yet.
+    for r in parents.itertuples(index=False):
+        if r.first_int_payment_date is None or r.first_int_payment_date < today:
+            continue
+        for tint in (r.tint_cusip_1, r.tint_cusip_2):
+            if tint and tint not in (None, "", "null"):
+                resolved.append({
+                    "cusip": str(tint),
+                    "maturity_date": r.first_int_payment_date,
+                    "strip_type": "Coupon STRIP",
+                    "parent_cusip": r.cusip,
+                })
+
+    if not resolved:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(resolved).dropna(subset=["cusip", "maturity_date"])
+    out["security_desc"] = (
+        "Coupon STRIP " + out["maturity_date"].astype(str)
+    )
+    out["outstanding_amt"] = None
+    out["record_date"] = dt.date.today()
+    out = out.drop_duplicates(subset=["cusip"], keep="last")
+    return out[["cusip", "security_desc", "maturity_date", "strip_type",
+                "outstanding_amt", "record_date", "parent_cusip"]]
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +472,20 @@ def main() -> None:
     except Exception as e:
         print(f"  Warning: Treasury Direct fetch failed ({e}). Proceeding with existing sec.strips.")
 
-    # Step 2: pull EOD from Bloomberg
+    # Step 2: discover coupon STRIP CUSIPs from parent bonds + Bloomberg lookup.
+    bbg = Bbg()
+    print("Discovering coupon STRIP CUSIPs from parent bond schedules…")
+    try:
+        coupons = fetch_coupon_strip_universe(bbg, conn)
+        if coupons.empty:
+            print("  No coupon STRIPS discovered.")
+        else:
+            n = upsert_strips_metadata(conn, coupons)
+            print(f"  Upserted {n:,} coupon STRIPS into sec.strips")
+    except Exception as e:
+        print(f"  Warning: coupon STRIP discovery failed ({e}). Continuing.")
+
+    # Step 3: pull EOD from Bloomberg
     cusips = get_active_strip_cusips(conn)
     if not cusips:
         print("No active STRIPS CUSIPs found. Nothing to pull from Bloomberg.")
@@ -344,7 +510,6 @@ def main() -> None:
                 return
 
     print(f"Pulling {len(cusips)} STRIPS CUSIPs from {start} to {end}...")
-    bbg = Bbg()
     inserted = fetch_strips_eod(bbg, conn, cusips, start, end)
 
     if inserted == 0:
