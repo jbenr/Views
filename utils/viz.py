@@ -26,10 +26,56 @@ from datetime import datetime, timedelta
 
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from matplotlib.font_manager import FontProperties
+from matplotlib.offsetbox import AnnotationBbox, DrawingArea
+from matplotlib.patches import Polygon
+from matplotlib.text import Text
+from matplotlib.ticker import AutoMinorLocator, MaxNLocator, NullLocator
 import seaborn as sns
 
 import ipywidgets as widgets
 from IPython.display import HTML, display, clear_output
+
+
+def _endpoint_flag(text: str, *, facecolor: str, textcolor: str, edgecolor: str):
+    """Return a tight Bloomberg-style left-pointing endpoint flag."""
+    fontprops = FontProperties(size=9, weight="bold")
+    fig = plt.gcf()
+    renderer = fig.canvas.get_renderer()
+    text_w_px, text_h_px, _ = renderer.get_text_width_height_descent(
+        text, fontprops, ismath=False,
+    )
+    dpi_scale = 72.0 / fig.dpi
+    text_w = text_w_px * dpi_scale
+    text_h = text_h_px * dpi_scale
+
+    pad_x = 5.0
+    pad_y = 3.5
+    pointer_w = 5.0
+    rect_w = text_w + 2 * pad_x
+    rect_h = text_h + 2 * pad_y
+    da = DrawingArea(pointer_w + rect_w, rect_h, 0, 0)
+    da.add_artist(Polygon(
+        [
+            (0, rect_h / 2),
+            (pointer_w, 0),
+            (pointer_w + rect_w, 0),
+            (pointer_w + rect_w, rect_h),
+            (pointer_w, rect_h),
+        ],
+        closed=True,
+        facecolor=facecolor, edgecolor=edgecolor, linewidth=0.8,
+    ))
+    da.add_artist(Text(
+        pointer_w + rect_w / 2,
+        rect_h / 2,
+        text,
+        color=textcolor,
+        fontproperties=fontprops,
+        ha="center",
+        va="center",
+    ))
+    return da
 
 
 def figure_copy_html(fig, dpi: int = 170, title: Optional[str] = None, title_size: int = 11) -> str:
@@ -231,7 +277,10 @@ class Viz:
         return name
 
     def _style_ax(self, ax, title=None, yaxis_title=None, xaxis_title=None):
-        """Apply PrismFP styling."""
+        """Apply PrismFP styling — bold bottom+right spines, tick marks pointing
+        out at every major label, lighter minor ticks between. Top/left spines
+        hidden (the left one is re-enabled by callers using a secondary axis).
+        """
         if title:
             ax.set_title(title.upper(), fontsize=self.TITLE_SIZE, color='#333',
                          pad=10, loc='left')
@@ -241,26 +290,44 @@ class Viz:
             ax.set_xlabel(xaxis_title.upper(), fontsize=self.FONT_SIZE, color='#333')
         ax.yaxis.tick_right()
         ax.yaxis.set_label_position('right')
-        ax.tick_params(labelsize=9, colors='#333')
-        for spine in ax.spines.values():
-            spine.set_color('#333')
-            spine.set_linewidth(0.5)
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=9))
+
+        # Minor ticks between every pair of major ticks — fills out the axis.
+        # Date axes will get a date-aware minor locator in _format_dates; the
+        # AutoMinorLocator below is right for numeric (y) and harmless for x
+        # since _format_dates overrides it.
+        ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+        ax.xaxis.set_minor_locator(NullLocator())
+
+        # Tick spikes: bold major, lighter minor — both point outward.
+        ax.tick_params(axis='both', which='major', labelsize=9, colors='#333',
+                       direction='out', length=5, width=1.0)
+        ax.tick_params(axis='both', which='minor', colors='#333',
+                       direction='out', length=3, width=0.6)
+
+        ax.spines['top'].set_visible(False)
+        ax.spines['left'].set_visible(False)
+        for side in ('bottom', 'right'):
+            ax.spines[side].set_color('#333')
+            ax.spines[side].set_linewidth(1.2)
+        ax.margins(x=0)  # line hugs left and right edges of the plot area
 
     def _format_dates(self, ax, start=None, end=None):
         """Auto-format date axis with tighter label spacing."""
         if start is not None and end is not None:
             span = (end - start).days
             if span <= 45:
-                minticks, maxticks = 10, 35   # daily ticks for 1M
+                minticks, maxticks = 12, 42   # daily-ish ticks for 1M
             elif span <= 180:
-                minticks, maxticks = 8, 20
+                minticks, maxticks = 10, 28
             else:
-                minticks, maxticks = 12, 24
+                minticks, maxticks = 14, 30
         else:
-            minticks, maxticks = 12, 24
+            minticks, maxticks = 14, 30
         locator = mdates.AutoDateLocator(minticks=minticks, maxticks=maxticks)
         ax.xaxis.set_major_locator(locator)
         ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        ax.xaxis.set_minor_locator(NullLocator())
         ax.xaxis.get_offset_text().set_visible(False)
 
     def _legend(self, ax):
@@ -473,6 +540,12 @@ class Viz:
 
         def render(fig, ax, start, end):
             subset = df.loc[start:end, cols]
+            x_end = end
+            if show_endpoint_marker:
+                span = end - start
+                if span > pd.Timedelta(0):
+                    # Keep a modest gap between the final observation and y-axis.
+                    x_end = end + span * 0.0225
             ax2 = None
             if left:
                 ax2 = ax.twinx()
@@ -532,14 +605,27 @@ class Viz:
 
                 if show_endpoint_marker and not bar and len(series) > 0:
                     last_val = series.iloc[-1]
-                    target.annotate(f'{last_val:.2f}',
-                                xy=(series.index[-1], last_val),
-                                fontsize=8, color='white', fontweight='bold',
-                                bbox=dict(boxstyle='round,pad=0.3', facecolor=color,
-                                          edgecolor='none', alpha=0.9),
-                                ha='left', va='center',
-                                xytext=(5, 0), textcoords='offset points',
-                                zorder=20)
+                    endpoint_face = color
+                    endpoint_text = '#FFFFFF'
+                    # Custom geometry keeps the pointer flush with the label body.
+                    flag = AnnotationBbox(
+                        _endpoint_flag(
+                            f'{last_val:.2f}',
+                            facecolor=endpoint_face,
+                            textcolor=endpoint_text,
+                            edgecolor=endpoint_face,
+                        ),
+                        (x_end, last_val),
+                        xybox=(0, 0),
+                        xycoords='data',
+                        boxcoords='offset points',
+                        box_alignment=(0, 0.5),
+                        frameon=False,
+                        pad=0,
+                        annotation_clip=False,
+                        zorder=20,
+                    )
+                    target.add_artist(flag)
 
                 if show_avg and avg is not None:
                     target.axhline(y=avg, color=color, linestyle='--', linewidth=1, alpha=0.7)
@@ -577,7 +663,21 @@ class Viz:
                 ax2.yaxis.set_label_position('left')
                 if yaxis_right_title:
                     ax2.set_ylabel(yaxis_right_title.upper(), fontsize=self.FONT_SIZE, color='#333')
-                ax2.tick_params(labelsize=9, colors='#333')
+                # Make ax2's left spine the visible bold one; hide its other spines
+                # so it doesn't double-draw the bottom/right with ax.
+                ax2.spines['top'].set_visible(False)
+                ax2.spines['right'].set_visible(False)
+                ax2.spines['bottom'].set_visible(False)
+                ax2.spines['left'].set_visible(True)
+                ax2.spines['left'].set_color('#333')
+                ax2.spines['left'].set_linewidth(1.2)
+                ax2.yaxis.set_major_locator(MaxNLocator(nbins=9))
+                ax2.yaxis.set_minor_locator(AutoMinorLocator(2))
+                ax2.tick_params(axis='y', which='major', labelsize=9, colors='#333',
+                                direction='out', length=5, width=1.0)
+                ax2.tick_params(axis='y', which='minor', colors='#333',
+                                direction='out', length=3, width=0.6)
+                ax2.margins(x=0)
                 # merge legends from both axes
                 h1, l1 = ax.get_legend_handles_labels()
                 h2, l2 = ax2.get_legend_handles_labels()
@@ -590,6 +690,7 @@ class Viz:
             else:
                 self._legend(ax)
             self._format_dates(ax, start, end)
+            ax.set_xlim(start, x_end)
             fig.subplots_adjust(bottom=0.15)
 
         return self._make_time_nav(df, render, title=title)
@@ -1095,18 +1196,42 @@ import time
 import webbrowser
 
 
+RANGE_BUTTON_LABELS = ["1M", "3M", "6M", "YTD", "1Y", "2Y", "5Y", "10Y", "ALL"]
+
+
 class _PlotlyChartRegistry:
-    """Module-level list of figures shown by the Dash app."""
+    """Module-level list of charts shown by the Dash app.
+
+    Each entry is a dict {id, title, png_b64, df, render_fn, viz_ref}.
+    Charts are rendered matplotlib figures saved as base64 PNGs; `df` +
+    `render_fn` are kept so range buttons can re-render server-side. The
+    'Plotly' name is legacy.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._charts = []
         self._version = 0
 
-    def add(self, figure, title=None):
+    def add(self, *, title, png_b64, df, render_fn, viz_ref, static=False):
         with self._lock:
-            self._charts.append({"id": uuid.uuid4().hex, "title": title, "figure": figure})
+            self._charts.append({
+                "id": uuid.uuid4().hex,
+                "title": title,
+                "png_b64": png_b64,
+                "df": df,
+                "render_fn": render_fn,
+                "viz_ref": viz_ref,
+                "static": static,
+            })
             self._version += 1
+
+    def get(self, chart_id):
+        with self._lock:
+            for c in self._charts:
+                if c["id"] == chart_id:
+                    return c
+            return None
 
     def clear(self):
         with self._lock:
@@ -1152,17 +1277,17 @@ def _open_browser(url):
 
 def _build_dash_app():
     import dash
-    from dash import Dash, dcc, html, Output, Input, State
+    from dash import Dash, dcc, html, Output, Input, State, MATCH, ALL, ctx
 
     app = Dash(__name__, title="Viz", update_title=None)
     app.layout = html.Div(
         style={"fontFamily": "Arial, Helvetica, sans-serif",
-               "background": "#fff", "padding": "16px", "color": "#333"},
+               "background": "#fff", "padding": "8px 4px", "color": "#333"},
         children=[
             html.Div(
                 style={"display": "flex", "alignItems": "center",
-                       "borderBottom": "1px solid #ddd", "paddingBottom": "8px",
-                       "marginBottom": "12px"},
+                       "borderBottom": "1px solid #ddd", "paddingBottom": "6px",
+                       "marginBottom": "10px", "paddingLeft": "4px"},
                 children=[
                     html.H3("VIZ", style={"margin": 0, "letterSpacing": "1px"}),
                     html.Span(id="_count",
@@ -1175,6 +1300,45 @@ def _build_dash_app():
         ],
     )
 
+    _btn_base_style = {
+        "minWidth": "44px", "height": "26px", "padding": "0 8px",
+        "marginRight": "4px", "fontSize": "11px", "border": "1px solid #999",
+        "borderRadius": "3px", "background": "#F7F7F7", "color": "#333",
+        "cursor": "pointer",
+    }
+    _btn_active_style = {**_btn_base_style, "background": "#F1C40F",
+                          "borderColor": "#B7950B"}
+
+    def _chart_block(c):
+        chart_id = c["id"]
+        title = (c["title"] or "").upper()
+        buttons = [] if c.get("static") else [
+            html.Button(
+                lbl,
+                id={"type": "range-btn", "chart": chart_id, "label": lbl},
+                n_clicks=0,
+                style=(_btn_active_style if lbl == "ALL" else _btn_base_style),
+            )
+            for lbl in RANGE_BUTTON_LABELS
+        ]
+        return html.Div(
+            style={"marginBottom": "24px"},
+            children=[
+                # title is baked into the image so copy-chart includes it; the
+                # row here only carries the range buttons (right-aligned).
+                html.Div(buttons,
+                         style={"display": "flex", "justifyContent": "flex-end",
+                                "marginBottom": "6px"}),
+                html.Img(
+                    id={"type": "chart-img", "chart": chart_id},
+                    src=f"data:image/png;base64,{c['png_b64']}",
+                    style={"maxWidth": "100%", "height": "auto",
+                           "display": "block", "margin": 0,
+                           "border": "1px solid #eee"},
+                ),
+            ],
+        )
+
     @app.callback(
         Output("_charts", "children"),
         Output("_version", "data"),
@@ -1186,23 +1350,35 @@ def _build_dash_app():
         charts, version = _REGISTRY.snapshot()
         if version == last_version:
             raise dash.exceptions.PreventUpdate
-        items = []
-        for c in charts:
-            items.append(html.Div(
-                style={"marginBottom": "20px"},
-                children=[
-                    dcc.Graph(
-                        figure=c["figure"],
-                        config={
-                            "displaylogo": False,
-                            "modeBarButtonsToRemove": ["lasso2d", "select2d"],
-                            "toImageButtonOptions": {"format": "png", "scale": 2,
-                                                     "filename": (c["title"] or "chart").lower().replace(" ", "_")},
-                        },
-                    ),
-                ],
-            ))
-        return items, version, f"{len(charts)} chart{'s' if len(charts) != 1 else ''}"
+        return ([_chart_block(c) for c in charts],
+                version,
+                f"{len(charts)} chart{'s' if len(charts) != 1 else ''}")
+
+    @app.callback(
+        Output({"type": "chart-img", "chart": MATCH}, "src"),
+        Output({"type": "range-btn", "chart": MATCH, "label": ALL}, "style"),
+        Input({"type": "range-btn", "chart": MATCH, "label": ALL}, "n_clicks"),
+        State({"type": "range-btn", "chart": MATCH, "label": ALL}, "id"),
+        prevent_initial_call=True,
+    )
+    def _on_range_click(_clicks, ids):
+        trig = ctx.triggered_id
+        if not isinstance(trig, dict):
+            raise dash.exceptions.PreventUpdate
+        chart_id = trig["chart"]
+        label = trig["label"]
+        chart = _REGISTRY.get(chart_id)
+        if chart is None:
+            raise dash.exceptions.PreventUpdate
+        start, end = _range_window(chart["df"], label)
+        png = chart["viz_ref"]._render_png(
+            chart["df"], chart["render_fn"], start, end, title=chart["title"],
+        )
+        styles = [
+            (_btn_active_style if d["label"] == label else _btn_base_style)
+            for d in ids
+        ]
+        return f"data:image/png;base64,{png}", styles
 
     return app
 
@@ -1210,6 +1386,11 @@ def _build_dash_app():
 def _ensure_server():
     if _SERVER_STATE["started"]:
         return _SERVER_STATE["url"]
+
+    # Silence per-request access logs — Dash polls every second so the
+    # default Werkzeug logger buries any print() output from the caller.
+    import logging as _logging
+    _logging.getLogger("werkzeug").setLevel(_logging.ERROR)
 
     port = _pick_port(int(os.getenv("VIZ_PORT", "8050")))
     app = _build_dash_app()
@@ -1234,54 +1415,23 @@ def _ensure_server():
     return url
 
 
-_PLOTLY_LS_MAP = {
-    "solid":  ("solid", 1.5),
-    "bold":   ("solid", 2.5),
-    "thin":   ("solid", 0.8),
-    "dashed": ("dash",  1.2),
-    "dash":   ("dash",  1.2),
-    "dotted": ("dot",   1.4),
-    "dot":    ("dot",   1.4),
-}
-_MPL_TO_PLOTLY_DASH = {"-": "solid", "--": "dash", ":": "dot", "-.": "dashdot"}
-
-
-def _resolve_plotly_style(style, default="solid"):
-    if style is None:
-        return _PLOTLY_LS_MAP[default]
-    if isinstance(style, (tuple, list)) and len(style) == 2:
-        ls, lw = style
-        return _MPL_TO_PLOTLY_DASH.get(ls, ls), lw
-    return _PLOTLY_LS_MAP.get(style, _PLOTLY_LS_MAP[default])
-
-
-_PLOTLY_RANGE_BUTTONS = [
-    {"count": 1,  "step": "month", "stepmode": "backward", "label": "1M"},
-    {"count": 3,  "step": "month", "stepmode": "backward", "label": "3M"},
-    {"count": 6,  "step": "month", "stepmode": "backward", "label": "6M"},
-    {"step": "year", "stepmode": "todate", "label": "YTD"},
-    {"count": 1,  "step": "year",  "stepmode": "backward", "label": "1Y"},
-    {"count": 2,  "step": "year",  "stepmode": "backward", "label": "2Y"},
-    {"count": 5,  "step": "year",  "stepmode": "backward", "label": "5Y"},
-    {"count": 10, "step": "year",  "stepmode": "backward", "label": "10Y"},
-    {"step": "all", "label": "ALL"},
-]
-
-
 class PlotlyViz(Viz):
-    """Browser-served counterpart to Viz. Same .line() signature; charts stack on a Dash page.
-
-    Prefer `Viz(backend='plotly')` over instantiating this directly. Inherits
-    from Viz so `isinstance(v, Viz)` and existing type hints still hold —
-    centered_chart/heatmaps/etc. still emit matplotlib (only .line() is plotly).
+    """Browser-served counterpart to Viz. Renders the SAME matplotlib charts
+    you'd see in Jupyter — identical colors, legend, axis style — and serves
+    them as PNGs on a Dash page. (No plotly anymore; class name is legacy.)
 
     First instantiation boots a Dash server in a background thread (port 8050
-    or next free) and opens the browser. Each .line() call appends a chart;
+    or next free) and opens the browser. Each `.line()` call appends a chart;
     the page polls and refreshes every second.
     """
 
     def __init__(self, backend=None, port=None, auto_clear=True, **kwargs):
-        # cheap matplotlib setup runs too so the non-plotly methods still work
+        # Force the non-interactive Agg backend before anything draws. Dash
+        # range-button callbacks fire on worker threads, and Windows' default
+        # interactive backend (TkAgg/QtAgg) isn't safe off the main thread.
+        # Agg is in-memory only — perfect since we just want PNG bytes.
+        plt.switch_backend("Agg")
+
         Viz.__init__(self)
         if port:
             os.environ["VIZ_PORT"] = str(port)
@@ -1289,168 +1439,108 @@ class PlotlyViz(Viz):
             _REGISTRY.clear()
         _ensure_server()
 
-    def line(
-        self,
-        df: pd.DataFrame,
-        cols: Optional[List[str]] = None,
-        title: Optional[str] = None,
-        subtitle: Optional[str] = None,
-        yaxis_title: Optional[str] = None,
-        yaxis_right_title: Optional[str] = None,
-        left: Optional[List[str]] = None,
-        show_avg: bool = False,
-        avg_unit: str = '',
-        interval: str = None,             # accepted for signature compat
-        show_endpoint_marker: bool = True,
-        residual: bool = False,
-        nas: bool = True,                 # accepted for signature compat
-        hlines: Optional[list] = None,
-        linestyles: Optional[dict] = None,
-        bar: bool = False,
-    ):
-        """Plotly line chart with native rangeselector buttons. Drop-in for Viz.line."""
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
+    def _render_png(self, df, render_fn, start, end, title=None):
+        """Render render_fn into a fresh matplotlib Figure and return base64 PNG.
 
-        cols = cols or df.select_dtypes(include=[np.number]).columns.tolist()
-        left_set = set(left or [])
-        ls_map = linestyles or {}
+        Title gets baked into the image so right-click-copy includes it. The
+        plot area is pushed flush to the figure's left edge so there's no
+        internal whitespace between the title and the chart.
+        """
+        fig, ax = plt.subplots(figsize=(13, 5.4))
+        fig.patch.set_facecolor("white")
+        # Push plot area to span (almost) the full figure width — y-labels and
+        # the endpoint ribbons live in the right margin (~5%).
+        fig.subplots_adjust(left=0.02, right=0.95, top=0.91)
+        render_fn(fig, ax, start, end)
+        if title:
+            fig.suptitle(title.upper(), fontsize=self.TITLE_SIZE,
+                          fontweight="bold", color="#333",
+                          x=0.02, ha="left", y=0.97)
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=140, bbox_inches="tight",
+                    facecolor="white", edgecolor="white")
+        plt.close(fig)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
 
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df = df.copy()
-            df.index = pd.to_datetime(df.index)
+    def _make_time_nav(self, df, render_fn, title=None):
+        """Render the matplotlib figure over the full date range and stash the
+        closure so range buttons can re-render server-side later.
 
-        use_secondary = bool(left_set)
-        fig = make_subplots(specs=[[{"secondary_y": True}]]) if use_secondary else go.Figure()
-        annotations = []
+        Overrides Viz._make_time_nav so all chart helpers (line, residual_dist,
+        etc.) flow into the browser instead of triggering plt.show() / Jupyter
+        widgets.
+        """
+        png = self._render_png(df, render_fn, df.index.min(), df.index.max(), title=title)
+        _REGISTRY.add(title=title, png_b64=png, df=df, render_fn=render_fn, viz_ref=self)
+        return None
 
-        # residual fills go in FIRST so the line plots on top
-        if residual and not bar and len(cols) == 1:
-            r = df[cols[0]].dropna()
-            if not r.empty:
-                pos = np.where(r.values >= 0, r.values, 0)
-                neg = np.where(r.values < 0, r.values, 0)
-                fill_args = dict(mode="none", showlegend=False, hoverinfo="skip")
-                for y_vals, color in ((pos, "rgba(39,174,96,0.18)"),
-                                      (neg, "rgba(192,57,43,0.18)")):
-                    tr = go.Scatter(x=r.index, y=y_vals, fill="tozeroy",
-                                    fillcolor=color, **fill_args)
-                    fig.add_trace(tr, secondary_y=False) if use_secondary else fig.add_trace(tr)
-                fig.add_hline(y=0, line=dict(color="#666", width=1, dash="dot"))
+    def table(self, df: pd.DataFrame, title: Optional[str] = None, max_rows: int = 20):
+        """Render a pandas table as a static PNG in the browser app."""
+        show = df.head(max_rows).copy()
 
-        for i, col in enumerate(cols):
-            color = self.colors[i % len(self.colors)]
-            series = df[col].dropna()
-            if series.empty:
-                continue
-            on_secondary = col in left_set
-            avg = series.mean() if show_avg else None
-            label = (f"{col} = {avg:.1f} {avg_unit}".strip()
-                     if show_avg and avg is not None else col)
-            dash, width = _resolve_plotly_style(ls_map.get(col), default="solid")
+        def _fmt(v):
+            if isinstance(v, (float, np.floating)):
+                return f"{v:,.3f}"
+            if isinstance(v, pd.Timestamp):
+                return v.strftime("%Y-%m-%d")
+            return str(v)
 
-            if bar:
-                bar_colors = ["#27AE60" if v >= 0 else "#C0392B" for v in series.values]
-                trace = go.Bar(x=series.index, y=series.values,
-                               marker_color=bar_colors, name=label)
-            else:
-                trace = go.Scatter(
-                    x=series.index, y=series.values,
-                    mode="lines", name=label,
-                    line=dict(color=color, width=width, dash=dash),
-                    hovertemplate=f"<b>{col}</b><br>%{{x|%Y-%m-%d}}<br>%{{y:.4f}}<extra></extra>",
-                    connectgaps=nas,
-                )
-
-            if use_secondary:
-                fig.add_trace(trace, secondary_y=on_secondary)
-            else:
-                fig.add_trace(trace)
-
-            if show_endpoint_marker and not bar and len(series):
-                yref = ("y2" if (on_secondary and use_secondary) else "y")
-                annotations.append(dict(
-                    x=series.index[-1], y=float(series.iloc[-1]),
-                    xref="x", yref=yref,
-                    text=f"{float(series.iloc[-1]):.2f}",
-                    showarrow=False,
-                    bgcolor=color, font=dict(color="white", size=10),
-                    xanchor="left", yanchor="middle",
-                    xshift=6, borderpad=3,
-                ))
-
-            if show_avg and avg is not None and not bar:
-                if use_secondary:
-                    fig.add_hline(y=avg, line=dict(color=color, width=1, dash="dash"),
-                                  opacity=0.6, secondary_y=on_secondary)
-                else:
-                    fig.add_hline(y=avg, line=dict(color=color, width=1, dash="dash"),
-                                  opacity=0.6)
-
-        if hlines:
-            for h in hlines:
-                if isinstance(h, dict):
-                    value   = h["value"]
-                    h_label = h.get("label")
-                    h_style = h.get("style", "dashed")
-                    h_color = h.get("color", "#666")
-                    h_alpha = h.get("alpha", 0.7)
-                elif isinstance(h, (tuple, list)):
-                    value   = h[0]
-                    h_label = h[1] if len(h) > 1 else None
-                    h_style = h[2] if len(h) > 2 else "dashed"
-                    h_color = h[3] if len(h) > 3 else "#666"
-                    h_alpha = 0.7
-                else:
-                    value, h_label, h_style, h_color, h_alpha = float(h), None, "dashed", "#666", 0.7
-                dash, width = _resolve_plotly_style(h_style, default="dashed")
-                fig.add_hline(
-                    y=value, line=dict(color=h_color, width=width, dash=dash),
-                    opacity=h_alpha,
-                    annotation_text=h_label,
-                    annotation_position="top right",
-                    annotation_font=dict(size=9, color=h_color),
-                )
-
-        title_text = title.upper() if title else None
-        fig.update_layout(
-            title=(dict(text=title_text, x=0.01, xanchor="left", y=0.97,
-                        font=dict(size=13, color="#333")) if title_text else None),
-            plot_bgcolor="#F5F5F5",
-            paper_bgcolor="#FFFFFF",
-            font=dict(family="Arial, Helvetica, sans-serif", size=10, color="#333"),
-            hovermode="x unified",
-            legend=dict(orientation="h", x=0, y=-0.16, font=dict(size=9)),
-            margin=dict(l=50, r=70, t=70, b=70),
-            annotations=annotations,
-            height=460,
-            xaxis=dict(
-                showgrid=True, gridcolor="#DCDCDC", gridwidth=0.5,
-                rangeselector=dict(
-                    buttons=_PLOTLY_RANGE_BUTTONS,
-                    bgcolor="#F7F7F7", activecolor="#F1C40F",
-                    borderwidth=1, bordercolor="#999",
-                    x=1, xanchor="right", y=1.06, yanchor="bottom",
-                    font=dict(size=10),
-                ),
-                rangeslider=dict(visible=False),
-                type="date",
-            ),
+        cell_text = [[_fmt(v) for v in row] for row in show.to_numpy()]
+        fig_h = max(2.4, 0.34 * (len(show) + 1))
+        fig, ax = plt.subplots(figsize=(13, fig_h))
+        fig.patch.set_facecolor("white")
+        ax.axis("off")
+        if title:
+            fig.suptitle(title.upper(), fontsize=self.TITLE_SIZE,
+                         fontweight="bold", color="#333", x=0.02, ha="left", y=0.98)
+        tbl = ax.table(
+            cellText=cell_text,
+            colLabels=[str(c) for c in show.columns],
+            loc="center",
+            cellLoc="right",
+            colLoc="right",
         )
-        # axis titles — primary on right (Prism style), secondary (if any) on left
-        if use_secondary:
-            fig.update_yaxes(title_text=(yaxis_title.upper() if yaxis_title else None),
-                             secondary_y=False, side="right",
-                             showgrid=True, gridcolor="#DCDCDC", gridwidth=0.5)
-            fig.update_yaxes(title_text=(yaxis_right_title.upper() if yaxis_right_title else None),
-                             secondary_y=True, side="left", showgrid=False)
-        else:
-            fig.update_yaxes(title_text=(yaxis_title.upper() if yaxis_title else None),
-                             side="right",
-                             showgrid=True, gridcolor="#DCDCDC", gridwidth=0.5)
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8)
+        tbl.scale(1.0, 1.35)
+        for (r, _c), cell in tbl.get_celld().items():
+            cell.set_edgecolor("#DCDCDC")
+            cell.set_linewidth(0.5)
+            if r == 0:
+                cell.set_facecolor("#F1C40F")
+                cell.set_text_props(weight="bold", color="#111")
+            else:
+                cell.set_facecolor("#FFFFFF" if r % 2 else "#F7F7F7")
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
+                    facecolor="white", edgecolor="white")
+        plt.close(fig)
+        dummy = pd.DataFrame(index=pd.DatetimeIndex([pd.Timestamp.today().normalize()]))
+        _REGISTRY.add(
+            title=title,
+            png_b64=base64.b64encode(buf.getvalue()).decode("ascii"),
+            df=dummy,
+            render_fn=lambda *_args: None,
+            viz_ref=self,
+            static=True,
+        )
+        return None
 
-        _REGISTRY.add(fig, title=title)
-        return fig
+
+def _range_window(df, label):
+    """Translate a button label into (start, end) timestamps within df.index."""
+    end = df.index.max()
+    if label == "ALL":
+        start = df.index.min()
+    elif label == "YTD":
+        start = pd.Timestamp(end.year, 1, 1)
+    elif label.endswith("M"):
+        start = end - pd.DateOffset(months=int(label[:-1]))
+    elif label.endswith("Y"):
+        start = end - pd.DateOffset(years=int(label[:-1]))
+    else:
+        start = df.index.min()
+    return max(start, df.index.min()), end
 
 
 # -----------------------------------------------------------------------------

@@ -27,7 +27,7 @@ for _p in [_HERE, *_HERE.parents]:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from stats import roll_lr, half_life
+from stats import roll_lr, half_life, ou_params
 from utils.viz import Viz
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -148,6 +148,7 @@ def drill(
         viz.line(res[["resid"]].rename(columns={"resid": f"resid({y_name} | {x_name})"}),
                  title=f"residual:  {y_name} − ({lookback}d β·{x_name} + α)",
                  yaxis_title="resid",
+                 residual=True,
                  hlines=[(0, None, "solid")])
 
     _print_fingerprint(f"{y_name} | {x_name}", residual_fingerprint(res["resid"]))
@@ -213,54 +214,173 @@ def peel(
     return drill(z, resid, lookback=lookback, x_name=z_name, y_name=resid_name, viz=viz)
 
 
+def _latest_ou_metrics(resid: pd.Series, lookback: int = 252) -> dict:
+    """Latest OU stats on a trailing residual window."""
+    r = resid.dropna()
+    if len(r) < max(20, lookback // 4):
+        return {
+            "ou_mean_resid": np.nan,
+            "ou_zscore": np.nan,
+            "half_life_d": np.nan,
+            "ou_window_n": len(r),
+        }
+
+    window = r.tail(lookback)
+    params = ou_params(window)
+    sigma = float(window.std())
+    mu = float(params["mu"])
+    current = float(window.iloc[-1])
+    z = (current - mu) / sigma if sigma > 0 and np.isfinite(mu) else np.nan
+    return {
+        "ou_mean_resid": mu,
+        "ou_zscore": z,
+        "half_life_d": float(params["half_life"]),
+        "ou_window_n": len(window),
+    }
+
+
+def rolling_ou_zscore(resid: pd.Series, lookback: int = 252) -> pd.Series:
+    """Rolling OU z-score: current residual vs trailing OU equilibrium."""
+    out = pd.Series(np.nan, index=resid.index, name="ou_zscore")
+    r = resid.astype(float)
+    min_obs = max(20, lookback // 4)
+
+    for i in range(len(r)):
+        window = r.iloc[max(0, i - lookback + 1):i + 1].dropna()
+        if len(window) < min_obs:
+            continue
+        params = ou_params(window)
+        mu = float(params["mu"])
+        sigma = float(window.std())
+        current = r.iloc[i]
+        if sigma > 0 and np.isfinite(mu) and np.isfinite(current):
+            out.iloc[i] = (current - mu) / sigma
+    return out
+
+
+def single_factor_10y_table(
+    df: pd.DataFrame,
+    *,
+    target: str = "10y",
+    lookback: int = 60,
+    ou_lookback: int = 252,
+    exclude: tuple[str, ...] = (),
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """Regress 10y against each candidate one at a time and summarize latest OU residual state."""
+    rows = []
+    models: dict[str, pd.DataFrame] = {}
+    candidates = [c for c in df.columns if c != target and c not in exclude]
+
+    for anchor in candidates:
+        pair = df[[anchor, target]].dropna()
+        if len(pair) < lookback:
+            continue
+
+        out = roll_lr(pair[anchor], pair[target], lookback=lookback).to_pandas()
+        out.index = pair.index
+        out["ou_zscore"] = rolling_ou_zscore(out["resid"], lookback=ou_lookback)
+        models[anchor] = out
+
+        valid = out.dropna(subset=["y", "yhat", "resid"])
+        if valid.empty:
+            continue
+
+        last = valid.iloc[-1]
+        ou = _latest_ou_metrics(out["resid"], lookback=ou_lookback)
+        ou_mean = ou["ou_mean_resid"]
+        rows.append({
+            "anchor": anchor,
+            "date": valid.index[-1],
+            "actual_10y": float(last["y"]),
+            "model_10y": float(last["yhat"]),
+            "residual": float(last["resid"]),
+            "ou_mean_resid": ou_mean,
+            "ou_fair_10y": float(last["yhat"] + ou_mean) if np.isfinite(ou_mean) else np.nan,
+            "ou_zscore": ou["ou_zscore"],
+            "half_life_d": ou["half_life_d"],
+            "beta": float(last["beta"]),
+            "r2": float(last["r2"]),
+            "ou_window_n": ou["ou_window_n"],
+        })
+
+    table = pd.DataFrame(rows)
+    if not table.empty:
+        table = (table
+                 .assign(abs_ou_zscore=lambda d: d["ou_zscore"].abs())
+                 .sort_values("abs_ou_zscore", ascending=False)
+                 .drop(columns="abs_ou_zscore")
+                 .reset_index(drop=True))
+    return table, models
+
+
 # ─── main ──────────────────────────────────────────────────────────────────
 
 def main() -> dict:
     viz = Viz(backend='plotly')
 
-    # 1. data — wide pandas frame of all TICKERS, yields in bps
     df = load_basket()
     print(f"basket: {len(df)} obs · {df.index.min().date()} → {df.index.max().date()}")
     print(f"        cols: {list(df.columns)}")
 
-    # 2. eyeball — UST yield curve
-    yld_cols = [c for c in ("2y", "5y", "10y", "30y") if c in df]
-    viz.line(df[yld_cols], title="UST yields", yaxis_title="yield, bps")
+    # Single-factor 10y models: each candidate gets its own rolling regression.
+    ten_single, ten_single_models = single_factor_10y_table(
+        df,
+        target="10y",
+        lookback=60,
+        ou_lookback=252,
+    )
+    print("\n--- 10y single-factor rolling regression residual OU table ---")
+    display_cols = [
+        "anchor", "date", "actual_10y", "model_10y", "residual",
+        "ou_mean_resid", "ou_fair_10y", "ou_zscore", "half_life_d",
+        "beta", "r2",
+    ]
+    if ten_single.empty:
+        print("No single-factor models had enough overlapping data.")
+    else:
+        display(ten_single[display_cols].round(3))
+        viz.table(
+            ten_single[display_cols].round(3),
+            title="10y single-factor rolling regression residual OU table",
+        )
 
-    # 3. drill — how much of 10y is just 2y?
-    out_10_2   = drill(df["2y"], df["10y"], lookback=60,
-                        x_name="2y", y_name="10y", viz=viz)
-    resid_10_2 = out_10_2["resid"]
+    # App charts: table, then 10y/anchor, residual, and OU z-score per anchor.
+    for anchor in ten_single["anchor"].tolist() if not ten_single.empty else []:
+        model = ten_single_models[anchor]
+        pair = pd.concat([
+            model["y"].rename("10y"),
+            model["x"].rename(anchor),
+        ], axis=1).dropna()
+        same_units = anchor in BPS_COLS
 
-    # 4. interrogate the residual — who moves with it, who does it predict?
-    others = df.drop(columns=["10y", "2y"])
-    corr   = corr_scan(resid_10_2, others)
-    pred   = predict_scan(resid_10_2, others)
-    print("\n--- residual vs other series (contemporaneous) ---")
-    display(corr.round(3).head(10))
-    print("\n--- residual predicts which fwd change? ---")
-    display(pred.round(3).head(15))
+        viz.line(
+            pair,
+            left=[] if same_units else [anchor],
+            title=f"10y vs {anchor}  (60d rolling model input)",
+            yaxis_title="level, bps" if same_units else "10y, bps",
+            yaxis_right_title=None if same_units else anchor,
+        )
 
-    # 5. peel 30y out — strip the next known factor
-    out_peeled   = peel(resid_10_2, df["30y"], lookback=60,
-                        resid_name="resid(10y|2y)", z_name="30y", viz=viz)
-    resid_peeled = out_peeled["resid"]
+        viz.line(
+            model[["resid"]].rename(columns={"resid": f"resid(10y | {anchor})"}),
+            title=f"residual: 10y - model({anchor})",
+            yaxis_title="resid, bps",
+            residual=True,
+            hlines=[(0, None, "solid")],
+        )
 
-    # 6. re-scan the peeled residual
-    deeper_others = df.drop(columns=["10y", "2y", "30y"])
-    pred2 = predict_scan(resid_peeled, deeper_others)
-    print("\n--- after peeling 30y: predict_scan on the new residual ---")
-    display(pred2.round(3).head(10))
+        viz.line(
+            model[["ou_zscore"]].rename(columns={"ou_zscore": f"OU z resid(10y | {anchor})"}),
+            title=f"OU z-score: residual(10y | {anchor})",
+            yaxis_title="z-score",
+            residual=True,
+            hlines=[(0, None, "solid"), (2, "+2", "dashed"), (-2, "-2", "dashed")],
+        )
 
     return {
         "df":            df,
-        "out_10_2":      out_10_2,
-        "resid_10_2":    resid_10_2,
-        "corr":          corr,
-        "pred":          pred,
-        "out_peeled":    out_peeled,
-        "resid_peeled":  resid_peeled,
-        "pred2":         pred2,
+        "ten_single":    ten_single,
+        "ten_single_models": ten_single_models,
     }
 
 
