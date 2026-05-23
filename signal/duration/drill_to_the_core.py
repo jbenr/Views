@@ -355,10 +355,14 @@ def main() -> dict:
 
         viz.line(
             pair,
-            left=[] if same_units else [anchor],
+            # left=[] if same_units else [anchor],
+            # title=f"10y vs {anchor}  (60d rolling model input)",
+            # yaxis_title="level, bps" if same_units else "10y, bps",
+            # yaxis_right_title=None if same_units else anchor,
+            left=[anchor],
             title=f"10y vs {anchor}  (60d rolling model input)",
-            yaxis_title="level, bps" if same_units else "10y, bps",
-            yaxis_right_title=None if same_units else anchor,
+            yaxis_title="10y, bps",
+            yaxis_right_title=anchor,
         )
 
         viz.line(
