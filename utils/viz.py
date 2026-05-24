@@ -1213,7 +1213,7 @@ class _PlotlyChartRegistry:
         self._charts = []
         self._version = 0
 
-    def add(self, *, title, png_b64, df, render_fn, viz_ref, static=False):
+    def add(self, *, title, png_b64, df, render_fn, viz_ref, static=False, html_block=None):
         with self._lock:
             self._charts.append({
                 "id": uuid.uuid4().hex,
@@ -1223,6 +1223,7 @@ class _PlotlyChartRegistry:
                 "render_fn": render_fn,
                 "viz_ref": viz_ref,
                 "static": static,
+                "html_block": html_block,
             })
             self._version += 1
 
@@ -1321,6 +1322,11 @@ def _build_dash_app():
             )
             for lbl in RANGE_BUTTON_LABELS
         ]
+        if c.get("html_block") is not None:
+            return html.Div(
+                style={"marginBottom": "24px"},
+                children=[c["html_block"]],
+            )
         return html.Div(
             style={"marginBottom": "24px"},
             children=[
@@ -1475,8 +1481,8 @@ class PlotlyViz(Viz):
         return None
 
     def table(self, df: pd.DataFrame, title: Optional[str] = None, max_rows: int = 20):
-        """Render a pandas table as a static PNG in the browser app."""
-        show = df.head(max_rows).copy()
+        """Render a pandas DataFrame as a plain HTML table in the browser app."""
+        from dash import html as dhtml
 
         def _fmt(v):
             if isinstance(v, (float, np.floating)):
@@ -1485,44 +1491,42 @@ class PlotlyViz(Viz):
                 return v.strftime("%Y-%m-%d")
             return str(v)
 
-        cell_text = [[_fmt(v) for v in row] for row in show.to_numpy()]
-        fig_h = max(2.4, 0.34 * (len(show) + 1))
-        fig, ax = plt.subplots(figsize=(13, fig_h))
-        fig.patch.set_facecolor("white")
-        ax.axis("off")
+        show = df.head(max_rows).copy()
+        _th_style = {
+            "padding": "5px 10px", "textAlign": "right",
+            "borderBottom": "2px solid #bbb", "fontWeight": "bold",
+            "fontSize": "12px", "color": "#333",
+        }
+        _td_style = {
+            "padding": "4px 10px", "textAlign": "right",
+            "borderBottom": "1px solid #e8e8e8", "fontSize": "12px",
+        }
+        header = dhtml.Tr([dhtml.Th(str(col), style=_th_style) for col in show.columns])
+        rows = [
+            dhtml.Tr([dhtml.Td(_fmt(v), style=_td_style) for v in row])
+            for row in show.to_numpy()
+        ]
+        children = []
         if title:
-            fig.suptitle(title.upper(), fontsize=self.TITLE_SIZE,
-                         fontweight="bold", color="#333", x=0.02, ha="left", y=0.98)
-        tbl = ax.table(
-            cellText=cell_text,
-            colLabels=[str(c) for c in show.columns],
-            loc="center",
-            cellLoc="right",
-            colLoc="right",
-        )
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(8)
-        tbl.scale(1.0, 1.35)
-        for (r, _c), cell in tbl.get_celld().items():
-            cell.set_edgecolor("#DCDCDC")
-            cell.set_linewidth(0.5)
-            if r == 0:
-                cell.set_facecolor("#F1C40F")
-                cell.set_text_props(weight="bold", color="#111")
-            else:
-                cell.set_facecolor("#FFFFFF" if r % 2 else "#F7F7F7")
-        buf = BytesIO()
-        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
-                    facecolor="white", edgecolor="white")
-        plt.close(fig)
+            children.append(dhtml.P(
+                title.upper(),
+                style={"fontWeight": "bold", "fontSize": "11px",
+                       "color": "#333", "marginBottom": "6px", "letterSpacing": "0.04em"},
+            ))
+        children.append(dhtml.Table(
+            [dhtml.Thead(header), dhtml.Tbody(rows)],
+            style={"borderCollapse": "collapse", "width": "100%"},
+        ))
+        block = dhtml.Div(children, style={"overflowX": "auto"})
         dummy = pd.DataFrame(index=pd.DatetimeIndex([pd.Timestamp.today().normalize()]))
         _REGISTRY.add(
             title=title,
-            png_b64=base64.b64encode(buf.getvalue()).decode("ascii"),
+            png_b64="",
             df=dummy,
             render_fn=lambda *_args: None,
             viz_ref=self,
             static=True,
+            html_block=block,
         )
         return None
 

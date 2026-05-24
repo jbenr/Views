@@ -29,6 +29,11 @@ if str(ROOT) not in sys.path:
 
 from stats import roll_lr, half_life, ou_params
 from utils.viz import Viz
+from signal.duration.signal_context import (
+    build_signal_features,
+    conditional_ic_table,
+    oos_edge_summary,
+)
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 pd.set_option("display.max_colwidth", None)
@@ -313,6 +318,51 @@ def single_factor_10y_table(
     return table, models
 
 
+# ─── backtest ──────────────────────────────────────────────────────────────
+
+def backtest_ou_signals(
+    models: dict[str, pd.DataFrame],
+    *,
+    horizons: tuple[int, ...] = (5, 20, 60),
+) -> pd.DataFrame:
+    """Spearman IC, hit rate, and 1d Sharpe for each model's OU z-score signal.
+
+    Signal convention: ou_zscore > 0 → 10y is rich → expect yield to fall.
+    Correct prediction: sign(ou_zscore_t) == sign(-Δy_{t+H}).
+    """
+    rows = []
+    for anchor, model in models.items():
+        row: dict = {"anchor": anchor}
+        signal = model["ou_zscore"]
+        y = model["y"]
+
+        fwd_1d = y.diff(1).shift(-1)
+        j1 = pd.concat([signal.rename("s"), fwd_1d.rename("f")], axis=1).dropna()
+        j1 = j1[j1["s"] != 0]
+        if len(j1) >= 30:
+            pnl = np.sign(j1["s"]) * (-j1["f"])
+            row["sharpe_1d"] = float(pnl.mean() / pnl.std() * np.sqrt(252)) if pnl.std() > 0 else np.nan
+        else:
+            row["sharpe_1d"] = np.nan
+
+        for h in horizons:
+            fwd = y.diff(h).shift(-h)
+            jh = pd.concat([signal.rename("s"), fwd.rename("f")], axis=1).dropna()
+            jh = jh[jh["s"] != 0]
+            if len(jh) < 30:
+                row[f"ic_{h}d"] = np.nan
+                row[f"hit_{h}d"] = np.nan
+                continue
+            row[f"ic_{h}d"] = float(jh["s"].corr(-jh["f"], method="spearman"))
+            row[f"hit_{h}d"] = float((np.sign(jh["s"]) == np.sign(-jh["f"])).mean())
+
+        rows.append(row)
+
+    col_order = ["anchor", "ic_5d", "ic_20d", "ic_60d", "hit_5d", "hit_20d", "hit_60d", "sharpe_1d"]
+    bt = pd.DataFrame(rows)
+    return bt[[c for c in col_order if c in bt.columns]]
+
+
 # ─── main ──────────────────────────────────────────────────────────────────
 
 def main() -> dict:
@@ -343,6 +393,39 @@ def main() -> dict:
             ten_single[display_cols].round(3),
             title="10y single-factor rolling regression residual OU table",
         )
+
+    bt = backtest_ou_signals(ten_single_models)
+    if not ten_single.empty and not bt.empty:
+        anchor_order = ten_single["anchor"].tolist()
+        bt = bt.set_index("anchor").reindex(anchor_order).reset_index()
+        display(bt.round(3))
+        viz.table(
+            bt.round(3),
+            title="10y single-factor OU signal backtest  (IC + hit rate + sharpe)",
+        )
+
+    # Signal context: conditional IC and OOS edge test for each anchor.
+    for anchor in (ten_single["anchor"].tolist() if not ten_single.empty else []):
+        model = ten_single_models[anchor]
+        feats = build_signal_features(model)
+        if feats.empty or feats["ou_zscore"].dropna().empty:
+            continue
+
+        cic = conditional_ic_table(feats, df["10y"])
+        if not cic.empty:
+            display(cic.round(3))
+            viz.table(
+                cic.round(3),
+                title=f"{anchor}  |  conditional IC by feature quintile",
+            )
+
+        oos = oos_edge_summary(feats, df["10y"])
+        if not oos.empty:
+            display(oos.round(3))
+            viz.table(
+                oos.round(3),
+                title=f"{anchor}  |  OOS edge test  (filtered vs unfiltered sharpe)",
+            )
 
     # App charts: table, then 10y/anchor, residual, and OU z-score per anchor.
     for anchor in ten_single["anchor"].tolist() if not ten_single.empty else []:
