@@ -27,6 +27,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 
 # ─── feature engineering ──────────────────────────────────────────────────────
@@ -172,7 +173,7 @@ def conditional_ic_table(
               .reset_index(drop=True))
 
 
-# ─── walk-forward OOS edge test ───────────────────────────────────────────────
+# ─── vectorized OOS edge test ────────────────────────────────────────────────
 
 def _simple_stats(pnl: pd.Series, horizon: int) -> dict:
     pnl = pnl.dropna()
@@ -192,6 +193,103 @@ def _simple_stats(pnl: pd.Series, horizon: int) -> dict:
         "t_stat":         float(pnl.mean() / (pnl.std() / np.sqrt(len(pnl)))),
     }
 
+
+def oos_edge_test_fast(
+    features: pd.DataFrame,
+    y: pd.Series,
+    filter_col: str,
+    *,
+    horizon: int = 20,
+    train_window: int = 504,
+) -> dict:
+    """Vectorized OOS filter — no Python loop over windows.
+
+    At each bar t, uses data [t-train_window, t-1] to estimate whether the
+    feature directionally predicts signal quality (rolling Pearson IC vs realized
+    PnL).  Takes the signal when the feature is on the IC-predicted good side of
+    the rolling median.  Bars before the first full training window are excluded.
+
+    Returns same keys as oos_edge_test: unfiltered, filtered, lift, filter_mask.
+    """
+    fwd = y.diff(horizon).shift(-horizon)
+    combined = pd.concat([
+        features["ou_zscore"].rename("z"),
+        features[filter_col].rename("feat"),
+        fwd.rename("fwd"),
+    ], axis=1).dropna()
+    combined = combined[combined["z"] != 0].copy()
+    combined["pnl"] = np.sign(combined["z"]) * (-combined["fwd"])
+
+    feat = combined["feat"]
+    pnl  = combined["pnl"]
+    min_periods = max(30, train_window // 4)
+
+    # shift(1) so training window ends at t-1 — no lookahead
+    rolling_ic  = feat.shift(1).rolling(train_window, min_periods=min_periods).corr(pnl.shift(1))
+    rolling_med = feat.shift(1).rolling(train_window, min_periods=min_periods).median()
+
+    above_med   = feat > rolling_med
+    ic_valid    = rolling_ic.notna()
+    filter_mask = ic_valid & ((rolling_ic > 0) & above_med | (rolling_ic <= 0) & ~above_med)
+
+    unfiltered = _simple_stats(pnl, horizon)
+    filtered   = _simple_stats(pnl[filter_mask], horizon)
+    lift = filtered.get("sharpe_ann", np.nan) - unfiltered.get("sharpe_ann", np.nan)
+
+    return {
+        "unfiltered":  unfiltered,
+        "filtered":    filtered,
+        "lift":        lift,
+        "filter_mask": filter_mask,
+    }
+
+
+def oos_edge_summary_fast(
+    features: pd.DataFrame,
+    y: pd.Series,
+    *,
+    horizon: int = 20,
+    train_window: int = 504,
+    feature_cols: Optional[list[str]] = None,
+) -> pd.DataFrame:
+    """Run oos_edge_test_fast over all (or selected) feature columns.
+
+    Fully vectorized — suitable for param sweeps.  Returns same format as
+    oos_edge_summary, sorted by lift descending.
+    """
+    if feature_cols is None:
+        feature_cols = [c for c in features.columns if c != "ou_zscore"]
+
+    rows = []
+    for col in feature_cols:
+        try:
+            result = oos_edge_test_fast(features, y, col, horizon=horizon, train_window=train_window)
+        except Exception:
+            continue
+        u  = result["unfiltered"]
+        f_ = result["filtered"]
+        n_u = u.get("n", 0)
+        rows.append({
+            "feature":           col,
+            "n_unfiltered":      n_u,
+            "n_filtered":        f_.get("n", np.nan),
+            "pct_kept":          f_.get("n", np.nan) / n_u if n_u else np.nan,
+            "sharpe_unfiltered": u.get("sharpe_ann", np.nan),
+            "sharpe_filtered":   f_.get("sharpe_ann", np.nan),
+            "lift":              result["lift"],
+            "hit_unfiltered":    u.get("hit_rate", np.nan),
+            "hit_filtered":      f_.get("hit_rate", np.nan),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    return (pd.DataFrame(rows)
+              .sort_values("lift", ascending=False)
+              .reset_index(drop=True))
+
+
+# ─── walk-forward OOS edge test (reference implementation) ───────────────────
 
 def oos_edge_test(
     features: pd.DataFrame,
@@ -296,6 +394,57 @@ def oos_edge_test(
         "filter_log":  pd.DataFrame(log_rows),
         "filter_mask": filter_mask,
     }
+
+
+def filtered_sharpe_summary(
+    models: dict,
+    y: pd.Series,
+    *,
+    horizons: tuple[int, ...] = (5, 20, 60),
+    train_window: int = 504,
+) -> pd.DataFrame:
+    """Best OOS-filtered sharpe per anchor across all features and horizons.
+
+    For each anchor × horizon, runs oos_edge_summary and records the top feature
+    by sharpe_filtered. Returns one row per anchor (best horizon wins), sorted by
+    sharpe_filtered descending.
+    """
+    rows = []
+    for anchor, model in tqdm(models.items(), desc="filtered sharpe scan", unit="anchor"):
+        feats = build_signal_features(model)
+        if feats.empty or feats["ou_zscore"].dropna().empty:
+            continue
+
+        best: dict | None = None
+        for h in horizons:
+            summary = oos_edge_summary_fast(feats, y, horizon=h, train_window=train_window)
+            if summary.empty:
+                continue
+            top = summary.iloc[0]  # sorted by lift desc — take the best filter
+            sharpe_f = top["sharpe_filtered"]
+            if not np.isfinite(sharpe_f):
+                continue
+            if best is None or sharpe_f > best["sharpe_filtered"]:
+                best = {
+                    "anchor":            anchor,
+                    "horizon":           h,
+                    "best_feature":      top["feature"],
+                    "sharpe_unfiltered": top["sharpe_unfiltered"],
+                    "sharpe_filtered":   sharpe_f,
+                    "lift":              top["lift"],
+                    "pct_kept":          top["pct_kept"],
+                    "hit_filtered":      top["hit_filtered"],
+                }
+
+        if best is not None:
+            rows.append(best)
+
+    if not rows:
+        return pd.DataFrame()
+
+    return (pd.DataFrame(rows)
+              .sort_values("sharpe_filtered", ascending=False)
+              .reset_index(drop=True))
 
 
 def oos_edge_summary(

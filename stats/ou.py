@@ -122,6 +122,44 @@ def roll_half_life(
     return result
 
 
+def roll_ou_zscore(
+    series: Union[pl.Series, pd.Series],
+    lookback: int = 252,
+    min_periods: int = None,
+) -> pl.Series:
+    """Vectorized rolling OU z-score: (current - rolling_mu) / rolling_sigma.
+
+    rolling_mu = -alpha/beta from AR(1) OLS on (lag, delta).
+    rolling_sigma = rolling std of the series.
+    No Python loop — replaces the walk-over-windows approach.
+    """
+    s = to_pl_series(series).cast(pl.Float64)
+    n = len(s)
+    min_p = min_periods if min_periods is not None else max(20, lookback // 4)
+
+    reg = roll_lr(s.shift(1), s.diff(), lookback=lookback, min_periods=min_p)
+
+    alpha = reg["alpha"].to_numpy().astype(float)
+    beta  = reg["beta"].to_numpy().astype(float)
+
+    # roll_lr drops the first null row from lag/diff — pad back to length n
+    pad = n - len(alpha)
+    if pad > 0:
+        alpha = np.concatenate([np.full(pad, np.nan), alpha])
+        beta  = np.concatenate([np.full(pad, np.nan), beta])
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mu = np.where(np.abs(beta) > 1e-12, -alpha / beta, np.nan)
+
+    sigma = s.rolling_std(lookback, min_periods=min_p).to_numpy().astype(float)
+    s_np  = s.to_numpy().astype(float)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        z = np.where(sigma > 0, (s_np - mu) / sigma, np.nan)
+
+    return pl.Series("ou_zscore", z, dtype=pl.Float64)
+
+
 def ou_summary(
     series: Union[pl.Series, pd.Series], lookback: int = None
 ) -> pl.DataFrame:

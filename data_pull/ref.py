@@ -63,6 +63,7 @@ STEPS = [
     ("strips",    "pull_strips.py",              "md.strips_eod",             True),
     ("index",     "pull_index_eod.py",           "md.index_eod",              True),
     ("cftc",      "pull_cftc.py",                "md.cftc",                   False),
+    ("swpn_vol",  "pull_swaption_vol.py",        "md.swaption_vol",           True),
     ("headline",  "build_headline.py",           "md.headline",               False),
     ("breakeven", "build_breakeven.py",          "md.breakeven",              False),
 ]
@@ -162,7 +163,7 @@ def _settle_live_rows():
     try:
         with psycopg.connect(DB_DSN) as conn:
             with conn.cursor() as cur:
-                for tbl in ['md.fut_eod', 'md.ust_eod', 'md.index_eod', 'md.strips_eod']:
+                for tbl in ['md.fut_eod', 'md.ust_eod', 'md.index_eod', 'md.strips_eod', 'md.swaption_vol']:
                     cur.execute(f"UPDATE {tbl} SET is_live = FALSE WHERE ts = CURRENT_DATE AND is_live = TRUE")
             conn.commit()
     except Exception:

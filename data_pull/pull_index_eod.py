@@ -42,7 +42,8 @@ ALL_TICKERS = (
     tkr.sofr_ois + tkr.swp_spd +
     tkr.tips + tkr.be + tkr.zc +
     tkr.stonk + tkr.sector +
-    tkr.prec_met + tkr.enrgy + tkr.ag + tkr.ind_met
+    tkr.prec_met + tkr.enrgy + tkr.ag + tkr.ind_met +
+    tkr.mtg
 )
 
 

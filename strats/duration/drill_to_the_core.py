@@ -27,12 +27,15 @@ for _p in [_HERE, *_HERE.parents]:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from stats import roll_lr, half_life, ou_params
+from stats import roll_lr, half_life, ou_params, roll_ou_zscore
+from utils.rates import linear_5y5y_forward
 from utils.viz import Viz
-from signal.duration.signal_context import (
+from strats.duration.signal_context import (
     build_signal_features,
     conditional_ic_table,
     oos_edge_summary,
+    oos_edge_test_fast,
+    filtered_sharpe_summary,
 )
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -46,19 +49,25 @@ DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets"
 START  = "2000-01-01"
 
 TICKERS = {
-    "2y":   "USGG2YR Index",
-    "5y":   "USGG5YR Index",
-    "10y":  "USGG10YR Index",
-    "30y":  "USGG30YR Index",
-    "be5":  "USGGBE05 Index",
-    "be10": "USGGBE10 Index",
-    "spx":  "SPX Index",
-    "oil":  "CO1 Comdty",
-    "dxy":  "DXY Curncy",
-    "move": "MOVE Index",
+    "2y":     "USGG2YR Index",
+    "5y":     "USGG5YR Index",
+    "10y":    "USGG10YR Index",
+    "30y":    "USGG30YR Index",
+    "be5":    "USGGBE05 Index",
+    "be10":   "USGGBE10 Index",
+    "spx":    "SPX Index",
+    "oil":    "CO1 Comdty",
+    "dxy":    "DXY Curncy",
+    "move":   "MOVE Index",
+    "mtg_cc": "MTGEFNCL Index",
+    # components for 5y5y forwards
+    "zc5":    "USSWIT5 Curncy",
+    "zc10":   "USSWIT10 Curncy",
+    "sofr5":  "USOSFR5 Curncy",
+    "sofr10": "USOSFR10 Curncy",
 }
 
-BPS_COLS = ("2y", "5y", "10y", "30y", "be5", "be10")
+BPS_COLS = ("2y", "5y", "10y", "30y", "be5", "be10", "mtg_cc", "zc5", "zc10", "sofr5", "sofr10")
 
 
 # ─── data ──────────────────────────────────────────────────────────────────
@@ -90,6 +99,14 @@ def load_basket(tickers: dict[str, str] = TICKERS, start: str = START) -> pd.Dat
     for c in BPS_COLS:
         if c in wide:
             wide[c] = wide[c] * 100.0
+    # derived: mortgage basis = current coupon yield - 10y (both already in bps)
+    if "mtg_cc" in wide.columns and "10y" in wide.columns:
+        wide["mtg_basis"] = wide["mtg_cc"] - wide["10y"]
+    # derived: 5y5y forwards via linear approx (2×10y − 5y)
+    if "zc5" in wide.columns and "zc10" in wide.columns:
+        wide["5y5y_ifs"] = linear_5y5y_forward(wide["zc5"], wide["zc10"])
+    if "sofr5" in wide.columns and "sofr10" in wide.columns:
+        wide["5y5y_sfr"] = linear_5y5y_forward(wide["sofr5"], wide["sofr10"])
     return wide.dropna(how="all")
 
 
@@ -244,25 +261,6 @@ def _latest_ou_metrics(resid: pd.Series, lookback: int = 252) -> dict:
     }
 
 
-def rolling_ou_zscore(resid: pd.Series, lookback: int = 252) -> pd.Series:
-    """Rolling OU z-score: current residual vs trailing OU equilibrium."""
-    out = pd.Series(np.nan, index=resid.index, name="ou_zscore")
-    r = resid.astype(float)
-    min_obs = max(20, lookback // 4)
-
-    for i in range(len(r)):
-        window = r.iloc[max(0, i - lookback + 1):i + 1].dropna()
-        if len(window) < min_obs:
-            continue
-        params = ou_params(window)
-        mu = float(params["mu"])
-        sigma = float(window.std())
-        current = r.iloc[i]
-        if sigma > 0 and np.isfinite(mu) and np.isfinite(current):
-            out.iloc[i] = (current - mu) / sigma
-    return out
-
-
 def single_factor_10y_table(
     df: pd.DataFrame,
     *,
@@ -283,7 +281,7 @@ def single_factor_10y_table(
 
         out = roll_lr(pair[anchor], pair[target], lookback=lookback).to_pandas()
         out.index = pair.index
-        out["ou_zscore"] = rolling_ou_zscore(out["resid"], lookback=ou_lookback)
+        out["ou_zscore"] = roll_ou_zscore(out["resid"], lookback=ou_lookback).to_numpy()
         models[anchor] = out
 
         valid = out.dropna(subset=["y", "yhat", "resid"])
@@ -352,15 +350,273 @@ def backtest_ou_signals(
             if len(jh) < 30:
                 row[f"ic_{h}d"] = np.nan
                 row[f"hit_{h}d"] = np.nan
+                row[f"sharpe_{h}d"] = np.nan
                 continue
+            pnl = np.sign(jh["s"]) * (-jh["f"])
             row[f"ic_{h}d"] = float(jh["s"].corr(-jh["f"], method="spearman"))
             row[f"hit_{h}d"] = float((np.sign(jh["s"]) == np.sign(-jh["f"])).mean())
+            row[f"sharpe_{h}d"] = float(pnl.mean() / pnl.std() * np.sqrt(252.0 / h)) if pnl.std() > 0 else np.nan
 
         rows.append(row)
 
-    col_order = ["anchor", "ic_5d", "ic_20d", "ic_60d", "hit_5d", "hit_20d", "hit_60d", "sharpe_1d"]
+    col_order = ["anchor", "ic_5d", "ic_20d", "ic_60d", "hit_5d", "hit_20d", "hit_60d",
+                 "sharpe_1d", "sharpe_5d", "sharpe_20d", "sharpe_60d"]
     bt = pd.DataFrame(rows)
     return bt[[c for c in col_order if c in bt.columns]]
+
+
+# ─── trade simulation + deep-dive charts ─────────────────────────────────
+
+def simulate_trades(
+    model: pd.DataFrame,
+    filter_mask: pd.Series,
+    *,
+    entry_z: float = 1.0,
+) -> pd.DataFrame:
+    """Simulate discrete OU trades with half-life exits.
+
+    Entry  : |ou_zscore| >= entry_z AND filter active AND no open trade.
+    Exit   : residual crosses trailing ou_mean in the right direction,
+             OR max_hold = round(half_life) bars elapses.
+    PnL    : direction × (entry_10y − exit_10y), bps.
+    """
+    ou_z_v  = model["ou_zscore"].values
+    resid_v = model["resid"].values
+    y_v     = model["y"].values
+    dates   = model.index
+    n       = len(dates)
+    mask_v  = filter_mask.reindex(dates, fill_value=False).values
+
+    trades = []
+    i = 0
+    while i < n:
+        z_i = ou_z_v[i]
+        if (np.isfinite(z_i) and abs(z_i) >= entry_z
+                and mask_v[i] and np.isfinite(resid_v[i])):
+
+            direction   = 1 if z_i > 0 else -1
+            entry_y     = y_v[i]
+            entry_r     = resid_v[i]
+
+            win = resid_v[max(0, i - 252): i + 1]
+            win = win[np.isfinite(win)]
+            ou_mean = float(np.mean(win)) if len(win) >= 3 else 0.0
+            hl      = float(half_life(pd.Series(win))) if len(win) >= 10 else 20.0
+            if not np.isfinite(hl) or hl <= 0:
+                hl = 20.0
+            max_hold = max(1, round(hl))
+
+            exit_i      = min(i + max_hold, n - 1)
+            exit_reason = "time"
+            for j in range(i + 1, min(i + max_hold + 1, n)):
+                r_j = resid_v[j]
+                if not np.isfinite(r_j):
+                    continue
+                if (direction == 1 and r_j <= ou_mean) or (direction == -1 and r_j >= ou_mean):
+                    exit_i      = j
+                    exit_reason = "mean"
+                    break
+
+            pnl = direction * (entry_y - y_v[exit_i])
+            trades.append({
+                "entry":       dates[i],
+                "exit":        dates[exit_i],
+                "dir":         "RCV" if direction == 1 else "PAY",
+                "entry_10y":   round(entry_y, 1),
+                "exit_10y":    round(y_v[exit_i], 1),
+                "pnl":         round(pnl, 1),
+                "entry_z":     round(z_i, 2),
+                "entry_resid": round(entry_r, 1),
+                "exit_resid":  round(resid_v[exit_i], 1),
+                "ou_mean":     round(ou_mean, 1),
+                "hl_d":        round(hl, 1),
+                "hold_d":      exit_i - i,
+                "exit_by":     exit_reason,
+            })
+            i = exit_i + 1
+        else:
+            i += 1
+
+    return pd.DataFrame(trades) if trades else pd.DataFrame()
+
+
+def _best_signal_drill(
+    best_row: pd.Series,
+    models: dict[str, pd.DataFrame],
+    df: pd.DataFrame,
+    viz,
+    *,
+    train_window: int = 504,
+    entry_z: float = 1.0,
+) -> pd.DataFrame:
+    """Three deep-dive charts + trade table for the best filtered signal."""
+    anchor   = best_row["anchor"]
+    h        = int(best_row["horizon"])
+    feat_col = best_row["best_feature"]
+
+    model  = models[anchor]
+    feats  = build_signal_features(model)
+    result = oos_edge_test_fast(feats, df["10y"], feat_col, horizon=h, train_window=train_window)
+
+    mask       = result["filter_mask"]
+    ou_z       = model["ou_zscore"]
+    y_10       = model["y"]
+    feat_ser   = feats[feat_col].reindex(model.index)
+    trades     = simulate_trades(model, mask, entry_z=entry_z)
+    sfx        = f"10y | {anchor}  ·  filter: {feat_col}  ·  h={h}d"
+
+    # ── Chart 1: signal conditions ──────────────────────────────────────────
+    # OU z-score (right) + filter feature (left) + shading where both fire.
+    def _render_conditions(fig, ax, start, end):
+        sub_z = ou_z.loc[start:end]
+        sub_f = feat_ser.loc[start:end]
+        sub_m = mask.reindex(sub_z.index, fill_value=False)
+
+        yz = max(float(sub_z.abs().max(skipna=True)) * 1.2, entry_z * 2.5)
+        rcv_on = (sub_m & (sub_z >= entry_z)).values.astype(bool)
+        pay_on = (sub_m & (sub_z <= -entry_z)).values.astype(bool)
+
+        ax.fill_between(sub_z.index, -yz, yz, where=rcv_on,
+                        color='#27AE60', alpha=0.13, zorder=1, label='_nolegend_')
+        ax.fill_between(sub_z.index, -yz, yz, where=pay_on,
+                        color='#C0392B', alpha=0.13, zorder=1, label='_nolegend_')
+
+        ax.plot(sub_z.index, sub_z.values, color='#2980B9', linewidth=1.5,
+                label='OU z-score', zorder=3)
+        ax.axhline( entry_z, color='#27AE60', linestyle='--', linewidth=0.9, alpha=0.8)
+        ax.axhline(-entry_z, color='#C0392B', linestyle='--', linewidth=0.9, alpha=0.8)
+        ax.axhline(0, color='#666', linestyle='-', linewidth=0.8)
+        ax.set_ylim(-yz, yz)
+
+        # entry dots on z-score line
+        if not trades.empty:
+            sub_t = trades[(trades["entry"] >= start) & (trades["entry"] <= end)]
+            for _, t in sub_t.iterrows():
+                d = t["entry"]
+                if d in sub_z.index:
+                    zv = sub_z.loc[d]
+                    c  = '#27AE60' if t["dir"] == "RCV" else '#C0392B'
+                    mk = 'v'       if t["dir"] == "RCV" else '^'
+                    ax.scatter([d], [zv], marker=mk, color=c, s=90, zorder=6,
+                               edgecolors='white', linewidths=0.5)
+
+        # filter feature on left axis
+        ax2 = ax.twinx()
+        ax2.plot(sub_f.index, sub_f.values, color='#F39C12', linewidth=1.2,
+                 linestyle='--', alpha=0.85, label=feat_col, zorder=2)
+        ax2.axhline(0, color='#F39C12', linestyle=':', linewidth=0.6, alpha=0.5)
+        ax2.grid(False)
+        ax2.yaxis.tick_left()
+        ax2.yaxis.set_label_position('left')
+        ax2.set_ylabel(feat_col.upper(), fontsize=8, color='#F39C12')
+        for sp in ('top', 'right', 'bottom'):
+            ax2.spines[sp].set_visible(False)
+        ax2.tick_params(axis='y', labelsize=8, colors='#F39C12')
+
+        viz._style_ax(ax, yaxis_title='z-score')
+        viz._format_dates(ax, start, end)
+        viz._legend(ax)
+
+    viz._make_time_nav(
+        pd.DataFrame(index=ou_z.dropna().index),
+        _render_conditions,
+        title=f"signal conditions  ·  {sfx}",
+    )
+
+    # ── Chart 2: 10y yield with entry / exit markers ────────────────────────
+    def _render_yield(fig, ax, start, end):
+        sub_y = y_10.loc[start:end].dropna()
+        ax.plot(sub_y.index, sub_y.values, color='#2C3E50', linewidth=1.5,
+                label='10y', zorder=3)
+
+        if not trades.empty:
+            sub_t = trades[(trades["entry"] >= start) & (trades["entry"] <= end)]
+
+            def _y_at(ds):
+                return [float(y_10.loc[d]) if d in y_10.index else np.nan for d in ds]
+
+            rcv = sub_t[sub_t["dir"] == "RCV"]
+            pay = sub_t[sub_t["dir"] == "PAY"]
+            if not rcv.empty:
+                ax.scatter(pd.DatetimeIndex(rcv["entry"]), _y_at(rcv["entry"]),
+                           marker='v', color='#27AE60', s=180, zorder=6,
+                           label='receive ▼', edgecolors='white', linewidths=0.8)
+            if not pay.empty:
+                ax.scatter(pd.DatetimeIndex(pay["entry"]), _y_at(pay["entry"]),
+                           marker='^', color='#C0392B', s=180, zorder=6,
+                           label='pay ▲', edgecolors='white', linewidths=0.8)
+
+            # exit circles
+            ax.scatter(pd.DatetimeIndex(sub_t["exit"]), _y_at(sub_t["exit"]),
+                       marker='o', color='#7F8C8D', s=60, zorder=5,
+                       label='exit', edgecolors='white', linewidths=0.8)
+
+            # entry→exit dotted connector per trade
+            for _, t in sub_t.iterrows():
+                if t["entry"] in y_10.index and t["exit"] in y_10.index:
+                    c = '#27AE60' if t["dir"] == "RCV" else '#C0392B'
+                    ax.plot([t["entry"], t["exit"]],
+                            [y_10.loc[t["entry"]], y_10.loc[t["exit"]]],
+                            color=c, linewidth=1.0, linestyle=':', alpha=0.5, zorder=4)
+
+        viz._style_ax(ax, yaxis_title='yield, bps')
+        viz._format_dates(ax, start, end)
+        viz._legend(ax)
+
+    viz._make_time_nav(
+        pd.DataFrame(index=y_10.dropna().index),
+        _render_yield,
+        title=f"10y yield  ·  entries & exits  ·  {sfx}",
+    )
+
+    # ── Chart 3: cumulative PnL + per-trade bars ────────────────────────────
+    def _render_pnl(fig, ax, start, end):
+        if trades.empty:
+            return
+        all_t = trades[trades["exit"] <= end].copy()
+        if all_t.empty:
+            return
+
+        cum = all_t.set_index("exit")["pnl"].cumsum()
+        ax.step(cum.index, cum.values, where='post', color='#2980B9',
+                linewidth=2.0, label='cum PnL', zorder=3)
+        ax.axhline(0, color='#666', linestyle='-', linewidth=0.8)
+        ax.fill_between(cum.index, 0, cum.values,
+                        where=(cum.values >= 0), color='#27AE60', alpha=0.12, step='post')
+        ax.fill_between(cum.index, 0, cum.values,
+                        where=(cum.values < 0),  color='#C0392B', alpha=0.12, step='post')
+
+        vis_t = all_t[(all_t["exit"] >= start) & (all_t["exit"] <= end)]
+        if not vis_t.empty:
+            ax2 = ax.twinx()
+            bc  = ['#27AE60' if v >= 0 else '#C0392B' for v in vis_t["pnl"]]
+            ax2.bar(pd.DatetimeIndex(vis_t["exit"]), vis_t["pnl"].values,
+                    color=bc, width=3, alpha=0.4, zorder=2, label='trade PnL')
+            ax2.axhline(0, color='#666', linestyle='-', linewidth=0.5, alpha=0.5)
+            ax2.grid(False)
+            ax2.yaxis.tick_left()
+            ax2.yaxis.set_label_position('left')
+            ax2.set_ylabel('TRADE PNL, BPS', fontsize=8)
+            for sp in ('top', 'right', 'bottom'):
+                ax2.spines[sp].set_visible(False)
+            ax2.tick_params(axis='y', labelsize=8)
+
+        viz._style_ax(ax, yaxis_title='cum pnl, bps')
+        viz._format_dates(ax, start, end)
+        viz._legend(ax)
+
+    viz._make_time_nav(
+        pd.DataFrame(index=y_10.dropna().index),
+        _render_pnl,
+        title=f"PnL  ·  {sfx}",
+    )
+
+    # trade table
+    if not trades.empty:
+        display(trades)
+        viz.table(trades, title=f"trade log  ·  {sfx}")
+
+    return trades
 
 
 # ─── main ──────────────────────────────────────────────────────────────────
@@ -404,70 +660,23 @@ def main() -> dict:
             title="10y single-factor OU signal backtest  (IC + hit rate + sharpe)",
         )
 
-    # Signal context: conditional IC and OOS edge test for each anchor.
-    for anchor in (ten_single["anchor"].tolist() if not ten_single.empty else []):
-        model = ten_single_models[anchor]
-        feats = build_signal_features(model)
-        if feats.empty or feats["ou_zscore"].dropna().empty:
-            continue
+    # Filtered sharpe: best OOS feature filter per anchor across all horizons.
+    print("\n--- filtered sharpe summary (best feature×horizon per anchor) ---")
+    filt = filtered_sharpe_summary(ten_single_models, df["10y"])
+    if not filt.empty:
+        display(filt.round(3))
+        viz.table(filt.round(3), title="best OOS-filtered sharpe per anchor")
 
-        cic = conditional_ic_table(feats, df["10y"])
-        if not cic.empty:
-            display(cic.round(3))
-            viz.table(
-                cic.round(3),
-                title=f"{anchor}  |  conditional IC by feature quintile",
-            )
-
-        oos = oos_edge_summary(feats, df["10y"])
-        if not oos.empty:
-            display(oos.round(3))
-            viz.table(
-                oos.round(3),
-                title=f"{anchor}  |  OOS edge test  (filtered vs unfiltered sharpe)",
-            )
-
-    # App charts: table, then 10y/anchor, residual, and OU z-score per anchor.
-    for anchor in ten_single["anchor"].tolist() if not ten_single.empty else []:
-        model = ten_single_models[anchor]
-        pair = pd.concat([
-            model["y"].rename("10y"),
-            model["x"].rename(anchor),
-        ], axis=1).dropna()
-        same_units = anchor in BPS_COLS
-
-        viz.line(
-            pair,
-            # left=[] if same_units else [anchor],
-            # title=f"10y vs {anchor}  (60d rolling model input)",
-            # yaxis_title="level, bps" if same_units else "10y, bps",
-            # yaxis_right_title=None if same_units else anchor,
-            left=[anchor],
-            title=f"10y vs {anchor}  (60d rolling model input)",
-            yaxis_title="10y, bps",
-            yaxis_right_title=anchor,
-        )
-
-        viz.line(
-            model[["resid"]].rename(columns={"resid": f"resid(10y | {anchor})"}),
-            title=f"residual: 10y - model({anchor})",
-            yaxis_title="resid, bps",
-            residual=True,
-            hlines=[(0, None, "solid")],
-        )
-
-        viz.line(
-            model[["ou_zscore"]].rename(columns={"ou_zscore": f"OU z resid(10y | {anchor})"}),
-            title=f"OU z-score: residual(10y | {anchor})",
-            yaxis_title="z-score",
-            residual=True,
-            hlines=[(0, None, "solid"), (2, "+2", "dashed"), (-2, "-2", "dashed")],
-        )
+    # Deep-dive charts for the best filtered signal.
+    if not filt.empty:
+        _best_signal_drill(filt.iloc[0], ten_single_models, df, viz)
 
     return {
-        "df":            df,
-        "ten_single":    ten_single,
+        "df":                df,
+        "ten_single":        ten_single,
         "ten_single_models": ten_single_models,
+        "bt":                bt,
+        "filt":              filt,
     }
 
 
