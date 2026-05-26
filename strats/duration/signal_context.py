@@ -204,10 +204,10 @@ def oos_edge_test_fast(
 ) -> dict:
     """Vectorized OOS filter — no Python loop over windows.
 
-    At each bar t, uses data [t-train_window, t-1] to estimate whether the
-    feature directionally predicts signal quality (rolling Pearson IC vs realized
-    PnL).  Takes the signal when the feature is on the IC-predicted good side of
-    the rolling median.  Bars before the first full training window are excluded.
+    At each bar t, uses only labels whose forward window has already completed.
+    Under the same-bar execution convention, a signal from t-horizon first becomes
+    eligible for training on t. Takes the signal when the feature is on the
+    IC-predicted good side of the rolling median.
 
     Returns same keys as oos_edge_test: unfiltered, filtered, lift, filter_mask.
     """
@@ -224,9 +224,11 @@ def oos_edge_test_fast(
     pnl  = combined["pnl"]
     min_periods = max(30, train_window // 4)
 
-    # shift(1) so training window ends at t-1 — no lookahead
-    rolling_ic  = feat.shift(1).rolling(train_window, min_periods=min_periods).corr(pnl.shift(1))
-    rolling_med = feat.shift(1).rolling(train_window, min_periods=min_periods).median()
+    # A pnl label for signal row k is not known until row k + horizon.
+    known_feat = feat.shift(horizon)
+    known_pnl = pnl.shift(horizon)
+    rolling_ic = known_feat.rolling(train_window, min_periods=min_periods).corr(known_pnl)
+    rolling_med = known_feat.rolling(train_window, min_periods=min_periods).median()
 
     above_med   = feat > rolling_med
     ic_valid    = rolling_ic.notna()
@@ -277,6 +279,8 @@ def oos_edge_summary_fast(
             "sharpe_unfiltered": u.get("sharpe_ann", np.nan),
             "sharpe_filtered":   f_.get("sharpe_ann", np.nan),
             "lift":              result["lift"],
+            "profit_factor_unfiltered": u.get("profit_factor", np.nan),
+            "profit_factor_filtered":   f_.get("profit_factor", np.nan),
             "hit_unfiltered":    u.get("hit_rate", np.nan),
             "hit_filtered":      f_.get("hit_rate", np.nan),
         })
@@ -305,7 +309,8 @@ def oos_edge_test(
     """Walk-forward OOS filter: does the context feature add edge?
 
     For each OOS window:
-    1. Fit the prior `train_window` bars — compute per-bin IC for `filter_col`.
+    1. Fit known labels from the prior `train_window` bars — compute per-bin IC
+       for `filter_col`.
     2. Identify bins with positive IC (the "good" context).
     3. In the OOS window, only take signals that fall in the good bins.
     4. Roll forward by `step` bars and repeat.
@@ -334,7 +339,10 @@ def oos_edge_test(
     log_rows: list[dict] = []
 
     for start_i in range(train_window, n, step):
-        train = combined.iloc[start_i - train_window : start_i]
+        train_end_i = start_i - horizon + 1
+        if train_end_i <= 0:
+            continue
+        train = combined.iloc[max(0, train_end_i - train_window) : train_end_i]
         test  = combined.iloc[start_i : min(start_i + step, n)]
         if test.empty:
             break
@@ -368,7 +376,7 @@ def oos_edge_test(
         filter_mask.loc[passes[passes].index] = True
 
         log_rows.append({
-            "train_end":  dates[start_i - 1],
+            "train_end":  train.index[-1],
             "test_start": dates[start_i],
             "test_end":   dates[min(start_i + step, n) - 1],
             "good_bins":  sorted(good_bins),
@@ -426,14 +434,16 @@ def filtered_sharpe_summary(
                 continue
             if best is None or sharpe_f > best["sharpe_filtered"]:
                 best = {
-                    "anchor":            anchor,
-                    "horizon":           h,
-                    "best_feature":      top["feature"],
-                    "sharpe_unfiltered": top["sharpe_unfiltered"],
-                    "sharpe_filtered":   sharpe_f,
-                    "lift":              top["lift"],
-                    "pct_kept":          top["pct_kept"],
-                    "hit_filtered":      top["hit_filtered"],
+                    "anchor":                     anchor,
+                    "horizon":                    h,
+                    "best_feature":               top["feature"],
+                    "sharpe_unfiltered":          top["sharpe_unfiltered"],
+                    "sharpe_filtered":            sharpe_f,
+                    "lift":                       top["lift"],
+                    "profit_factor_unfiltered":   top.get("profit_factor_unfiltered", np.nan),
+                    "profit_factor_filtered":     top.get("profit_factor_filtered", np.nan),
+                    "pct_kept":                   top["pct_kept"],
+                    "hit_filtered":               top["hit_filtered"],
                 }
 
         if best is not None:
@@ -487,6 +497,8 @@ def oos_edge_summary(
             "sharpe_unfiltered":   u.get("sharpe_ann", np.nan),
             "sharpe_filtered":     f_.get("sharpe_ann", np.nan),
             "lift":                result["lift"],
+            "profit_factor_unfiltered": u.get("profit_factor", np.nan),
+            "profit_factor_filtered":   f_.get("profit_factor", np.nan),
             "hit_unfiltered":      u.get("hit_rate", np.nan),
             "hit_filtered":        f_.get("hit_rate", np.nan),
         })

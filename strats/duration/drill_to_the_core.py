@@ -27,7 +27,9 @@ for _p in [_HERE, *_HERE.parents]:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from stats import roll_lr, half_life, ou_params, roll_ou_zscore
+from stats import roll_lr, half_life, ou_params, roll_half_life, roll_ou_zscore
+from backtest import BacktestConfig, Engine, SignalConfig, SignalPipeline, TradeDef
+from backtest.metrics import trade_log as engine_trade_log
 from utils.rates import linear_5y5y_forward
 from utils.viz import Viz
 from strats.duration.signal_context import (
@@ -318,7 +320,16 @@ def single_factor_10y_table(
 
 # ─── backtest ──────────────────────────────────────────────────────────────
 
-def backtest_ou_signals(
+def _profit_factor(pnl: pd.Series) -> float:
+    """Gross profit divided by gross loss; zeros do not affect either side."""
+    wins = pnl[pnl > 0].sum()
+    losses = pnl[pnl < 0].sum()
+    if losses < 0:
+        return float(wins / abs(losses))
+    return float("inf") if wins > 0 else np.nan
+
+
+def ou_signal_forward_diagnostics(
     models: dict[str, pd.DataFrame],
     *,
     horizons: tuple[int, ...] = (5, 20, 60),
@@ -340,8 +351,10 @@ def backtest_ou_signals(
         if len(j1) >= 30:
             pnl = np.sign(j1["s"]) * (-j1["f"])
             row["sharpe_1d"] = float(pnl.mean() / pnl.std() * np.sqrt(252)) if pnl.std() > 0 else np.nan
+            row["pf_1d"] = _profit_factor(pnl)
         else:
             row["sharpe_1d"] = np.nan
+            row["pf_1d"] = np.nan
 
         for h in horizons:
             fwd = y.diff(h).shift(-h)
@@ -351,93 +364,122 @@ def backtest_ou_signals(
                 row[f"ic_{h}d"] = np.nan
                 row[f"hit_{h}d"] = np.nan
                 row[f"sharpe_{h}d"] = np.nan
+                row[f"pf_{h}d"] = np.nan
                 continue
             pnl = np.sign(jh["s"]) * (-jh["f"])
             row[f"ic_{h}d"] = float(jh["s"].corr(-jh["f"], method="spearman"))
             row[f"hit_{h}d"] = float((np.sign(jh["s"]) == np.sign(-jh["f"])).mean())
             row[f"sharpe_{h}d"] = float(pnl.mean() / pnl.std() * np.sqrt(252.0 / h)) if pnl.std() > 0 else np.nan
+            row[f"pf_{h}d"] = _profit_factor(pnl)
 
         rows.append(row)
 
     col_order = ["anchor", "ic_5d", "ic_20d", "ic_60d", "hit_5d", "hit_20d", "hit_60d",
-                 "sharpe_1d", "sharpe_5d", "sharpe_20d", "sharpe_60d"]
+                 "sharpe_1d", "sharpe_5d", "sharpe_20d", "sharpe_60d",
+                 "pf_1d", "pf_5d", "pf_20d", "pf_60d"]
     bt = pd.DataFrame(rows)
     return bt[[c for c in col_order if c in bt.columns]]
 
 
-# ─── trade simulation + deep-dive charts ─────────────────────────────────
+# ─── engine backtest + deep-dive charts ─────────────────────────────────
 
-def simulate_trades(
+def _engine_data(model: pd.DataFrame) -> pl.DataFrame:
+    """Build the minimal wide frame expected by the shared backtest engine."""
+    return pl.DataFrame({
+        "ts": pd.to_datetime(model.index).date,
+        "10y": model["y"].astype(float).to_numpy(),
+    })
+
+
+def _gated_entry_signal(
     model: pd.DataFrame,
     filter_mask: pd.Series,
     *,
     entry_z: float = 1.0,
-) -> pd.DataFrame:
-    """Simulate discrete OU trades with half-life exits.
+) -> pd.Series:
+    """Gate entries with the OOS filter while preserving z-score exits.
 
-    Entry  : |ou_zscore| >= entry_z AND filter active AND no open trade.
-    Exit   : residual crosses trailing ou_mean in the right direction,
-             OR max_hold = round(half_life) bars elapses.
-    PnL    : direction × (entry_10y − exit_10y), bps.
+    The shared SignalConfig uses thresholds for both entries and exits. When
+    the filter is off, cap extreme z-scores just inside the entry bands so new
+    positions cannot open, but mean-crossing exits still fire.
     """
-    ou_z_v  = model["ou_zscore"].values
-    resid_v = model["resid"].values
-    y_v     = model["y"].values
-    dates   = model.index
-    n       = len(dates)
-    mask_v  = filter_mask.reindex(dates, fill_value=False).values
+    z = model["ou_zscore"].reindex(model.index).astype(float).copy()
+    active = filter_mask.reindex(model.index, fill_value=False).astype(bool)
+    eps = 1e-6
+    z.loc[~active & (z >= entry_z)] = entry_z - eps
+    z.loc[~active & (z <= -entry_z)] = -entry_z + eps
+    return z
 
-    trades = []
-    i = 0
-    while i < n:
-        z_i = ou_z_v[i]
-        if (np.isfinite(z_i) and abs(z_i) >= entry_z
-                and mask_v[i] and np.isfinite(resid_v[i])):
 
-            direction   = 1 if z_i > 0 else -1
-            entry_y     = y_v[i]
-            entry_r     = resid_v[i]
+def _dynamic_time_stop(model: pd.DataFrame, lookback: int = 252) -> pd.Series:
+    """Rolling half-life in bars, falling back to 20 when the fit is invalid."""
+    hl = roll_half_life(model["resid"], lookback=lookback).to_pandas()
+    hl.index = model.index
+    hl = hl.where(np.isfinite(hl) & (hl > 0), 20.0)
+    return hl.round().clip(lower=1)
 
-            win = resid_v[max(0, i - 252): i + 1]
-            win = win[np.isfinite(win)]
-            ou_mean = float(np.mean(win)) if len(win) >= 3 else 0.0
-            hl      = float(half_life(pd.Series(win))) if len(win) >= 10 else 20.0
-            if not np.isfinite(hl) or hl <= 0:
-                hl = 20.0
-            max_hold = max(1, round(hl))
 
-            exit_i      = min(i + max_hold, n - 1)
-            exit_reason = "time"
-            for j in range(i + 1, min(i + max_hold + 1, n)):
-                r_j = resid_v[j]
-                if not np.isfinite(r_j):
-                    continue
-                if (direction == 1 and r_j <= ou_mean) or (direction == -1 and r_j >= ou_mean):
-                    exit_i      = j
-                    exit_reason = "mean"
-                    break
+def run_engine_backtest(
+    model: pd.DataFrame,
+    filter_mask: pd.Series,
+    *,
+    entry_z: float = 1.0,
+) -> tuple:
+    """Run the OU signal through the shared backtest engine.
 
-            pnl = direction * (entry_y - y_v[exit_i])
-            trades.append({
-                "entry":       dates[i],
-                "exit":        dates[exit_i],
-                "dir":         "RCV" if direction == 1 else "PAY",
-                "entry_10y":   round(entry_y, 1),
-                "exit_10y":    round(y_v[exit_i], 1),
-                "pnl":         round(pnl, 1),
-                "entry_z":     round(z_i, 2),
-                "entry_resid": round(entry_r, 1),
-                "exit_resid":  round(resid_v[exit_i], 1),
-                "ou_mean":     round(ou_mean, 1),
-                "hl_d":        round(hl, 1),
-                "hold_d":      exit_i - i,
-                "exit_by":     exit_reason,
-            })
-            i = exit_i + 1
-        else:
-            i += 1
+    Internal engine convention: direction -1 profits when 10y yield falls.
+    Display convention: direction -1 is BUY rates; direction +1 is SELL rates.
+    """
+    signal = _gated_entry_signal(model, filter_mask, entry_z=entry_z)
+    time_stop = _dynamic_time_stop(model)
 
-    return pd.DataFrame(trades) if trades else pd.DataFrame()
+    def compute(data: pl.DataFrame) -> pl.DataFrame:
+        return pl.DataFrame({
+            "signal": signal.to_numpy(),
+            "time_stop": time_stop.to_numpy(),
+        })
+
+    pipeline = SignalPipeline(
+        name="10y_ou_filtered",
+        trade_def=TradeDef.outright("10y", "10y"),
+        compute_fn=compute,
+        config=SignalConfig(
+            entry_long=-entry_z,
+            entry_short=entry_z,
+            exit_long=0.0,
+            exit_short=0.0,
+            max_positions=1,
+        ),
+    )
+    result = Engine(BacktestConfig(max_total_positions=1)).add_signal(pipeline).run(_engine_data(model))
+    return result, signal, time_stop
+
+
+def engine_metrics_frame(result) -> pd.DataFrame:
+    """Compact display table from shared backtest metrics."""
+    metrics = result.summary()
+    keep = [
+        "total_pnl_bps", "n_trades", "hit_rate", "avg_win_bps", "avg_loss_bps",
+        "profit_factor", "sharpe", "max_drawdown_bps", "calmar", "avg_holding_days",
+    ]
+    return pd.DataFrame([{k: metrics.get(k, np.nan) for k in keep}])
+
+
+def engine_trades_frame(result) -> pd.DataFrame:
+    """Trade log with buy/sell naming layered on top of engine accounting."""
+    trades = engine_trade_log(result.closed_trades).to_pandas()
+    if trades.empty:
+        return trades
+    trades = trades.rename(columns={
+        "entry_date": "entry",
+        "exit_date": "exit",
+        "entry_level": "entry_10y",
+        "exit_level": "exit_10y",
+    })
+    trades["entry"] = pd.to_datetime(trades["entry"])
+    trades["exit"] = pd.to_datetime(trades["exit"])
+    trades.insert(3, "side", np.where(trades["direction"] == "short", "BUY", "SELL"))
+    return trades
 
 
 def _best_signal_drill(
@@ -459,10 +501,15 @@ def _best_signal_drill(
     result = oos_edge_test_fast(feats, df["10y"], feat_col, horizon=h, train_window=train_window)
 
     mask       = result["filter_mask"]
-    ou_z       = model["ou_zscore"]
-    y_10       = model["y"]
+    bt_result, _, _ = run_engine_backtest(model, mask, entry_z=entry_z)
+    trades     = engine_trades_frame(bt_result)
+    ou_z       = model["ou_zscore"].copy()
+    y_10       = model["y"].copy()
     feat_ser   = feats[feat_col].reindex(model.index)
-    trades     = simulate_trades(model, mask, entry_z=entry_z)
+    ou_z.index = pd.to_datetime(ou_z.index)
+    y_10.index = pd.to_datetime(y_10.index)
+    feat_ser.index = pd.to_datetime(feat_ser.index)
+    mask.index = pd.to_datetime(mask.index)
     sfx        = f"10y | {anchor}  ·  filter: {feat_col}  ·  h={h}d"
 
     # ── Chart 1: signal conditions ──────────────────────────────────────────
@@ -473,12 +520,12 @@ def _best_signal_drill(
         sub_m = mask.reindex(sub_z.index, fill_value=False)
 
         yz = max(float(sub_z.abs().max(skipna=True)) * 1.2, entry_z * 2.5)
-        rcv_on = (sub_m & (sub_z >= entry_z)).values.astype(bool)
-        pay_on = (sub_m & (sub_z <= -entry_z)).values.astype(bool)
+        buy_on = (sub_m & (sub_z >= entry_z)).values.astype(bool)
+        sell_on = (sub_m & (sub_z <= -entry_z)).values.astype(bool)
 
-        ax.fill_between(sub_z.index, -yz, yz, where=rcv_on,
+        ax.fill_between(sub_z.index, -yz, yz, where=buy_on,
                         color='#27AE60', alpha=0.13, zorder=1, label='_nolegend_')
-        ax.fill_between(sub_z.index, -yz, yz, where=pay_on,
+        ax.fill_between(sub_z.index, -yz, yz, where=sell_on,
                         color='#C0392B', alpha=0.13, zorder=1, label='_nolegend_')
 
         ax.plot(sub_z.index, sub_z.values, color='#2980B9', linewidth=1.5,
@@ -495,8 +542,8 @@ def _best_signal_drill(
                 d = t["entry"]
                 if d in sub_z.index:
                     zv = sub_z.loc[d]
-                    c  = '#27AE60' if t["dir"] == "RCV" else '#C0392B'
-                    mk = 'v'       if t["dir"] == "RCV" else '^'
+                    c  = '#27AE60' if t["side"] == "BUY" else '#C0392B'
+                    mk = 'v'       if t["side"] == "BUY" else '^'
                     ax.scatter([d], [zv], marker=mk, color=c, s=90, zorder=6,
                                edgecolors='white', linewidths=0.5)
 
@@ -535,16 +582,16 @@ def _best_signal_drill(
             def _y_at(ds):
                 return [float(y_10.loc[d]) if d in y_10.index else np.nan for d in ds]
 
-            rcv = sub_t[sub_t["dir"] == "RCV"]
-            pay = sub_t[sub_t["dir"] == "PAY"]
-            if not rcv.empty:
-                ax.scatter(pd.DatetimeIndex(rcv["entry"]), _y_at(rcv["entry"]),
+            buys = sub_t[sub_t["side"] == "BUY"]
+            sells = sub_t[sub_t["side"] == "SELL"]
+            if not buys.empty:
+                ax.scatter(pd.DatetimeIndex(buys["entry"]), _y_at(buys["entry"]),
                            marker='v', color='#27AE60', s=180, zorder=6,
-                           label='receive ▼', edgecolors='white', linewidths=0.8)
-            if not pay.empty:
-                ax.scatter(pd.DatetimeIndex(pay["entry"]), _y_at(pay["entry"]),
+                           label='buy ▼', edgecolors='white', linewidths=0.8)
+            if not sells.empty:
+                ax.scatter(pd.DatetimeIndex(sells["entry"]), _y_at(sells["entry"]),
                            marker='^', color='#C0392B', s=180, zorder=6,
-                           label='pay ▲', edgecolors='white', linewidths=0.8)
+                           label='sell ▲', edgecolors='white', linewidths=0.8)
 
             # exit circles
             ax.scatter(pd.DatetimeIndex(sub_t["exit"]), _y_at(sub_t["exit"]),
@@ -554,7 +601,7 @@ def _best_signal_drill(
             # entry→exit dotted connector per trade
             for _, t in sub_t.iterrows():
                 if t["entry"] in y_10.index and t["exit"] in y_10.index:
-                    c = '#27AE60' if t["dir"] == "RCV" else '#C0392B'
+                    c = '#27AE60' if t["side"] == "BUY" else '#C0392B'
                     ax.plot([t["entry"], t["exit"]],
                             [y_10.loc[t["entry"]], y_10.loc[t["exit"]]],
                             color=c, linewidth=1.0, linestyle=':', alpha=0.5, zorder=4)
@@ -577,7 +624,7 @@ def _best_signal_drill(
         if all_t.empty:
             return
 
-        cum = all_t.set_index("exit")["pnl"].cumsum()
+        cum = all_t.set_index("exit")["pnl_bps"].cumsum()
         ax.step(cum.index, cum.values, where='post', color='#2980B9',
                 linewidth=2.0, label='cum PnL', zorder=3)
         ax.axhline(0, color='#666', linestyle='-', linewidth=0.8)
@@ -589,8 +636,8 @@ def _best_signal_drill(
         vis_t = all_t[(all_t["exit"] >= start) & (all_t["exit"] <= end)]
         if not vis_t.empty:
             ax2 = ax.twinx()
-            bc  = ['#27AE60' if v >= 0 else '#C0392B' for v in vis_t["pnl"]]
-            ax2.bar(pd.DatetimeIndex(vis_t["exit"]), vis_t["pnl"].values,
+            bc  = ['#27AE60' if v >= 0 else '#C0392B' for v in vis_t["pnl_bps"]]
+            ax2.bar(pd.DatetimeIndex(vis_t["exit"]), vis_t["pnl_bps"].values,
                     color=bc, width=3, alpha=0.4, zorder=2, label='trade PnL')
             ax2.axhline(0, color='#666', linestyle='-', linewidth=0.5, alpha=0.5)
             ax2.grid(False)
@@ -613,10 +660,15 @@ def _best_signal_drill(
 
     # trade table
     if not trades.empty:
-        display(trades)
-        viz.table(trades, title=f"trade log  ·  {sfx}")
+        metrics = engine_metrics_frame(bt_result)
+        display(metrics.round(3))
+        viz.table(metrics.round(3), title=f"engine backtest metrics  ·  {sfx}")
+        display_trades = trades.drop(columns=["direction"], errors="ignore").copy()
+        display_trades["pnl_bps"] = display_trades["pnl_bps"].round(1)
+        display(display_trades)
+        viz.table(display_trades, title=f"trade log  ·  {sfx}")
 
-    return trades
+    return bt_result
 
 
 # ─── main ──────────────────────────────────────────────────────────────────
@@ -650,14 +702,14 @@ def main() -> dict:
             title="10y single-factor rolling regression residual OU table",
         )
 
-    bt = backtest_ou_signals(ten_single_models)
+    bt = ou_signal_forward_diagnostics(ten_single_models)
     if not ten_single.empty and not bt.empty:
         anchor_order = ten_single["anchor"].tolist()
         bt = bt.set_index("anchor").reindex(anchor_order).reset_index()
         display(bt.round(3))
         viz.table(
             bt.round(3),
-            title="10y single-factor OU signal backtest  (IC + hit rate + sharpe)",
+            title="10y single-factor OU signal diagnostics  (IC + hit rate + sharpe)",
         )
 
     # Filtered sharpe: best OOS feature filter per anchor across all horizons.
@@ -668,8 +720,9 @@ def main() -> dict:
         viz.table(filt.round(3), title="best OOS-filtered sharpe per anchor")
 
     # Deep-dive charts for the best filtered signal.
+    best_bt = None
     if not filt.empty:
-        _best_signal_drill(filt.iloc[0], ten_single_models, df, viz)
+        best_bt = _best_signal_drill(filt.iloc[0], ten_single_models, df, viz)
 
     return {
         "df":                df,
@@ -677,6 +730,7 @@ def main() -> dict:
         "ten_single_models": ten_single_models,
         "bt":                bt,
         "filt":              filt,
+        "best_bt":           best_bt,
     }
 
 
