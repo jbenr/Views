@@ -99,6 +99,9 @@ class Engine:
         ts_arrays: dict[str, Optional[np.ndarray]] = {}  # dynamic time stops
         sz_arrays: dict[str, Optional[np.ndarray]] = {}  # dynamic position sizes
 
+        # Extra columns passed through from compute_fn (beyond signal/action/time_stop/size)
+        extras_arrays: dict[str, dict[str, np.ndarray]] = {}
+
         for pipeline in self.pipelines:
             name = pipeline.name
             sf = signal_frames[name]
@@ -107,6 +110,12 @@ class Engine:
             lvl_arrays[name] = composite_levels[name].to_numpy()
             ts_arrays[name] = sf["time_stop"].to_numpy() if "time_stop" in sf.columns else None
             sz_arrays[name] = sf["size"].to_numpy() if "size" in sf.columns else None
+            reserved = {"signal", "action", "time_stop", "size"}
+            extras_arrays[name] = {
+                c: sf[c].to_numpy()
+                for c in sf.columns
+                if c not in reserved
+            }
 
         # 4. State machine — position management
         all_closed: list[ClosedPosition] = []
@@ -164,6 +173,17 @@ class Engine:
                     if effective_ts and pos.bars_held >= effective_ts:
                         exit_reason = "time_stop"
 
+                    # Custom exit function — fires after time_stop, before trailing_stop
+                    if exit_reason is None and config.exit_fn is not None:
+                        bar_data = {"signal": signal_val, "level": level}
+                        bar_data.update({
+                            c: float(arr[i])
+                            for c, arr in extras_arrays[name].items()
+                        })
+                        fn_reason = config.exit_fn(pos, bar_data)
+                        if fn_reason:
+                            exit_reason = fn_reason
+
                     # Trailing stop
                     if (
                         config.trailing_stop_bps
@@ -209,6 +229,12 @@ class Engine:
                     elif action == "enter_short":
                         direction = -1
 
+                    if direction is not None and config.entry_filter_fn is not None:
+                        filter_bar = {"signal": signal_val, "level": level}
+                        filter_bar.update({c: float(arr[i]) for c, arr in extras_arrays[name].items()})
+                        if not config.entry_filter_fn(direction, filter_bar):
+                            direction = None
+
                     if direction is not None:
                         leg_sizes = {}
                         if self.config.dv01_map:
@@ -230,6 +256,11 @@ class Engine:
                             if not np.isnan(raw_sz) and raw_sz > 0:
                                 entry_size = float(raw_sz)
 
+                        entry_extras = {
+                            c: float(arr[i])
+                            for c, arr in extras_arrays[name].items()
+                        }
+
                         pos = Position(
                             trade_def=pipeline.trade_def,
                             entry_date=date,
@@ -239,6 +270,7 @@ class Engine:
                             entry_signal=float(signal_val),
                             leg_sizes=leg_sizes,
                             dynamic_time_stop=dyn_ts,
+                            entry_extras=entry_extras,
                         )
                         active[name].append(pos)
 

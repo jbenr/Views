@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Callable
 import polars as pl
 
-from .trades import TradeDef
+from .trades import TradeDef, Position
 
 
 @dataclass
@@ -37,6 +37,19 @@ class SignalConfig:
     stop_loss_bps: Optional[float] = None
     time_stop_bars: Optional[int] = None
     trailing_stop_bps: Optional[float] = None
+
+    # Custom exit function — called each bar for every open position.
+    # Signature: (pos: Position, bar: dict) -> Optional[str]
+    # Return a reason string to exit, None to stay in.
+    # Runs after time_stop; trailing_stop still overrides it.
+    # bar contains: "signal", "level", plus any extras the compute_fn passed through.
+    exit_fn: Optional[Callable] = None
+
+    # Entry gate — called before opening each new position.
+    # Signature: (direction: int, bar: dict) -> bool
+    # Return False to block the entry. direction is +1 or -1.
+    # bar contains: "signal", "level", plus any extras from compute_fn.
+    entry_filter_fn: Optional[Callable] = None
 
     # Position limits per signal
     max_positions: int = 1
@@ -120,3 +133,41 @@ class SignalPipeline:
             actions = actions.with_columns(col_series.alias(col_name))
 
         return actions
+
+
+# ── standard exit recipes ────────────────────────────────────────────────────
+
+def profit_target(pct: float = 0.5) -> Callable:
+    """Exit when signal has reverted `pct` of its entry value back toward zero.
+
+    Works on any z-score signal. For an entry at z=1.5 with pct=0.5,
+    exits when z drops to 0.75.
+    """
+    def fn(pos: Position, bar: dict) -> Optional[str]:
+        target = pos.entry_signal * (1.0 - pct)
+        if pos.direction == 1 and bar["signal"] >= target:
+            return "profit_target"
+        if pos.direction == -1 and bar["signal"] <= target:
+            return "profit_target"
+    return fn
+
+
+def half_drift_residual() -> Callable:
+    """Exit when the residual has reverted halfway from entry level to the OU mean.
+
+    Requires compute_fn to pass 'resid' and 'ou_mean' as extra columns so
+    they are captured in pos.entry_extras at entry and available in bar at exit.
+
+    Grounded in OU theory: at t = half-life, E[resid] = mu + (entry_resid - mu)/2.
+    """
+    def fn(pos: Position, bar: dict) -> Optional[str]:
+        if "resid" not in bar or "resid" not in pos.entry_extras:
+            return None
+        mu          = pos.entry_extras.get("ou_mean", 0.0)
+        entry_resid = pos.entry_extras["resid"]
+        target      = mu + (entry_resid - mu) * 0.5
+        if pos.direction == -1 and bar["resid"] <= target:
+            return "half_drift"
+        if pos.direction == 1 and bar["resid"] >= target:
+            return "half_drift"
+    return fn

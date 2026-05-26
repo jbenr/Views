@@ -12,6 +12,7 @@ import sys
 import warnings
 from pathlib import Path
 
+import matplotlib.transforms as mtransforms
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -27,18 +28,25 @@ for _p in [_HERE, *_HERE.parents]:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from stats import roll_lr, half_life, ou_params, roll_half_life, roll_ou_zscore
-from backtest import BacktestConfig, Engine, SignalConfig, SignalPipeline, TradeDef
+from backtest import (
+    BacktestConfig,
+    Engine,
+    SignalConfig,
+    SignalPipeline,
+    TradeDef,
+    half_drift_residual,
+)
 from backtest.metrics import trade_log as engine_trade_log
-from utils.rates import linear_5y5y_forward
-from utils.viz import Viz
+from stats import half_life, ou_params, roll_half_life, roll_lr, roll_ou_zscore
 from strats.duration.signal_context import (
     build_signal_features,
     conditional_ic_table,
+    filtered_sharpe_summary,
     oos_edge_summary,
     oos_edge_test_fast,
-    filtered_sharpe_summary,
 )
+from utils.rates import linear_5y5y_forward
+from utils.viz import Viz
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 pd.set_option("display.max_colwidth", None)
@@ -48,31 +56,44 @@ pd.set_option("display.width", 200)
 # ─── config ────────────────────────────────────────────────────────────────
 
 DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets")
-START  = "2000-01-01"
+START = "2000-01-01"
 
 TICKERS = {
-    "2y":     "USGG2YR Index",
-    "5y":     "USGG5YR Index",
-    "10y":    "USGG10YR Index",
-    "30y":    "USGG30YR Index",
-    "be5":    "USGGBE05 Index",
-    "be10":   "USGGBE10 Index",
-    "spx":    "SPX Index",
-    "oil":    "CO1 Comdty",
-    "dxy":    "DXY Curncy",
-    "move":   "MOVE Index",
+    "2y": "USGG2YR Index",
+    "5y": "USGG5YR Index",
+    "10y": "USGG10YR Index",
+    "30y": "USGG30YR Index",
+    "be5": "USGGBE05 Index",
+    "be10": "USGGBE10 Index",
+    "spx": "SPX Index",
+    "oil": "CO1 Comdty",
+    "dxy": "DXY Curncy",
+    "move": "MOVE Index",
     "mtg_cc": "MTGEFNCL Index",
     # components for 5y5y forwards
-    "zc5":    "USSWIT5 Curncy",
-    "zc10":   "USSWIT10 Curncy",
-    "sofr5":  "USOSFR5 Curncy",
+    "zc5": "USSWIT5 Curncy",
+    "zc10": "USSWIT10 Curncy",
+    "sofr5": "USOSFR5 Curncy",
     "sofr10": "USOSFR10 Curncy",
 }
 
-BPS_COLS = ("2y", "5y", "10y", "30y", "be5", "be10", "mtg_cc", "zc5", "zc10", "sofr5", "sofr10")
+BPS_COLS = (
+    "2y",
+    "5y",
+    "10y",
+    "30y",
+    "be5",
+    "be10",
+    "mtg_cc",
+    "zc5",
+    "zc10",
+    "sofr5",
+    "sofr10",
+)
 
 
 # ─── data ──────────────────────────────────────────────────────────────────
+
 
 def _query_to_pl(sql: str) -> pl.DataFrame:
     with psycopg.connect(DB_DSN) as conn:
@@ -94,10 +115,12 @@ def load_basket(tickers: dict[str, str] = TICKERS, start: str = START) -> pd.Dat
         WHERE ticker IN ({tlist}) AND ts >= '{start}'
         ORDER BY ts
     """)
-    wide = (raw.to_pandas()
-               .pivot(index="ts", columns="ticker", values="px")
-               .sort_index()
-               .rename(columns={v: k for k, v in tickers.items()}))
+    wide = (
+        raw.to_pandas()
+        .pivot(index="ts", columns="ticker", values="px")
+        .sort_index()
+        .rename(columns={v: k for k, v in tickers.items()})
+    )
     for c in BPS_COLS:
         if c in wide:
             wide[c] = wide[c] * 100.0
@@ -114,6 +137,7 @@ def load_basket(tickers: dict[str, str] = TICKERS, start: str = START) -> pd.Dat
 
 # ─── residual diagnostics ──────────────────────────────────────────────────
 
+
 def residual_fingerprint(resid: pd.Series) -> dict:
     """Compact stats describing what a residual looks like."""
     r = resid.dropna()
@@ -125,14 +149,14 @@ def residual_fingerprint(resid: pd.Series) -> dict:
     except Exception:
         adf_p = np.nan
     return {
-        "n":         len(r),
-        "std":       float(r.std()),
-        "kurt":      float(r.kurt()),
-        "skew":      float(r.skew()),
-        "acf_lag1":  float(ac[1]),
-        "acf_lag5":  float(ac[5]),
+        "n": len(r),
+        "std": float(r.std()),
+        "kurt": float(r.kurt()),
+        "skew": float(r.skew()),
+        "acf_lag1": float(ac[1]),
+        "acf_lag5": float(ac[5]),
         "half_life": float(half_life(r)),
-        "adf_p":     adf_p,
+        "adf_p": adf_p,
     }
 
 
@@ -164,16 +188,25 @@ def drill(
     res.index = pair.index
 
     if viz is not None:
-        viz.line(pair.rename(columns={"x": x_name, "y": y_name}),
-                 title=f"{y_name}  vs  {x_name}", yaxis_title="level")
-        viz.line(res[["beta", "r2"]], left=["r2"],
-                 title=f"rolling β and R²  (lookback={lookback})",
-                 yaxis_title="β", yaxis_right_title="R²")
-        viz.line(res[["resid"]].rename(columns={"resid": f"resid({y_name} | {x_name})"}),
-                 title=f"residual:  {y_name} − ({lookback}d β·{x_name} + α)",
-                 yaxis_title="resid",
-                 residual=True,
-                 hlines=[(0, None, "solid")])
+        viz.line(
+            pair.rename(columns={"x": x_name, "y": y_name}),
+            title=f"{y_name}  vs  {x_name}",
+            yaxis_title="level",
+        )
+        viz.line(
+            res[["beta", "r2"]],
+            left=["r2"],
+            title=f"rolling β and R²  (lookback={lookback})",
+            yaxis_title="β",
+            yaxis_right_title="R²",
+        )
+        viz.line(
+            res[["resid"]].rename(columns={"resid": f"resid({y_name} | {x_name})"}),
+            title=f"residual:  {y_name} − ({lookback}d β·{x_name} + α)",
+            yaxis_title="resid",
+            residual=True,
+            hlines=[(0, None, "solid")],
+        )
 
     _print_fingerprint(f"{y_name} | {x_name}", residual_fingerprint(res["resid"]))
     return res
@@ -183,20 +216,26 @@ def corr_scan(resid: pd.Series, candidates: pd.DataFrame) -> pd.DataFrame:
     """Corr of resid against each candidate column (level and change). Sorted by |corr_level|."""
     rows = []
     for col in candidates.columns:
-        joint = pd.concat([resid.rename("r"), candidates[col].rename("z")], axis=1).dropna()
+        joint = pd.concat(
+            [resid.rename("r"), candidates[col].rename("z")], axis=1
+        ).dropna()
         if len(joint) < 100:
             continue
-        rows.append({
-            "candidate":   col,
-            "corr_level":  joint["r"].corr(joint["z"]),
-            "corr_change": joint["r"].diff().corr(joint["z"].diff()),
-            "n":           len(joint),
-        })
-    return (pd.DataFrame(rows)
-              .assign(abs_corr=lambda d: d["corr_level"].abs())
-              .sort_values("abs_corr", ascending=False)
-              .drop(columns="abs_corr")
-              .reset_index(drop=True))
+        rows.append(
+            {
+                "candidate": col,
+                "corr_level": joint["r"].corr(joint["z"]),
+                "corr_change": joint["r"].diff().corr(joint["z"].diff()),
+                "n": len(joint),
+            }
+        )
+    return (
+        pd.DataFrame(rows)
+        .assign(abs_corr=lambda d: d["corr_level"].abs())
+        .sort_values("abs_corr", ascending=False)
+        .drop(columns="abs_corr")
+        .reset_index(drop=True)
+    )
 
 
 def predict_scan(
@@ -212,17 +251,21 @@ def predict_scan(
             joint = pd.concat([resid.rename("r"), fwd.rename("f")], axis=1).dropna()
             if len(joint) < 100:
                 continue
-            rows.append({
-                "target":  col,
-                "horizon": h,
-                "ic":      joint["r"].corr(joint["f"], method="spearman"),
-                "n":       len(joint),
-            })
-    return (pd.DataFrame(rows)
-              .assign(abs_ic=lambda d: d["ic"].abs())
-              .sort_values("abs_ic", ascending=False)
-              .drop(columns="abs_ic")
-              .reset_index(drop=True))
+            rows.append(
+                {
+                    "target": col,
+                    "horizon": h,
+                    "ic": joint["r"].corr(joint["f"], method="spearman"),
+                    "n": len(joint),
+                }
+            )
+    return (
+        pd.DataFrame(rows)
+        .assign(abs_ic=lambda d: d["ic"].abs())
+        .sort_values("abs_ic", ascending=False)
+        .drop(columns="abs_ic")
+        .reset_index(drop=True)
+    )
 
 
 def peel(
@@ -293,32 +336,38 @@ def single_factor_10y_table(
         last = valid.iloc[-1]
         ou = _latest_ou_metrics(out["resid"], lookback=ou_lookback)
         ou_mean = ou["ou_mean_resid"]
-        rows.append({
-            "anchor": anchor,
-            "date": valid.index[-1],
-            "actual_10y": float(last["y"]),
-            "model_10y": float(last["yhat"]),
-            "residual": float(last["resid"]),
-            "ou_mean_resid": ou_mean,
-            "ou_fair_10y": float(last["yhat"] + ou_mean) if np.isfinite(ou_mean) else np.nan,
-            "ou_zscore": ou["ou_zscore"],
-            "half_life_d": ou["half_life_d"],
-            "beta": float(last["beta"]),
-            "r2": float(last["r2"]),
-            "ou_window_n": ou["ou_window_n"],
-        })
+        rows.append(
+            {
+                "anchor": anchor,
+                "date": valid.index[-1],
+                "actual_10y": float(last["y"]),
+                "model_10y": float(last["yhat"]),
+                "residual": float(last["resid"]),
+                "ou_mean_resid": ou_mean,
+                "ou_fair_10y": float(last["yhat"] + ou_mean)
+                if np.isfinite(ou_mean)
+                else np.nan,
+                "ou_zscore": ou["ou_zscore"],
+                "half_life_d": ou["half_life_d"],
+                "beta": float(last["beta"]),
+                "r2": float(last["r2"]),
+                "ou_window_n": ou["ou_window_n"],
+            }
+        )
 
     table = pd.DataFrame(rows)
     if not table.empty:
-        table = (table
-                 .assign(abs_ou_zscore=lambda d: d["ou_zscore"].abs())
-                 .sort_values("abs_ou_zscore", ascending=False)
-                 .drop(columns="abs_ou_zscore")
-                 .reset_index(drop=True))
+        table = (
+            table.assign(abs_ou_zscore=lambda d: d["ou_zscore"].abs())
+            .sort_values("abs_ou_zscore", ascending=False)
+            .drop(columns="abs_ou_zscore")
+            .reset_index(drop=True)
+        )
     return table, models
 
 
 # ─── backtest ──────────────────────────────────────────────────────────────
+
 
 def _profit_factor(pnl: pd.Series) -> float:
     """Gross profit divided by gross loss; zeros do not affect either side."""
@@ -350,7 +399,11 @@ def ou_signal_forward_diagnostics(
         j1 = j1[j1["s"] != 0]
         if len(j1) >= 30:
             pnl = np.sign(j1["s"]) * (-j1["f"])
-            row["sharpe_1d"] = float(pnl.mean() / pnl.std() * np.sqrt(252)) if pnl.std() > 0 else np.nan
+            row["sharpe_1d"] = (
+                float(pnl.mean() / pnl.std() * np.sqrt(252))
+                if pnl.std() > 0
+                else np.nan
+            )
             row["pf_1d"] = _profit_factor(pnl)
         else:
             row["sharpe_1d"] = np.nan
@@ -369,26 +422,47 @@ def ou_signal_forward_diagnostics(
             pnl = np.sign(jh["s"]) * (-jh["f"])
             row[f"ic_{h}d"] = float(jh["s"].corr(-jh["f"], method="spearman"))
             row[f"hit_{h}d"] = float((np.sign(jh["s"]) == np.sign(-jh["f"])).mean())
-            row[f"sharpe_{h}d"] = float(pnl.mean() / pnl.std() * np.sqrt(252.0 / h)) if pnl.std() > 0 else np.nan
+            row[f"sharpe_{h}d"] = (
+                float(pnl.mean() / pnl.std() * np.sqrt(252.0 / h))
+                if pnl.std() > 0
+                else np.nan
+            )
             row[f"pf_{h}d"] = _profit_factor(pnl)
 
         rows.append(row)
 
-    col_order = ["anchor", "ic_5d", "ic_20d", "ic_60d", "hit_5d", "hit_20d", "hit_60d",
-                 "sharpe_1d", "sharpe_5d", "sharpe_20d", "sharpe_60d",
-                 "pf_1d", "pf_5d", "pf_20d", "pf_60d"]
+    col_order = [
+        "anchor",
+        "ic_5d",
+        "ic_20d",
+        "ic_60d",
+        "hit_5d",
+        "hit_20d",
+        "hit_60d",
+        "sharpe_1d",
+        "sharpe_5d",
+        "sharpe_20d",
+        "sharpe_60d",
+        "pf_1d",
+        "pf_5d",
+        "pf_20d",
+        "pf_60d",
+    ]
     bt = pd.DataFrame(rows)
     return bt[[c for c in col_order if c in bt.columns]]
 
 
 # ─── engine backtest + deep-dive charts ─────────────────────────────────
 
+
 def _engine_data(model: pd.DataFrame) -> pl.DataFrame:
     """Build the minimal wide frame expected by the shared backtest engine."""
-    return pl.DataFrame({
-        "ts": pd.to_datetime(model.index).date,
-        "10y": model["y"].astype(float).to_numpy(),
-    })
+    return pl.DataFrame(
+        {
+            "ts": pd.to_datetime(model.index).date,
+            "10y": model["y"].astype(float).to_numpy(),
+        }
+    )
 
 
 def _gated_entry_signal(
@@ -424,20 +498,38 @@ def run_engine_backtest(
     filter_mask: pd.Series,
     *,
     entry_z: float = 1.0,
+    ou_lookback: int = 252,
+    mom_ser: pd.Series | None = None,
+    entry_filter_fn=None,
 ) -> tuple:
     """Run the OU signal through the shared backtest engine.
 
     Internal engine convention: direction -1 profits when 10y yield falls.
     Display convention: direction -1 is BUY rates; direction +1 is SELL rates.
+
+    mom_ser: optional momentum series aligned to model.index; included as
+             "mom" extra column so entry_filter_fn can gate on direction.
+    entry_filter_fn: optional callable (direction, bar) -> bool passed to
+                     SignalConfig to gate entries. See SignalConfig docs.
     """
     signal = _gated_entry_signal(model, filter_mask, entry_z=entry_z)
-    time_stop = _dynamic_time_stop(model)
+    time_stop = _dynamic_time_stop(model, lookback=ou_lookback)
+
+    # Rolling OU mean — the equilibrium the residual reverts to.
+    ou_mean = model["resid"].rolling(ou_lookback, min_periods=ou_lookback // 4).mean()
+
+    mom_aligned = mom_ser.reindex(model.index).fillna(0.0) if mom_ser is not None else None
 
     def compute(data: pl.DataFrame) -> pl.DataFrame:
-        return pl.DataFrame({
+        cols = {
             "signal": signal.to_numpy(),
             "time_stop": time_stop.to_numpy(),
-        })
+            "resid": model["resid"].to_numpy(),
+            "ou_mean": ou_mean.to_numpy(),
+        }
+        if mom_aligned is not None:
+            cols["mom"] = mom_aligned.to_numpy()
+        return pl.DataFrame(cols)
 
     pipeline = SignalPipeline(
         name="10y_ou_filtered",
@@ -446,12 +538,18 @@ def run_engine_backtest(
         config=SignalConfig(
             entry_long=-entry_z,
             entry_short=entry_z,
-            exit_long=0.0,
-            exit_short=0.0,
+            exit_long=None,  # signal exits disabled — half_drift_residual owns this
+            exit_short=None,
+            exit_fn=half_drift_residual(),
+            entry_filter_fn=entry_filter_fn,
             max_positions=1,
         ),
     )
-    result = Engine(BacktestConfig(max_total_positions=1)).add_signal(pipeline).run(_engine_data(model))
+    result = (
+        Engine(BacktestConfig(max_total_positions=1))
+        .add_signal(pipeline)
+        .run(_engine_data(model))
+    )
     return result, signal, time_stop
 
 
@@ -459,8 +557,16 @@ def engine_metrics_frame(result) -> pd.DataFrame:
     """Compact display table from shared backtest metrics."""
     metrics = result.summary()
     keep = [
-        "total_pnl_bps", "n_trades", "hit_rate", "avg_win_bps", "avg_loss_bps",
-        "profit_factor", "sharpe", "max_drawdown_bps", "calmar", "avg_holding_days",
+        "total_pnl_bps",
+        "n_trades",
+        "hit_rate",
+        "avg_win_bps",
+        "avg_loss_bps",
+        "profit_factor",
+        "sharpe",
+        "max_drawdown_bps",
+        "calmar",
+        "avg_holding_days",
     ]
     return pd.DataFrame([{k: metrics.get(k, np.nan) for k in keep}])
 
@@ -470,12 +576,14 @@ def engine_trades_frame(result) -> pd.DataFrame:
     trades = engine_trade_log(result.closed_trades).to_pandas()
     if trades.empty:
         return trades
-    trades = trades.rename(columns={
-        "entry_date": "entry",
-        "exit_date": "exit",
-        "entry_level": "entry_10y",
-        "exit_level": "exit_10y",
-    })
+    trades = trades.rename(
+        columns={
+            "entry_date": "entry",
+            "exit_date": "exit",
+            "entry_level": "entry_10y",
+            "exit_level": "exit_10y",
+        }
+    )
     trades["entry"] = pd.to_datetime(trades["entry"])
     trades["exit"] = pd.to_datetime(trades["exit"])
     trades.insert(3, "side", np.where(trades["direction"] == "short", "BUY", "SELL"))
@@ -490,91 +598,127 @@ def _best_signal_drill(
     *,
     train_window: int = 504,
     entry_z: float = 1.0,
+    ou_lookback: int = 252,
+    directional_mom_filter: bool = True,
 ) -> pd.DataFrame:
     """Three deep-dive charts + trade table for the best filtered signal."""
-    anchor   = best_row["anchor"]
-    h        = int(best_row["horizon"])
+    anchor = best_row["anchor"]
+    h = int(best_row["horizon"])
     feat_col = best_row["best_feature"]
 
-    model  = models[anchor]
-    feats  = build_signal_features(model)
-    result = oos_edge_test_fast(feats, df["10y"], feat_col, horizon=h, train_window=train_window)
+    model = models[anchor]
+    feats = build_signal_features(model)
+    result = oos_edge_test_fast(
+        feats, df["10y"], feat_col, horizon=h, train_window=train_window
+    )
 
-    mask       = result["filter_mask"]
-    bt_result, _, _ = run_engine_backtest(model, mask, entry_z=entry_z)
-    trades     = engine_trades_frame(bt_result)
-    ou_z       = model["ou_zscore"].copy()
-    y_10       = model["y"].copy()
-    feat_ser   = feats[feat_col].reindex(model.index)
+    mask = result["filter_mask"]
+    feat_ser = feats[feat_col].reindex(model.index)
+
+    # Directional gate: BUYs (direction=-1) need positive momentum (rates falling),
+    # SELLs (direction=+1) need negative momentum (rates rising).
+    dir_filter = None
+    if directional_mom_filter:
+        dir_filter = lambda d, bar: (d == -1 and bar["mom"] > 0) or (d == 1 and bar["mom"] < 0)
+
+    bt_result, _, time_stop_ser = run_engine_backtest(
+        model, mask,
+        entry_z=entry_z,
+        ou_lookback=ou_lookback,
+        mom_ser=feat_ser,
+        entry_filter_fn=dir_filter,
+    )
+    trades = engine_trades_frame(bt_result)
+    ou_z = model["ou_zscore"].copy()
+    y_10 = model["y"].copy()
     ou_z.index = pd.to_datetime(ou_z.index)
     y_10.index = pd.to_datetime(y_10.index)
     feat_ser.index = pd.to_datetime(feat_ser.index)
     mask.index = pd.to_datetime(mask.index)
-    sfx        = f"10y | {anchor}  ·  filter: {feat_col}  ·  h={h}d"
+    sfx = f"10y | {anchor}  ·  filter: {feat_col}  ·  h={h}d"
 
-    # ── Chart 1: signal conditions ──────────────────────────────────────────
-    # OU z-score (right) + filter feature (left) + shading where both fire.
-    def _render_conditions(fig, ax, start, end):
+    # ── Chart 1: signal conditions — two stacked panels, shared x-axis ────────
+    # Top: OU z-score + entry markers.  Bottom: momentum filter feature.
+    def _render_conditions(fig, axes, start, end):
+        ax_z, ax_f = axes
+
         sub_z = ou_z.loc[start:end]
         sub_f = feat_ser.loc[start:end]
         sub_m = mask.reindex(sub_z.index, fill_value=False)
 
+        # ── top: OU z-score ────────────────────────────────────────────────
         yz = max(float(sub_z.abs().max(skipna=True)) * 1.2, entry_z * 2.5)
         buy_on = (sub_m & (sub_z >= entry_z)).values.astype(bool)
         sell_on = (sub_m & (sub_z <= -entry_z)).values.astype(bool)
 
-        ax.fill_between(sub_z.index, -yz, yz, where=buy_on,
-                        color='#27AE60', alpha=0.13, zorder=1, label='_nolegend_')
-        ax.fill_between(sub_z.index, -yz, yz, where=sell_on,
-                        color='#C0392B', alpha=0.13, zorder=1, label='_nolegend_')
+        ax_z.fill_between(sub_z.index, -yz, yz, where=buy_on,
+                          color="#27AE60", alpha=0.13, zorder=1, label="_nolegend_")
+        ax_z.fill_between(sub_z.index, -yz, yz, where=sell_on,
+                          color="#C0392B", alpha=0.13, zorder=1, label="_nolegend_")
+        ax_z.plot(sub_z.index, sub_z.values, color="#2980B9", linewidth=1.5,
+                  label="OU z-score", zorder=3)
+        ax_z.axhline(entry_z, color="#27AE60", linestyle="--", linewidth=0.9, alpha=0.8,
+                     label=f"+{entry_z:.1f} entry")
+        ax_z.axhline(-entry_z, color="#C0392B", linestyle="--", linewidth=0.9, alpha=0.8,
+                     label=f"−{entry_z:.1f} entry")
+        ax_z.axhline(0, color="#666", linestyle="-", linewidth=0.8)
+        ax_z.set_ylim(-yz, yz)
 
-        ax.plot(sub_z.index, sub_z.values, color='#2980B9', linewidth=1.5,
-                label='OU z-score', zorder=3)
-        ax.axhline( entry_z, color='#27AE60', linestyle='--', linewidth=0.9, alpha=0.8)
-        ax.axhline(-entry_z, color='#C0392B', linestyle='--', linewidth=0.9, alpha=0.8)
-        ax.axhline(0, color='#666', linestyle='-', linewidth=0.8)
-        ax.set_ylim(-yz, yz)
-
-        # entry dots on z-score line
         if not trades.empty:
             sub_t = trades[(trades["entry"] >= start) & (trades["entry"] <= end)]
             for _, t in sub_t.iterrows():
                 d = t["entry"]
                 if d in sub_z.index:
                     zv = sub_z.loc[d]
-                    c  = '#27AE60' if t["side"] == "BUY" else '#C0392B'
-                    mk = 'v'       if t["side"] == "BUY" else '^'
-                    ax.scatter([d], [zv], marker=mk, color=c, s=90, zorder=6,
-                               edgecolors='white', linewidths=0.5)
+                    c = "#27AE60" if t["side"] == "BUY" else "#C0392B"
+                    mk = "v" if t["side"] == "BUY" else "^"
+                    tip_off = np.sqrt(90) / 2 / 72
+                    dy = tip_off if mk == "v" else -tip_off
+                    t_mk = ax_z.transData + mtransforms.ScaledTranslation(0, dy, fig.dpi_scale_trans)
+                    ax_z.scatter([d], [zv], marker=mk, color=c, s=90, zorder=6,
+                                 edgecolors="white", linewidths=0.5, transform=t_mk)
 
-        # filter feature on left axis
-        ax2 = ax.twinx()
-        ax2.plot(sub_f.index, sub_f.values, color='#F39C12', linewidth=1.2,
-                 linestyle='--', alpha=0.85, label=feat_col, zorder=2)
-        ax2.axhline(0, color='#F39C12', linestyle=':', linewidth=0.6, alpha=0.5)
-        ax2.grid(False)
-        ax2.yaxis.tick_left()
-        ax2.yaxis.set_label_position('left')
-        ax2.set_ylabel(feat_col.upper(), fontsize=8, color='#F39C12')
-        for sp in ('top', 'right', 'bottom'):
-            ax2.spines[sp].set_visible(False)
-        ax2.tick_params(axis='y', labelsize=8, colors='#F39C12')
+        viz._style_ax(ax_z, yaxis_title="z-score")
+        viz._legend(ax_z)
 
-        viz._style_ax(ax, yaxis_title='z-score')
-        viz._format_dates(ax, start, end)
-        viz._legend(ax)
+        # ── bottom: momentum filter feature ───────────────────────────────
+        fyz = max(float(sub_f.abs().max(skipna=True)) * 1.2, 0.5)
+        pos_mom = (sub_f > 0).values
+        neg_mom = (sub_f < 0).values
+        ax_f.fill_between(sub_f.index, -fyz, fyz, where=pos_mom,
+                          color="#27AE60", alpha=0.10, zorder=1, label="_nolegend_")
+        ax_f.fill_between(sub_f.index, -fyz, fyz, where=neg_mom,
+                          color="#C0392B", alpha=0.10, zorder=1, label="_nolegend_")
+        ax_f.plot(sub_f.index, sub_f.values, color="#F39C12", linewidth=1.2,
+                  label=feat_col, zorder=3)
+        ax_f.axhline(0, color="#666", linestyle="-", linewidth=0.8)
+        ax_f.set_ylim(-fyz, fyz)
+
+        viz._style_ax(ax_f, yaxis_title=feat_col.upper())
+        viz._format_dates(ax_f, start, end)
+        viz._legend(ax_f)
+
+        fig.subplots_adjust(hspace=0.08)
 
     viz._make_time_nav(
         pd.DataFrame(index=ou_z.dropna().index),
         _render_conditions,
         title=f"signal conditions  ·  {sfx}",
+        nrows=2,
+        height_ratios=[3, 2],
     )
 
     # ── Chart 2: 10y yield with entry / exit markers ────────────────────────
     def _render_yield(fig, ax, start, end):
         sub_y = y_10.loc[start:end].dropna()
-        ax.plot(sub_y.index, sub_y.values, color='#2C3E50', linewidth=1.5,
-                label='10y', zorder=3)
+        ax.plot(
+            sub_y.index,
+            sub_y.values,
+            color="#2C3E50",
+            linewidth=1.5,
+            label="10y",
+            zorder=3,
+        )
 
         if not trades.empty:
             sub_t = trades[(trades["entry"] >= start) & (trades["entry"] <= end)]
@@ -584,29 +728,66 @@ def _best_signal_drill(
 
             buys = sub_t[sub_t["side"] == "BUY"]
             sells = sub_t[sub_t["side"] == "SELL"]
+            tip_offset = np.sqrt(180) / 2 / 72  # inches: half marker height in points
             if not buys.empty:
-                ax.scatter(pd.DatetimeIndex(buys["entry"]), _y_at(buys["entry"]),
-                           marker='v', color='#27AE60', s=180, zorder=6,
-                           label='buy ▼', edgecolors='white', linewidths=0.8)
+                # 'v' tip points down — shift center up so tip lands on data
+                t_buy = ax.transData + mtransforms.ScaledTranslation(0, tip_offset, ax.figure.dpi_scale_trans)
+                ax.scatter(
+                    pd.DatetimeIndex(buys["entry"]),
+                    _y_at(buys["entry"]),
+                    marker="v",
+                    color="#27AE60",
+                    s=180,
+                    zorder=6,
+                    label="buy ▼",
+                    edgecolors="white",
+                    linewidths=0.8,
+                    transform=t_buy,
+                )
             if not sells.empty:
-                ax.scatter(pd.DatetimeIndex(sells["entry"]), _y_at(sells["entry"]),
-                           marker='^', color='#C0392B', s=180, zorder=6,
-                           label='sell ▲', edgecolors='white', linewidths=0.8)
+                # '^' tip points up — shift center down so tip lands on data
+                t_sell = ax.transData + mtransforms.ScaledTranslation(0, -tip_offset, ax.figure.dpi_scale_trans)
+                ax.scatter(
+                    pd.DatetimeIndex(sells["entry"]),
+                    _y_at(sells["entry"]),
+                    marker="^",
+                    color="#C0392B",
+                    s=180,
+                    zorder=6,
+                    label="sell ▲",
+                    edgecolors="white",
+                    linewidths=0.8,
+                    transform=t_sell,
+                )
 
             # exit circles
-            ax.scatter(pd.DatetimeIndex(sub_t["exit"]), _y_at(sub_t["exit"]),
-                       marker='o', color='#7F8C8D', s=60, zorder=5,
-                       label='exit', edgecolors='white', linewidths=0.8)
+            ax.scatter(
+                pd.DatetimeIndex(sub_t["exit"]),
+                _y_at(sub_t["exit"]),
+                marker="o",
+                color="#7F8C8D",
+                s=60,
+                zorder=5,
+                label="exit",
+                edgecolors="white",
+                linewidths=0.8,
+            )
 
             # entry→exit dotted connector per trade
             for _, t in sub_t.iterrows():
                 if t["entry"] in y_10.index and t["exit"] in y_10.index:
-                    c = '#27AE60' if t["side"] == "BUY" else '#C0392B'
-                    ax.plot([t["entry"], t["exit"]],
-                            [y_10.loc[t["entry"]], y_10.loc[t["exit"]]],
-                            color=c, linewidth=1.0, linestyle=':', alpha=0.5, zorder=4)
+                    c = "#27AE60" if t["side"] == "BUY" else "#C0392B"
+                    ax.plot(
+                        [t["entry"], t["exit"]],
+                        [y_10.loc[t["entry"]], y_10.loc[t["exit"]]],
+                        color=c,
+                        linewidth=1.0,
+                        linestyle=":",
+                        alpha=0.5,
+                        zorder=4,
+                    )
 
-        viz._style_ax(ax, yaxis_title='yield, bps')
+        viz._style_ax(ax, yaxis_title="yield, bps")
         viz._format_dates(ax, start, end)
         viz._legend(ax)
 
@@ -625,30 +806,58 @@ def _best_signal_drill(
             return
 
         cum = all_t.set_index("exit")["pnl_bps"].cumsum()
-        ax.step(cum.index, cum.values, where='post', color='#2980B9',
-                linewidth=2.0, label='cum PnL', zorder=3)
-        ax.axhline(0, color='#666', linestyle='-', linewidth=0.8)
-        ax.fill_between(cum.index, 0, cum.values,
-                        where=(cum.values >= 0), color='#27AE60', alpha=0.12, step='post')
-        ax.fill_between(cum.index, 0, cum.values,
-                        where=(cum.values < 0),  color='#C0392B', alpha=0.12, step='post')
+        ax.step(
+            cum.index,
+            cum.values,
+            where="post",
+            color="#2980B9",
+            linewidth=2.0,
+            label="cum PnL",
+            zorder=3,
+        )
+        ax.axhline(0, color="#666", linestyle="-", linewidth=0.8)
+        ax.fill_between(
+            cum.index,
+            0,
+            cum.values,
+            where=(cum.values >= 0),
+            color="#27AE60",
+            alpha=0.12,
+            step="post",
+        )
+        ax.fill_between(
+            cum.index,
+            0,
+            cum.values,
+            where=(cum.values < 0),
+            color="#C0392B",
+            alpha=0.12,
+            step="post",
+        )
 
         vis_t = all_t[(all_t["exit"] >= start) & (all_t["exit"] <= end)]
         if not vis_t.empty:
             ax2 = ax.twinx()
-            bc  = ['#27AE60' if v >= 0 else '#C0392B' for v in vis_t["pnl_bps"]]
-            ax2.bar(pd.DatetimeIndex(vis_t["exit"]), vis_t["pnl_bps"].values,
-                    color=bc, width=3, alpha=0.4, zorder=2, label='trade PnL')
-            ax2.axhline(0, color='#666', linestyle='-', linewidth=0.5, alpha=0.5)
+            bc = ["#27AE60" if v >= 0 else "#C0392B" for v in vis_t["pnl_bps"]]
+            ax2.bar(
+                pd.DatetimeIndex(vis_t["exit"]),
+                vis_t["pnl_bps"].values,
+                color=bc,
+                width=3,
+                alpha=0.4,
+                zorder=2,
+                label="trade PnL",
+            )
+            ax2.axhline(0, color="#666", linestyle="-", linewidth=0.5, alpha=0.5)
             ax2.grid(False)
             ax2.yaxis.tick_left()
-            ax2.yaxis.set_label_position('left')
-            ax2.set_ylabel('TRADE PNL, BPS', fontsize=8)
-            for sp in ('top', 'right', 'bottom'):
+            ax2.yaxis.set_label_position("left")
+            ax2.set_ylabel("TRADE PNL, BPS", fontsize=8)
+            for sp in ("top", "right", "bottom"):
                 ax2.spines[sp].set_visible(False)
-            ax2.tick_params(axis='y', labelsize=8)
+            ax2.tick_params(axis="y", labelsize=8)
 
-        viz._style_ax(ax, yaxis_title='cum pnl, bps')
+        viz._style_ax(ax, yaxis_title="cum pnl, bps")
         viz._format_dates(ax, start, end)
         viz._legend(ax)
 
@@ -663,8 +872,20 @@ def _best_signal_drill(
         metrics = engine_metrics_frame(bt_result)
         display(metrics.round(3))
         viz.table(metrics.round(3), title=f"engine backtest metrics  ·  {sfx}")
-        display_trades = trades.drop(columns=["direction"], errors="ignore").copy()
+        ts = time_stop_ser.copy()
+        ts.index = pd.to_datetime(ts.index)
+        display_trades = (
+            trades.drop(columns=["direction", "pnl_dollar"], errors="ignore")
+            .rename(columns={"entry_signal": "entry_z", "exit_signal": "exit_z"})
+            .copy()
+        )
         display_trades["pnl_bps"] = display_trades["pnl_bps"].round(1)
+        display_trades["entry_z"] = display_trades["entry_z"].round(3)
+        display_trades["exit_z"] = display_trades["exit_z"].round(3)
+        display_trades["time_stop_bars"] = (
+            pd.to_datetime(display_trades["entry"]).map(ts).round().astype("Int64")
+        )
+        display_trades = display_trades.sort_values("exit", ascending=False)
         display(display_trades)
         viz.table(display_trades, title=f"trade log  ·  {sfx}")
 
@@ -673,25 +894,42 @@ def _best_signal_drill(
 
 # ─── main ──────────────────────────────────────────────────────────────────
 
+
 def main() -> dict:
-    viz = Viz(backend='plotly')
+    viz = Viz(backend="plotly")
 
     df = load_basket()
     print(f"basket: {len(df)} obs · {df.index.min().date()} → {df.index.max().date()}")
     print(f"        cols: {list(df.columns)}")
 
+    # ── parameters ────────────────────────────────────────────────────────────
+    reg_lookback = 60    # rolling OLS window for single-factor models
+    ou_lookback  = 252   # OU estimation window (mean, half-life, time stop)
+    entry_z      = 1.0   # |ou_zscore| threshold to enter a trade
+    # Exit: residual reverts halfway to OU mean (half_drift_residual),
+    #       OR ou_lookback-derived half-life bars elapse — whichever first.
+    directional_mom_filter = True  # BUYs need positive momentum, SELLs need negative
+
     # Single-factor 10y models: each candidate gets its own rolling regression.
     ten_single, ten_single_models = single_factor_10y_table(
         df,
         target="10y",
-        lookback=60,
-        ou_lookback=252,
+        lookback=reg_lookback,
+        ou_lookback=ou_lookback,
     )
     print("\n--- 10y single-factor rolling regression residual OU table ---")
     display_cols = [
-        "anchor", "date", "actual_10y", "model_10y", "residual",
-        "ou_mean_resid", "ou_fair_10y", "ou_zscore", "half_life_d",
-        "beta", "r2",
+        "anchor",
+        "date",
+        "actual_10y",
+        "model_10y",
+        "residual",
+        "ou_mean_resid",
+        "ou_fair_10y",
+        "ou_zscore",
+        "half_life_d",
+        "beta",
+        "r2",
     ]
     if ten_single.empty:
         print("No single-factor models had enough overlapping data.")
@@ -722,15 +960,23 @@ def main() -> dict:
     # Deep-dive charts for the best filtered signal.
     best_bt = None
     if not filt.empty:
-        best_bt = _best_signal_drill(filt.iloc[0], ten_single_models, df, viz)
+        best_bt = _best_signal_drill(
+            filt.iloc[0],
+            ten_single_models,
+            df,
+            viz,
+            entry_z=entry_z,
+            ou_lookback=ou_lookback,
+            directional_mom_filter=directional_mom_filter,
+        )
 
     return {
-        "df":                df,
-        "ten_single":        ten_single,
+        "df": df,
+        "ten_single": ten_single,
         "ten_single_models": ten_single_models,
-        "bt":                bt,
-        "filt":              filt,
-        "best_bt":           best_bt,
+        "bt": bt,
+        "filt": filt,
+        "best_bt": best_bt,
     }
 
 

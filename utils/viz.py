@@ -351,15 +351,28 @@ class Viz:
         except Exception:
             return False
 
-    def _make_time_nav(self, df, render_fn, title=None):
-        """Date pickers + range buttons wired to render_fn(fig, ax, start, end).
+    def _make_time_nav(self, df, render_fn, title=None, nrows=1, height_ratios=None):
+        """Date pickers + range buttons wired to render_fn(fig, ax_or_axes, start, end).
+
+        When nrows=1 (default): render_fn receives a single Axes as second arg.
+        When nrows>1: render_fn receives a numpy array of Axes (sharex=True).
         Falls back to plt.show() outside notebooks.
         """
+        kw = dict(sharex=(nrows > 1), gridspec_kw={'height_ratios': height_ratios} if height_ratios else {})
+
+        def _make_fig():
+            h = 5 if nrows == 1 else 4 * nrows
+            _fig, _axes = plt.subplots(nrows, 1, figsize=(12, h), **kw)
+            _fig.patch.set_facecolor('white')
+            if nrows == 1:
+                return _fig, _axes, [_axes]   # (fig, axes_arg, original_list)
+            return _fig, _axes, list(_axes)
+
         def _static_show():
-            fig, ax = plt.subplots(figsize=(12, 5))
-            render_fn(fig, ax, df.index.min(), df.index.max())
+            _fig, axes_arg, _ = _make_fig()
+            render_fn(_fig, axes_arg, df.index.min(), df.index.max())
             plt.show()
-            return fig
+            return _fig
 
         if not self._in_notebook():
             return _static_show()
@@ -384,8 +397,7 @@ class Viz:
             btn_widgets.append(b)
         btn_widgets[-1].button_style = 'warning'  # ALL starts active
 
-        fig, ax = plt.subplots(figsize=(12, 5))
-        fig.patch.set_facecolor('white')
+        fig, axes_arg, original_axes = _make_fig()
         plt.close(fig)
 
         chart_widget = widgets.Output()
@@ -399,10 +411,11 @@ class Viz:
 
         def update_range(start, end):
             _refresh_title()
-            ax.clear()
-            for extra in fig.axes[1:]:
+            for extra in [a for a in fig.axes if a not in original_axes]:
                 extra.remove()
-            render_fn(fig, ax, start, end)
+            for a in original_axes:
+                a.clear()
+            render_fn(fig, axes_arg, start, end)
             with chart_widget:
                 clear_output(wait=True)
                 display(fig)
@@ -1213,7 +1226,7 @@ class _PlotlyChartRegistry:
         self._charts = []
         self._version = 0
 
-    def add(self, *, title, png_b64, df, render_fn, viz_ref, static=False, html_block=None):
+    def add(self, *, title, png_b64, df, render_fn, viz_ref, static=False, html_block=None, nrows=1, height_ratios=None):
         with self._lock:
             self._charts.append({
                 "id": uuid.uuid4().hex,
@@ -1224,6 +1237,8 @@ class _PlotlyChartRegistry:
                 "viz_ref": viz_ref,
                 "static": static,
                 "html_block": html_block,
+                "nrows": nrows,
+                "height_ratios": height_ratios,
             })
             self._version += 1
 
@@ -1379,6 +1394,7 @@ def _build_dash_app():
         start, end = _range_window(chart["df"], label)
         png = chart["viz_ref"]._render_png(
             chart["df"], chart["render_fn"], start, end, title=chart["title"],
+            nrows=chart.get("nrows", 1), height_ratios=chart.get("height_ratios"),
         )
         styles = [
             (_btn_active_style if d["label"] == label else _btn_base_style)
@@ -1445,19 +1461,22 @@ class PlotlyViz(Viz):
             _REGISTRY.clear()
         _ensure_server()
 
-    def _render_png(self, df, render_fn, start, end, title=None):
+    def _render_png(self, df, render_fn, start, end, title=None, nrows=1, height_ratios=None):
         """Render render_fn into a fresh matplotlib Figure and return base64 PNG.
 
         Title gets baked into the image so right-click-copy includes it. The
         plot area is pushed flush to the figure's left edge so there's no
         internal whitespace between the title and the chart.
         """
-        fig, ax = plt.subplots(figsize=(13, 5.4))
+        h = 5.4 if nrows == 1 else 4.2 * nrows
+        kw = dict(sharex=(nrows > 1), gridspec_kw={'height_ratios': height_ratios} if height_ratios else {})
+        fig, _axes = plt.subplots(nrows, 1, figsize=(13, h), **kw)
+        axes_arg = _axes if nrows > 1 else _axes
         fig.patch.set_facecolor("white")
         # Push plot area to span (almost) the full figure width — y-labels and
         # the endpoint ribbons live in the right margin (~5%).
         fig.subplots_adjust(left=0.02, right=0.95, top=0.91)
-        render_fn(fig, ax, start, end)
+        render_fn(fig, axes_arg, start, end)
         if title:
             fig.suptitle(title.upper(), fontsize=self.TITLE_SIZE,
                           fontweight="bold", color="#333",
@@ -1468,7 +1487,7 @@ class PlotlyViz(Viz):
         plt.close(fig)
         return base64.b64encode(buf.getvalue()).decode("ascii")
 
-    def _make_time_nav(self, df, render_fn, title=None):
+    def _make_time_nav(self, df, render_fn, title=None, nrows=1, height_ratios=None):
         """Render the matplotlib figure over the full date range and stash the
         closure so range buttons can re-render server-side later.
 
@@ -1476,8 +1495,8 @@ class PlotlyViz(Viz):
         etc.) flow into the browser instead of triggering plt.show() / Jupyter
         widgets.
         """
-        png = self._render_png(df, render_fn, df.index.min(), df.index.max(), title=title)
-        _REGISTRY.add(title=title, png_b64=png, df=df, render_fn=render_fn, viz_ref=self)
+        png = self._render_png(df, render_fn, df.index.min(), df.index.max(), title=title, nrows=nrows, height_ratios=height_ratios)
+        _REGISTRY.add(title=title, png_b64=png, df=df, render_fn=render_fn, viz_ref=self, nrows=nrows, height_ratios=height_ratios)
         return None
 
     def table(self, df: pd.DataFrame, title: Optional[str] = None, max_rows: int = 20):

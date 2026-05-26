@@ -85,6 +85,9 @@ class Position:
     entry_signal: float = 0.0
     leg_sizes: dict[str, float] = field(default_factory=dict)
 
+    # Arbitrary per-bar data captured at entry (e.g. resid, ou_mean for exit_fn)
+    entry_extras: dict = field(default_factory=dict)
+
     # Mutable tracking state
     peak_pnl: float = 0.0
     bars_held: int = 0
@@ -109,7 +112,7 @@ class ClosedPosition:
     pnl_bps: float
     pnl_dollar: float
     bars_held: int
-    exit_reason: str  # "signal", "stop_loss", "time_stop", "trailing_stop"
+    exit_reason: str  # "signal", "exit_fn", "stop_loss", "time_stop", "trailing_stop"
     entry_signal: float
     exit_signal: float
     leg_sizes: dict[str, float] = field(default_factory=dict)
