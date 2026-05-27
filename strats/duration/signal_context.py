@@ -201,6 +201,9 @@ def oos_edge_test_fast(
     *,
     horizon: int = 20,
     train_window: int = 504,
+    by_direction: bool = False,
+    filter_rule: Optional[str] = None,
+    filter_quantile: float = 0.5,
 ) -> dict:
     """Vectorized OOS filter — no Python loop over windows.
 
@@ -208,6 +211,13 @@ def oos_edge_test_fast(
     Under the same-bar execution convention, a signal from t-horizon first becomes
     eligible for training on t. Takes the signal when the feature is on the
     IC-predicted good side of the rolling median.
+
+    filter_rule controls what "passes" means:
+      - None: learn high/low from rolling IC sign, optionally by signal side
+      - "low": feature is below its rolling quantile, same rule for buys and sells
+      - "high": feature is above its rolling quantile, same rule for buys and sells
+      - "directional": feature sign agrees with z-score sign. Use only for
+        signed features like z-score momentum.
 
     Returns same keys as oos_edge_test: unfiltered, filtered, lift, filter_mask.
     """
@@ -222,17 +232,53 @@ def oos_edge_test_fast(
 
     feat = combined["feat"]
     pnl  = combined["pnl"]
+    side = np.sign(combined["z"])
     min_periods = max(30, train_window // 4)
 
     # A pnl label for signal row k is not known until row k + horizon.
     known_feat = feat.shift(horizon)
     known_pnl = pnl.shift(horizon)
-    rolling_ic = known_feat.rolling(train_window, min_periods=min_periods).corr(known_pnl)
-    rolling_med = known_feat.rolling(train_window, min_periods=min_periods).median()
+    if filter_rule in {"low", "high"}:
+        rolling_ic = known_feat.rolling(train_window, min_periods=min_periods).corr(known_pnl)
+        rolling_med = known_feat.rolling(train_window, min_periods=min_periods).quantile(filter_quantile)
+    elif filter_rule == "directional":
+        rolling_ic = known_feat.rolling(train_window, min_periods=min_periods).corr(known_pnl)
+        rolling_med = known_feat.rolling(train_window, min_periods=min_periods).median()
+    elif by_direction:
+        side_min_periods = max(15, train_window // 8)
+        known_side = side.shift(horizon)
+        rolling_ic_by_side = {}
+        rolling_med_by_side = {}
+        for side_val in (-1.0, 1.0):
+            side_mask = known_side == side_val
+            side_feat = known_feat.where(side_mask)
+            side_pnl = known_pnl.where(side_mask)
+            rolling_ic_by_side[side_val] = side_feat.rolling(
+                train_window,
+                min_periods=side_min_periods,
+            ).corr(side_pnl)
+            rolling_med_by_side[side_val] = side_feat.rolling(
+                train_window,
+                min_periods=side_min_periods,
+            ).median()
+        rolling_ic = rolling_ic_by_side[1.0].where(side > 0, rolling_ic_by_side[-1.0])
+        rolling_med = rolling_med_by_side[1.0].where(side > 0, rolling_med_by_side[-1.0])
+    else:
+        rolling_ic = known_feat.rolling(train_window, min_periods=min_periods).corr(known_pnl)
+        rolling_med = known_feat.rolling(train_window, min_periods=min_periods).median()
 
-    above_med   = feat > rolling_med
-    ic_valid    = rolling_ic.notna()
-    filter_mask = ic_valid & ((rolling_ic > 0) & above_med | (rolling_ic <= 0) & ~above_med)
+    above_med = feat > rolling_med
+    med_valid = rolling_med.notna()
+    ic_valid = rolling_ic.notna()
+    if filter_rule == "low":
+        filter_mask = med_valid & ~above_med
+    elif filter_rule == "high":
+        filter_mask = med_valid & above_med
+    elif filter_rule == "directional":
+        rolling_med = pd.Series(0.0, index=feat.index)
+        filter_mask = feat.notna() & (((side > 0) & (feat > 0)) | ((side < 0) & (feat < 0)))
+    else:
+        filter_mask = ic_valid & ((rolling_ic > 0) & above_med | (rolling_ic <= 0) & ~above_med)
 
     unfiltered = _simple_stats(pnl, horizon)
     filtered   = _simple_stats(pnl[filter_mask], horizon)
@@ -243,6 +289,8 @@ def oos_edge_test_fast(
         "filtered":    filtered,
         "lift":        lift,
         "filter_mask": filter_mask,
+        "rolling_ic":  rolling_ic,
+        "rolling_med": rolling_med,
     }
 
 
@@ -253,6 +301,8 @@ def oos_edge_summary_fast(
     horizon: int = 20,
     train_window: int = 504,
     feature_cols: Optional[list[str]] = None,
+    by_direction: bool = False,
+    filter_cutoffs: Optional[dict[str, tuple[float, ...]]] = None,
 ) -> pd.DataFrame:
     """Run oos_edge_test_fast over all (or selected) feature columns.
 
@@ -261,29 +311,53 @@ def oos_edge_summary_fast(
     """
     if feature_cols is None:
         feature_cols = [c for c in features.columns if c != "ou_zscore"]
+    if filter_cutoffs is None:
+        filter_cutoffs = {
+            "low": (0.25, 0.33, 0.50),
+            "high": (0.50, 0.67, 0.75),
+        }
 
     rows = []
     for col in feature_cols:
-        try:
-            result = oos_edge_test_fast(features, y, col, horizon=horizon, train_window=train_window)
-        except Exception:
-            continue
-        u  = result["unfiltered"]
-        f_ = result["filtered"]
-        n_u = u.get("n", 0)
-        rows.append({
-            "feature":           col,
-            "n_unfiltered":      n_u,
-            "n_filtered":        f_.get("n", np.nan),
-            "pct_kept":          f_.get("n", np.nan) / n_u if n_u else np.nan,
-            "sharpe_unfiltered": u.get("sharpe_ann", np.nan),
-            "sharpe_filtered":   f_.get("sharpe_ann", np.nan),
-            "lift":              result["lift"],
-            "profit_factor_unfiltered": u.get("profit_factor", np.nan),
-            "profit_factor_filtered":   f_.get("profit_factor", np.nan),
-            "hit_unfiltered":    u.get("hit_rate", np.nan),
-            "hit_filtered":      f_.get("hit_rate", np.nan),
-        })
+        specs = [("directional", 0.5)] if col.startswith("zscore_mom_") else [
+            (rule, q)
+            for rule in ("low", "high")
+            for q in filter_cutoffs.get(rule, ())
+        ]
+        for rule, q in specs:
+            try:
+                result = oos_edge_test_fast(
+                    features,
+                    y,
+                    col,
+                    horizon=horizon,
+                    train_window=train_window,
+                    by_direction=by_direction,
+                    filter_rule=rule,
+                    filter_quantile=q,
+                )
+            except Exception:
+                continue
+            u  = result["unfiltered"]
+            f_ = result["filtered"]
+            n_u = u.get("n", 0)
+            suffix = rule if rule == "directional" else f"{rule}_q{int(round(q * 100))}"
+            rows.append({
+                "feature":           f"{col}_{suffix}",
+                "filter_col":        col,
+                "filter_rule":       rule,
+                "filter_quantile":   q,
+                "n_unfiltered":      n_u,
+                "n_filtered":        f_.get("n", np.nan),
+                "pct_kept":          f_.get("n", np.nan) / n_u if n_u else np.nan,
+                "sharpe_unfiltered": u.get("sharpe_ann", np.nan),
+                "sharpe_filtered":   f_.get("sharpe_ann", np.nan),
+                "lift":              result["lift"],
+                "profit_factor_unfiltered": u.get("profit_factor", np.nan),
+                "profit_factor_filtered":   f_.get("profit_factor", np.nan),
+                "hit_unfiltered":    u.get("hit_rate", np.nan),
+                "hit_filtered":      f_.get("hit_rate", np.nan),
+            })
 
     if not rows:
         return pd.DataFrame()
@@ -410,6 +484,8 @@ def filtered_sharpe_summary(
     *,
     horizons: tuple[int, ...] = (5, 20, 60),
     train_window: int = 504,
+    by_direction: bool = False,
+    filter_cutoffs: Optional[dict[str, tuple[float, ...]]] = None,
 ) -> pd.DataFrame:
     """Best OOS-filtered sharpe per anchor across all features and horizons.
 
@@ -425,7 +501,14 @@ def filtered_sharpe_summary(
 
         best: dict | None = None
         for h in horizons:
-            summary = oos_edge_summary_fast(feats, y, horizon=h, train_window=train_window)
+            summary = oos_edge_summary_fast(
+                feats,
+                y,
+                horizon=h,
+                train_window=train_window,
+                by_direction=by_direction,
+                filter_cutoffs=filter_cutoffs,
+            )
             if summary.empty:
                 continue
             top = summary.iloc[0]  # sorted by lift desc — take the best filter
@@ -437,6 +520,9 @@ def filtered_sharpe_summary(
                     "anchor":                     anchor,
                     "horizon":                    h,
                     "best_feature":               top["feature"],
+                    "filter_col":                 top.get("filter_col", top["feature"]),
+                    "filter_rule":                top.get("filter_rule", "learned"),
+                    "filter_quantile":            top.get("filter_quantile", np.nan),
                     "sharpe_unfiltered":          top["sharpe_unfiltered"],
                     "sharpe_filtered":            sharpe_f,
                     "lift":                       top["lift"],

@@ -152,22 +152,22 @@ def profit_target(pct: float = 0.5) -> Callable:
     return fn
 
 
-def half_drift_residual() -> Callable:
-    """Exit when the residual has reverted halfway from entry level to the OU mean.
+def half_drift_residual(frac: float = 0.5) -> Callable:
+    """Exit when residual has reverted `frac` of the way from entry to OU mean.
 
     Requires compute_fn to pass 'resid' and 'ou_mean' as extra columns so
     they are captured in pos.entry_extras at entry and available in bar at exit.
 
-    Grounded in OU theory: at t = half-life, E[resid] = mu + (entry_resid - mu)/2.
+    frac=0.5 is the half-drift target. Lower values take profit earlier.
     """
     def fn(pos: Position, bar: dict) -> Optional[str]:
         if "resid" not in bar or "resid" not in pos.entry_extras:
             return None
         mu          = pos.entry_extras.get("ou_mean", 0.0)
         entry_resid = pos.entry_extras["resid"]
-        target      = mu + (entry_resid - mu) * 0.5
+        target      = mu + (entry_resid - mu) * (1.0 - frac)
         if pos.direction == -1 and bar["resid"] <= target:
-            return "half_drift"
+            return f"resid_target_{frac:.2f}"
         if pos.direction == 1 and bar["resid"] >= target:
-            return "half_drift"
+            return f"resid_target_{frac:.2f}"
     return fn

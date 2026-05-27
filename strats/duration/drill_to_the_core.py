@@ -366,6 +366,25 @@ def single_factor_10y_table(
     return table, models
 
 
+def single_factor_model(
+    df: pd.DataFrame,
+    *,
+    anchor: str,
+    target: str = "10y",
+    lookback: int = 60,
+    ou_lookback: int = 252,
+) -> pd.DataFrame:
+    """Build one rolling 10y residual model for parameter sweeps."""
+    pair = df[[anchor, target]].dropna()
+    if len(pair) < lookback:
+        return pd.DataFrame()
+
+    out = roll_lr(pair[anchor], pair[target], lookback=lookback).to_pandas()
+    out.index = pair.index
+    out["ou_zscore"] = roll_ou_zscore(out["resid"], lookback=ou_lookback).to_numpy()
+    return out
+
+
 # ─── backtest ──────────────────────────────────────────────────────────────
 
 
@@ -499,6 +518,7 @@ def run_engine_backtest(
     *,
     entry_z: float = 1.0,
     ou_lookback: int = 252,
+    residual_target_frac: float = 0.5,
     mom_ser: pd.Series | None = None,
     entry_filter_fn=None,
 ) -> tuple:
@@ -540,7 +560,7 @@ def run_engine_backtest(
             entry_short=entry_z,
             exit_long=None,  # signal exits disabled — half_drift_residual owns this
             exit_short=None,
-            exit_fn=half_drift_residual(),
+            exit_fn=half_drift_residual(residual_target_frac),
             entry_filter_fn=entry_filter_fn,
             max_positions=1,
         ),
@@ -590,6 +610,137 @@ def engine_trades_frame(result) -> pd.DataFrame:
     return trades
 
 
+def select_filtered_candidate(
+    filt: pd.DataFrame,
+    *,
+    anchor: str | None = None,
+    horizon: int | None = None,
+    filter_col: str | None = None,
+    filter_rule: str | None = None,
+    filter_quantile: float | None = None,
+) -> pd.Series | None:
+    """Pick a row from the filtered summary, defaulting to the top-ranked row."""
+    if filt.empty:
+        return None
+
+    candidates = filt.copy()
+    if anchor is not None:
+        candidates = candidates[candidates["anchor"] == anchor]
+    if horizon is not None:
+        candidates = candidates[candidates["horizon"] == horizon]
+    if filter_col is not None:
+        if "filter_col" in candidates.columns:
+            candidates = candidates[candidates["filter_col"] == filter_col]
+        else:
+            candidates = candidates[candidates["best_feature"].str.startswith(filter_col)]
+    if filter_rule is not None and "filter_rule" in candidates.columns:
+        candidates = candidates[candidates["filter_rule"] == filter_rule]
+    if filter_quantile is not None and "filter_quantile" in candidates.columns:
+        candidates = candidates[np.isclose(candidates["filter_quantile"], filter_quantile)]
+
+    if candidates.empty:
+        return None
+    return candidates.sort_values("sharpe_filtered", ascending=False).iloc[0]
+
+
+def parameter_robustness(
+    df: pd.DataFrame,
+    *,
+    anchor: str,
+    filter_col: str,
+    horizon: int,
+    filter_cutoffs: dict[str, tuple[float, ...]] | None = None,
+    reg_lookbacks: tuple[int, ...] = (40, 60, 90, 126),
+    ou_lookbacks: tuple[int, ...] = (126, 252, 504),
+    entry_zs: tuple[float, ...] = (1.5, 2.0, 2.5),
+    residual_target_fracs: tuple[float, ...] = (0.25, 0.5, 0.75),
+    train_window: int = 504,
+) -> pd.DataFrame:
+    """Small engine-scored robustness grid for one pre-selected signal idea."""
+    if filter_cutoffs is None:
+        filter_cutoffs = {
+            "low": (0.25, 0.33, 0.50),
+            "high": (0.50, 0.67, 0.75),
+        }
+    rows = []
+    for reg_lb in reg_lookbacks:
+        for ou_lb in ou_lookbacks:
+            model = single_factor_model(
+                df,
+                anchor=anchor,
+                lookback=reg_lb,
+                ou_lookback=ou_lb,
+            )
+            if model.empty:
+                continue
+
+            feats = build_signal_features(model)
+            if feats.empty or filter_col not in feats.columns:
+                continue
+
+            filter_specs = [
+                (rule, q)
+                for rule in ("low", "high")
+                for q in filter_cutoffs.get(rule, ())
+            ]
+            for rule, q in filter_specs:
+                result = oos_edge_test_fast(
+                    feats,
+                    df["10y"],
+                    filter_col,
+                    horizon=horizon,
+                    train_window=train_window,
+                    filter_rule=rule,
+                    filter_quantile=q,
+                )
+                mask = result["filter_mask"]
+                fwd = result["filtered"]
+                for entry_z in entry_zs:
+                    for target_frac in residual_target_fracs:
+                        bt_result, _, _ = run_engine_backtest(
+                            model,
+                            mask,
+                            entry_z=entry_z,
+                            ou_lookback=ou_lb,
+                            residual_target_frac=target_frac,
+                        )
+                        metrics = bt_result.summary()
+                        rows.append(
+                            {
+                                "anchor": anchor,
+                                "horizon": horizon,
+                                "filter_col": filter_col,
+                                "filter_rule": rule,
+                                "filter_quantile": q,
+                                "reg_lookback": reg_lb,
+                                "ou_lookback": ou_lb,
+                                "entry_z": entry_z,
+                                "residual_target_frac": target_frac,
+                                "n_trades": metrics.get("n_trades", 0),
+                                "total_pnl_bps": metrics.get("total_pnl_bps", np.nan),
+                                "sharpe": metrics.get("sharpe", np.nan),
+                                "profit_factor": metrics.get("profit_factor", np.nan),
+                                "hit_rate": metrics.get("hit_rate", np.nan),
+                                "max_drawdown_bps": metrics.get("max_drawdown_bps", np.nan),
+                                "avg_holding_days": metrics.get("avg_holding_days", np.nan),
+                                "fwd_sharpe_filtered": fwd.get("sharpe_ann", np.nan),
+                                "pct_kept": (
+                                    fwd.get("n", np.nan) / result["unfiltered"].get("n", np.nan)
+                                    if result["unfiltered"].get("n", 0)
+                                    else np.nan
+                                ),
+                            }
+                        )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return (
+        out.sort_values(["sharpe", "profit_factor", "n_trades"], ascending=False)
+        .reset_index(drop=True)
+    )
+
+
 def _best_signal_drill(
     best_row: pd.Series,
     models: dict[str, pd.DataFrame],
@@ -599,34 +750,43 @@ def _best_signal_drill(
     train_window: int = 504,
     entry_z: float = 1.0,
     ou_lookback: int = 252,
+    residual_target_frac: float = 0.5,
     directional_mom_filter: bool = True,
 ) -> pd.DataFrame:
     """Three deep-dive charts + trade table for the best filtered signal."""
     anchor = best_row["anchor"]
     h = int(best_row["horizon"])
-    feat_col = best_row["best_feature"]
+    filter_name = best_row["best_feature"]
+    feat_col = best_row.get("filter_col", filter_name)
+    filter_rule = best_row.get("filter_rule", "learned")
+    filter_quantile = float(best_row.get("filter_quantile", 0.5) or 0.5)
+    if not np.isfinite(filter_quantile):
+        filter_quantile = 0.5
 
     model = models[anchor]
     feats = build_signal_features(model)
     result = oos_edge_test_fast(
-        feats, df["10y"], feat_col, horizon=h, train_window=train_window
+        feats,
+        df["10y"],
+        feat_col,
+        horizon=h,
+        train_window=train_window,
+        by_direction=directional_mom_filter,
+        filter_rule=filter_rule,
+        filter_quantile=float(filter_quantile),
     )
 
     mask = result["filter_mask"]
+    filter_med = result["rolling_med"].reindex(model.index)
     feat_ser = feats[feat_col].reindex(model.index)
-
-    # Directional gate: BUYs (direction=-1) need positive momentum (rates falling),
-    # SELLs (direction=+1) need negative momentum (rates rising).
-    dir_filter = None
-    if directional_mom_filter:
-        dir_filter = lambda d, bar: (d == -1 and bar["mom"] > 0) or (d == 1 and bar["mom"] < 0)
 
     bt_result, _, time_stop_ser = run_engine_backtest(
         model, mask,
         entry_z=entry_z,
         ou_lookback=ou_lookback,
+        residual_target_frac=residual_target_frac,
         mom_ser=feat_ser,
-        entry_filter_fn=dir_filter,
+        entry_filter_fn=None,
     )
     trades = engine_trades_frame(bt_result)
     ou_z = model["ou_zscore"].copy()
@@ -634,16 +794,18 @@ def _best_signal_drill(
     ou_z.index = pd.to_datetime(ou_z.index)
     y_10.index = pd.to_datetime(y_10.index)
     feat_ser.index = pd.to_datetime(feat_ser.index)
+    filter_med.index = pd.to_datetime(filter_med.index)
     mask.index = pd.to_datetime(mask.index)
-    sfx = f"10y | {anchor}  ·  filter: {feat_col}  ·  h={h}d"
+    sfx = f"10y | {anchor}  ·  filter: {filter_name}  ·  h={h}d"
 
     # ── Chart 1: signal conditions — two stacked panels, shared x-axis ────────
-    # Top: OU z-score + entry markers.  Bottom: momentum filter feature.
+    # Top: OU z-score + entry markers.  Bottom: selected filter feature.
     def _render_conditions(fig, axes, start, end):
         ax_z, ax_f = axes
 
         sub_z = ou_z.loc[start:end]
         sub_f = feat_ser.loc[start:end]
+        sub_med = filter_med.loc[start:end]
         sub_m = mask.reindex(sub_z.index, fill_value=False)
 
         # ── top: OU z-score ────────────────────────────────────────────────
@@ -652,9 +814,9 @@ def _best_signal_drill(
         sell_on = (sub_m & (sub_z <= -entry_z)).values.astype(bool)
 
         ax_z.fill_between(sub_z.index, -yz, yz, where=buy_on,
-                          color="#27AE60", alpha=0.13, zorder=1, label="_nolegend_")
+                          color="#27AE60", alpha=0.13, zorder=1, label="BUY entry allowed")
         ax_z.fill_between(sub_z.index, -yz, yz, where=sell_on,
-                          color="#C0392B", alpha=0.13, zorder=1, label="_nolegend_")
+                          color="#C0392B", alpha=0.13, zorder=1, label="SELL entry allowed")
         ax_z.plot(sub_z.index, sub_z.values, color="#2980B9", linewidth=1.5,
                   label="OU z-score", zorder=3)
         ax_z.axhline(entry_z, color="#27AE60", linestyle="--", linewidth=0.9, alpha=0.8,
@@ -679,20 +841,39 @@ def _best_signal_drill(
                                  edgecolors="white", linewidths=0.5, transform=t_mk)
 
         viz._style_ax(ax_z, yaxis_title="z-score")
-        viz._legend(ax_z)
+        ax_z.legend(
+            loc="upper left",
+            bbox_to_anchor=(0.01, 0.99),
+            ncol=3,
+            fontsize=8,
+            frameon=False,
+        )
 
-        # ── bottom: momentum filter feature ───────────────────────────────
-        fyz = max(float(sub_f.abs().max(skipna=True)) * 1.2, 0.5)
-        pos_mom = (sub_f > 0).values
-        neg_mom = (sub_f < 0).values
-        ax_f.fill_between(sub_f.index, -fyz, fyz, where=pos_mom,
-                          color="#27AE60", alpha=0.10, zorder=1, label="_nolegend_")
-        ax_f.fill_between(sub_f.index, -fyz, fyz, where=neg_mom,
-                          color="#C0392B", alpha=0.10, zorder=1, label="_nolegend_")
+        # ── bottom: selected filter feature ───────────────────────────────
+        finite_f = pd.concat([sub_f, sub_med], axis=1).stack().dropna()
+        if finite_f.empty:
+            ylo, yhi = -1.0, 1.0
+        else:
+            fmin = min(float(finite_f.min()), 0.0)
+            fmax = max(float(finite_f.max()), 0.0)
+            pad = (fmax - fmin) * 0.15
+            if pad == 0:
+                pad = max(abs(fmax) * 0.15, 0.01)
+            ylo, yhi = fmin - pad, fmax + pad
+        pass_mask = sub_m.reindex(sub_f.index, fill_value=False).values.astype(bool)
+        ax_f.fill_between(sub_f.index, ylo, yhi, where=pass_mask,
+                          color="#2ECC71", alpha=0.10, zorder=1, label="filter pass")
         ax_f.plot(sub_f.index, sub_f.values, color="#F39C12", linewidth=1.2,
                   label=feat_col, zorder=3)
+        med_label = (
+            "zero line"
+            if filter_rule == "directional"
+            else f"rolling q{int(round(float(filter_quantile) * 100))}"
+        )
+        ax_f.plot(sub_med.index, sub_med.values, color="#555", linewidth=0.9,
+                  linestyle="--", label=med_label, zorder=3)
         ax_f.axhline(0, color="#666", linestyle="-", linewidth=0.8)
-        ax_f.set_ylim(-fyz, fyz)
+        ax_f.set_ylim(ylo, yhi)
 
         viz._style_ax(ax_f, yaxis_title=feat_col.upper())
         viz._format_dates(ax_f, start, end)
@@ -801,11 +982,22 @@ def _best_signal_drill(
     def _render_pnl(fig, ax, start, end):
         if trades.empty:
             return
-        all_t = trades[trades["exit"] <= end].copy()
-        if all_t.empty:
-            return
+        all_t = trades.sort_values("exit").copy()
+        all_t["cum_pnl_bps"] = all_t["pnl_bps"].cumsum()
 
-        cum = all_t.set_index("exit")["pnl_bps"].cumsum()
+        prior = all_t[all_t["exit"] < start]
+        baseline = float(prior["cum_pnl_bps"].iloc[-1]) if not prior.empty else 0.0
+        window_t = all_t[(all_t["exit"] >= start) & (all_t["exit"] <= end)].copy()
+        cum = pd.concat(
+            [
+                pd.Series([baseline], index=pd.DatetimeIndex([start])),
+                window_t.set_index("exit")["cum_pnl_bps"],
+                pd.Series(
+                    [float(window_t["cum_pnl_bps"].iloc[-1]) if not window_t.empty else baseline],
+                    index=pd.DatetimeIndex([end]),
+                ),
+            ]
+        )
         ax.step(
             cum.index,
             cum.values,
@@ -835,7 +1027,7 @@ def _best_signal_drill(
             step="post",
         )
 
-        vis_t = all_t[(all_t["exit"] >= start) & (all_t["exit"] <= end)]
+        vis_t = window_t
         if not vis_t.empty:
             ax2 = ax.twinx()
             bc = ["#27AE60" if v >= 0 else "#C0392B" for v in vis_t["pnl_bps"]]
@@ -859,6 +1051,7 @@ def _best_signal_drill(
 
         viz._style_ax(ax, yaxis_title="cum pnl, bps")
         viz._format_dates(ax, start, end)
+        ax.set_xlim(start, end)
         viz._legend(ax)
 
     viz._make_time_nav(
@@ -874,17 +1067,66 @@ def _best_signal_drill(
         viz.table(metrics.round(3), title=f"engine backtest metrics  ·  {sfx}")
         ts = time_stop_ser.copy()
         ts.index = pd.to_datetime(ts.index)
+        resid_ser = model["resid"].copy()
+        resid_ser.index = pd.to_datetime(resid_ser.index)
+        ou_mean_ser = model["resid"].rolling(
+            ou_lookback,
+            min_periods=ou_lookback // 4,
+        ).mean()
+        ou_mean_ser.index = pd.to_datetime(ou_mean_ser.index)
         display_trades = (
             trades.drop(columns=["direction", "pnl_dollar"], errors="ignore")
             .rename(columns={"entry_signal": "entry_z", "exit_signal": "exit_z"})
             .copy()
         )
+        entry_dates = pd.to_datetime(display_trades["entry"])
+        exit_dates = pd.to_datetime(display_trades["exit"])
+        display_trades["entry_resid_bps"] = entry_dates.map(resid_ser)
+        display_trades["exit_resid_bps"] = exit_dates.map(resid_ser)
+        display_trades["entry_ou_mean_bps"] = entry_dates.map(ou_mean_ser)
+        display_trades["target_resid_bps"] = (
+            display_trades["entry_ou_mean_bps"]
+            + (display_trades["entry_resid_bps"] - display_trades["entry_ou_mean_bps"])
+            * (1.0 - residual_target_frac)
+        )
+        display_trades["target_move_bps"] = (
+            display_trades["target_resid_bps"] - display_trades["entry_resid_bps"]
+        )
+        display_trades["half_life_days"] = entry_dates.map(ts).round().astype("Int64")
         display_trades["pnl_bps"] = display_trades["pnl_bps"].round(1)
         display_trades["entry_z"] = display_trades["entry_z"].round(3)
         display_trades["exit_z"] = display_trades["exit_z"].round(3)
-        display_trades["time_stop_bars"] = (
-            pd.to_datetime(display_trades["entry"]).map(ts).round().astype("Int64")
-        )
+        residual_cols = [
+            "entry_resid_bps",
+            "exit_resid_bps",
+            "entry_ou_mean_bps",
+            "target_resid_bps",
+            "target_move_bps",
+        ]
+        display_trades[residual_cols] = display_trades[residual_cols].round(1)
+        preferred_cols = [
+            "trade_name",
+            "entry",
+            "exit",
+            "side",
+            "entry_10y",
+            "exit_10y",
+            "entry_z",
+            "exit_z",
+            "entry_resid_bps",
+            "exit_resid_bps",
+            "entry_ou_mean_bps",
+            "target_resid_bps",
+            "target_move_bps",
+            "half_life_days",
+            "bars_held",
+            "exit_reason",
+            "pnl_bps",
+        ]
+        display_trades = display_trades[
+            [c for c in preferred_cols if c in display_trades.columns]
+            + [c for c in display_trades.columns if c not in preferred_cols]
+        ]
         display_trades = display_trades.sort_values("exit", ascending=False)
         display(display_trades)
         viz.table(display_trades, title=f"trade log  ·  {sfx}")
@@ -905,10 +1147,36 @@ def main() -> dict:
     # ── parameters ────────────────────────────────────────────────────────────
     reg_lookback = 60    # rolling OLS window for single-factor models
     ou_lookback  = 252   # OU estimation window (mean, half-life, time stop)
-    entry_z      = 1.0   # |ou_zscore| threshold to enter a trade
+    entry_z      = 1.5   # |ou_zscore| threshold to enter a trade
     # Exit: residual reverts halfway to OU mean (half_drift_residual),
     #       OR ou_lookback-derived half-life bars elapse — whichever first.
-    directional_mom_filter = True  # BUYs need positive momentum, SELLs need negative
+    directional_mom_filter = True  # z-score momentum filters use sign-aligned regimes
+    drilldown_override = None
+    # drilldown_override = {
+    #     "anchor": "30y",
+    #     "horizon": 20,
+    #     "filter_col": "beta",
+    #     "filter_rule": None,  # None means choose the better beta_low/beta_high row.
+    # }
+    # drilldown_override = {
+    #     "anchor": "sofr10",
+    #     "horizon": 5,
+    #     "filter_col": "zscore_streak",
+    #     "filter_rule": None,
+    # }
+    robustness_config = {
+        "anchor": "30y",
+        "horizon": 20,
+        "filter_col": "beta",
+        "filter_cutoffs": {
+            "low": (0.25, 0.33, 0.50),
+            "high": (0.50, 0.67, 0.75),
+        },
+        "reg_lookbacks": (40, 60, 90, 126),
+        "ou_lookbacks": (126, 252, 504),
+        "entry_zs": (1.5, 2.0, 2.5),
+        "residual_target_fracs": (0.25, 0.50, 0.75),
+    }
 
     # Single-factor 10y models: each candidate gets its own rolling regression.
     ten_single, ten_single_models = single_factor_10y_table(
@@ -952,16 +1220,50 @@ def main() -> dict:
 
     # Filtered sharpe: best OOS feature filter per anchor across all horizons.
     print("\n--- filtered sharpe summary (best feature×horizon per anchor) ---")
-    filt = filtered_sharpe_summary(ten_single_models, df["10y"])
+    filt = filtered_sharpe_summary(
+        ten_single_models,
+        df["10y"],
+        by_direction=directional_mom_filter,
+    )
     if not filt.empty:
         display(filt.round(3))
-        viz.table(filt.round(3), title="best OOS-filtered sharpe per anchor")
+        viz.table(filt.round(3), title="best regime-filtered sharpe per anchor")
 
-    # Deep-dive charts for the best filtered signal.
+    # Robustness grid: hold the idea fixed, then vary only implementation parameters.
+    robust = parameter_robustness(df, **robustness_config)
+    if not robust.empty:
+        robust_display = robust.copy()
+        numeric_cols = robust_display.select_dtypes(include=[np.number]).columns
+        robust_display[numeric_cols] = robust_display[numeric_cols].round(3)
+        display(robust_display)
+        viz.table(
+            robust_display,
+            title=(
+                "engine robustness grid"
+                f"  ·  {robustness_config['anchor']}"
+                f" / {robustness_config['filter_col']}"
+                f" / h={robustness_config['horizon']}d"
+            ),
+            max_rows=80,
+        )
+
+    # Deep-dive charts for the selected filtered signal.
     best_bt = None
     if not filt.empty:
+        if drilldown_override is None:
+            drill_row = filt.iloc[0]
+        else:
+            drill_row = select_filtered_candidate(filt, **drilldown_override)
+            if drill_row is None:
+                print(f"No filtered candidate matched override: {drilldown_override}")
+                drill_row = filt.iloc[0]
+        print(
+            "\n--- engine drilldown candidate ---\n"
+            f"{drill_row['anchor']} · h={int(drill_row['horizon'])}d · "
+            f"{drill_row['best_feature']} · sharpe={drill_row['sharpe_filtered']:.3f}"
+        )
         best_bt = _best_signal_drill(
-            filt.iloc[0],
+            drill_row,
             ten_single_models,
             df,
             viz,
@@ -976,6 +1278,7 @@ def main() -> dict:
         "ten_single_models": ten_single_models,
         "bt": bt,
         "filt": filt,
+        "robust": robust,
         "best_bt": best_bt,
     }
 

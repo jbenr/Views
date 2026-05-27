@@ -1514,11 +1514,12 @@ class PlotlyViz(Viz):
         _th_style = {
             "padding": "5px 10px", "textAlign": "right",
             "borderBottom": "2px solid #bbb", "fontWeight": "bold",
-            "fontSize": "12px", "color": "#333",
+            "fontSize": "12px", "color": "#333", "whiteSpace": "nowrap",
         }
         _td_style = {
             "padding": "4px 10px", "textAlign": "right",
             "borderBottom": "1px solid #e8e8e8", "fontSize": "12px",
+            "whiteSpace": "nowrap",
         }
         header = dhtml.Tr([dhtml.Th(str(col), style=_th_style) for col in show.columns])
         rows = [
@@ -1534,7 +1535,7 @@ class PlotlyViz(Viz):
             ))
         children.append(dhtml.Table(
             [dhtml.Thead(header), dhtml.Tbody(rows)],
-            style={"borderCollapse": "collapse", "width": "100%"},
+            style={"borderCollapse": "collapse", "minWidth": "100%", "width": "max-content"},
         ))
         block = dhtml.Div(children, style={"overflowX": "auto"})
         dummy = pd.DataFrame(index=pd.DatetimeIndex([pd.Timestamp.today().normalize()]))
