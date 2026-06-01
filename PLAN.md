@@ -58,6 +58,35 @@ This system exists to keep the research honest.
 
 ---
 
+## 2.1 Stat-Arb Discovery Engine
+
+The deeper goal is to build a laboratory for discovering conditional relative-value edges.
+
+Given a target market, like 10Y rates, the process should systematically test what explains it, what residuals are left over, what state variables make those residuals more or less tradable, and what trading policy works conditional on those states.
+
+Residual volatility is one example of a useful conditioning variable. But the tool should not assume residual volatility is the answer upfront. It should help discover whether residual volatility, residual momentum, beta, R2, drawdown, z-score streaks, macro volatility, curve slope, cross-asset momentum, liquidity proxies, or something else explains when a residual becomes tradable.
+
+The workflow:
+
+1. Choose a target: 10Y yield, curve slope, breakeven, swap spread, volatility point, or cross-market spread.
+2. Choose an explanatory model: regress the target on candidates such as 30Y, DXY, SOFR forwards, breakevens, oil, MOVE, mortgage convexity, equities, or other macro/rates variables.
+3. Construct the residual: isolate the part of the target not explained by the model.
+4. Generate candidate state variables: residual vol, residual momentum, rolling beta, R2, drawdown, streaks, macro vol, curve shape, cross-asset momentum, liquidity, positioning, or event regimes.
+5. Ask when the residual is predictive, when it is noise, when mean reversion works, when entries should be wider, when exits should be faster, and when the strategy should not trade.
+6. Convert those findings into conditional policies: if regime A, trade with params X; if regime B, trade with params Y; if regime C, stand down or trade differently.
+
+This is stat arb because the process is not: "I have a discretionary view that 10Y should rally."
+
+The process is:
+
+> There is a statistical relationship between 10Y and some explanatory basket. When 10Y deviates from that relationship, the deviation may mean-revert. But the quality of that mean reversion depends on measurable state variables.
+
+The arbitrage is not riskless. The "arb" is the systematic exploitation of relative mispricing versus a statistical fair-value model. The edge comes from identifying the right fair-value model, the right residual, the right conditioning variables, and the right regime-dependent trading rule.
+
+The real objective is not merely to optimize a strategy. It is to discover when a statistical relationship becomes tradable.
+
+---
+
 ## 3. What This Is
 
 Macro Signal Ledger is a framework for live macro signal generation and performance tracking.
@@ -1232,4 +1261,3 @@ Not a spreadsheet.
 Not a story.
 
 A live, timestamped, honest track record.
-

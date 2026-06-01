@@ -1,0 +1,2 @@
+[role='option'][aria-selected='true'] { font-weight: bold !important; }
+.viz-ref-btn:active { transform: translateY(2px); box-shadow: inset 0 2px 4px rgba(0,0,0,0.22); background: #DFAE00 !important; }

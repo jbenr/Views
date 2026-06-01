@@ -315,18 +315,23 @@ class Viz:
     def _format_dates(self, ax, start=None, end=None):
         """Auto-format date axis with tighter label spacing."""
         if start is not None and end is not None:
-            span = (end - start).days
-            if span <= 45:
-                minticks, maxticks = 12, 42   # daily-ish ticks for 1M
-            elif span <= 180:
-                minticks, maxticks = 10, 28
-            else:
-                minticks, maxticks = 14, 30
+            span_days = (end - start).days
+        else:
+            span_days = None
+
+        if span_days is not None and span_days <= 45:
+            minticks, maxticks = 12, 42   # daily-ish ticks for 1M
+        elif span_days is not None and span_days <= 180:
+            minticks, maxticks = 10, 28
         else:
             minticks, maxticks = 14, 30
         locator = mdates.AutoDateLocator(minticks=minticks, maxticks=maxticks)
         ax.xaxis.set_major_locator(locator)
         ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+
+        # Keep date axes clean: the major locator already adapts to the visible
+        # range, while unlabeled minor ticks read as random clutter on long PnL
+        # charts and short drilldown windows.
         ax.xaxis.set_minor_locator(NullLocator())
         ax.xaxis.get_offset_text().set_visible(False)
 
@@ -1226,10 +1231,16 @@ class _PlotlyChartRegistry:
         self._charts = []
         self._version = 0
 
-    def add(self, *, title, png_b64, df, render_fn, viz_ref, static=False, html_block=None, nrows=1, height_ratios=None):
+    def add(self, *, title, png_b64, df, render_fn, viz_ref, static=False, html_block=None, nrows=1, height_ratios=None, fig_height=None, section_id=None, bump_version=True):
+        """Add a chart entry. If section_id is set, the chart is owned by an
+        interactive section: it's hidden from the top-level page render and
+        removed when that section is rebuilt (clear_section). The chart_id is
+        returned so callers can wire it into custom HTML.
+        """
+        chart_id = uuid.uuid4().hex
         with self._lock:
             self._charts.append({
-                "id": uuid.uuid4().hex,
+                "id": chart_id,
                 "title": title,
                 "png_b64": png_b64,
                 "df": df,
@@ -1239,6 +1250,65 @@ class _PlotlyChartRegistry:
                 "html_block": html_block,
                 "nrows": nrows,
                 "height_ratios": height_ratios,
+                "fig_height": fig_height,
+                "section_id": section_id,
+            })
+            if bump_version:
+                self._version += 1
+        return chart_id
+
+    def clear_section(self, section_id, *, bump_version=True):
+        """Drop chart entries owned by the given interactive section."""
+        if not section_id:
+            return
+        with self._lock:
+            self._charts = [c for c in self._charts if c.get("section_id") != section_id]
+            if bump_version:
+                self._version += 1
+
+    def update_interactive_state(self, section_id, *, blocks=None, control_values=None, bump_version=True):
+        """Keep interactive section state current without forcing a page repaint.
+
+        Section submits update their own output directly. If every section-owned
+        chart mutation bumps the global registry version, the 1s page poll can
+        repaint mid-build from stale blocks, briefly showing old tables with
+        missing charts. Store the latest blocks/control values, but let callers
+        decide whether top-level refresh should notice immediately.
+        """
+        with self._lock:
+            for c in self._charts:
+                if c.get("id") == section_id and c.get("type") == "interactive":
+                    if blocks is not None:
+                        c["initial_blocks"] = blocks
+                    if control_values:
+                        for ctrl in c["controls"]:
+                            name = ctrl.get("name")
+                            if name in control_values:
+                                ctrl["value"] = control_values[name]
+                    break
+            if bump_version:
+                self._version += 1
+
+    def add_interactive(self, *, section_id=None, title, controls, initial_blocks, build_fn, viz_ref, progress_text=None):
+        """Register an interactive section.
+
+        controls       : list of {"name", "label", "options", "value"}.
+                         Each entry becomes a labeled dropdown wired into the submit callback.
+        initial_blocks : list of block dicts captured from the first build_fn run
+                         (charts already registered with section_id; rendered to
+                         dash children at page-render time via _section_blocks_to_children).
+        build_fn       : callable (scoped_viz, **control_values) → None.
+        """
+        with self._lock:
+            self._charts.append({
+                "id": section_id or uuid.uuid4().hex,
+                "type": "interactive",
+                "title": title,
+                "controls": controls,
+                "initial_blocks": initial_blocks,
+                "build_fn": build_fn,
+                "viz_ref": viz_ref,
+                "progress_text": progress_text,
             })
             self._version += 1
 
@@ -1258,9 +1328,30 @@ class _PlotlyChartRegistry:
         with self._lock:
             return list(self._charts), self._version
 
+    def section_charts(self, section_id):
+        with self._lock:
+            return [
+                c for c in self._charts
+                if c.get("section_id") == section_id and c.get("type") != "interactive"
+            ]
+
 
 _REGISTRY = _PlotlyChartRegistry()
 _SERVER_STATE = {"started": False, "port": None, "url": None}
+_JOB_LOCK = threading.Lock()
+_INTERACTIVE_JOBS = {}
+
+
+def _job_update(job_id, **kwargs):
+    with _JOB_LOCK:
+        job = _INTERACTIVE_JOBS.setdefault(job_id, {})
+        job.update(kwargs)
+
+
+def _job_snapshot(job_id):
+    with _JOB_LOCK:
+        job = _INTERACTIVE_JOBS.get(job_id)
+        return dict(job) if job is not None else None
 
 
 def _pick_port(start=8050, tries=20):
@@ -1295,7 +1386,17 @@ def _build_dash_app():
     import dash
     from dash import Dash, dcc, html, Output, Input, State, MATCH, ALL, ctx
 
-    app = Dash(__name__, title="Viz", update_title=None)
+    import os as _os
+    from pathlib import Path as _Path
+    _assets_dir = _Path(__file__).parent / "assets"
+    _assets_dir.mkdir(exist_ok=True)
+    (_assets_dir / "viz.css").write_text(
+        "[role='option'][aria-selected='true'] { font-weight: bold !important; }\n"
+        ".viz-ref-btn:active { transform: translateY(2px);"
+        " box-shadow: inset 0 2px 4px rgba(0,0,0,0.22);"
+        " background: #DFAE00 !important; }\n"
+    )
+    app = Dash(__name__, title="Viz", update_title=None, assets_folder=str(_assets_dir))
     app.layout = html.Div(
         style={"fontFamily": "Arial, Helvetica, sans-serif",
                "background": "#fff", "padding": "8px 4px", "color": "#333"},
@@ -1324,11 +1425,124 @@ def _build_dash_app():
     }
     _btn_active_style = {**_btn_base_style, "background": "#F1C40F",
                           "borderColor": "#B7950B"}
+    _btn_pressed_style = {
+        **_btn_active_style,
+        "transform": "translateY(2px)",
+        "boxShadow": "inset 0 2px 4px rgba(0,0,0,0.22)",
+        "background": "#DFAE00",
+        "cursor": "wait",
+    }
+    _progress_style = {
+        "display": "block",
+        "margin": "12px 0 14px 0",
+        "padding": "12px",
+        "background": "#FFF8D8",
+        "border": "1px solid #E0B800",
+        "borderRadius": "4px",
+    }
+    _progress_hidden_style = {"display": "none"}
 
-    def _chart_block(c):
+    def _progress_panel(job):
+        done = int(job.get("done") or 0)
+        total = job.get("total")
+        msg = job.get("message") or "Working..."
+        pct = None if not total else max(0, min(100, int(done / total * 100)))
+        progress_kwargs = {"style": {"width": "100%", "height": "14px", "accentColor": "#B7950B"}}
+        if total:
+            progress_kwargs.update({"value": done, "max": total})
+        return [
+            html.Div(
+                msg,
+                style={
+                    "fontWeight": "bold",
+                    "fontSize": "12px",
+                    "color": "#333",
+                    "marginBottom": "8px",
+                    "letterSpacing": "0.02em",
+                },
+            ),
+            html.Progress(**progress_kwargs),
+            html.Div(
+                (
+                    f"{done:,} / {int(total):,} engine backtests complete"
+                    + (f"  ({pct}%)" if pct is not None else "")
+                    if total
+                    else "Starting..."
+                ),
+                style={
+                    "fontSize": "11px",
+                    "color": "#777",
+                    "fontStyle": "italic",
+                    "marginTop": "6px",
+                },
+            ),
+        ]
+
+    def _table_div_static(title, df, max_rows=20, max_height=None):
+        """Render a DataFrame as an HTML table (matches PlotlyViz.table styling)."""
+        def _fmt(v):
+            if isinstance(v, (float, np.floating)):
+                return f"{v:,.3f}"
+            if isinstance(v, pd.Timestamp):
+                return v.strftime("%Y-%m-%d")
+            return str(v)
+
+        show = df.head(max_rows).copy()
+        th_style = {
+            "padding": "5px 10px", "textAlign": "right",
+            "borderBottom": "2px solid #bbb", "fontWeight": "bold",
+            "fontSize": "12px", "color": "#333", "whiteSpace": "nowrap",
+            "position": "sticky", "top": 0, "background": "#FAFAFA", "zIndex": 1,
+        }
+        td_style = {
+            "padding": "4px 10px", "textAlign": "right",
+            "borderBottom": "1px solid #e8e8e8", "fontSize": "12px",
+            "whiteSpace": "nowrap",
+        }
+        header = html.Tr([html.Th(str(col), style=th_style) for col in show.columns])
+        rows = [
+            html.Tr([html.Td(_fmt(v), style=td_style) for v in row])
+            for row in show.to_numpy()
+        ]
+        children = []
+        if title:
+            children.append(html.P(
+                title.upper(),
+                style={"fontWeight": "bold", "fontSize": "11px",
+                       "color": "#333", "marginBottom": "6px",
+                       "letterSpacing": "0.04em"},
+            ))
+        children.append(html.Table(
+            [html.Thead(header), html.Tbody(rows)],
+            style={"borderCollapse": "collapse", "minWidth": "100%", "width": "max-content"},
+        ))
+        style = {"overflowX": "auto", "marginBottom": "16px"}
+        if max_height:
+            style.update({"maxHeight": max_height, "overflowY": "auto"})
+        return html.Div(children, style=style)
+
+    def _section_blocks_to_children(blocks):
+        """Convert _ScopedViz blocks into dash children. Chart blocks are
+        registry-backed (chart_id) so they reuse _chart_block — same range
+        buttons + chart-img pattern as top-level charts. Tables render inline."""
+        out = []
+        for b in blocks:
+            if b["type"] == "chart":
+                entry = _REGISTRY.get(b["chart_id"])
+                if entry is not None:
+                    out.append(_chart_block(entry))
+            elif b["type"] == "table":
+                out.append(_table_div_static(
+                    b.get("title"), b["df"], b.get("max_rows", 20), b.get("max_height"),
+                ))
+        return out
+
+    def _chart_block(c, hide_buttons=False):
+        if c.get("type") == "interactive":
+            return _interactive_block(c)
         chart_id = c["id"]
         title = (c["title"] or "").upper()
-        buttons = [] if c.get("static") else [
+        buttons = [] if c.get("static") or hide_buttons else [
             html.Button(
                 lbl,
                 id={"type": "range-btn", "chart": chart_id, "label": lbl},
@@ -1360,6 +1574,192 @@ def _build_dash_app():
             ],
         )
 
+    def _interactive_block(c):
+        section_id = c["id"]
+        title = (c["title"] or "").upper()
+
+        def _option_items(ctrl):
+            return [
+                {"label": str(o.get("label")) if isinstance(o, dict) else str(o),
+                 "value": str(o.get("value")) if isinstance(o, dict) else str(o)}
+                for o in ctrl["options"]
+            ]
+
+        def _select_style(ctrl):
+            return {
+                "width": ctrl.get("width", "180px"),
+                "fontSize": "12px",
+                "fontFamily": "Arial, Helvetica, sans-serif",
+            }
+
+        def _controls_for(group):
+            widgets = []
+            for ctrl in [x for x in c["controls"] if x.get("group", "anchor") == group]:
+                widgets.append(html.Span(
+                    ctrl["label"].upper(),
+                    style={"fontWeight": "bold", "fontSize": "11px",
+                           "color": "#333", "letterSpacing": "0.04em"},
+                ))
+                widgets.append(dcc.Dropdown(
+                    id={"type": "interactive-control", "section": section_id, "name": ctrl["name"]},
+                    options=_option_items(ctrl),
+                    value=str(ctrl["value"]),
+                    clearable=False,
+                    searchable=False,
+                    style=_select_style(ctrl),
+                ))
+            return widgets
+
+        anchor_widgets = _controls_for("anchor")
+        anchor_widgets.append(html.Button(
+            "REF",
+            id={"type": "interactive-submit", "section": section_id},
+            n_clicks=0,
+            className="viz-ref-btn",
+            style={**_btn_base_style, "minWidth": "56px",
+                   "background": "#F1C40F", "borderColor": "#B7950B",
+                   "fontWeight": "bold"},
+        ))
+        # Status text lives right next to REF; the submit callback toggles
+        # it via `running=` so the loading signal stays close to the button
+        # while the output area below is hidden during recalc.
+        anchor_widgets.append(html.Span(
+            "",
+            id={"type": "interactive-status", "section": section_id},
+            style={"fontSize": "11px", "color": "#777",
+                   "fontStyle": "italic", "marginLeft": "4px"},
+        ))
+        header_children = []
+        if title:
+            header_children.append(html.Div(
+                title,
+                style={"fontWeight": "bold", "fontSize": "12px",
+                       "color": "#333", "marginBottom": "8px",
+                       "letterSpacing": "0.04em"},
+            ))
+        header_children.append(html.Div(
+            anchor_widgets,
+            style={"display": "flex", "alignItems": "center", "gap": "8px",
+                   "flexWrap": "wrap", "marginBottom": "12px"},
+        ))
+        for group, label in [("metric", "performance metric")]:
+            widgets = _controls_for(group)
+            if widgets:
+                header_children.append(html.Div(
+                    [
+                        html.Span(
+                            label.upper(),
+                            style={"fontWeight": "bold", "fontSize": "11px",
+                                   "color": "#777", "letterSpacing": "0.04em",
+                                   "marginRight": "4px"},
+                        ),
+                        *widgets,
+                    ],
+                    style={"display": "flex", "alignItems": "center", "gap": "8px",
+                           "flexWrap": "wrap", "marginBottom": "10px"},
+                ))
+        param_controls = [x for x in c["controls"] if x.get("group") == "params"]
+        param_sections = [
+            (("model",), "model"),
+            (("filter",), "filter"),
+            (("entry", "exit"), "entry / exit / risk"),
+        ]
+        param_children = []
+        for subgroups, label in param_sections:
+            controls = [x for x in param_controls if x.get("subgroup") in subgroups]
+            if not controls:
+                continue
+            block = [
+                html.Div(
+                    label.upper(),
+                    style={"fontWeight": "bold", "fontSize": "10px",
+                           "color": "#777", "letterSpacing": "0.06em",
+                           "marginBottom": "6px"},
+                )
+            ]
+            row = []
+            for ctrl in controls:
+                row.append(html.Div(
+                    [
+                        html.Div(
+                            ctrl["label"].upper(),
+                            style={"fontWeight": "bold", "fontSize": "10px",
+                                   "color": "#333", "letterSpacing": "0.04em",
+                                   "marginBottom": "4px"},
+                        ),
+                        dcc.Dropdown(
+                            id={"type": "interactive-control", "section": section_id, "name": ctrl["name"]},
+                            options=_option_items(ctrl),
+                            value=str(ctrl["value"]),
+                            clearable=False,
+                            style=_select_style(ctrl),
+                        ),
+                    ],
+                    style={"marginRight": "10px", "marginBottom": "8px"},
+                ))
+            block.append(html.Div(
+                row,
+                style={"display": "flex", "alignItems": "flex-start",
+                       "gap": "6px", "flexWrap": "wrap"},
+            ))
+            param_children.append(html.Div(
+                block,
+                style={"padding": "8px 10px", "border": "1px solid #E3E3E3",
+                       "background": "#FFFFFF", "marginRight": "10px",
+                       "marginBottom": "10px"},
+            ))
+        if param_children:
+            header_children.append(html.Div(
+                [
+                    html.Div(
+                        "STRATEGY PARAMS",
+                        style={"fontWeight": "bold", "fontSize": "11px",
+                               "color": "#777", "letterSpacing": "0.04em",
+                               "marginBottom": "8px"},
+                    ),
+                    html.Div(
+                        param_children,
+                        style={"display": "flex", "alignItems": "stretch",
+                               "gap": "8px", "flexWrap": "wrap"},
+                    ),
+                ],
+                style={"marginBottom": "10px"},
+            ))
+        return html.Div(
+            style={"marginBottom": "24px", "padding": "10px",
+                   "background": "#FAFAFA", "border": "1px solid #ddd"},
+            children=[
+                *header_children,
+                html.Div(
+                    id={"type": "interactive-progress", "section": section_id},
+                    style=_progress_hidden_style,
+                    children=[],
+                ),
+                dcc.Loading(
+                    type="circle",
+                    color="#B7950B",
+                    delay_show=150,
+                    overlay_style={
+                        "visibility": "visible",
+                        "filter": "grayscale(0.15)",
+                        "opacity": 0.35,
+                    },
+                    parent_style={"minHeight": "160px"},
+                    children=html.Div(
+                        id={"type": "interactive-output", "section": section_id},
+                        children=_section_blocks_to_children(c["initial_blocks"]),
+                    ),
+                ),
+                dcc.Store(id={"type": "interactive-job", "section": section_id}),
+                dcc.Interval(
+                    id={"type": "interactive-job-poll", "section": section_id},
+                    interval=500,
+                    n_intervals=0,
+                    disabled=True,
+                ),
+            ],
+        )
+
     @app.callback(
         Output("_charts", "children"),
         Output("_version", "data"),
@@ -1371,9 +1771,12 @@ def _build_dash_app():
         charts, version = _REGISTRY.snapshot()
         if version == last_version:
             raise dash.exceptions.PreventUpdate
-        return ([_chart_block(c) for c in charts],
+        # Section-owned charts (section_id set) render inside their interactive
+        # section's output area, not as top-level entries on the page.
+        top_level = [c for c in charts if not c.get("section_id")]
+        return ([_chart_block(c) for c in top_level],
                 version,
-                f"{len(charts)} chart{'s' if len(charts) != 1 else ''}")
+                f"{len(top_level)} chart{'s' if len(top_level) != 1 else ''}")
 
     @app.callback(
         Output({"type": "chart-img", "chart": MATCH}, "src"),
@@ -1389,18 +1792,164 @@ def _build_dash_app():
         chart_id = trig["chart"]
         label = trig["label"]
         chart = _REGISTRY.get(chart_id)
-        if chart is None:
-            raise dash.exceptions.PreventUpdate
-        start, end = _range_window(chart["df"], label)
-        png = chart["viz_ref"]._render_png(
-            chart["df"], chart["render_fn"], start, end, title=chart["title"],
-            nrows=chart.get("nrows", 1), height_ratios=chart.get("height_ratios"),
-        )
         styles = [
             (_btn_active_style if d["label"] == label else _btn_base_style)
             for d in ids
         ]
+        if chart is None:
+            return dash.no_update, styles
+        start, end = _range_window(chart["df"], label)
+        try:
+            png = chart["viz_ref"]._render_png(
+                chart["df"], chart["render_fn"], start, end, title=chart["title"],
+                nrows=chart.get("nrows", 1), height_ratios=chart.get("height_ratios"),
+                fig_height=chart.get("fig_height"),
+            )
+        except Exception:
+            return dash.no_update, styles
         return f"data:image/png;base64,{png}", styles
+
+    @app.callback(
+        Output({"type": "interactive-job", "section": MATCH}, "data"),
+        Input({"type": "interactive-submit", "section": MATCH}, "n_clicks"),
+        State({"type": "interactive-control", "section": MATCH, "name": ALL}, "value"),
+        State({"type": "interactive-control", "section": MATCH, "name": ALL}, "id"),
+        prevent_initial_call=True,
+    )
+    def _on_interactive_submit(_clicks, values, ids):
+        trig = ctx.triggered_id
+        if not isinstance(trig, dict):
+            raise dash.exceptions.PreventUpdate
+        section_id = trig["section"]
+        section = _REGISTRY.get(section_id)
+        if section is None or section.get("type") != "interactive":
+            raise dash.exceptions.PreventUpdate
+        kwargs = {id_["name"]: val for id_, val in zip(ids, values)}
+        job_id = uuid.uuid4().hex
+        _job_update(
+            job_id,
+            status="running",
+            done=0,
+            total=None,
+            message=section.get("progress_text") or "Starting robustness sweep...",
+            blocks=None,
+            error=None,
+        )
+
+        def _run_job():
+            def _progress(done=None, total=None, message=None):
+                updates = {}
+                if done is not None:
+                    updates["done"] = int(done)
+                if total is not None:
+                    updates["total"] = int(total)
+                if message is not None:
+                    updates["message"] = message
+                if updates:
+                    _job_update(job_id, **updates)
+
+            _REGISTRY.clear_section(section_id, bump_version=False)
+            scoped = _ScopedViz(
+                section["viz_ref"],
+                section_id,
+                bump_version=False,
+                progress_fn=_progress,
+            )
+            try:
+                section["build_fn"](scoped, **kwargs)
+            except Exception:
+                import traceback
+                _job_update(
+                    job_id,
+                    status="error",
+                    error=traceback.format_exc(),
+                    message="Build failed",
+                )
+                return
+            _REGISTRY.update_interactive_state(
+                section_id,
+                blocks=scoped.blocks,
+                control_values=kwargs,
+                bump_version=False,
+            )
+            _job_update(
+                job_id,
+                status="done",
+                blocks=scoped.blocks,
+                message="Done",
+            )
+
+        threading.Thread(target=_run_job, daemon=True, name=f"viz-job-{job_id[:8]}").start()
+        return {"job_id": job_id}
+
+    @app.callback(
+        Output({"type": "interactive-output", "section": MATCH}, "children"),
+        Output({"type": "interactive-progress", "section": MATCH}, "children"),
+        Output({"type": "interactive-progress", "section": MATCH}, "style"),
+        Output({"type": "interactive-status", "section": MATCH}, "children"),
+        Output({"type": "interactive-submit", "section": MATCH}, "children"),
+        Output({"type": "interactive-submit", "section": MATCH}, "disabled"),
+        Output({"type": "interactive-submit", "section": MATCH}, "style"),
+        Output({"type": "interactive-job-poll", "section": MATCH}, "disabled"),
+        Input({"type": "interactive-job-poll", "section": MATCH}, "n_intervals"),
+        Input({"type": "interactive-job", "section": MATCH}, "data"),
+        prevent_initial_call=True,
+    )
+    def _poll_interactive_job(_n, job_data):
+        if not job_data or not job_data.get("job_id"):
+            raise dash.exceptions.PreventUpdate
+        job = _job_snapshot(job_data["job_id"])
+        if job is None:
+            raise dash.exceptions.PreventUpdate
+
+        if job.get("status") == "error":
+            if job.get("delivered"):
+                raise dash.exceptions.PreventUpdate
+            _job_update(job_data["job_id"], delivered=True)
+            return (
+                [html.Pre(
+                    f"build_fn failed:\n\n{job.get('error', '')}",
+                    style={"background": "#FFF3F3", "color": "#900", "padding": "10px",
+                           "fontSize": "11px", "whiteSpace": "pre-wrap"},
+                )],
+                [],
+                _progress_hidden_style,
+                "failed",
+                "REF",
+                False,
+                {**_btn_base_style, "minWidth": "56px",
+                 "background": "#F1C40F", "borderColor": "#B7950B",
+                 "fontWeight": "bold"},
+                True,
+            )
+
+        if job.get("status") == "done":
+            if job.get("delivered"):
+                raise dash.exceptions.PreventUpdate
+            _job_update(job_data["job_id"], delivered=True)
+            return (
+                _section_blocks_to_children(job.get("blocks") or []),
+                [],
+                _progress_hidden_style,
+                "",
+                "REF",
+                False,
+                {**_btn_base_style, "minWidth": "56px",
+                 "background": "#F1C40F", "borderColor": "#B7950B",
+                 "fontWeight": "bold"},
+                True,
+            )
+
+        return (
+            dash.no_update,
+            _progress_panel(job),
+            _progress_style,
+            "calculating...",
+            "REF...",
+            True,
+            {**_btn_active_style, "cursor": "wait"},
+            False,
+        )
 
     return app
 
@@ -1461,14 +2010,14 @@ class PlotlyViz(Viz):
             _REGISTRY.clear()
         _ensure_server()
 
-    def _render_png(self, df, render_fn, start, end, title=None, nrows=1, height_ratios=None):
+    def _render_png(self, df, render_fn, start, end, title=None, nrows=1, height_ratios=None, fig_height=None):
         """Render render_fn into a fresh matplotlib Figure and return base64 PNG.
 
         Title gets baked into the image so right-click-copy includes it. The
         plot area is pushed flush to the figure's left edge so there's no
         internal whitespace between the title and the chart.
         """
-        h = 5.4 if nrows == 1 else 4.2 * nrows
+        h = fig_height if fig_height is not None else (5.4 if nrows == 1 else 4.2 * nrows)
         kw = dict(sharex=(nrows > 1), gridspec_kw={'height_ratios': height_ratios} if height_ratios else {})
         fig, _axes = plt.subplots(nrows, 1, figsize=(13, h), **kw)
         axes_arg = _axes if nrows > 1 else _axes
@@ -1487,7 +2036,7 @@ class PlotlyViz(Viz):
         plt.close(fig)
         return base64.b64encode(buf.getvalue()).decode("ascii")
 
-    def _make_time_nav(self, df, render_fn, title=None, nrows=1, height_ratios=None):
+    def _make_time_nav(self, df, render_fn, title=None, nrows=1, height_ratios=None, fig_height=None):
         """Render the matplotlib figure over the full date range and stash the
         closure so range buttons can re-render server-side later.
 
@@ -1495,11 +2044,19 @@ class PlotlyViz(Viz):
         etc.) flow into the browser instead of triggering plt.show() / Jupyter
         widgets.
         """
-        png = self._render_png(df, render_fn, df.index.min(), df.index.max(), title=title, nrows=nrows, height_ratios=height_ratios)
-        _REGISTRY.add(title=title, png_b64=png, df=df, render_fn=render_fn, viz_ref=self, nrows=nrows, height_ratios=height_ratios)
+        png = self._render_png(
+            df, render_fn, df.index.min(), df.index.max(),
+            title=title, nrows=nrows, height_ratios=height_ratios,
+            fig_height=fig_height,
+        )
+        _REGISTRY.add(
+            title=title, png_b64=png, df=df, render_fn=render_fn,
+            viz_ref=self, nrows=nrows, height_ratios=height_ratios,
+            fig_height=fig_height,
+        )
         return None
 
-    def table(self, df: pd.DataFrame, title: Optional[str] = None, max_rows: int = 20):
+    def table(self, df: pd.DataFrame, title: Optional[str] = None, max_rows: int = 20, max_height: Optional[str] = None):
         """Render a pandas DataFrame as a plain HTML table in the browser app."""
         from dash import html as dhtml
 
@@ -1515,6 +2072,7 @@ class PlotlyViz(Viz):
             "padding": "5px 10px", "textAlign": "right",
             "borderBottom": "2px solid #bbb", "fontWeight": "bold",
             "fontSize": "12px", "color": "#333", "whiteSpace": "nowrap",
+            "position": "sticky", "top": 0, "background": "#FAFAFA", "zIndex": 1,
         }
         _td_style = {
             "padding": "4px 10px", "textAlign": "right",
@@ -1537,7 +2095,10 @@ class PlotlyViz(Viz):
             [dhtml.Thead(header), dhtml.Tbody(rows)],
             style={"borderCollapse": "collapse", "minWidth": "100%", "width": "max-content"},
         ))
-        block = dhtml.Div(children, style={"overflowX": "auto"})
+        block_style = {"overflowX": "auto"}
+        if max_height:
+            block_style.update({"maxHeight": max_height, "overflowY": "auto"})
+        block = dhtml.Div(children, style=block_style)
         dummy = pd.DataFrame(index=pd.DatetimeIndex([pd.Timestamp.today().normalize()]))
         _REGISTRY.add(
             title=title,
@@ -1548,6 +2109,177 @@ class PlotlyViz(Viz):
             static=True,
             html_block=block,
         )
+        return None
+
+    def _render_static_png(self, render_fn, title=None, fig_height=None, ncols=1):
+        h = fig_height if fig_height is not None else 4.0
+        fig, ax = plt.subplots(1, ncols, figsize=(13, h), squeeze=False)
+        axes_arg = ax.ravel() if ncols > 1 else ax.ravel()[0]
+        fig.patch.set_facecolor("white")
+        fig.subplots_adjust(left=0.06, right=0.94, top=0.86, bottom=0.18, wspace=0.32)
+        render_fn(fig, axes_arg)
+        if title:
+            fig.suptitle(title.upper(), fontsize=self.TITLE_SIZE,
+                         fontweight="bold", color="#333",
+                         x=0.02, ha="left", y=0.97)
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=140, bbox_inches="tight",
+                    facecolor="white", edgecolor="white")
+        plt.close(fig)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    def _add_static_chart(self, *, title, png_b64, fig_height=None):
+        dummy = pd.DataFrame(index=pd.DatetimeIndex([pd.Timestamp.today().normalize()]))
+        _REGISTRY.add(
+            title=title,
+            png_b64=png_b64,
+            df=dummy,
+            render_fn=lambda *_args: None,
+            viz_ref=self,
+            static=True,
+            fig_height=fig_height,
+        )
+        return None
+
+    def static_chart(
+        self,
+        render_fn,
+        title: Optional[str] = None,
+        fig_height: Optional[float] = None,
+        ncols: int = 1,
+    ):
+        png = self._render_static_png(
+            render_fn, title=title, fig_height=fig_height, ncols=ncols,
+        )
+        return self._add_static_chart(title=title, png_b64=png, fig_height=fig_height)
+
+    def robustness_explorer(
+        self,
+        *,
+        anchors: list,
+        initial_anchor: str,
+        build_fn,
+        title: Optional[str] = None,
+        controls: Optional[list[dict]] = None,
+        lazy_initial: bool = False,
+        progress_text: Optional[str] = None,
+    ):
+        """Interactive section: dropdown of anchors + REF button → re-runs build_fn.
+
+        build_fn signature: build_fn(scoped_viz, anchor=...). Use scoped_viz like
+        a regular viz (.line, .table, etc.); chart calls get registered with a
+        section_id and rendered inline (with range buttons) inside the section's
+        output area; tables render alongside them.
+        """
+        section_id = uuid.uuid4().hex
+        scoped = _ScopedViz(self, section_id)
+        all_controls = [{
+            "name": "anchor",
+            "label": "anchor",
+            "options": [str(a) for a in anchors],
+            "value": str(initial_anchor),
+            "group": "anchor",
+            "width": "240px",
+        }]
+        if controls:
+            all_controls.extend(controls)
+        initial_kwargs = {ctrl["name"]: ctrl["value"] for ctrl in all_controls}
+        if lazy_initial:
+            scoped.table(
+                pd.DataFrame({
+                    "status": [
+                        "Select an anchor and press REF to run the robustness sweep."
+                    ]
+                }),
+                title="robustness explorer",
+            )
+        else:
+            build_fn(scoped, **initial_kwargs)
+        _REGISTRY.add_interactive(
+            section_id=section_id,
+            title=title,
+            controls=all_controls,
+            initial_blocks=scoped.blocks,
+            build_fn=build_fn,
+            viz_ref=self,
+            progress_text=progress_text,
+        )
+        return None
+
+
+class _ScopedViz(PlotlyViz):
+    """PlotlyViz subclass that captures chart/table calls for an interactive section.
+
+    Charts are registered in _REGISTRY with the section's section_id so they
+    get the same range-button + chart-img machinery as top-level charts (the
+    page render skips section-owned charts; the section's output area renders
+    them via _chart_block). Tables stay as inline block dicts since they don't
+    need registry-backed rerenders. Skips PlotlyViz.__init__ — server is
+    already running, no auto-clear.
+    """
+
+    def __new__(cls, parent: PlotlyViz, section_id: str, bump_version=True, progress_fn=None):
+        # Bypass Viz.__new__'s backend factory dispatch. _ScopedViz is an
+        # internal wrapper with its own constructor signature.
+        return object.__new__(cls)
+
+    def __init__(self, parent: PlotlyViz, section_id: str, bump_version=True, progress_fn=None):
+        self.colors = parent.colors
+        self.section_id = section_id
+        self.bump_version = bump_version
+        self._progress_fn = progress_fn
+        self.blocks: list[dict] = []
+
+    def progress(self, done=None, total=None, message=None):
+        if self._progress_fn is not None:
+            self._progress_fn(done=done, total=total, message=message)
+
+    def _make_time_nav(self, df, render_fn, title=None, nrows=1, height_ratios=None, fig_height=None):
+        png = self._render_png(
+            df, render_fn, df.index.min(), df.index.max(),
+            title=title, nrows=nrows, height_ratios=height_ratios,
+            fig_height=fig_height,
+        )
+        chart_id = _REGISTRY.add(
+            title=title, png_b64=png, df=df, render_fn=render_fn,
+            viz_ref=self, nrows=nrows, height_ratios=height_ratios,
+            fig_height=fig_height,
+            section_id=self.section_id,
+            bump_version=self.bump_version,
+        )
+        self.blocks.append({"type": "chart", "chart_id": chart_id})
+        return None
+
+    def table(
+        self,
+        df: pd.DataFrame,
+        title: Optional[str] = None,
+        max_rows: int = 20,
+        max_height: Optional[str] = None,
+    ):
+        self.blocks.append({
+            "type": "table",
+            "title": title,
+            "df": df,
+            "max_rows": max_rows,
+            "max_height": max_height,
+        })
+        return None
+
+    def _add_static_chart(self, *, title, png_b64, fig_height=None):
+        dummy = pd.DataFrame(index=pd.DatetimeIndex([pd.Timestamp.today().normalize()]))
+        chart_id = _REGISTRY.add(
+            title=title,
+            png_b64=png_b64,
+            df=dummy,
+            render_fn=lambda *_args: None,
+            viz_ref=self,
+            static=True,
+            fig_height=fig_height,
+            section_id=self.section_id,
+            bump_version=self.bump_version,
+        )
+        self.blocks.append({"type": "chart", "chart_id": chart_id})
         return None
 
 

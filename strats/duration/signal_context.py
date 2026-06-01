@@ -65,6 +65,7 @@ def build_signal_features(
 
     f = pd.DataFrame(index=m.index)
     f["ou_zscore"] = z
+    f["resid"] = resid
 
     # --- model quality ---
     f["r2"]       = r2
@@ -199,6 +200,7 @@ def oos_edge_test_fast(
     y: pd.Series,
     filter_col: str,
     *,
+    signal_col: str = "ou_zscore",
     horizon: int = 20,
     train_window: int = 504,
     by_direction: bool = False,
@@ -223,16 +225,16 @@ def oos_edge_test_fast(
     """
     fwd = y.diff(horizon).shift(-horizon)
     combined = pd.concat([
-        features["ou_zscore"].rename("z"),
+        features[signal_col].rename("signal"),
         features[filter_col].rename("feat"),
         fwd.rename("fwd"),
     ], axis=1).dropna()
-    combined = combined[combined["z"] != 0].copy()
-    combined["pnl"] = np.sign(combined["z"]) * (-combined["fwd"])
+    combined = combined[combined["signal"] != 0].copy()
+    combined["pnl"] = np.sign(combined["signal"]) * (-combined["fwd"])
 
     feat = combined["feat"]
     pnl  = combined["pnl"]
-    side = np.sign(combined["z"])
+    side = np.sign(combined["signal"])
     min_periods = max(30, train_window // 4)
 
     # A pnl label for signal row k is not known until row k + horizon.
@@ -298,6 +300,7 @@ def oos_edge_summary_fast(
     features: pd.DataFrame,
     y: pd.Series,
     *,
+    signal_col: str = "ou_zscore",
     horizon: int = 20,
     train_window: int = 504,
     feature_cols: Optional[list[str]] = None,
@@ -310,7 +313,8 @@ def oos_edge_summary_fast(
     oos_edge_summary, sorted by lift descending.
     """
     if feature_cols is None:
-        feature_cols = [c for c in features.columns if c != "ou_zscore"]
+        exclude = {"ou_zscore", signal_col}
+        feature_cols = [c for c in features.columns if c not in exclude]
     if filter_cutoffs is None:
         filter_cutoffs = {
             "low": (0.25, 0.33, 0.50),
@@ -330,6 +334,7 @@ def oos_edge_summary_fast(
                     features,
                     y,
                     col,
+                    signal_col=signal_col,
                     horizon=horizon,
                     train_window=train_window,
                     by_direction=by_direction,
@@ -482,6 +487,7 @@ def filtered_sharpe_summary(
     models: dict,
     y: pd.Series,
     *,
+    signal_col: str = "ou_zscore",
     horizons: tuple[int, ...] = (5, 20, 60),
     train_window: int = 504,
     by_direction: bool = False,
@@ -504,6 +510,7 @@ def filtered_sharpe_summary(
             summary = oos_edge_summary_fast(
                 feats,
                 y,
+                signal_col=signal_col,
                 horizon=h,
                 train_window=train_window,
                 by_direction=by_direction,

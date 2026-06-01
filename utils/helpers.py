@@ -1,13 +1,33 @@
 """Polars / pandas input conversion helpers."""
 
 from __future__ import annotations
+import contextlib
 import os
+import threading
+import time
 import polars as pl
 import pandas as pd
 import psycopg
 from typing import Union
 
-DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets")
+DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets?connect_timeout=10")
+
+
+@contextlib.contextmanager
+def timed(label: str):
+    """Print label, tick dots every second while block runs, then print elapsed time."""
+    print(label, end="", flush=True)
+    stop = threading.Event()
+    t0 = time.time()
+    def _tick():
+        while not stop.wait(1.0):
+            print(".", end="", flush=True)
+    threading.Thread(target=_tick, daemon=True).start()
+    try:
+        yield
+    finally:
+        stop.set()
+        print(f" {time.time() - t0:.1f}s", flush=True)
 
 
 def to_pl_series(s: Union[pl.Series, pd.Series]) -> pl.Series:
