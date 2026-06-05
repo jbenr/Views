@@ -56,6 +56,8 @@ The process should answer:
 
 This system exists to keep the research honest.
 
+One practical note on signals: the baseline is the raw residual - the distance from the model's fitted value in real units. A z-score is a derived view, not a tradeable level. It also carries a subtle problem: the rolling normalization window chases the data. In a trending regime the window adapts, compressing the z-score even as the raw residual reaches extreme levels. Study the residual first. Z-scores are enrichment, not the ground truth.
+
 ---
 
 ## 2.1 Stat-Arb Discovery Engine
@@ -84,6 +86,25 @@ The process is:
 The arbitrage is not riskless. The "arb" is the systematic exploitation of relative mispricing versus a statistical fair-value model. The edge comes from identifying the right fair-value model, the right residual, the right conditioning variables, and the right regime-dependent trading rule.
 
 The real objective is not merely to optimize a strategy. It is to discover when a statistical relationship becomes tradable.
+
+---
+
+## 2.2 Momentum and Regime Conditioning
+
+Mean reversion only works in mean-reverting regimes. The residual says "dislocated." It does not say "about to revert." That question requires regime conditioning.
+
+**Half-life** is the primary gate. A short half-life means the residual has been mean-reverting fast - trade it. A long or undefined half-life means the residual may be trending - the dislocation may get worse before it gets better.
+
+Four additional conditioning signals:
+
+- **Range breakout**: residual above its N-day high has left the prior equilibrium range. Fade signal is suspect. `s_range_breakout` in `setups.py` can detect this.
+- **Residual momentum**: if the residual is still moving away from fair value, the reversion hasn't started. Wait for the drift to exhaust before entering.
+- **Factor momentum**: anchors have their own trends. If oil is in a strong uptrend, the model's predicted level may be repricing to a new equilibrium, not creating a mean-reversion opportunity.
+- **Beta drift**: if the rolling beta between target and anchor is trending steadily, the structural relationship is shifting. A large residual may be the model lagging behind a regime change, not a dislocation.
+
+**Hurst exponent** is the direct measure of memory structure. H < 0.5 = mean-reverting, H > 0.5 = trending, H ≈ 0.5 = random walk. Unlike half-life it does not require fitting an AR(1). Use it on the residual to confirm the series has mean-reverting memory before treating the signal as a fade.
+
+These are conditioning variables inside the step 4–6 stat-arb workflow, not a separate strategy. The goal is to make the residual signal fire only in confirmed mean-reverting regimes.
 
 ---
 
