@@ -35,6 +35,37 @@ North star: a live, timestamped, auditable macro trading platform with a real tr
 
 ---
 
+## Valuation Model Techniques
+
+The model quality determines the signal quality. Work through these in order.
+
+**Single-factor (baseline)**
+- [ ] Audit which single-factor anchors produce the cleanest residuals for 10Y - IC, half-life, ADF stat
+- [ ] Document the winner and why (this is the baseline everything else gets compared to)
+
+**Pairs / spread trading**
+- [ ] `strats/duration/spread_rv.py` - trade 10Y vs 5y5y fwd inflation as a two-leg spread (in progress)
+- [ ] Extend to other pairs: 10Y vs BE10, 10Y vs 5y5y SOFR fwd, 5y vs 5y BE, 10Y vs 30Y
+- [ ] Verify: P&L of the pairs trade = fading the spread residual (hedge ratio from rolling beta)
+- [ ] Compare pairs: IC, hit rate, Sharpe at 20d - which pairing has the most consistent edge?
+
+**Multi-factor regression**
+- [ ] Build multi-factor OLS model for 10Y - 2 to 4 anchors chosen by forward IC not in-sample R-squared
+- [ ] Test whether multi-factor residual has better OOS IC than the best single-factor
+- [ ] Check beta stability - unstable betas mean the model is overfit
+
+**PCA decomposition**
+- [ ] Apply PCA to the full rates curve - confirm PC1/PC2/PC3 = level/slope/curvature
+- [ ] Model 10Y as a function of its PC loadings, compute PCA residual
+- [ ] Compare PCA residual IC to single-factor and multi-factor at same horizon
+- [ ] Extend to inflation surface PCA (BEs, ZCIS, TIPS)
+
+**Combine and evaluate**
+- [ ] Summary table: single-factor vs multi-factor vs PCA vs best pair - IC, hit rate, Sharpe at 20d OOS
+- [ ] Pick the model that wins OOS and use it as the primary signal
+
+---
+
 ## Research - Duration Signal
 
 **Model foundation**

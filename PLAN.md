@@ -104,7 +104,23 @@ Four additional conditioning signals:
 
 **Hurst exponent** is the direct measure of memory structure. H < 0.5 = mean-reverting, H > 0.5 = trending, H ≈ 0.5 = random walk. Unlike half-life it does not require fitting an AR(1). Use it on the residual to confirm the series has mean-reverting memory before treating the signal as a fade.
 
-These are conditioning variables inside the step 4–6 stat-arb workflow, not a separate strategy. The goal is to make the residual signal fire only in confirmed mean-reverting regimes.
+These are conditioning variables inside the step 4-6 stat-arb workflow, not a separate strategy. The goal is to make the residual signal fire only in confirmed mean-reverting regimes.
+
+---
+
+## 2.3 Valuation Model Techniques
+
+The residual is only as good as the model. A stronger model means a cleaner signal.
+
+**Single-factor regression** is the baseline. Model the target against one anchor. Simple and interpretable, but the residual absorbs variance from every other macro factor. A large residual might be real dislocation or a missing variable.
+
+**Multi-factor regression** adds anchors. Better R-squared, cleaner residual, but collinearity risk. If anchors are correlated, betas become unstable and the residual may be a statistical artifact. Choose anchors by IC, not R-squared.
+
+**PCA decomposition** lets the data find the latent factors. For rates, the first three PCs explain most curve variance: level, slope, curvature. Modeling a target against its PC loadings leaves a residual genuinely orthogonal to the common drivers. `stats/pca.py` already has `fit_pca`, `roll_pca`, and `residual_from_pca`.
+
+**Pairs trading** is the natural expression of any two-instrument dislocation. Rather than trading 10Y directionally, you trade both legs. When 10Y looks cheap vs the 5y5y forward inflation swap, buy 10Y and sell the swap in beta-weighted size. The rolling OLS beta is the hedge ratio. The residual is the spread. The model and the trade are the same object.
+
+Valuation and the backtest are not separate steps. The model defines fair value, the residual is the signal, and the beta is the trade size on each leg. These are computed together and must be evaluated together.
 
 ---
 
