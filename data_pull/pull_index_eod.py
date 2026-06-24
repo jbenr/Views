@@ -18,6 +18,7 @@ import os
 import sys
 import datetime as dt
 import argparse
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -76,23 +77,32 @@ def ensure_table(conn) -> None:
     conn.commit()
 
 
-def get_date_range(conn, force_start: dt.date | None = None) -> tuple[dt.date | None, dt.date | None]:
+def get_grouped_pulls(
+    conn, tickers: list[str], force_start: dt.date | None = None
+) -> dict[dt.date, list[str]]:
+    """Return {start_date: [tickers]} grouping by per-ticker max(ts).
+
+    New tickers not yet in the DB fall back to 2000-01-01 so they get full history
+    on the first pull — no manual backfill needed when the ticker universe grows.
+    """
     today = dt.date.today()
+
     if force_start:
-        return (force_start, today)
+        return {force_start: list(tickers)}
 
     with conn.cursor() as cur:
-        cur.execute("SELECT max(ts)::date FROM md.index_eod;")
-        row = cur.fetchone()
+        cur.execute("SELECT ticker, MAX(ts)::date FROM md.index_eod GROUP BY ticker")
+        db_maxes = {row[0]: row[1] for row in cur.fetchall()}
 
-    if row is None or row[0] is None:
-        return (dt.date(2000, 1, 1), today)
+    fallback = dt.date(2000, 1, 1)
+    groups: dict[dt.date, list[str]] = defaultdict(list)
+    for ticker in tickers:
+        start = db_maxes.get(ticker, fallback)
+        start = start.date() if isinstance(start, dt.datetime) else start
+        if start < today:
+            groups[start].append(ticker)
 
-    max_date = row[0]
-    if isinstance(max_date, dt.datetime):
-        max_date = max_date.date()
-
-    return (max_date, today)
+    return dict(groups)
 
 
 def upsert(conn, df: pd.DataFrame) -> int:
@@ -170,7 +180,13 @@ def fetch_bdh(
         if not batch_dfs:
             continue
 
-        inserted = upsert(conn, pd.concat(batch_dfs, ignore_index=True))
+        batch_df = pd.concat(
+            [df.dropna(axis=1, how="all") for df in batch_dfs], ignore_index=True
+        )
+        for col in expected_cols:
+            if col not in batch_df.columns:
+                batch_df[col] = np.nan
+        inserted = upsert(conn, batch_df[expected_cols])
         total_inserted += inserted
 
     return total_inserted
@@ -191,22 +207,31 @@ def main() -> None:
     conn = get_conn()
     ensure_table(conn)
 
-    start, end = get_date_range(conn, force_start)
-    if start is None:
+    tickers = list(dict.fromkeys(ALL_TICKERS))  # dedupe, preserve order
+    groups = get_grouped_pulls(conn, tickers, force_start)
+
+    if not groups:
         print("No new dates to pull. Up to date.")
         conn.close()
         return
 
-    tickers = list(dict.fromkeys(ALL_TICKERS))  # dedupe, preserve order
-    print(f"Pulling {len(tickers)} tickers from {start} to {end}...")
+    today = dt.date.today()
+    n_tickers = sum(len(v) for v in groups.values())
+    print(f"Pulling {n_tickers} tickers across {len(groups)} date group(s)...")
 
     bbg = Bbg()
-    inserted = fetch_bdh(bbg, conn, tickers, start, end)
+    total_inserted = 0
 
-    if inserted == 0:
+    for start, group_tickers in sorted(groups.items()):
+        if len(groups) > 1:
+            print(f"  {len(group_tickers)} tickers from {start} to {today}...")
+        inserted = fetch_bdh(bbg, conn, group_tickers, start, today)
+        total_inserted += inserted
+
+    if total_inserted == 0:
         print("Bloomberg returned no data. Nothing inserted.")
     else:
-        print(f"✅ Upserted {inserted:,} rows into md.index_eod")
+        print(f"✅ Upserted {total_inserted:,} rows into md.index_eod")
 
     conn.close()
 

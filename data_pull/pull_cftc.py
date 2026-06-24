@@ -29,7 +29,7 @@ from tqdm import tqdm
 # Config
 # ---------------------------------------------------------------------------
 
-DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@localhost:5432/markets")
+DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets")
 
 BASE_URL = "https://www.cftc.gov"
 HISTORICAL_URL = BASE_URL + "/files/dea/history/fut_fin_txt_{year}.zip"

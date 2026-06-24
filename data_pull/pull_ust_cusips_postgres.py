@@ -28,7 +28,7 @@ FISCAL_URL = (
     "https://api.fiscaldata.treasury.gov/"
     "services/api/fiscal_service/v1/accounting/od/auctions_query"
 )
-DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@localhost:5432/markets")
+DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets")
 TABLE = os.getenv("AUCTIONS_TABLE", "sec.auctioned_securities")  # schema.table
 PAGE_SIZE = 10_000  # Fiscal Data API max page size is typically 10k
 

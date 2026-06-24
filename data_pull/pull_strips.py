@@ -19,7 +19,9 @@ import os
 import sys
 import datetime as dt
 import argparse
+from collections import defaultdict
 
+import numpy as np
 import requests
 import pandas as pd
 import psycopg
@@ -93,14 +95,32 @@ def ensure_tables(conn) -> None:
     conn.commit()
 
 
-def get_max_eod_date(conn) -> dt.date | None:
+def get_grouped_pulls(
+    conn, cusips: list[str], force_start: dt.date | None = None
+) -> dict[dt.date, list[str]]:
+    """Return {start_date: [cusips]} grouping by per-CUSIP max(ts).
+
+    New CUSIPs not yet in the DB fall back to 2000-01-01 so they get full history
+    on the first pull — no manual backfill needed when new STRIPS are discovered.
+    """
+    today = dt.date.today()
+
+    if force_start:
+        return {force_start: list(cusips)}
+
     with conn.cursor() as cur:
-        cur.execute("SELECT max(ts)::date FROM md.strips_eod;")
-        row = cur.fetchone()
-    if row and row[0]:
-        v = row[0]
-        return v.date() if isinstance(v, dt.datetime) else v
-    return None
+        cur.execute("SELECT cusip, MAX(ts)::date FROM md.strips_eod GROUP BY cusip")
+        db_maxes = {row[0]: row[1] for row in cur.fetchall()}
+
+    fallback = dt.date(2000, 1, 1)
+    groups: dict[dt.date, list[str]] = defaultdict(list)
+    for cusip in cusips:
+        start = db_maxes.get(cusip, fallback)
+        start = start.date() if isinstance(start, dt.datetime) else start
+        if start < today:
+            groups[start].append(cusip)
+
+    return dict(groups)
 
 
 def get_active_strip_cusips(conn) -> list[str]:
@@ -416,7 +436,14 @@ def fetch_strips_eod(
         if not batch_dfs:
             continue
 
-        inserted = upsert_strips_eod(conn, pd.concat(batch_dfs, ignore_index=True))
+        strip_cols = ["ts", "cusip", "px_last", "yld_ytm_mid", "source"]
+        batch_df = pd.concat(
+            [df.dropna(axis=1, how="all") for df in batch_dfs], ignore_index=True
+        )
+        for col in strip_cols:
+            if col not in batch_df.columns:
+                batch_df[col] = np.nan
+        inserted = upsert_strips_eod(conn, batch_df[strip_cols])
         total_inserted += inserted
 
     return total_inserted
@@ -494,28 +521,30 @@ def main() -> None:
 
     force_start = dt.datetime.strptime(args.backfill, "%Y-%m-%d").date() if args.backfill else None
     if args.mode.lower() in ("full", "all", "refresh"):
-        start, end = dt.date(2000, 1, 1), dt.date.today()
-    elif force_start:
-        start, end = force_start, dt.date.today()
-    else:
-        max_date = get_max_eod_date(conn)
-        if max_date is None:
-            start, end = dt.date(2000, 1, 1), dt.date.today()
-        else:
-            start = max_date
-            end = dt.date.today()
-            if start >= end:
-                print("Up to date.")
-                conn.close()
-                return
+        force_start = dt.date(2000, 1, 1)
 
-    print(f"Pulling {len(cusips)} STRIPS CUSIPs from {start} to {end}...")
-    inserted = fetch_strips_eod(bbg, conn, cusips, start, end)
+    groups = get_grouped_pulls(conn, cusips, force_start)
 
-    if inserted == 0:
+    if not groups:
+        print("Up to date.")
+        conn.close()
+        return
+
+    today = dt.date.today()
+    n_cusips = sum(len(v) for v in groups.values())
+    print(f"Pulling {n_cusips} STRIPS CUSIPs across {len(groups)} date group(s)...")
+
+    total_inserted = 0
+    for start, group_cusips in sorted(groups.items()):
+        if len(groups) > 1:
+            print(f"  {len(group_cusips)} CUSIPs from {start} to {today}...")
+        inserted = fetch_strips_eod(bbg, conn, group_cusips, start, today)
+        total_inserted += inserted
+
+    if total_inserted == 0:
         print("Bloomberg returned no data. Nothing inserted.")
     else:
-        print(f"✅ Upserted {inserted:,} rows into md.strips_eod")
+        print(f"✅ Upserted {total_inserted:,} rows into md.strips_eod")
 
     conn.close()
 

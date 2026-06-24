@@ -14,7 +14,7 @@ from tqdm import tqdm
 sys.path.append(os.path.expanduser("~/werk/Views"))
 from data_pull.berg import Bbg
 
-DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@localhost:5432/markets")
+DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets")
 BATCH_SIZE = 50
 
 

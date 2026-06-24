@@ -17,6 +17,7 @@ import os
 import sys
 import datetime as dt
 import argparse
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -60,19 +61,38 @@ def ensure_table(conn) -> None:
     conn.commit()
 
 
-def get_date_range(conn, force_start: dt.date | None = None) -> tuple[dt.date, dt.date]:
+def get_grouped_pulls(
+    conn, tickers: list[str], meta: dict, force_start: dt.date | None = None
+) -> dict[dt.date, list[str]]:
+    """Return {start_date: [tickers]} grouping by per-surface-point max(ts).
+
+    Each Bloomberg ticker maps to an (expiry, tenor, strike) point. New points added
+    to the surface fall back to 2010-01-01 so they backfill automatically.
+    """
     today = dt.date.today()
+
     if force_start:
-        return (force_start, today)
+        return {force_start: list(tickers)}
+
     with conn.cursor() as cur:
-        cur.execute("SELECT max(ts)::date FROM md.swaption_vol;")
-        row = cur.fetchone()
-    if row is None or row[0] is None:
-        return (dt.date(2010, 1, 1), today)
-    max_date = row[0]
-    if isinstance(max_date, dt.datetime):
-        max_date = max_date.date()
-    return (max_date, today)
+        cur.execute("""
+            SELECT expiry, tenor, strike, MAX(ts)::date
+            FROM md.swaption_vol
+            GROUP BY expiry, tenor, strike
+        """)
+        db_maxes = {(row[0], row[1], row[2]): row[3] for row in cur.fetchall()}
+
+    fallback = dt.date(2010, 1, 1)
+    groups: dict[dt.date, list[str]] = defaultdict(list)
+    for ticker in tickers:
+        m = meta.get(ticker, {})
+        key = (m.get("expiry"), m.get("tenor"), m.get("strike"))
+        start = db_maxes.get(key, fallback)
+        start = start.date() if isinstance(start, dt.datetime) else start
+        if start < today:
+            groups[start].append(ticker)
+
+    return dict(groups)
 
 
 def upsert(conn, df: pd.DataFrame) -> int:
@@ -152,17 +172,31 @@ def main() -> None:
     conn = get_conn()
     ensure_table(conn)
 
-    start, end = get_date_range(conn, force_start)
     tickers = list(tkr.swpn_meta.keys())
-    print(f"Pulling {len(tickers)} swaption vol tickers from {start} to {end}...")
+    groups = get_grouped_pulls(conn, tickers, tkr.swpn_meta, force_start)
+
+    if not groups:
+        print("No new dates to pull. Up to date.")
+        conn.close()
+        return
+
+    today = dt.date.today()
+    n_tickers = sum(len(v) for v in groups.values())
+    print(f"Pulling {n_tickers} swaption vol tickers across {len(groups)} date group(s)...")
 
     bbg = Bbg()
-    inserted = fetch_bdh(bbg, conn, tickers, tkr.swpn_meta, start, end)
+    total_inserted = 0
 
-    if inserted == 0:
+    for start, group_tickers in sorted(groups.items()):
+        if len(groups) > 1:
+            print(f"  {len(group_tickers)} tickers from {start} to {today}...")
+        inserted = fetch_bdh(bbg, conn, group_tickers, tkr.swpn_meta, start, today)
+        total_inserted += inserted
+
+    if total_inserted == 0:
         print("Bloomberg returned no data. Nothing inserted.")
     else:
-        print(f"Upserted {inserted:,} rows into md.swaption_vol")
+        print(f"Upserted {total_inserted:,} rows into md.swaption_vol")
 
     conn.close()
 

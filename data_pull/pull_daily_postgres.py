@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import os
 import datetime as dt
-from typing import List, Tuple
+from collections import defaultdict
+from typing import List
 
 import pandas as pd
 import psycopg  # pip install "psycopg[binary]"
@@ -95,27 +96,45 @@ def get_cusips(conn) -> List[str]:
     return [r[0] for r in rows]
 
 
-def get_date_range(conn, force_start: dt.date = None) -> tuple[dt.date, dt.date]:
+def get_grouped_pulls(
+    conn, force_start: dt.date | None = None
+) -> dict[dt.date, list[str]]:
+    """
+    Return {start_date: [cusips]} for every CUSIP that needs data pulled.
+
+    Normal mode: per-CUSIP max(ts) in ust_eod, falling back to issue_date for
+    CUSIPs with no data yet.  This means a newly-auctioned CUSIP automatically
+    gets its full history from issue day — no manual backfill required.
+
+    Backfill mode (force_start set): every CUSIP starts from force_start.
+    """
     today = dt.date.today()
-    
+
     if force_start:
-        return (force_start, today)
-    
+        return {force_start: get_cusips(conn)}
+
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT max(ts)::date
-            FROM md.ust_eod;
-        """)
-        row = cur.fetchone()
+        cur.execute(
+            """
+            SELECT a.cusip,
+                   COALESCE(MAX(u.ts)::date, MIN(a.issue_date)::date) AS start_from
+            FROM sec.auctioned_securities a
+            LEFT JOIN md.ust_eod u ON u.cusip = a.cusip
+            WHERE a.cusip IS NOT NULL
+              AND a.security_type IN ('Note', 'Bond')
+            GROUP BY a.cusip
+            HAVING COALESCE(MAX(u.ts)::date, MIN(a.issue_date)::date) < %s
+            """,
+            (today,),
+        )
+        rows = cur.fetchall()
 
-    if row is None or row[0] is None:
-        return (dt.date(1990, 1, 1), today)
+    groups: dict[dt.date, list[str]] = defaultdict(list)
+    for cusip, start in rows:
+        start = start.date() if isinstance(start, dt.datetime) else start
+        groups[start].append(cusip)
 
-    max_date = row[0]
-    if isinstance(max_date, dt.datetime):
-        max_date = max_date.date()
-
-    return (max_date, today)
+    return dict(groups)
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +148,7 @@ def fetch_bdh_for_cusips(
     start: dt.date,
     end: dt.date,
     batch_size: int = BATCH_SIZE,
+    desc: str = "Bloomberg BDH batches",
 ) -> int:
     """
     Call BDH in batches and upsert each batch into md.ust_eod.
@@ -153,7 +173,7 @@ def fetch_bdh_for_cusips(
     for i in tqdm(
         range(0, len(cusips), batch_size),
         total=n_batches,
-        desc="Bloomberg BDH batches",
+        desc=desc,
         unit="batch",
     ):
         batch_cusips = cusips[i : i + batch_size]
@@ -204,7 +224,16 @@ def fetch_bdh_for_cusips(
         if not batch_dfs:
             continue
 
-        batch_df = pd.concat(batch_dfs, ignore_index=True)
+        # Drop all-NA columns per frame before concat to avoid pandas FutureWarning
+        # about dtype inference; restore any missing expected columns afterward.
+        batch_df = pd.concat(
+            [df.dropna(axis=1, how="all") for df in batch_dfs], ignore_index=True
+        )
+        for col in expected_cols:
+            if col not in batch_df.columns:
+                batch_df[col] = np.nan
+        batch_df = batch_df[expected_cols]
+
         inserted = upsert_ust_eod(conn, batch_df)
         total_inserted += inserted
 
@@ -265,31 +294,40 @@ def main() -> None:
     with get_conn() as conn:
         ensure_ust_eod_table(conn)
 
-        cusips = get_cusips(conn)
-        if not cusips:
-            print("No CUSIPs found in auctioned_securities (Note/Bond). Nothing to do.")
-            return
-
         parser = argparse.ArgumentParser()
         parser.add_argument("--backfill", type=str, help="Force start date (YYYY-MM-DD)")
         args = parser.parse_args()
 
         force_start = dt.datetime.strptime(args.backfill, "%Y-%m-%d").date() if args.backfill else None
-        start, end = get_date_range(conn, force_start)
-        if start is None or end is None:
+        groups = get_grouped_pulls(conn, force_start)
+
+        if not groups:
             print("No new dates to pull. You're up to date.")
             return
 
-        print(f"Found {len(cusips)} CUSIPs.")
-        print(f"Pulling Bloomberg history from {start} to {end}...")
+        today = dt.date.today()
+        n_cusips = sum(len(v) for v in groups.values())
+        n_groups = len(groups)
+        print(f"Found {n_cusips} CUSIPs across {n_groups} date group(s).")
 
-        bbg = Bbg()  # uses localhost:8194 by default
+        bbg = Bbg()
+        total_inserted = 0
 
-        inserted = fetch_bdh_for_cusips(bbg, conn, cusips, start, end)
-        if inserted == 0:
+        for start, group_cusips in sorted(groups.items()):
+            if len(groups) > 1:
+                print(f"  {len(group_cusips)} CUSIPs from {start} to {today}...")
+            else:
+                print(f"Pulling Bloomberg history from {start} to {today}...")
+            inserted = fetch_bdh_for_cusips(
+                bbg, conn, group_cusips, start, today,
+                desc=f"Bloomberg BDH batches",
+            )
+            total_inserted += inserted
+
+        if total_inserted == 0:
             print("Bloomberg returned no data. Nothing inserted.")
         else:
-            print(f"✅ Upserted {inserted} rows into md.ust_eod")
+            print(f"✅ Upserted {total_inserted} rows into md.ust_eod")
 
 
 if __name__ == "__main__":
