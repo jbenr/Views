@@ -541,7 +541,7 @@ def incremental_update() -> None:
         start = max_dt
         end = dt.date.today()
 
-        if start >= end:
+        if start > end:
             print(
                 f"✅ No new dates to pull.\n"
                 f"   Database is up to date as of {max_dt}."

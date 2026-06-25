@@ -146,11 +146,15 @@ def rebuild_breakeven(conn) -> int:
     with conn.cursor() as cur:
         cur.execute("TRUNCATE md.breakeven;")
         cur.execute(
-            f"""
-            INSERT INTO md.breakeven 
-                (ts, tenor, status, nominal_cusip, tips_cusip, nominal_yield, tips_yield, breakeven) 
+            f"""INSERT INTO md.breakeven
+                (ts, tenor, status, nominal_cusip, tips_cusip, nominal_yield, tips_yield, breakeven)
             {sql}
-            """,
+            ON CONFLICT (ts, tenor, status) DO UPDATE SET
+                nominal_cusip = EXCLUDED.nominal_cusip,
+                tips_cusip    = EXCLUDED.tips_cusip,
+                nominal_yield = EXCLUDED.nominal_yield,
+                tips_yield    = EXCLUDED.tips_yield,
+                breakeven     = EXCLUDED.breakeven""",
             (list(BREAKEVEN_TENORS),),
         )
         row_count = cur.rowcount
@@ -159,7 +163,9 @@ def rebuild_breakeven(conn) -> int:
 
 
 def incremental_breakeven(conn) -> int:
-    """Append only new dates to md.breakeven."""
+    """Upsert breakeven rows, always reprocessing the last 14 days as a lookback
+    window so that upstream headline backfills are automatically reflected."""
+    import datetime
     max_breakeven = get_max_breakeven_date(conn)
     max_headline = get_max_headline_date(conn)
 
@@ -168,7 +174,6 @@ def incremental_breakeven(conn) -> int:
         return 0
 
     if max_breakeven is None:
-        # Table is empty, do full rebuild
         print("md.breakeven is empty. Running full rebuild...")
         return rebuild_breakeven(conn)
 
@@ -176,18 +181,22 @@ def incremental_breakeven(conn) -> int:
         print(f"md.breakeven is up to date (max date: {max_breakeven}).")
         return 0
 
-    # Only process dates after max_breakeven
+    lookback = max_breakeven - datetime.timedelta(days=14)
     date_filter = "AND ht.ts > %s"
     sql = BREAKEVEN_SQL.format(date_filter=date_filter)
 
     with conn.cursor() as cur:
         cur.execute(
-            f"""
-            INSERT INTO md.breakeven 
-                (ts, tenor, status, nominal_cusip, tips_cusip, nominal_yield, tips_yield, breakeven) 
+            f"""INSERT INTO md.breakeven
+                (ts, tenor, status, nominal_cusip, tips_cusip, nominal_yield, tips_yield, breakeven)
             {sql}
-            """,
-            (list(BREAKEVEN_TENORS), max_breakeven),
+            ON CONFLICT (ts, tenor, status) DO UPDATE SET
+                nominal_cusip = EXCLUDED.nominal_cusip,
+                tips_cusip    = EXCLUDED.tips_cusip,
+                nominal_yield = EXCLUDED.nominal_yield,
+                tips_yield    = EXCLUDED.tips_yield,
+                breakeven     = EXCLUDED.breakeven""",
+            (list(BREAKEVEN_TENORS), lookback),
         )
         row_count = cur.rowcount
     conn.commit()

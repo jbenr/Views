@@ -28,6 +28,7 @@ from tqdm import tqdm
 sys.path.append(os.path.expanduser("~/werk/Views"))
 from data_pull.berg import Bbg
 from utils import tickers as tkr
+from data_pull.blacklist import INDEX_TICKERS
 
 # ---------------------------------------------------------------------------
 # Config
@@ -37,15 +38,18 @@ DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets"
 BBG_FIELDS = ["PX_LAST", "PX_OPEN", "PX_HIGH", "PX_LOW", "VOLUME"]
 BATCH_SIZE = 50
 
-# Collect all tickers from tickers.py
-ALL_TICKERS = (
-    tkr.ust + tkr.crv + tkr.fly +
-    tkr.sofr_ois + tkr.swp_spd +
-    tkr.tips + tkr.be + tkr.zc +
-    tkr.stonk + tkr.sector +
-    tkr.prec_met + tkr.enrgy + tkr.ag + tkr.ind_met +
-    tkr.mtg
-)
+# Collect all tickers from tickers.py, minus permanently-dead ones
+ALL_TICKERS = [
+    t for t in (
+        tkr.ust + tkr.crv + tkr.fly +
+        tkr.sofr_ois + tkr.swp_spd +
+        tkr.tips + tkr.be + tkr.zc +
+        tkr.stonk + tkr.sector +
+        tkr.prec_met + tkr.enrgy + tkr.ag + tkr.ind_met +
+        tkr.mtg
+    )
+    if t not in INDEX_TICKERS
+]
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +103,7 @@ def get_grouped_pulls(
     for ticker in tickers:
         start = db_maxes.get(ticker, fallback)
         start = start.date() if isinstance(start, dt.datetime) else start
-        if start < today:
+        if start <= today:
             groups[start].append(ticker)
 
     return dict(groups)

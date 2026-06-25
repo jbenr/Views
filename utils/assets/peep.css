@@ -1,0 +1,74 @@
+/* peep — light Bloomberg-style theme matching viz.py */
+
+body { background: #FFFFFF; color: #333333; font-family: Arial, Helvetica, sans-serif; }
+
+/* ── dropdowns ─────────────────────────────────────────────────────────────── */
+.Select-control { background-color: #FFFFFF !important; border-color: #DCDCDC !important; color: #333 !important; }
+.Select-menu-outer { background-color: #FFFFFF !important; border-color: #DCDCDC !important; z-index: 9999 !important; }
+.Select-option { background-color: #FFFFFF !important; color: #333 !important; }
+.Select-option:hover, .Select-option.is-focused { background-color: #F5F5F5 !important; }
+.Select-option.is-selected { background-color: #EAF3FB !important; font-weight: bold; }
+.Select-value-label { color: #333 !important; }
+.Select--multi .Select-value { background-color: #EAF3FB !important; border-color: #DCDCDC !important; color: #2980B9 !important; }
+.Select-placeholder { color: #AAAAAA !important; }
+
+/* ── data table ─────────────────────────────────────────────────────────────── */
+
+/* header sort arrows */
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner th {
+    cursor: pointer !important;
+}
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner th:hover {
+    background-color: #EBEBEB !important;
+}
+
+/* per-column filter dropdowns in filter-row */
+#filter-row .Select-control {
+    min-height: 28px !important;
+    border-color: #DCDCDC !important;
+    background: #FFFFFF !important;
+}
+#filter-row .Select--multi .Select-value {
+    background: #EAF3FB !important;
+    border-color: #DCDCDC !important;
+    color: #2980B9 !important;
+    font-size: 10px !important;
+    margin-top: 2px !important;
+}
+#filter-row .Select-placeholder {
+    font-size: 11px !important;
+    color: #AAAAAA !important;
+    line-height: 26px !important;
+}
+
+/* no selection highlight */
+.dash-spreadsheet-container .dash-spreadsheet-inner td.focused,
+.dash-spreadsheet-container .dash-spreadsheet-inner td.cell--selected {
+    background-color: inherit !important;
+    outline: none !important;
+    box-shadow: none !important;
+}
+
+/* pagination */
+.previous-next-container button, .page-number {
+    background: #F5F5F5 !important;
+    color: #333 !important;
+    border: 1px solid #DCDCDC !important;
+    border-radius: 2px !important;
+    font-size: 11px !important;
+}
+.previous-next-container button:hover, .page-number:hover {
+    background: #EBEBEB !important;
+}
+.page-number.current-page {
+    background: #F1C40F !important;
+    font-weight: bold !important;
+    border-color: #B7950B !important;
+}
+
+/* inputs */
+input[type=number], input[type=text] {
+    background: #FFFFFF;
+    color: #333;
+    font-family: Arial, Helvetica, sans-serif;
+}

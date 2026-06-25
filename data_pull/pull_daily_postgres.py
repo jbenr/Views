@@ -15,6 +15,7 @@ import datetime as dt
 from collections import defaultdict
 from typing import List
 
+import numpy as np
 import pandas as pd
 import psycopg  # pip install "psycopg[binary]"
 from tqdm import tqdm
@@ -123,7 +124,19 @@ def get_grouped_pulls(
             WHERE a.cusip IS NOT NULL
               AND a.security_type IN ('Note', 'Bond')
             GROUP BY a.cusip
-            HAVING COALESCE(MAX(u.ts)::date, MIN(a.issue_date)::date) < %s
+            HAVING
+                MAX(a.maturity_date) >= CURRENT_DATE - INTERVAL '1 year'
+                AND (
+                    -- Active: always re-pull through today (refreshes today's settlement)
+                    (MAX(a.maturity_date) >= CURRENT_DATE
+                     AND COALESCE(MAX(u.ts)::date, MIN(a.issue_date)::date) <= %s)
+                    OR
+                    -- Matured: only pull if there is a real gap (> 3 days before maturity).
+                    -- Bonds within 3 days of maturity have complete enough data;
+                    -- Bloomberg returns nothing past maturity so they would loop forever.
+                    (MAX(a.maturity_date) < CURRENT_DATE
+                     AND COALESCE(MAX(u.ts)::date, MIN(a.issue_date)::date) < MAX(a.maturity_date)::date - INTERVAL '3 days')
+                )
             """,
             (today,),
         )

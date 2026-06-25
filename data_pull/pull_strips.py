@@ -29,6 +29,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.expanduser("~/werk/Views"))
 from data_pull.berg import Bbg
+from data_pull.blacklist import STRIP_CUSIPS
 
 # ---------------------------------------------------------------------------
 # Config
@@ -117,7 +118,7 @@ def get_grouped_pulls(
     for cusip in cusips:
         start = db_maxes.get(cusip, fallback)
         start = start.date() if isinstance(start, dt.datetime) else start
-        if start < today:
+        if start <= today:
             groups[start].append(cusip)
 
     return dict(groups)
@@ -513,7 +514,7 @@ def main() -> None:
         print(f"  Warning: coupon STRIP discovery failed ({e}). Continuing.")
 
     # Step 3: pull EOD from Bloomberg
-    cusips = get_active_strip_cusips(conn)
+    cusips = [c for c in get_active_strip_cusips(conn) if c not in STRIP_CUSIPS]
     if not cusips:
         print("No active STRIPS CUSIPs found. Nothing to pull from Bloomberg.")
         conn.close()

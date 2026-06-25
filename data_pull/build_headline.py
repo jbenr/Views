@@ -158,7 +158,12 @@ def rebuild_headline(conn) -> int:
     with conn.cursor() as cur:
         cur.execute("TRUNCATE md.headline;")
         cur.execute(
-            f"INSERT INTO md.headline (ts, tenor, asset_class, cusip, status, px_last, yld_ytm_mid) {sql}",
+            f"""INSERT INTO md.headline (ts, tenor, asset_class, cusip, status, px_last, yld_ytm_mid)
+            {sql}
+            ON CONFLICT (ts, tenor, asset_class, status) DO UPDATE SET
+                cusip       = EXCLUDED.cusip,
+                px_last     = EXCLUDED.px_last,
+                yld_ytm_mid = EXCLUDED.yld_ytm_mid""",
             (list(HEADLINE_TENORS),),
         )
         row_count = cur.rowcount
@@ -167,7 +172,8 @@ def rebuild_headline(conn) -> int:
 
 
 def incremental_headline(conn) -> int:
-    """Append only new dates to md.headline."""
+    """Upsert headline rows, always reprocessing the last 14 days as a lookback
+    window so that ust_eod backfills are automatically reflected."""
     max_headline = get_max_headline_date(conn)
     max_eod = get_max_eod_date(conn)
 
@@ -176,7 +182,6 @@ def incremental_headline(conn) -> int:
         return 0
 
     if max_headline is None:
-        # Table is empty, do full rebuild
         print("md.headline is empty. Running full rebuild...")
         return rebuild_headline(conn)
 
@@ -184,14 +189,21 @@ def incremental_headline(conn) -> int:
         print(f"md.headline is up to date (max date: {max_headline}).")
         return 0
 
-    # Only process dates after max_headline
+    # Reprocess from 14 days before current max to catch any backfilled ust_eod data
+    import datetime
+    lookback = max_headline - datetime.timedelta(days=14)
     date_filter = "AND d.ts > %s"
     sql = HEADLINE_SQL.format(date_filter=date_filter)
 
     with conn.cursor() as cur:
         cur.execute(
-            f"INSERT INTO md.headline (ts, tenor, asset_class, cusip, status, px_last, yld_ytm_mid) {sql}",
-            (list(HEADLINE_TENORS), max_headline),
+            f"""INSERT INTO md.headline (ts, tenor, asset_class, cusip, status, px_last, yld_ytm_mid)
+            {sql}
+            ON CONFLICT (ts, tenor, asset_class, status) DO UPDATE SET
+                cusip       = EXCLUDED.cusip,
+                px_last     = EXCLUDED.px_last,
+                yld_ytm_mid = EXCLUDED.yld_ytm_mid""",
+            (list(HEADLINE_TENORS), lookback),
         )
         row_count = cur.rowcount
     conn.commit()

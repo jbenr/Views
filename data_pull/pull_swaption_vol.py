@@ -64,11 +64,7 @@ def ensure_table(conn) -> None:
 def get_grouped_pulls(
     conn, tickers: list[str], meta: dict, force_start: dt.date | None = None
 ) -> dict[dt.date, list[str]]:
-    """Return {start_date: [tickers]} grouping by per-surface-point max(ts).
-
-    Each Bloomberg ticker maps to an (expiry, tenor, strike) point. New points added
-    to the surface fall back to 2010-01-01 so they backfill automatically.
-    """
+    """Return {start_date: [tickers]} grouping by per-surface-point max(ts)."""
     today = dt.date.today()
 
     if force_start:
@@ -89,7 +85,7 @@ def get_grouped_pulls(
         key = (m.get("expiry"), m.get("tenor"), m.get("strike"))
         start = db_maxes.get(key, fallback)
         start = start.date() if isinstance(start, dt.datetime) else start
-        if start < today:
+        if start <= today:
             groups[start].append(ticker)
 
     return dict(groups)
@@ -172,7 +168,7 @@ def main() -> None:
     conn = get_conn()
     ensure_table(conn)
 
-    tickers = list(tkr.swpn_meta.keys())
+    tickers = tkr.swpn_atm  # ATM surface only — skew tickers return no data via BDH
     groups = get_grouped_pulls(conn, tickers, tkr.swpn_meta, force_start)
 
     if not groups:
