@@ -3,16 +3,16 @@ Beta-weighted 10s30s curve signal research.
 
 Justifies three design choices in signal.py:
   (1) Changes-based OLS (roll_lr_diff) not levels — 10Y and 30Y are I(1),
-      levels regression is spurious. Cumulated changes residual gives a
+      levels regression is spurious. Rolling changes residual gives a
       stationary spread with directional contamination stripped out.
   (2) Hedge-ratio lookback — too short = noisy beta, too long = stale in
       regime shifts. Diag 2 picks the sweet spot via σ of rolling β.
   (3) z-score entry threshold — diag 4 calibrates to 40-day forward hit
       rates. Half-life from diag 3 drives the time stop.
 
-Output: printed diagnostics + four charts in strats/curve/out/
+Output: printed diagnostics + four charts in book/curve/out/
 
-Run:  mamba run -n 2s10s python strats/curve/research.py
+Run:  mamba run -n 2s10s python book/curve/research.py
 """
 
 from __future__ import annotations
@@ -76,19 +76,19 @@ def load_data() -> pl.DataFrame:
 
 
 def beta_weight(df: pl.DataFrame, lookback: int) -> pl.DataFrame:
-    """Changes-based OLS: regress Δ30Y on Δ10Y. Returns df[1:] with beta, resid_cum, r2."""
+    """Changes-based OLS: regress Δ30Y on Δ10Y. Returns df[1:] with beta, resid_roll, r2."""
     reg = roll_lr_diff(df["10y"], df["30y"], lookback=lookback)
     return df.slice(1).with_columns([
         reg["beta"].alias("beta"),
-        reg["resid_cum"].alias("resid_cum"),
+        reg["resid"].rolling_sum(lookback, min_samples=lookback).alias("resid_roll"),
         reg["r2"].alias("r2"),
     ])
 
 
 def threshold_scan(df: pl.DataFrame, z_col: str = "zscore") -> pd.DataFrame:
     """For each entry z, compute n entries and fwd FWD_BARS hit rate."""
-    sub = df.select(["ts", z_col, "resid_cum"]).drop_nulls().to_pandas().reset_index(drop=True)
-    fwd_chg = sub["resid_cum"].shift(-FWD_BARS) - sub["resid_cum"]
+    sub = df.select(["ts", z_col, "resid_roll"]).drop_nulls().to_pandas().reset_index(drop=True)
+    fwd_chg = sub["resid_roll"].shift(-FWD_BARS) - sub["resid_roll"]
     rows = []
     for t in [1.0, 1.5, 2.0, 2.5, 3.0]:
         lm = sub[z_col] < -t
@@ -111,7 +111,7 @@ def threshold_scan(df: pl.DataFrame, z_col: str = "zscore") -> pd.DataFrame:
 
 def plot_naive_vs_bw(df: pl.DataFrame, bw: pl.DataFrame, c_naive: float, c_bw: float):
     naive_pd = df.with_columns((pl.col("30y") - pl.col("10y")).alias("naive")).to_pandas().set_index("ts")
-    bw_pd    = bw.drop_nulls(subset=["resid_cum"]).to_pandas().set_index("ts")
+    bw_pd    = bw.drop_nulls(subset=["resid_roll"]).to_pandas().set_index("ts")
 
     fig, axes = plt.subplots(2, 1, figsize=(13, 7), sharex=True)
 
@@ -124,7 +124,7 @@ def plot_naive_vs_bw(df: pl.DataFrame, bw: pl.DataFrame, c_naive: float, c_bw: f
                   yaxis_title="bps")
 
     ax1 = axes[1]
-    ax1.plot(bw_pd.index, bw_pd["resid_cum"], color=viz.COLORS[1], lw=1.2)
+    ax1.plot(bw_pd.index, bw_pd["resid_roll"], color=viz.COLORS[1], lw=1.2)
     ax1r = ax1.twinx()
     ax1r.plot(bw_pd.index, bw_pd["10y"], color=viz.COLORS[2], lw=0.8, alpha=0.35)
     ax1r.set_ylabel("10Y (bps)", fontsize=8, color=viz.COLORS[2])
@@ -158,7 +158,7 @@ def plot_rolling_beta(df: pl.DataFrame):
 
 
 def plot_rolling_hl(bw: pl.DataFrame):
-    hl    = roll_half_life(bw["resid_cum"], lookback=252)
+    hl    = roll_half_life(bw["resid_roll"], lookback=252)
     ts    = bw["ts"].to_pandas()
     hl_np = hl.to_numpy().astype(float)
 
@@ -230,16 +230,16 @@ def main() -> dict:
     # compute beta-weighted spread at chosen lookback
     bw = beta_weight(df, CHOSEN_LB)
 
-    # direction check: resid_cum should have much lower ρ with 10Y than naive
-    c_bw = bw.drop_nulls(subset=["10y", "resid_cum"]).select(
-        pl.corr("10y", "resid_cum")
+    # direction check: resid_roll should have much lower ρ with 10Y than naive
+    c_bw = bw.drop_nulls(subset=["10y", "resid_roll"]).select(
+        pl.corr("10y", "resid_roll")
     ).item()
-    print(f"  post-hedge: resid_cum vs 10Y  ρ = {c_bw:+.3f}  (vs naive {c_naive:+.3f})\n")
+    print(f"  post-hedge: resid_roll vs 10Y  ρ = {c_bw:+.3f}  (vs naive {c_naive:+.3f})\n")
 
     # diag 3: OU params — is the residual stationary? half_life sets the time stop
     # if it hasn't mean-reverted in 2× half_life, the thesis is wrong and we exit
     print(f"── diag 3: OU params on residual ({CHOSEN_LB}d lookback) ──")
-    params = ou_params(bw["resid_cum"].drop_nulls())
+    params = ou_params(bw["resid_roll"].drop_nulls())
     hl = params["half_life"]
     time_stop = int(hl * 2) if not np.isnan(hl) else 40
     print(f"  theta     = {params['theta']:.4f}  (mean-reversion speed)")
@@ -249,7 +249,7 @@ def main() -> dict:
 
     # add z-score
     bw = bw.with_columns(
-        roll_ou_zscore(bw["resid_cum"], lookback=CHOSEN_LB).alias("zscore")
+        roll_ou_zscore(bw["resid_roll"], lookback=CHOSEN_LB).alias("zscore")
     )
 
     # diag 4: threshold scan — tighter entry = fewer but cleaner trades

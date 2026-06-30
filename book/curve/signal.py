@@ -40,10 +40,10 @@ def compute(data: pl.DataFrame) -> pl.DataFrame:
     """Beta-weighted 10s30s OU z-score.
 
     1. Changes-based OLS: regress Δ30Y on Δ10Y (BETA_LB window) → hedge ratio β
-    2. Cumulate the daily residuals → level-space spread with direction stripped
-    3. OU z-score of that cumulated residual → signal
+    2. Roll the daily residuals → level-space spread with direction stripped
+    3. OU z-score of that rolling residual → signal
 
-    Returns 'signal' (z-score) and 'resid_cum' (for exit_fn inspection).
+    Returns 'signal' (z-score) and 'resid_roll' (for exit_fn inspection).
     The leading null from roll_lr_diff's first-diff is padded so output
     length matches input.
     """
@@ -51,10 +51,13 @@ def compute(data: pl.DataFrame) -> pl.DataFrame:
 
     # roll_lr_diff drops one row (the first diff is null) — pad back to len(data)
     null1 = pl.Series([None], dtype=pl.Float64)
-    resid_cum = pl.concat([null1, reg["resid_cum"]])
+    resid_roll = pl.concat([
+        null1,
+        reg["resid"].rolling_sum(BETA_LB, min_samples=BETA_LB),
+    ])
 
-    z = roll_ou_zscore(resid_cum, lookback=ZSCORE_LB)
-    return pl.DataFrame({"signal": z, "resid_cum": resid_cum})
+    z = roll_ou_zscore(resid_roll, lookback=ZSCORE_LB)
+    return pl.DataFrame({"signal": z, "resid_roll": resid_roll})
 
 
 pipeline = SignalPipeline(

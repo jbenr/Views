@@ -44,7 +44,7 @@ The model quality determines the signal quality. Work through these in order.
 - [ ] Document the winner and why (this is the baseline everything else gets compared to)
 
 **Pairs / spread trading**
-- [ ] `strats/duration/spread_rv.py` - trade 10Y vs 5y5y fwd inflation as a two-leg spread (in progress)
+- [ ] `book/duration/spread_rv.py` - trade 10Y vs 5y5y fwd inflation as a two-leg spread (in progress)
 - [ ] Extend to other pairs: 10Y vs BE10, 10Y vs 5y5y SOFR fwd, 5y vs 5y BE, 10Y vs 30Y
 - [ ] Verify: P&L of the pairs trade = fading the spread residual (hedge ratio from rolling beta)
 - [ ] Compare pairs: IC, hit rate, Sharpe at 20d - which pairing has the most consistent edge?

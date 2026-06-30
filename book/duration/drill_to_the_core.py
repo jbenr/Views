@@ -39,7 +39,7 @@ from backtest import (
 )
 from backtest.metrics import trade_log as engine_trade_log
 from stats import half_life, ou_params, roll_half_life, roll_lr, roll_ou_zscore
-from strats.duration.signal_context import (
+from book.duration.signal_context import (
     build_signal_features,
     conditional_ic_table,
     filtered_sharpe_summary,

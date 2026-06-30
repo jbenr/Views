@@ -1,1 +1,1 @@
-# moved to strats/curve/research.py
+# moved to book/curve/research.py
