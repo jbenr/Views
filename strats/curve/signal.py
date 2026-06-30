@@ -10,34 +10,64 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backtest import SignalPipeline, SignalConfig, TradeDef
+from stats.ols import roll_lr_diff
+from stats.ou import roll_ou_zscore
 
-SIGNAL_NAME = "beta_weighted_5s30s"
+SIGNAL_NAME = "beta_weighted_10s30s"
+
+# Hedge ratio lookback. research.py diag 2: 63d σ=0.113 vs 21d σ=0.137.
+# Stable enough, responsive enough to regime shifts.
+BETA_LB = 63
+
+# Z-score lookback matches BETA_LB — same horizon for hedge and signal.
+ZSCORE_LB = 63
+
+# research.py diag 4 finding: longs hit 73.5% at z=2.0 over 40d forward.
+# Shorts hit 47.2% — below random. Curve has structural steepening bias
+# (QE, fiscal, term premium) that makes short-curve entries unreliable.
+# Until we find a robust short filter, we bias toward longs.
+ENTRY_LONG_Z  = -2.0   # z < -2.0 → buy cheap spread (works: 73.5% hit rate)
+ENTRY_SHORT_Z =  2.5   # z > +2.5 → sell rich spread (raise bar for weak side)
 
 TICKERS = {
-    "5y":   "USGG5YR Index",
     "10y":  "USGG10YR Index",
     "30y":  "USGG30YR Index",
-    "5s30s": "USYC5Y30 Index",
-    "oil":  "CO1 Comdty",
-    "dxy":  "DXY Curncy",
-    "spx":  "SPX Index",
+    "move": "MOVE Index",
 }
 
 
 def compute(data: pl.DataFrame) -> pl.DataFrame:
-    raise NotImplementedError
+    """Beta-weighted 10s30s OU z-score.
+
+    1. Changes-based OLS: regress Δ30Y on Δ10Y (BETA_LB window) → hedge ratio β
+    2. Cumulate the daily residuals → level-space spread with direction stripped
+    3. OU z-score of that cumulated residual → signal
+
+    Returns 'signal' (z-score) and 'resid_cum' (for exit_fn inspection).
+    The leading null from roll_lr_diff's first-diff is padded so output
+    length matches input.
+    """
+    reg = roll_lr_diff(data["10y"], data["30y"], lookback=BETA_LB)
+
+    # roll_lr_diff drops one row (the first diff is null) — pad back to len(data)
+    null1 = pl.Series([None], dtype=pl.Float64)
+    resid_cum = pl.concat([null1, reg["resid_cum"]])
+
+    z = roll_ou_zscore(resid_cum, lookback=ZSCORE_LB)
+    return pl.DataFrame({"signal": z, "resid_cum": resid_cum})
 
 
 pipeline = SignalPipeline(
     name=SIGNAL_NAME,
-    trade_def=TradeDef.spread("5s30s", "5y", "30y"),
+    trade_def=TradeDef.spread("10s30s", "10y", "30y"),
     compute_fn=compute,
     config=SignalConfig(
-        entry_long=-2.0,
-        entry_short=2.0,
+        entry_long=ENTRY_LONG_Z,
+        entry_short=ENTRY_SHORT_Z,
         exit_long=0.0,
         exit_short=0.0,
-        stop_loss_bps=30.0,
-        time_stop_bars=20,
+        stop_loss_bps=25.0,
+        # 2× rolling median half-life (19d from research.py diag 3)
+        time_stop_bars=40,
     ),
 )

@@ -5,6 +5,7 @@ import contextlib
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import polars as pl
@@ -19,32 +20,76 @@ def _connect(dsn: str | None = None) -> psycopg.Connection:
     """Open a DB connection. On Windows, wakes WSL+postgres automatically if the first attempt fails."""
     dsn = dsn or DB_DSN
 
-    # Probe with a short timeout so we don't wait 10s to discover WSL is down.
     probe = re.sub(r"connect_timeout=\d+", "connect_timeout=3", dsn)
     if "connect_timeout" not in probe:
         probe += ("&" if "?" in probe else "?") + "connect_timeout=3"
 
+    if os.name != "nt":
+        return psycopg.connect(dsn)
+
     try:
         return psycopg.connect(probe)
+    except Exception as e:
+        probe_err = str(e).split("\n")[0].strip()
+        starting_up = "starting up" in probe_err.lower()
+
+    t0   = time.time()
+    lock = threading.Lock()
+
+    def _log(msg: str) -> None:
+        with lock:
+            sys.stdout.write(f"\r{' ' * 72}\r  {msg}\n")
+            sys.stdout.flush()
+
+    def _start_ticker(label: str) -> threading.Event:
+        phase_t0 = time.time()
+        stop = threading.Event()
+        def _tick():
+            while not stop.wait(0.1):
+                elapsed  = time.time() - phase_t0
+                secs_int = int(elapsed)
+                dots = "." * (((max(secs_int, 1) - 1) % 3) + 1)
+                with lock:
+                    sys.stdout.write(f"\r  {label}  {elapsed:.1f}s{dots:<4}")
+                    sys.stdout.flush()
+        threading.Thread(target=_tick, daemon=True).start()
+        return stop
+
+    _log(f"probe: {probe_err}")
+
+    # ── phase 1: wake WSL and start postgres ─────────────────────────────────
+    if not starting_up:
+        _log("step 1 — waking WSL...")
+        stop1 = _start_ticker("waking WSL")
+        result = subprocess.run(
+            ["wsl", "-d", "Ubuntu", "-u", "root", "--", "service", "postgresql", "start"],
+            capture_output=True, timeout=90,
+        )
+        stop1.set()
+        _log(f"step 1 done  rc={result.returncode}  [{time.time() - t0:.1f}s]")
+    else:
+        _log("step 1 — skipped (postgres already responding, just not ready yet)")
+
+    # ── phase 2: wait for postgres to accept connections ──────────────────────
+    _log("step 2 — waiting for postgres...")
+    stop2 = _start_ticker("postgres")
+
+    try:
+        for attempt in range(1, 20):
+            time.sleep(2)
+            try:
+                conn = psycopg.connect(dsn)
+                stop2.set()
+                _log(f"attempt {attempt}: connected!  [{time.time() - t0:.1f}s total]")
+                return conn
+            except Exception as e:
+                _log(f"attempt {attempt}: {str(e).split(chr(10))[0].strip()}")
+
+        stop2.set()
+        return psycopg.connect(dsn)  # final — raises naturally if still down
     except Exception:
-        if os.name != "nt":
-            raise  # not Windows — nothing to wake, surface the error
-
-    print("DB unreachable — starting WSL postgres...", end="", flush=True)
-    subprocess.run(
-        ["wsl", "-d", "Ubuntu", "--", "service", "postgresql", "start"],
-        capture_output=True, timeout=30,
-    )
-    for _ in range(5):
-        time.sleep(2)
-        try:
-            conn = psycopg.connect(dsn)
-            print(" ready.", flush=True)
-            return conn
-        except Exception:
-            pass
-
-    return psycopg.connect(dsn)  # final attempt — raises naturally if still down
+        stop2.set()
+        raise
 
 
 @contextlib.contextmanager
