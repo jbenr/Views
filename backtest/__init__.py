@@ -1,5 +1,9 @@
 from .trades import TradeDef, TradeType, Position, ClosedPosition
-from .signals import SignalConfig, SignalPipeline, generate_signals, profit_target, half_drift_residual
+from .signals import (
+    SignalConfig, SignalPipeline, BooleanSignalPipeline,
+    generate_signals, generate_boolean_actions,
+    profit_target, half_drift_residual,
+)
 from .sizing import DV01Map, size_dv01_neutral, size_beta_weighted, size_custom
 from .engine import Engine, BacktestConfig, BacktestResult
 from .metrics import compute_metrics, drawdown_series, trade_log

@@ -85,6 +85,33 @@ def generate_signals(signal_series: pl.Series, config: SignalConfig) -> pl.DataF
     return pl.DataFrame({"signal": signal_series}).with_columns(expr)
 
 
+def generate_boolean_actions(signal_frame: pl.DataFrame) -> pl.DataFrame:
+    """Convert explicit boolean signal columns into engine actions.
+
+    Required columns:
+      - signal
+      - enter_long, enter_short, exit_long, exit_short
+
+    Exits take priority over entries. That keeps the engine conservative:
+    it will close an existing trade before considering a fresh entry on a
+    later bar, instead of same-bar reversing.
+    """
+    required = {"signal", "enter_long", "enter_short", "exit_long", "exit_short"}
+    missing = required.difference(signal_frame.columns)
+    if missing:
+        raise ValueError(f"boolean signal frame missing columns: {sorted(missing)}")
+
+    action = (
+        pl.when(pl.col("exit_long")).then(pl.lit("exit_long"))
+        .when(pl.col("exit_short")).then(pl.lit("exit_short"))
+        .when(pl.col("enter_long")).then(pl.lit("enter_long"))
+        .when(pl.col("enter_short")).then(pl.lit("enter_short"))
+        .otherwise(pl.lit(None))
+        .alias("action")
+    )
+    return signal_frame.with_columns(action)
+
+
 @dataclass
 class SignalPipeline:
     """Wraps a signal computation function + its TradeDef + config.
@@ -133,6 +160,19 @@ class SignalPipeline:
             actions = actions.with_columns(col_series.alias(col_name))
 
         return actions
+
+
+@dataclass
+class BooleanSignalPipeline:
+    """Pipeline for strategies that already produce boolean entry/exit arrays."""
+
+    name: str
+    trade_def: TradeDef
+    compute_fn: Callable[[pl.DataFrame], pl.DataFrame]
+    config: SignalConfig = field(default_factory=SignalConfig)
+
+    def run(self, data: pl.DataFrame) -> pl.DataFrame:
+        return generate_boolean_actions(self.compute_fn(data))
 
 
 # ── standard exit recipes ────────────────────────────────────────────────────

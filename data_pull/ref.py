@@ -13,13 +13,25 @@ import sys
 import os
 import re
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 import psycopg
 from zoneinfo import ZoneInfo
 
-DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets")
+def _with_connect_timeout(dsn: str, seconds: int = 10) -> str:
+    if "connect_timeout=" in dsn:
+        return re.sub(r"connect_timeout=\d+", f"connect_timeout={seconds}", dsn)
+    sep = "&" if "?" in dsn else "?"
+    return f"{dsn}{sep}connect_timeout={seconds}"
+
+
+DB_DSN = _with_connect_timeout(
+    os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets"),
+    seconds=10,
+)
 ET     = ZoneInfo("America/New_York")
 
 # enable ANSI on Windows
@@ -45,6 +57,22 @@ def _fmt_et(d: datetime) -> str:
     d = d.astimezone(ET)
     h = int(d.strftime('%I'))
     return f"{d.strftime('%b')} {d.day}, {d.year} {h}:{d.strftime('%M:%S')}{d.strftime('%p').lower()} ET"
+
+
+def _safe_dsn_label(dsn: str) -> str:
+    """Return connection target without leaking the password."""
+    try:
+        parsed = urlsplit(dsn)
+        query = dict(parse_qsl(parsed.query))
+        user = f"{parsed.username}@" if parsed.username else ""
+        host = parsed.hostname or "unknown-host"
+        port = f":{parsed.port}" if parsed.port else ""
+        db = parsed.path.lstrip("/") or "unknown-db"
+        timeout = query.get("connect_timeout")
+        suffix = f" connect_timeout={timeout}s" if timeout else ""
+        return f"{user}{host}{port}/{db}{suffix}"
+    except Exception:
+        return "<unparseable DB_DSN>"
 
 SCRIPT_DIR = Path(__file__).parent
 LOG_DIR = SCRIPT_DIR / "logs"
@@ -74,8 +102,15 @@ STEPS = [
 def run(script: str, log_file, extra: list[str] | None = None) -> tuple[bool, str, float]:
     """Run script, streaming output live to terminal and capturing it for the log."""
     start = datetime.now()
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1", "DB_DSN": DB_DSN}
     cmd = [sys.executable, "-u", script] + (extra or [])
+
+    log_file.write(f"\n--- {script} ---\n")
+    log_file.write(f"started: {_fmt_et(start)}\n")
+    log_file.write(f"cwd: {SCRIPT_DIR}\n")
+    log_file.write(f"cmd: {' '.join(cmd)}\n")
+    log_file.write(f"db: {_safe_dsn_label(DB_DSN)}\n")
+    log_file.flush()
 
     proc = subprocess.Popen(
         cmd,
@@ -128,7 +163,12 @@ def run(script: str, log_file, extra: list[str] | None = None) -> tuple[bool, st
     full_output = "".join(captured["stdout"]) + "".join(captured["stderr"])
 
     # write full output to log
-    log_file.write(f"\n--- {script} ---\n{full_output}\n")
+    log_file.write(f"exit_code: {proc.returncode}\n")
+    log_file.write(f"duration_s: {duration:.1f}\n")
+    log_file.write("output:\n")
+    log_file.write(full_output)
+    log_file.write("\n")
+    log_file.flush()
 
     return proc.returncode == 0, full_output, duration
 
@@ -160,6 +200,73 @@ def parse_rows(output: str) -> int | None:
     return None
 
 
+def wake_wsl_postgres(report=None) -> tuple[bool, str, float]:
+    """On Windows, keep WSL alive and start the local Postgres cluster if present."""
+    start = datetime.now()
+    if os.name != "nt":
+        return True, "skipped on non-Windows", 0.0
+    if os.getenv("REF_SKIP_WSL_WAKE") == "1":
+        return True, "skipped by REF_SKIP_WSL_WAKE=1", 0.0
+
+    distro = os.getenv("REF_WSL_DISTRO", "Ubuntu")
+    script = (
+        "pgrep -f 'sleep infinity' >/dev/null || "
+        "nohup sleep infinity >/dev/null 2>&1 & "
+        "service postgresql start >/dev/null 2>&1 || true; "
+        "pg_isready -h 127.0.0.1 -p 5432 || true"
+    )
+
+    try:
+        result = subprocess.run(
+            ["wsl", "-d", distro, "-u", "root", "--", "bash", "-lc", script],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except Exception as e:
+        dur = (datetime.now() - start).total_seconds()
+        return False, f"WSL wake failed: {str(e).splitlines()[0]}", dur
+
+    dur = (datetime.now() - start).total_seconds()
+    msg = " ".join((result.stdout + result.stderr).split())
+    if result.returncode != 0:
+        return False, f"WSL wake rc={result.returncode}: {msg or 'no output'}", dur
+    return True, msg or f"started {distro}", dur
+
+
+def wait_for_db(max_wait_s: int = 180, report=None) -> tuple[bool, str, float]:
+    """Wait until Postgres accepts SQL, not just TCP, before child scripts run."""
+    start = datetime.now()
+    deadline = start.timestamp() + max_wait_s
+    last_err = ""
+    attempt = 0
+
+    while datetime.now().timestamp() < deadline:
+        attempt += 1
+        try:
+            with psycopg.connect(DB_DSN) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_is_in_recovery(), now()")
+                    in_recovery, _ = cur.fetchone()
+                    if not in_recovery:
+                        return True, f"ready on attempt {attempt}", (datetime.now() - start).total_seconds()
+                    last_err = "database still in recovery"
+        except Exception as e:
+            last_err = str(e).split("\n")[0].strip()
+
+        elapsed = (datetime.now() - start).total_seconds()
+        time_left = max(0, int(deadline - datetime.now().timestamp()))
+        msg = f"attempt {attempt}: {last_err[:70]} ({elapsed:.1f}s elapsed, {time_left}s left)"
+        if report is not None:
+            report(c(f"       | {msg}", C.DIM))
+        else:
+            print(f"\r  {msg}", end="", flush=True)
+        time.sleep(3)
+
+    if report is None:
+        print()
+    return False, last_err or "timed out waiting for Postgres", (datetime.now() - start).total_seconds()
+
 def _settle_live_rows():
     """After EOD BDH run, clear is_live flag for today's rows."""
     try:
@@ -179,6 +286,7 @@ def main():
     parser.add_argument("--only", type=str)
     parser.add_argument("--live",  action="store_true", help="L1 live: fut + index (BDP)")
     parser.add_argument("--live2", action="store_true", help="L2 live: + ust + strips (BDP)")
+    parser.add_argument("--db-wait", type=int, default=180, help="seconds to wait for Postgres readiness before running pulls")
     args = parser.parse_args()
 
     ts = datetime.now()
@@ -186,8 +294,9 @@ def main():
     log = open(log_path, "w", encoding="utf-8")
 
     def out(msg):
-        print(msg)
+        print(msg, flush=True)
         log.write(_ANSI.sub("", msg) + "\n")
+        log.flush()
 
     # ── live mode ──────────────────────────────────────────────────────────────
     if args.live or args.live2:
@@ -227,6 +336,39 @@ def main():
     out(f"\n{c('='*60, C.DIM)}")
     out(f"  {c('REF - ' + _fmt_et(ts), C.BOLD)}")
     out(f"{c('='*60, C.DIM)}\n")
+    out(c(f"db: {_safe_dsn_label(DB_DSN)}", C.DIM))
+    out(c(f"mode: eod | only={args.only or 'all'} | skip_bbg={args.skip_bbg} | db_wait={args.db_wait}s", C.DIM))
+
+    if not active_steps:
+        out(c(f"no steps selected; check --only={args.only!r} or --skip-bbg", C.RED))
+        out(c(f"  log: {log_path}", C.DIM))
+        log.close()
+        sys.exit(1)
+
+    step_keys = ", ".join(key for key, *_ in active_steps)
+    out(c(f"steps: {len(active_steps)} selected [{step_keys}]", C.DIM))
+    out("")
+
+    out("[preflight] WSL/Postgres wake")
+    wake_ok, wake_msg, wake_dur = wake_wsl_postgres(report=out)
+    wake_tick = c(">", C.GREEN) if wake_ok else c("!", C.RED)
+    wake_stat = c("OK", C.GREEN) if wake_ok else c("WARN", C.RED)
+    out(f"       {wake_tick} {wake_stat} {wake_dur:>5.1f}s  {c(wake_msg, C.DIM)}")
+    if not wake_ok:
+        out(c("       | continuing to DB readiness check anyway", C.RED, C.DIM))
+    out("")
+
+    out("[preflight] Postgres readiness")
+    db_ok, db_msg, db_dur = wait_for_db(max_wait_s=args.db_wait, report=out)
+    tick = c(">", C.GREEN) if db_ok else c("x", C.RED)
+    stat = c("OK", C.GREEN) if db_ok else c("FAIL", C.RED)
+    out(f"       {tick} {stat} {db_dur:>5.1f}s  {c(db_msg, C.DIM)}")
+    if not db_ok:
+        out(c(f"       | {db_msg}", C.RED, C.DIM))
+        out(c(f"  log: {log_path}", C.DIM))
+        log.close()
+        sys.exit(1)
+    out("")
 
     total = len(active_steps)
     results = []

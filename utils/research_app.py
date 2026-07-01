@@ -145,12 +145,14 @@ def make_app(
     debug: bool = True,
 ) -> Dash:
     """
-    Build a Dash app with a standard header + slider row + body area.
+    Build a Dash app with a standard header + slider row(s) + body area.
 
     title     : bold coloured title in the header (e.g. "10s30s")
     subtitle  : grey subtitle (e.g. "beta-weighted curve explorer")
     data_info : right-aligned data range string
-    sliders   : list of slider() Divs
+    sliders   : list of slider() Divs, or a list of such lists to lay out
+                as separate rows (e.g. group entry params on one row and
+                exit params on another)
     body      : html.Div containing charts, stats, etc.
     debug     : True shows callback errors in browser (recommended during dev)
     """
@@ -164,7 +166,20 @@ def make_app(
     )
     app.title = title
 
-    n = len(sliders)
+    slider_rows = sliders if sliders and isinstance(sliders[0], list) else [sliders]
+    slider_row_divs = [
+        html.Div(
+            style={
+                "padding": "10px 28px",
+                "display": "grid",
+                "gridTemplateColumns": " ".join(["1fr"] * len(row)),
+                "gap": "8px 48px",
+            },
+            children=row,
+        )
+        for row in slider_rows
+    ]
+
     app.layout = html.Div(
         style={"background": BG, "minHeight": "100vh", "paddingBottom": 64,
                "fontFamily": "Arial, Helvetica, sans-serif", "color": TEXT},
@@ -181,16 +196,10 @@ def make_app(
                 html.Span(data_info, style={"marginLeft": "auto", "fontSize": 11,
                                              "color": DIM, "fontStyle": "italic"}),
             ]),
-            # slider row
+            # slider rows
             html.Div(
-                style={
-                    "padding": "14px 28px 10px",
-                    "borderBottom": f"1px solid {BORDER}",
-                    "display": "grid",
-                    "gridTemplateColumns": " ".join(["1fr"] * n),
-                    "gap": "8px 48px",
-                },
-                children=sliders,
+                style={"borderBottom": f"1px solid {BORDER}", "paddingTop": 4},
+                children=slider_row_divs,
             ),
             # body
             body,

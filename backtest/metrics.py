@@ -78,7 +78,7 @@ def trade_log(closed_trades: list) -> pl.DataFrame:
 
     records = []
     for t in closed_trades:
-        records.append({
+        record = {
             "trade_name": t.trade_def.name,
             "entry_date": t.entry_date,
             "exit_date": t.exit_date,
@@ -92,7 +92,12 @@ def trade_log(closed_trades: list) -> pl.DataFrame:
             "exit_reason": t.exit_reason,
             "entry_signal": t.entry_signal,
             "exit_signal": t.exit_signal,
-        })
+        }
+        for key, value in getattr(t, "entry_extras", {}).items():
+            record[f"entry_{key}"] = value
+        for key, value in getattr(t, "exit_extras", {}).items():
+            record[f"exit_{key}"] = value
+        records.append(record)
     return pl.DataFrame(records)
 
 

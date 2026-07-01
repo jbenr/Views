@@ -95,6 +95,7 @@ class Engine:
 
         sig_arrays: dict[str, np.ndarray] = {}
         act_arrays: dict[str, list] = {}
+        bool_arrays: dict[str, dict[str, np.ndarray]] = {}
         lvl_arrays: dict[str, np.ndarray] = {}
         ts_arrays: dict[str, Optional[np.ndarray]] = {}  # dynamic time stops
         sz_arrays: dict[str, Optional[np.ndarray]] = {}  # dynamic position sizes
@@ -107,10 +108,18 @@ class Engine:
             sf = signal_frames[name]
             sig_arrays[name] = sf["signal"].to_numpy()
             act_arrays[name] = sf["action"].to_list()
+            bool_cols = {"enter_long", "enter_short", "exit_long", "exit_short"}
+            bool_arrays[name] = {
+                c: sf[c].to_numpy()
+                for c in bool_cols
+                if c in sf.columns
+            }
+            for c in bool_cols:
+                bool_arrays[name].setdefault(c, np.zeros(len(sf), dtype=bool))
             lvl_arrays[name] = composite_levels[name].to_numpy()
             ts_arrays[name] = sf["time_stop"].to_numpy() if "time_stop" in sf.columns else None
             sz_arrays[name] = sf["size"].to_numpy() if "size" in sf.columns else None
-            reserved = {"signal", "action", "time_stop", "size"}
+            reserved = {"signal", "action", "time_stop", "size", *bool_cols}
             extras_arrays[name] = {
                 c: sf[c].to_numpy()
                 for c in sf.columns
@@ -135,6 +144,7 @@ class Engine:
                 signal_val = sig_arrays[name][i]
                 action = act_arrays[name][i]
                 level = lvl_arrays[name][i]
+                bools = bool_arrays[name]
 
                 if np.isnan(signal_val) or np.isnan(level):
                     daily_records.append({
@@ -159,9 +169,9 @@ class Engine:
                     exit_reason = None
 
                     # Signal-based exit
-                    if pos.direction == 1 and action == "exit_long":
+                    if pos.direction == 1 and (action == "exit_long" or bools["exit_long"][i]):
                         exit_reason = "signal"
-                    elif pos.direction == -1 and action == "exit_short":
+                    elif pos.direction == -1 and (action == "exit_short" or bools["exit_short"][i]):
                         exit_reason = "signal"
 
                     # Stop loss
@@ -192,6 +202,10 @@ class Engine:
                         exit_reason = "trailing_stop"
 
                     if exit_reason:
+                        exit_extras = {
+                            c: float(arr[i])
+                            for c, arr in extras_arrays[name].items()
+                        }
                         pnl_bps = current_pnl - tc
                         realized_today += pnl_bps
                         all_closed.append(
@@ -210,6 +224,8 @@ class Engine:
                                 entry_signal=pos.entry_signal,
                                 exit_signal=float(signal_val),
                                 leg_sizes=pos.leg_sizes,
+                                entry_extras=pos.entry_extras,
+                                exit_extras=exit_extras,
                             )
                         )
                     else:
@@ -224,9 +240,9 @@ class Engine:
                     and total_active < self.config.max_total_positions
                 ):
                     direction = None
-                    if action == "enter_long":
+                    if action == "enter_long" or bools["enter_long"][i]:
                         direction = 1
-                    elif action == "enter_short":
+                    elif action == "enter_short" or bools["enter_short"][i]:
                         direction = -1
 
                     if direction is not None and config.entry_filter_fn is not None:

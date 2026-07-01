@@ -116,3 +116,5 @@ class ClosedPosition:
     entry_signal: float
     exit_signal: float
     leg_sizes: dict[str, float] = field(default_factory=dict)
+    entry_extras: dict = field(default_factory=dict)
+    exit_extras: dict = field(default_factory=dict)

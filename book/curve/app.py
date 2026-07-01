@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import plotly.graph_objects as go
-from dash import Input, Output, ctx, dash_table, dcc, html
+from dash import Input, Output, ctx, dcc, html
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
@@ -28,6 +28,10 @@ from utils.research_app import (
     BG, PANEL, BORDER, TEXT, DIM, GRID, ORANGE, C0, C1, C2,
     styled_fig, stat_block, slider_with_input, graph, make_app, run,
 )
+from backtest import (
+    BooleanSignalPipeline, BacktestConfig, Engine, SignalConfig, TradeDef,
+    half_drift_residual,
+)
 from stats.ols import roll_lr_diff
 from stats.ou import ou_params, roll_half_life, roll_ou_zscore
 
@@ -36,14 +40,29 @@ from stats.ou import ou_params, roll_half_life, roll_ou_zscore
 TICKERS  = {"10y": "USGG10YR Index", "30y": "USGG30YR Index"}
 START    = "2010-01-01"
 FWD_BARS = 40
-LB_VALS  = [21, 42, 63, 90, 126]
+BETA_LB_VALS = [10, 15, 21, 30, 42, 63, 90, 126]
+Z_LB_VALS = [21, 42, 63, 90, 126]
 Z_VALS   = [1.0, 1.5, 2.0, 2.5, 3.0]
+RESID_VALS = [2.5, 5, 7.5, 10, 12.5, 15, 17.5, 20, 22.5, 25, 27.5, 30]
+EXIT_TARGET_VALS = [0.25, 0.5, 0.75, 1.0]
+HL_MULT_VALS = [0.5, 1.0, 1.5, 2.0, 3.0]
+SIGNAL_MODES = [
+    {"label": "OU z-score", "value": "z"},
+    {"label": "Residual bps", "value": "resid"},
+]
+EXIT_POLICIES = [
+    {"label": "Zero-cross", "value": "zero"},
+    {"label": "Residual target", "value": "target"},
+    {"label": "OU half-life stop", "value": "hl"},
+    {"label": "Target or half-life", "value": "target_or_hl"},
+    {"label": "Zero-cross or half-life", "value": "zero_or_hl"},
+]
 
 METRICS = [
     {"label": "Avg hit rate",   "value": "avg_hit"},
     {"label": "Long hit rate",  "value": "hit_long"},
     {"label": "Short hit rate", "value": "hit_short"},
-    {"label": "Approx Sharpe",  "value": "sharpe"},
+    {"label": "Realized Sharpe", "value": "sharpe"},
     {"label": "Cum PnL",        "value": "pnl"},
 ]
 METRIC_LABEL = {m["value"]: m["label"] for m in METRICS}
@@ -53,20 +72,105 @@ TRADE_COLUMNS = [
     {"name": "Side", "id": "side"},
     {"name": "Entry", "id": "entry_date"},
     {"name": "Exit", "id": "exit_date"},
-    {"name": "Entry z", "id": "entry_signal", "type": "numeric", "format": {"specifier": "+.2f"}},
-    {"name": "Exit z", "id": "exit_signal", "type": "numeric", "format": {"specifier": "+.2f"}},
+    {"name": "Entry sig", "id": "entry_signal", "type": "numeric", "format": {"specifier": "+.2f"}},
+    {"name": "Exit sig", "id": "exit_signal", "type": "numeric", "format": {"specifier": "+.2f"}},
     {"name": "Entry lvl", "id": "entry_level", "type": "numeric", "format": {"specifier": "+.2f"}},
     {"name": "Exit lvl", "id": "exit_level", "type": "numeric", "format": {"specifier": "+.2f"}},
     {"name": "Entry resid", "id": "entry_resid", "type": "numeric", "format": {"specifier": "+.2f"}},
     {"name": "Exit resid", "id": "exit_resid", "type": "numeric", "format": {"specifier": "+.2f"}},
     {"name": "Beta", "id": "entry_beta", "type": "numeric", "format": {"specifier": ".3f"}},
     {"name": "OU HL", "id": "entry_ou_hl", "type": "numeric", "format": {"specifier": ".1f"}},
+    {"name": "Exp resid", "id": "entry_expected_resid_pnl", "type": "numeric", "format": {"specifier": "+.2f"}},
     {"name": "Bars", "id": "bars_held", "type": "numeric"},
     {"name": "Exit reason", "id": "exit_reason"},
     {"name": "PnL", "id": "pnl", "type": "numeric", "format": {"specifier": "+.2f"}},
     {"name": "Cum PnL", "id": "cum_pnl", "type": "numeric", "format": {"specifier": "+.2f"}},
     {"name": "Run Sharpe", "id": "running_sharpe", "type": "numeric", "format": {"specifier": "+.2f"}},
 ]
+_TRADE_LEFT = {"side", "entry_date", "exit_date", "exit_reason"}
+_TRADE_SIGNED = {"entry_signal", "exit_signal", "entry_level", "exit_level",
+                 "entry_resid", "exit_resid", "entry_expected_resid_pnl",
+                 "pnl", "cum_pnl", "running_sharpe"}
+
+
+def _render_stats_section(label: str, blocks: list) -> html.Div:
+    """One labeled row of stat_block()s within the summary bar."""
+    return html.Div([
+        html.Span(label, style={
+            "color": DIM, "fontSize": 9, "fontWeight": "bold",
+            "textTransform": "uppercase", "letterSpacing": "0.05em",
+            "display": "block", "marginBottom": 6,
+        }),
+        html.Div(blocks, style={"display": "flex", "gap": 40, "flexWrap": "wrap"}),
+    ])
+
+
+def _fmt_trade_cell(col_id: str, value) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    if col_id in {"trade_id", "bars_held"}:
+        return str(int(value))
+    if col_id in _TRADE_SIGNED:
+        return f"{float(value):+.2f}"
+    if col_id == "entry_beta":
+        return f"{float(value):.3f}"
+    if col_id == "entry_ou_hl":
+        return f"{float(value):.1f}"
+    return str(value)
+
+
+def _render_trade_table(trades: pd.DataFrame):
+    if trades.empty:
+        return html.Div("No closed trades for this parameter set.", style={
+            "color": DIM, "fontSize": 11, "padding": "10px 12px",
+        })
+
+    header_style = {
+        "position": "sticky", "top": 0, "zIndex": 1,
+        "backgroundColor": PANEL, "color": TEXT,
+        "fontWeight": "bold", "fontSize": 10,
+        "padding": "6px 7px", "borderBottom": f"1px solid {BORDER}",
+        "borderRight": f"1px solid {GRID}", "whiteSpace": "nowrap",
+        "textAlign": "right",
+    }
+    cell_base = {
+        "fontSize": 10, "padding": "5px 7px",
+        "borderBottom": f"1px solid {GRID}",
+        "borderRight": f"1px solid {GRID}",
+        "whiteSpace": "nowrap", "textAlign": "right",
+    }
+    rows = []
+    for _, row in trades.iterrows():
+        side = row.get("side")
+        bg = "rgba(39,174,96,0.04)" if side == "long" else "rgba(231,76,60,0.04)"
+        cells = []
+        for col in TRADE_COLUMNS:
+            col_id = col["id"]
+            style = dict(cell_base)
+            if col_id in _TRADE_LEFT:
+                style["textAlign"] = "left"
+            if col_id == "pnl":
+                pnl = row.get("pnl")
+                if pd.notna(pnl):
+                    style["color"] = C1 if float(pnl) > 0 else C0 if float(pnl) < 0 else TEXT
+            cells.append(html.Td(_fmt_trade_cell(col_id, row.get(col_id)), style=style))
+        rows.append(html.Tr(cells, style={"backgroundColor": bg}))
+
+    return html.Table([
+        html.Thead(html.Tr([
+            html.Th(col["name"], style={
+                **header_style,
+                "textAlign": "left" if col["id"] in _TRADE_LEFT else "right",
+            })
+            for col in TRADE_COLUMNS
+        ])),
+        html.Tbody(rows),
+    ], style={
+        "borderCollapse": "collapse",
+        "width": "100%",
+        "minWidth": 1180,
+        "fontFamily": "Arial, Helvetica, sans-serif",
+    })
 
 
 # ── data ──────────────────────────────────────────────────────────────────────
@@ -110,8 +214,9 @@ def _compute(beta_lb: int, zscore_lb: int) -> pd.DataFrame:
     beta      = pl.concat([null1, reg["beta"]]).alias("beta")
     z         = roll_ou_zscore(resid_roll, lookback=zscore_lb).alias("zscore")
     hl        = roll_half_life(resid_roll, lookback=zscore_lb).alias("ou_half_life")
+    ou_mean   = resid_roll.rolling_mean(zscore_lb, min_samples=max(20, zscore_lb // 4)).alias("ou_mean")
     df = DATA.with_columns([beta, resid_roll, z, hl,
-                             (pl.col("30y") - pl.col("10y")).alias("naive")])
+                             ou_mean, (pl.col("30y") - pl.col("10y")).alias("naive")])
     df = df.with_columns(
         (pl.col("30y") - pl.col("beta") * pl.col("10y")).alias("beta_wtd")
     )
@@ -134,117 +239,247 @@ def _hit_rates(pdf: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _trade_pnl(pdf: pd.DataFrame, entry_z: float) -> float:
+def _trade_pnl(
+    pdf: pd.DataFrame,
+    entry_z: float,
+    exit_policy: str = "zero",
+    target_frac: float = 0.5,
+    hl_mult: float = 1.0,
+) -> float:
     """Final walk-forward PnL in naive 10s30s bps for a given entry threshold."""
-    _, _, _, cum_pnl, _ = _simulate(pdf, entry_z)
-    if len(cum_pnl) == 0:
+    _, _, _, cum_pnl, _, _, equity_curve = _simulate(
+        pdf, entry_z, exit_policy=exit_policy, target_frac=target_frac, hl_mult=hl_mult
+    )
+    if len(equity_curve) == 0:
         return np.nan
-    return float(cum_pnl.iloc[-1])
+    return float(equity_curve.iloc[-1])
 
 
-def _sharpe(pdf: pd.DataFrame, entry_z: float) -> float:
-    sub = pdf[["zscore", "resid_roll"]].dropna()
-    fwd = sub["resid_roll"].shift(-FWD_BARS) - sub["resid_roll"]
-    pnl = pd.concat([
-        fwd[sub["zscore"] < -entry_z],
-        -fwd[sub["zscore"] > entry_z],
-    ]).dropna()
-    if len(pnl) < 5 or pnl.std() == 0:
+def _sharpe(
+    pdf: pd.DataFrame,
+    entry_z: float,
+    exit_policy: str = "zero",
+    target_frac: float = 0.5,
+    hl_mult: float = 1.0,
+) -> float:
+    """Annualized daily Sharpe from actual naive-spread mark-to-market PnL."""
+    _, _, _, _, _, daily_pnl, _ = _simulate(
+        pdf, entry_z, exit_policy=exit_policy, target_frac=target_frac, hl_mult=hl_mult
+    )
+    return _daily_sharpe(daily_pnl)
+
+
+def _daily_sharpe(daily_pnl: pd.Series) -> float:
+    """Annualized Sharpe from daily mark-to-market PnL."""
+    pnl = daily_pnl.dropna()
+    if len(pnl) < 20 or pnl.std(ddof=1) == 0:
         return np.nan
-    return float(pnl.mean() / pnl.std() * np.sqrt(252 / FWD_BARS))
+    return float(pnl.mean() / pnl.std(ddof=1) * np.sqrt(252))
 
 
-def _simulate(pdf: pd.DataFrame, entry_z: float):
-    """Walk-forward simulation and closed-trade audit log."""
-    cols = ["zscore", "resid_roll", "naive", "beta", "ou_half_life"]
+def _predictability_stats(pdf: pd.DataFrame, horizon: int = FWD_BARS) -> dict:
+    """Forecast quality of the fade-residual signal vs forward naive 10s30s change.
+
+    Distinct from realized backtest performance (Sharpe, PnL): these measure
+    whether the signal has predictive content at all, independent of the
+    current entry/exit rule.
+    """
+    empty = {"ic": np.nan, "r2": np.nan, "rank_ic": np.nan, "hit": np.nan}
+    sub = pdf[["resid_roll", "naive"]].dropna()
+    if len(sub) < horizon + 20:
+        return empty
+    fwd_naive = sub["naive"].shift(-horizon) - sub["naive"]
+    pred = -sub["resid_roll"]
+    aligned = pd.concat([pred.rename("pred"), fwd_naive.rename("fwd")], axis=1).dropna()
+    aligned = aligned[aligned["pred"] != 0]
+    if len(aligned) < 20 or aligned["pred"].std(ddof=1) == 0 or aligned["fwd"].std(ddof=1) == 0:
+        return empty
+    ic = float(aligned["pred"].corr(aligned["fwd"]))
+    rank_ic = float(aligned["pred"].corr(aligned["fwd"], method="spearman"))
+    hit = float((np.sign(aligned["pred"]) == np.sign(aligned["fwd"])).mean())
+    return {"ic": ic, "r2": ic * ic, "rank_ic": rank_ic, "hit": hit}
+
+
+def _uses_zero_exit(exit_policy: str) -> bool:
+    return exit_policy in {"zero", "zero_or_hl"}
+
+
+def _uses_hl_stop(exit_policy: str) -> bool:
+    return exit_policy in {"hl", "target_or_hl", "zero_or_hl"}
+
+
+def _uses_resid_target(exit_policy: str) -> bool:
+    return exit_policy in {"target", "target_or_hl"}
+
+
+def _build_z_signal_frame(
+    pdf: pd.DataFrame,
+    entry_z: float,
+    exit_policy: str = "zero",
+    hl_mult: float = 1.0,
+) -> pd.DataFrame:
+    """Strategy layer: convert OU z-score into boolean entry/exit arrays."""
+    cols = ["zscore", "resid_roll", "naive", "beta", "ou_half_life", "ou_mean"]
     sub = pdf[cols].dropna(subset=["zscore", "resid_roll", "naive"])
-    z_arr = sub["zscore"].values
-    r_arr = sub["resid_roll"].values
-    n_arr = sub["naive"].values
-    dates = sub.index
-    n = len(z_arr)
+    zero_exit = _uses_zero_exit(exit_policy)
+    time_stop = (sub["ou_half_life"] * hl_mult).round().clip(lower=1) if _uses_hl_stop(exit_policy) else np.nan
+    return pd.DataFrame({
+        "signal_value": sub["zscore"],
+        "level": sub["naive"],
+        "resid": sub["resid_roll"],
+        "beta": sub["beta"],
+        "ou_half_life": sub["ou_half_life"],
+        "ou_mean": sub["ou_mean"],
+        "time_stop": time_stop,
+        "enter_long": sub["zscore"] < -entry_z,
+        "enter_short": sub["zscore"] > entry_z,
+        "exit_long": (sub["zscore"] >= 0) if zero_exit else False,
+        "exit_short": (sub["zscore"] <= 0) if zero_exit else False,
+    }, index=sub.index)
 
-    long_entries: list = []
-    short_entries: list = []
-    exit_dates: list = []
-    pnls: list = []
-    rows: list[dict] = []
 
-    state = None
-    entry = None
+def _build_resid_signal_frame(
+    pdf: pd.DataFrame,
+    entry_bps: float,
+    exit_bps: float = 0.0,
+    exit_policy: str = "zero",
+    hl_mult: float = 1.0,
+) -> pd.DataFrame:
+    """Strategy layer: pure residual-bps entry/exit arrays."""
+    cols = ["zscore", "resid_roll", "naive", "beta", "ou_half_life", "ou_mean"]
+    sub = pdf[cols].dropna(subset=["resid_roll", "naive"])
+    resid = sub["resid_roll"]
+    zero_exit = _uses_zero_exit(exit_policy)
+    time_stop = (sub["ou_half_life"] * hl_mult).round().clip(lower=1) if _uses_hl_stop(exit_policy) else np.nan
+    return pd.DataFrame({
+        "signal_value": resid,
+        "level": sub["naive"],
+        "resid": resid,
+        "beta": sub["beta"],
+        "ou_half_life": sub["ou_half_life"],
+        "ou_mean": sub["ou_mean"],
+        "time_stop": time_stop,
+        "enter_long": resid < -entry_bps,
+        "enter_short": resid > entry_bps,
+        "exit_long": (resid >= -exit_bps) if zero_exit else False,
+        "exit_short": (resid <= exit_bps) if zero_exit else False,
+    }, index=sub.index)
 
-    for i in range(n):
-        zi, ri, ni = z_arr[i], r_arr[i], n_arr[i]
-        if np.isnan(zi) or np.isnan(ri) or np.isnan(ni):
-            continue
 
-        exit_reason = None
-        if state == "long":
-            if zi >= 0:
-                exit_reason = "signal"
-            elif (i - entry["idx"]) >= FWD_BARS:
-                exit_reason = "time_stop"
-        elif state == "short":
-            if zi <= 0:
-                exit_reason = "signal"
-            elif (i - entry["idx"]) >= FWD_BARS:
-                exit_reason = "time_stop"
+def _run_signal_engine(
+    signals: pd.DataFrame,
+    max_hold_bars: int = FWD_BARS,
+    exit_policy: str = "zero",
+    target_frac: float = 0.5,
+):
+    """Adapter over the generic backtest Engine for boolean signal frames."""
+    if signals.empty:
+        empty = pd.Series(dtype=float)
+        return [], [], [], empty, pd.DataFrame(), empty, empty
 
-        if exit_reason is not None and entry is not None:
-            direction = 1 if state == "long" else -1
-            pnl = direction * (ni - entry["level"])
-            pnls.append(pnl)
-            exit_dates.append(dates[i])
-            cum = float(np.sum(pnls))
-            avg_bars = np.mean([r["bars_held"] for r in rows] + [i - entry["idx"]])
-            running_sharpe = np.nan
-            if len(pnls) > 1 and np.std(pnls, ddof=1) > 0 and avg_bars > 0:
-                running_sharpe = float(np.mean(pnls) / np.std(pnls, ddof=1) * np.sqrt(252 / avg_bars))
-            rows.append({
-                "trade_id": len(rows) + 1,
-                "side": state,
-                "entry_date": entry["date"].strftime("%Y-%m-%d"),
-                "exit_date": dates[i].strftime("%Y-%m-%d"),
-                "entry_signal": round(float(entry["signal"]), 3),
-                "exit_signal": round(float(zi), 3),
-                "entry_level": round(float(entry["level"]), 3),
-                "exit_level": round(float(ni), 3),
-                "entry_resid": _round_or_none(entry["resid"], 3),
-                "exit_resid": _round_or_none(ri, 3),
-                "entry_beta": _round_or_none(entry["beta"], 4),
-                "entry_ou_hl": _round_or_none(entry["ou_half_life"], 2),
-                "bars_held": int(i - entry["idx"]),
-                "exit_reason": exit_reason,
-                "pnl": round(float(pnl), 3),
-                "cum_pnl": round(cum, 3),
-                "running_sharpe": _round_or_none(running_sharpe, 3),
-            })
-            state = None
-            entry = None
+    engine_frame = signals.rename(columns={"signal_value": "signal"}).copy()
+    engine_frame["ts"] = pd.to_datetime(engine_frame.index).date
+    cols = ["ts", "level", "signal", "enter_long", "enter_short", "exit_long",
+            "exit_short", "resid", "beta", "ou_half_life", "ou_mean", "time_stop"]
+    data = pl.from_pandas(engine_frame[cols])
+    exit_fn = half_drift_residual(target_frac) if _uses_resid_target(exit_policy) else None
 
-        if state is None:
-            if zi < -entry_z:
-                long_entries.append(dates[i])
-                state = "long"
-            elif zi > entry_z:
-                short_entries.append(dates[i])
-                state = "short"
-            if state is not None:
-                entry = {
-                    "idx": i,
-                    "date": dates[i],
-                    "signal": zi,
-                    "level": ni,
-                    "resid": ri,
-                    "naive": ni,
-                    "beta": sub["beta"].iloc[i],
-                    "ou_half_life": sub["ou_half_life"].iloc[i],
-                }
+    pipeline = BooleanSignalPipeline(
+        name="curve_signal",
+        trade_def=TradeDef.outright("naive_10s30s", "level"),
+        compute_fn=lambda df: df.select([
+            "signal", "enter_long", "enter_short", "exit_long", "exit_short",
+            "resid", "beta", "ou_half_life", "ou_mean", "time_stop",
+        ]),
+        config=SignalConfig(time_stop_bars=max_hold_bars, exit_fn=exit_fn),
+    )
+    result = Engine(BacktestConfig(max_total_positions=1)).add_signal(pipeline).run(data)
 
+    closed = result.closed_trades
+    open_trades = result.open_trades
+    long_entries = [pd.Timestamp(t.entry_date) for t in closed + open_trades if t.direction == 1]
+    short_entries = [pd.Timestamp(t.entry_date) for t in closed + open_trades if t.direction == -1]
+    exit_dates = [pd.Timestamp(t.exit_date) for t in closed]
+
+    pnls = [float(t.pnl_bps) for t in closed]
     cum_pnl = pd.Series(dtype=float)
     if pnls:
         cum_pnl = pd.Series(np.cumsum(pnls), index=pd.DatetimeIndex(exit_dates))
-    return long_entries, short_entries, exit_dates, cum_pnl, pd.DataFrame(rows)
+
+    rows = []
+    for idx, trade in enumerate(closed, start=1):
+        cum = float(np.sum(pnls[:idx]))
+        held = [t.bars_held for t in closed[:idx]]
+        avg_bars = np.mean(held) if held else np.nan
+        running_sharpe = np.nan
+        if idx > 1 and np.std(pnls[:idx], ddof=1) > 0 and avg_bars > 0:
+            running_sharpe = float(np.mean(pnls[:idx]) / np.std(pnls[:idx], ddof=1) * np.sqrt(252 / avg_bars))
+        entry_resid = trade.entry_extras.get("resid")
+        entry_mu = trade.entry_extras.get("ou_mean", 0.0)
+        expected_resid_pnl = np.nan
+        if entry_resid is not None and pd.notna(entry_resid):
+            target_resid = entry_mu + (entry_resid - entry_mu) * (1.0 - target_frac)
+            expected_resid_pnl = abs(float(entry_resid) - float(target_resid))
+        rows.append({
+            "trade_id": idx,
+            "side": "long" if trade.direction == 1 else "short",
+            "entry_date": pd.Timestamp(trade.entry_date).strftime("%Y-%m-%d"),
+            "exit_date": pd.Timestamp(trade.exit_date).strftime("%Y-%m-%d"),
+            "entry_signal": round(float(trade.entry_signal), 3),
+            "exit_signal": round(float(trade.exit_signal), 3),
+            "entry_level": round(float(trade.entry_level), 3),
+            "exit_level": round(float(trade.exit_level), 3),
+            "entry_resid": _round_or_none(trade.entry_extras.get("resid"), 3),
+            "exit_resid": _round_or_none(trade.exit_extras.get("resid"), 3),
+            "entry_beta": _round_or_none(trade.entry_extras.get("beta"), 4),
+            "entry_ou_hl": _round_or_none(trade.entry_extras.get("ou_half_life"), 2),
+            "entry_expected_resid_pnl": _round_or_none(expected_resid_pnl, 3),
+            "bars_held": int(trade.bars_held),
+            "exit_reason": trade.exit_reason,
+            "pnl": round(float(trade.pnl_bps), 3),
+            "cum_pnl": round(cum, 3),
+            "running_sharpe": _round_or_none(running_sharpe, 3),
+        })
+
+    daily_pdf = result.daily_pnl.to_pandas()
+    equity_pdf = result.equity_curve.to_pandas()
+    if daily_pdf.empty:
+        daily_pnl = pd.Series(dtype=float)
+    else:
+        daily_pnl = pd.Series(daily_pdf["pnl_bps"].to_numpy(), index=pd.to_datetime(daily_pdf["ts"]))
+    if equity_pdf.empty:
+        equity_curve = pd.Series(dtype=float)
+    else:
+        equity_curve = pd.Series(equity_pdf["cumulative_pnl"].to_numpy(), index=pd.to_datetime(equity_pdf["ts"]))
+
+    return long_entries, short_entries, exit_dates, cum_pnl, pd.DataFrame(rows), daily_pnl, equity_curve
+
+
+def _simulate(
+    pdf: pd.DataFrame,
+    entry_z: float,
+    exit_policy: str = "zero",
+    target_frac: float = 0.5,
+    hl_mult: float = 1.0,
+):
+    """Compatibility wrapper for the current OU-z strategy."""
+    signals = _build_z_signal_frame(pdf, entry_z, exit_policy=exit_policy, hl_mult=hl_mult)
+    return _run_signal_engine(signals, exit_policy=exit_policy, target_frac=target_frac)
+
+
+def _simulate_resid(
+    pdf: pd.DataFrame,
+    entry_bps: float,
+    exit_policy: str = "zero",
+    target_frac: float = 0.5,
+    hl_mult: float = 1.0,
+):
+    """Pure residual-bps strategy wrapper."""
+    signals = _build_resid_signal_frame(
+        pdf, entry_bps, exit_policy=exit_policy, hl_mult=hl_mult
+    )
+    return _run_signal_engine(signals, exit_policy=exit_policy, target_frac=target_frac)
+
 
 def _round_or_none(value, ndigits: int):
     try:
@@ -263,11 +498,17 @@ def _marker_xy(pdf: pd.DataFrame, dates, col: str = "10y"):
 
 
 @lru_cache(maxsize=64)
-def _grid(metric: str, entry_z: float) -> tuple:
+def _grid(
+    metric: str,
+    entry_z: float,
+    exit_policy: str = "zero",
+    target_frac: float = 0.5,
+    hl_mult: float = 1.0,
+) -> tuple:
     """β-lb (y) × z-lb (x) at fixed entry_z. Cached."""
-    grid = np.full((len(LB_VALS), len(LB_VALS)), np.nan)
-    for i, beta_lb in enumerate(LB_VALS):
-        for j, zscore_lb in enumerate(LB_VALS):
+    grid = np.full((len(BETA_LB_VALS), len(Z_LB_VALS)), np.nan)
+    for i, beta_lb in enumerate(BETA_LB_VALS):
+        for j, zscore_lb in enumerate(Z_LB_VALS):
             try:
                 pdf  = _compute(beta_lb, zscore_lb)
                 scan = _hit_rates(pdf)
@@ -279,9 +520,9 @@ def _grid(metric: str, entry_z: float) -> tuple:
                 elif metric == "avg_hit":
                     grid[i, j] = (crow["hit_long"] + crow["hit_short"]) / 2
                 elif metric == "sharpe":
-                    grid[i, j] = _sharpe(pdf, entry_z)
+                    grid[i, j] = _sharpe(pdf, entry_z, exit_policy, target_frac, hl_mult)
                 elif metric == "pnl":
-                    grid[i, j] = _trade_pnl(pdf, entry_z)
+                    grid[i, j] = _trade_pnl(pdf, entry_z, exit_policy, target_frac, hl_mult)
             except Exception:
                 pass
     return tuple(tuple(float(v) if not np.isnan(v) else None for v in row)
@@ -289,10 +530,16 @@ def _grid(metric: str, entry_z: float) -> tuple:
 
 
 @lru_cache(maxsize=64)
-def _grid2(metric: str, zscore_lb_snap: int) -> tuple:
+def _grid2(
+    metric: str,
+    zscore_lb_snap: int,
+    exit_policy: str = "zero",
+    target_frac: float = 0.5,
+    hl_mult: float = 1.0,
+) -> tuple:
     """β-lb (y) × entry threshold (x) at fixed zscore_lb. Cached."""
-    grid = np.full((len(LB_VALS), len(Z_VALS)), np.nan)
-    for i, beta_lb in enumerate(LB_VALS):
+    grid = np.full((len(BETA_LB_VALS), len(Z_VALS)), np.nan)
+    for i, beta_lb in enumerate(BETA_LB_VALS):
         for j, ez in enumerate(Z_VALS):
             try:
                 pdf  = _compute(beta_lb, zscore_lb_snap)
@@ -305,9 +552,9 @@ def _grid2(metric: str, zscore_lb_snap: int) -> tuple:
                 elif metric == "avg_hit":
                     grid[i, j] = (crow["hit_long"] + crow["hit_short"]) / 2
                 elif metric == "sharpe":
-                    grid[i, j] = _sharpe(pdf, ez)
+                    grid[i, j] = _sharpe(pdf, ez, exit_policy, target_frac, hl_mult)
                 elif metric == "pnl":
-                    grid[i, j] = _trade_pnl(pdf, ez)
+                    grid[i, j] = _trade_pnl(pdf, ez, exit_policy, target_frac, hl_mult)
             except Exception:
                 pass
     return tuple(tuple(float(v) if not np.isnan(v) else None for v in row)
@@ -316,6 +563,81 @@ def _grid2(metric: str, zscore_lb_snap: int) -> tuple:
 
 # ── value parsers ─────────────────────────────────────────────────────────────
 
+
+def _resid_metric(
+    pdf: pd.DataFrame,
+    metric: str,
+    entry_bps: float,
+    exit_policy: str = "zero",
+    target_frac: float = 0.5,
+    hl_mult: float = 1.0,
+) -> float:
+    """Heatmap metric for the residual-bps strategy."""
+    _, _, _, _, trades, daily_pnl, equity_curve = _simulate_resid(
+        pdf, entry_bps, exit_policy=exit_policy, target_frac=target_frac, hl_mult=hl_mult
+    )
+    if metric == "sharpe":
+        return _daily_sharpe(daily_pnl)
+    if metric == "pnl":
+        return float(equity_curve.iloc[-1]) if len(equity_curve) else np.nan
+    if trades.empty:
+        return np.nan
+    if metric == "hit_long":
+        sub = trades[trades["side"] == "long"]
+        return float((sub["pnl"] > 0).mean()) if len(sub) else np.nan
+    if metric == "hit_short":
+        sub = trades[trades["side"] == "short"]
+        return float((sub["pnl"] > 0).mean()) if len(sub) else np.nan
+    if metric == "avg_hit":
+        vals = []
+        for side in ("long", "short"):
+            sub = trades[trades["side"] == side]
+            if len(sub):
+                vals.append(float((sub["pnl"] > 0).mean()))
+        return float(np.mean(vals)) if vals else np.nan
+    return np.nan
+
+
+@lru_cache(maxsize=64)
+def _grid_resid_zlb(
+    metric: str,
+    entry_bps: float,
+    exit_policy: str,
+    target_frac: float,
+    hl_mult: float,
+) -> tuple:
+    """Beta-lb (y) x OU z-lb (x) for residual strategy. z-lb is diagnostic only."""
+    grid = np.full((len(BETA_LB_VALS), len(Z_LB_VALS)), np.nan)
+    for i, beta_lb in enumerate(BETA_LB_VALS):
+        for j, zscore_lb in enumerate(Z_LB_VALS):
+            try:
+                pdf = _compute(beta_lb, zscore_lb)
+                grid[i, j] = _resid_metric(pdf, metric, entry_bps, exit_policy, target_frac, hl_mult)
+            except Exception:
+                pass
+    return tuple(tuple(float(v) if not np.isnan(v) else None for v in row)
+                 for row in grid)
+
+
+@lru_cache(maxsize=64)
+def _grid_resid_entry(
+    metric: str,
+    zscore_lb_snap: int,
+    exit_policy: str,
+    target_frac: float,
+    hl_mult: float,
+) -> tuple:
+    """Beta-lb (y) x residual entry threshold (x) at fixed OU z-lb."""
+    grid = np.full((len(BETA_LB_VALS), len(RESID_VALS)), np.nan)
+    for i, beta_lb in enumerate(BETA_LB_VALS):
+        for j, entry_bps in enumerate(RESID_VALS):
+            try:
+                pdf = _compute(beta_lb, zscore_lb_snap)
+                grid[i, j] = _resid_metric(pdf, metric, entry_bps, exit_policy, target_frac, hl_mult)
+            except Exception:
+                pass
+    return tuple(tuple(float(v) if not np.isnan(v) else None for v in row)
+                 for row in grid)
 def _parse_lb(typed, slider, default=63) -> int:
     try:
         return max(5, int(float(typed or slider or default)))
@@ -361,7 +683,7 @@ def _heatmap_fig(
 
     text = [[fmt(v) if v is not None else "—" for v in row] for row in z]
 
-    fig = styled_fig(title, height=270)
+    fig = styled_fig(title, height=360)
     fig.add_trace(go.Heatmap(
         x=[str(v) for v in x_labels],
         y=[str(v) for v in y_labels],
@@ -390,7 +712,7 @@ def _heatmap_fig(
     fig.update_layout(
         xaxis=dict(title=x_title, showgrid=False, tickfont=dict(size=9), linecolor=BORDER),
         yaxis=dict(title=y_title, showgrid=False, tickfont=dict(size=9), linecolor=BORDER),
-        margin=dict(l=60, r=70, t=36, b=46),
+        margin=dict(l=66, r=74, t=44, b=54),
     )
     return fig
 
@@ -405,16 +727,67 @@ app = make_app(
     subtitle = "beta-weighted curve explorer",
     data_info= f"{len(DATA):,} rows · {DATA['ts'].min()} → {DATA['ts'].max()}",
     sliders  = [
-        slider_with_input("beta-lb",   LB_VALS, 63,  "beta lookback (days)"),
-        slider_with_input("zscore-lb", LB_VALS, 63,  "z-score lookback (days)"),
-        slider_with_input("entry-z",   Z_VALS,  2.0, "entry threshold  ±z"),
+        # row 1: entry side — signal construction + entry threshold
+        [
+            html.Div([
+                html.Span("signal mode", style={
+                    "color": DIM, "fontSize": 10, "fontWeight": "bold",
+                    "letterSpacing": "0.05em", "textTransform": "uppercase",
+                    "display": "block", "marginBottom": 6,
+                }),
+                dcc.Dropdown(
+                    id="signal-mode",
+                    options=SIGNAL_MODES,
+                    value="resid",
+                    clearable=False,
+                    searchable=False,
+                    style={"fontSize": 12, "fontFamily": "Arial, Helvetica, sans-serif"},
+                ),
+            ]),
+            slider_with_input("beta-lb",   BETA_LB_VALS, 63, "beta lookback (days)"),
+            slider_with_input("zscore-lb", Z_LB_VALS,    63, "z-score lookback (days)"),
+            # entry threshold: both sliders share this one grid cell; only the
+            # slider matching the active signal mode is shown (see callback below)
+            html.Div([
+                html.Div(
+                    id="entry-z-wrap",
+                    children=[slider_with_input("entry-z", Z_VALS, 2.0, "entry threshold  ±z")],
+                    style={"display": "none"},
+                ),
+                html.Div(
+                    id="entry-resid-wrap",
+                    children=[slider_with_input("entry-resid", RESID_VALS, 10, "entry threshold  ±resid bps")],
+                    style={"display": "block"},
+                ),
+            ]),
+        ],
+        # row 2: exit params
+        [
+            html.Div([
+                html.Span("exit policy", style={
+                    "color": DIM, "fontSize": 10, "fontWeight": "bold",
+                    "letterSpacing": "0.05em", "textTransform": "uppercase",
+                    "display": "block", "marginBottom": 6,
+                }),
+                dcc.Dropdown(
+                    id="exit-policy",
+                    options=EXIT_POLICIES,
+                    value="target_or_hl",
+                    clearable=False,
+                    searchable=False,
+                    style={"fontSize": 12, "fontFamily": "Arial, Helvetica, sans-serif"},
+                ),
+            ]),
+            slider_with_input("exit-target-frac", EXIT_TARGET_VALS, 0.5, "target fraction"),
+            slider_with_input("exit-hl-mult",     HL_MULT_VALS,     1.0, "OU half-life multiple"),
+        ],
     ],
     body=html.Div([
         # stats bar
         html.Div(id="stats-row", style={
-            "padding": "10px 28px 10px", "background": PANEL,
+            "padding": "10px 28px 12px", "background": PANEL,
             "borderBottom": f"1px solid {BORDER}",
-            "display": "flex", "gap": 40, "flexWrap": "wrap",
+            "display": "flex", "flexDirection": "column", "gap": 10,
         }),
         # row 1: naive vs beta-weighted spread + signal spread
         html.Div(style=_ROW, children=[graph("chart-yields"), graph("chart-spread")]),
@@ -447,52 +820,33 @@ app = make_app(
                 "textTransform": "uppercase", "letterSpacing": "0.05em",
                 "marginBottom": 6,
             }),
-            dash_table.DataTable(
+            html.Div(
                 id="trade-log",
-                columns=TRADE_COLUMNS,
-                data=[],
-                sort_action="native",
-                page_action="native",
-                page_size=15,
-                fixed_rows={"headers": True},
-                style_table={
+                children=_render_trade_table(pd.DataFrame()),
+                style={
                     "overflowX": "auto",
-                    "border": f"1px solid {BORDER}",
-                    "maxHeight": "520px",
                     "overflowY": "auto",
+                    "border": f"1px solid {BORDER}",
+                    "maxHeight": "318px",
                 },
-                style_header={
-                    "backgroundColor": PANEL,
-                    "color": TEXT,
-                    "fontWeight": "bold",
-                    "borderBottom": f"1px solid {BORDER}",
-                    "fontSize": 10,
-                },
-                style_cell={
-                    "fontFamily": "Arial, Helvetica, sans-serif",
-                    "fontSize": 10,
-                    "padding": "5px 7px",
-                    "border": f"1px solid {GRID}",
-                    "whiteSpace": "nowrap",
-                    "textAlign": "right",
-                },
-                style_cell_conditional=[
-                    {"if": {"column_id": "side"}, "textAlign": "left"},
-                    {"if": {"column_id": "entry_date"}, "textAlign": "left"},
-                    {"if": {"column_id": "exit_date"}, "textAlign": "left"},
-                    {"if": {"column_id": "exit_reason"}, "textAlign": "left"},
-                ],
-                style_data_conditional=[
-                    {"if": {"filter_query": "{pnl} > 0", "column_id": "pnl"}, "color": C1},
-                    {"if": {"filter_query": "{pnl} < 0", "column_id": "pnl"}, "color": C0},
-                    {"if": {"filter_query": "{side} = \"long\""}, "backgroundColor": "rgba(39,174,96,0.04)"},
-                    {"if": {"filter_query": "{side} = \"short\""}, "backgroundColor": "rgba(231,76,60,0.04)"},
-                ],
             ),
         ]),
     ]),
     debug=True,
 )
+
+
+# ── signal-mode visibility ──────────────────────────────────────────────────
+
+@app.callback(
+    Output("entry-z-wrap",     "style"),
+    Output("entry-resid-wrap", "style"),
+    Input("signal-mode", "value"),
+)
+def _toggle_entry_threshold(signal_mode):
+    if signal_mode == "resid":
+        return {"display": "none"}, {"display": "block"}
+    return {"display": "block"}, {"display": "none"}
 
 
 # ── sync callbacks (slider ↔ typed input) ─────────────────────────────────────
@@ -517,9 +871,12 @@ def _register_sync(id_: str, vals: list):
         return sv, str(int(sv) if sv == int(sv) else sv)
 
 
-_register_sync("beta-lb",   LB_VALS)
-_register_sync("zscore-lb", LB_VALS)
+_register_sync("beta-lb",   BETA_LB_VALS)
+_register_sync("zscore-lb", Z_LB_VALS)
 _register_sync("entry-z",   Z_VALS)
+_register_sync("entry-resid", RESID_VALS)
+_register_sync("exit-target-frac", EXIT_TARGET_VALS)
+_register_sync("exit-hl-mult", HL_MULT_VALS)
 
 
 # ── main callback: time-series charts + stats ─────────────────────────────────
@@ -532,25 +889,49 @@ _register_sync("entry-z",   Z_VALS)
     Output("chart-pnl",    "figure"),
     Output("chart-hits",   "figure"),
     Output("stats-row",    "children"),
-    Output("trade-log",    "data"),
+    Output("trade-log",    "children"),
     Input("beta-lb-typed",   "value"),
     Input("zscore-lb-typed", "value"),
     Input("entry-z-typed",   "value"),
+    Input("entry-resid-typed", "value"),
+    Input("signal-mode", "value"),
+    Input("exit-policy", "value"),
+    Input("exit-target-frac-typed", "value"),
+    Input("exit-hl-mult-typed", "value"),
     Input("beta-lb",   "value"),
     Input("zscore-lb", "value"),
     Input("entry-z",   "value"),
+    Input("entry-resid", "value"),
+    Input("exit-target-frac", "value"),
+    Input("exit-hl-mult", "value"),
 )
-def update_charts(beta_t, zscore_t, ez_t, beta_s, zscore_s, ez_s):
+def update_charts(
+    beta_t, zscore_t, ez_t, er_t, signal_mode, exit_policy, target_t, hl_t,
+    beta_s, zscore_s, ez_s, er_s, target_s, hl_s,
+):
     beta_lb   = _parse_lb(beta_t,   beta_s,   63)
     zscore_lb = _parse_lb(zscore_t, zscore_s, 63)
     entry_z   = _parse_z(ez_t,     ez_s,     2.0)
+    entry_resid = _parse_z(er_t, er_s, 10.0)
+    target_frac = min(1.0, max(0.01, _parse_z(target_t, target_s, 0.5)))
+    hl_mult = max(0.1, _parse_z(hl_t, hl_s, 1.0))
+    exit_policy = exit_policy or "target_or_hl"
 
     pdf  = _compute(beta_lb, zscore_lb)
     scan = _hit_rates(pdf)
     crow = _crow(scan, entry_z)
 
-    long_entries, short_entries, exit_dates, cum_pnl, trades = _simulate(pdf, entry_z)
-
+    if signal_mode == "resid":
+        long_entries, short_entries, exit_dates, cum_pnl, trades, daily_pnl, equity_curve = _simulate_resid(
+            pdf, entry_resid, exit_policy=exit_policy, target_frac=target_frac, hl_mult=hl_mult
+        )
+        signal_label = f"resid +/-{entry_resid:g}bp"
+    else:
+        long_entries, short_entries, exit_dates, cum_pnl, trades, daily_pnl, equity_curve = _simulate(
+            pdf, entry_z, exit_policy=exit_policy, target_frac=target_frac, hl_mult=hl_mult
+        )
+        signal_label = f"OU z +/-{entry_z:g}"
+    exit_label = f"{exit_policy.replace('_', ' ')} | target={target_frac:.0%} | HLx={hl_mult:g}"
     le_x, le_y = _marker_xy(pdf, long_entries, "naive")
     se_x, se_y = _marker_xy(pdf, short_entries, "naive")
     ex_x, ex_y = _marker_xy(pdf, exit_dates,   "naive")
@@ -595,6 +976,10 @@ def update_charts(beta_t, zscore_t, ez_t, beta_s, zscore_s, ez_s):
     # chart 3: rolling residual
     fig3 = styled_fig(f"Rolling residual  (beta lookback={beta_lb}d)", "bps", height=280)
     fig3.add_hline(y=0, line=dict(color=BORDER, dash="dot", width=0.8))
+    if signal_mode == "resid":
+        fig3.add_hline(y= entry_resid, line=dict(color=C0, dash="dash", width=1.1))
+        fig3.add_hline(y=-entry_resid, line=dict(color=C1, dash="dash", width=1.1),
+                       annotation_text=f"±{entry_resid:g}bp", annotation_position="right")
     fig3.add_trace(go.Scatter(
         x=pdf.index, y=pdf["resid_roll"], name="rolling residual", showlegend=False,
         line=dict(color=C2, width=1.2),
@@ -602,16 +987,16 @@ def update_charts(beta_t, zscore_t, ez_t, beta_s, zscore_s, ez_s):
 
     # ── chart 4: OU z-score ───────────────────────────────────────────────────
     z_clean = pdf["zscore"].dropna()
-    fig4 = styled_fig(f"OU z-score — z-lb={zscore_lb}d  entry=±{entry_z}", "z", height=280)
-    if len(z_clean) > 0:
+    fig4 = styled_fig(f"OU z-score — z-lb={zscore_lb}d  active signal={signal_label}", "z", height=280)
+    if signal_mode == "z" and len(z_clean) > 0:
         pad = 0.5
         fig4.add_hrect(y0= entry_z, y1=z_clean.max() + pad,
                        fillcolor=C0, opacity=0.06, line_width=0)
         fig4.add_hrect(y0=z_clean.min() - pad, y1=-entry_z,
                        fillcolor=C1, opacity=0.06, line_width=0)
-    fig4.add_hline(y= entry_z, line=dict(color=C0, dash="dash", width=1.2))
-    fig4.add_hline(y=-entry_z, line=dict(color=C1, dash="dash", width=1.2),
-                   annotation_text=f"±{entry_z}", annotation_position="right")
+        fig4.add_hline(y= entry_z, line=dict(color=C0, dash="dash", width=1.2))
+        fig4.add_hline(y=-entry_z, line=dict(color=C1, dash="dash", width=1.2),
+                       annotation_text=f"±{entry_z}", annotation_position="right")
     fig4.add_hline(y=0, line=dict(color=BORDER, dash="dot", width=0.8))
     fig4.add_trace(go.Scatter(
         x=pdf.index, y=pdf["zscore"], showlegend=False,
@@ -620,18 +1005,14 @@ def update_charts(beta_t, zscore_t, ez_t, beta_s, zscore_s, ez_s):
 
     # ── chart 5: cumulative PnL ───────────────────────────────────────────────
     n_trades = len(long_entries) + len(short_entries)
-    fig5 = styled_fig(f"Cumulative PnL  ({n_trades} trades)", "bps", height=240)
+    fig5 = styled_fig(f"Cumulative PnL  ({n_trades} trades, {signal_label}, {exit_label}, daily MTM)", "bps", height=240)
     fig5.add_hline(y=0, line=dict(color=BORDER, width=1))
-    if len(cum_pnl) > 0:
-        plot_pnl = pd.concat([
-            pd.Series([0.0], index=[pdf.index[0]]),
-            cum_pnl,
-        ]).sort_index()
-        final = float(cum_pnl.iloc[-1])
+    if len(equity_curve) > 0:
+        final = float(equity_curve.iloc[-1])
         color = C1 if final >= 0 else C0
         fig5.add_trace(go.Scatter(
-            x=plot_pnl.index, y=plot_pnl.values,
-            mode="lines", line_shape="hv",
+            x=equity_curve.index, y=equity_curve.values,
+            mode="lines",
             line=dict(color=color, width=1.5),
             fill="tozeroy",
             fillcolor=f"rgba(39,174,96,0.10)" if final >= 0 else "rgba(231,76,60,0.10)",
@@ -671,31 +1052,55 @@ def update_charts(beta_t, zscore_t, ez_t, beta_s, zscore_s, ez_s):
     hl      = p["half_life"]
     hl_val  = crow["hit_long"]
     hs_val  = crow["hit_short"]
-    sh      = _sharpe(pdf, entry_z)
-    final   = float(cum_pnl.iloc[-1]) if len(cum_pnl) > 0 else np.nan
+    sh      = _daily_sharpe(daily_pnl)
+    final   = float(equity_curve.iloc[-1]) if len(equity_curve) > 0 else np.nan
+    pred    = _predictability_stats(pdf)
 
-    stats = [
+    predictability_stats = [
         stat_block("direction ρ naive",       f"{c_naive:+.3f}"),
         stat_block("direction ρ β-weighted",  f"{c_bw:+.3f}"),
         stat_block("OU half-life",            f"{hl:.0f}d" if not np.isnan(hl) else "—"),
         stat_block("OU σ / day",              f"{p['sigma']:.2f} bps"),
+        stat_block(f"resid→naive {FWD_BARS}d IC",
+                   f"{pred['ic']:+.3f}" if not np.isnan(pred["ic"]) else "—",
+                   alert=not np.isnan(pred["ic"]) and pred["ic"] > 0.10),
+        stat_block(f"resid→naive {FWD_BARS}d R2",
+                   f"{pred['r2']:.1%}" if not np.isnan(pred["r2"]) else "—"),
+        stat_block(f"resid→naive {FWD_BARS}d rank IC",
+                   f"{pred['rank_ic']:+.3f}" if not np.isnan(pred["rank_ic"]) else "—",
+                   alert=not np.isnan(pred["rank_ic"]) and pred["rank_ic"] > 0.10),
+        stat_block(f"resid→naive {FWD_BARS}d sign hit",
+                   f"{pred['hit']:.1%}" if not np.isnan(pred["hit"]) else "—",
+                   alert=not np.isnan(pred["hit"]) and pred["hit"] > 0.55),
+    ]
+    performance_stats = [
         stat_block(f"hit long  z={entry_z}",
                    f"{hl_val:.1%}" if not np.isnan(hl_val) else "—",
                    alert=not np.isnan(hl_val) and hl_val > 0.6),
         stat_block(f"hit short  z={entry_z}",
                    f"{hs_val:.1%}" if not np.isnan(hs_val) else "—",
                    alert=not np.isnan(hs_val) and hs_val < 0.45),
-        stat_block("approx sharpe",
+        stat_block("realized sharpe",
                    f"{sh:.2f}" if not np.isnan(sh) else "—",
                    alert=not np.isnan(sh) and sh > 0.8),
         stat_block("cum PnL",
                    f"{final:+.1f} bps" if not np.isnan(final) else "—",
                    alert=not np.isnan(final) and final > 0),
+        stat_block("signal mode", signal_label),
+        stat_block("exit policy", exit_label),
         stat_block("n long entries",  str(len(long_entries))),
         stat_block("n short entries", str(len(short_entries))),
     ]
 
-    return fig1, fig2, fig3, fig4, fig5, fig6, stats, trades.to_dict("records")
+    stats = [
+        _render_stats_section("signal predictability", predictability_stats),
+        _render_stats_section("strategy performance", performance_stats),
+    ]
+
+    if not trades.empty:
+        trades = trades.sort_values(["exit_date", "trade_id"], ascending=[False, False])
+
+    return fig1, fig2, fig3, fig4, fig5, fig6, stats, _render_trade_table(trades)
 
 
 # ── heatmap callback ──────────────────────────────────────────────────────────
@@ -706,46 +1111,85 @@ def update_charts(beta_t, zscore_t, ez_t, beta_s, zscore_s, ez_s):
     Input("metric-select",   "value"),
     Input("entry-z-typed",   "value"),
     Input("entry-z",         "value"),
+    Input("entry-resid-typed", "value"),
+    Input("entry-resid",       "value"),
+    Input("signal-mode",       "value"),
+    Input("exit-policy",       "value"),
+    Input("exit-target-frac-typed", "value"),
+    Input("exit-target-frac",       "value"),
+    Input("exit-hl-mult-typed", "value"),
+    Input("exit-hl-mult",       "value"),
     Input("beta-lb-typed",   "value"),
     Input("beta-lb",         "value"),
     Input("zscore-lb-typed", "value"),
     Input("zscore-lb",       "value"),
 )
-def update_heatmaps(metric, ez_t, ez_s, beta_t, beta_s, zscore_t, zscore_s):
+def update_heatmaps(
+    metric, ez_t, ez_s, er_t, er_s, signal_mode,
+    exit_policy, target_t, target_s, hl_t, hl_s,
+    beta_t, beta_s, zscore_t, zscore_s,
+):
     metric    = metric or "avg_hit"
     entry_z   = _parse_z(ez_t,    ez_s,    2.0)
+    entry_resid = _parse_z(er_t, er_s, 10.0)
+    target_frac = min(1.0, max(0.01, _parse_z(target_t, target_s, 0.5)))
+    hl_mult = max(0.1, _parse_z(hl_t, hl_s, 1.0))
+    exit_policy = exit_policy or "target_or_hl"
     beta_lb   = _parse_lb(beta_t,  beta_s,  63)
     zscore_lb = _parse_lb(zscore_t, zscore_s, 63)
 
-    # Heatmap 1: β-lb × z-lb  (at fixed entry_z)
-    g1 = _grid(metric, round(entry_z, 2))
-    fig_h1 = _heatmap_fig(
-        title    = f"β-lb × z-lb  — {METRIC_LABEL[metric]}  (entry ±{entry_z})",
-        grid     = g1,
-        x_labels = LB_VALS, y_labels = LB_VALS,
-        x_title  = "z-score lookback (days)",
-        y_title  = "β lookback (days)",
-        metric   = metric,
-        cur_x    = zscore_lb if zscore_lb in LB_VALS else None,
-        cur_y    = beta_lb   if beta_lb   in LB_VALS else None,
-    )
+    zs_snap = min(Z_LB_VALS, key=lambda x: abs(x - zscore_lb))
+    if signal_mode == "resid":
+        exit_short = f"{exit_policy.replace('_', ' ')} target={target_frac:.0%} HLx={hl_mult:g}"
+        g1 = _grid_resid_zlb(metric, round(entry_resid, 2), exit_policy, round(target_frac, 4), round(hl_mult, 4))
+        fig_h1 = _heatmap_fig(
+            title    = f"beta-lb x OU z-lb - {METRIC_LABEL[metric]}  (resid +/-{entry_resid:g}bp; {exit_short})",
+            grid     = g1,
+            x_labels = Z_LB_VALS, y_labels = BETA_LB_VALS,
+            x_title  = "OU z-score lookback (diagnostic)",
+            y_title  = "beta lookback (days)",
+            metric   = metric,
+            cur_x    = zscore_lb if zscore_lb in Z_LB_VALS else None,
+            cur_y    = beta_lb   if beta_lb   in BETA_LB_VALS else None,
+        )
 
-    # Heatmap 2: β-lb × entry_z  (at fixed z-lb snapped to nearest LB_VALS)
-    zs_snap = min(LB_VALS, key=lambda x: abs(x - zscore_lb))
-    g2 = _grid2(metric, zs_snap)
-    fig_h2 = _heatmap_fig(
-        title    = f"β-lb × entry ±z  — {METRIC_LABEL[metric]}  (z-lb={zs_snap}d)",
-        grid     = g2,
-        x_labels = Z_VALS, y_labels = LB_VALS,
-        x_title  = "entry threshold ±z",
-        y_title  = "β lookback (days)",
-        metric   = metric,
-        cur_x    = entry_z if entry_z in Z_VALS else None,
-        cur_y    = beta_lb if beta_lb in LB_VALS else None,
-    )
+        g2 = _grid_resid_entry(metric, zs_snap, exit_policy, round(target_frac, 4), round(hl_mult, 4))
+        fig_h2 = _heatmap_fig(
+            title    = f"beta-lb x entry +/-resid bps - {METRIC_LABEL[metric]}  (z-lb={zs_snap}d; {exit_short})",
+            grid     = g2,
+            x_labels = RESID_VALS, y_labels = BETA_LB_VALS,
+            x_title  = "entry threshold +/-resid bps",
+            y_title  = "beta lookback (days)",
+            metric   = metric,
+            cur_x    = entry_resid if entry_resid in RESID_VALS else None,
+            cur_y    = beta_lb if beta_lb in BETA_LB_VALS else None,
+        )
+    else:
+        g1 = _grid(metric, round(entry_z, 2), exit_policy, round(target_frac, 4), round(hl_mult, 4))
+        fig_h1 = _heatmap_fig(
+            title    = f"beta-lb x z-lb - {METRIC_LABEL[metric]}  (entry +/-{entry_z})",
+            grid     = g1,
+            x_labels = Z_LB_VALS, y_labels = BETA_LB_VALS,
+            x_title  = "z-score lookback (days)",
+            y_title  = "beta lookback (days)",
+            metric   = metric,
+            cur_x    = zscore_lb if zscore_lb in Z_LB_VALS else None,
+            cur_y    = beta_lb   if beta_lb   in BETA_LB_VALS else None,
+        )
+
+        g2 = _grid2(metric, zs_snap, exit_policy, round(target_frac, 4), round(hl_mult, 4))
+        fig_h2 = _heatmap_fig(
+            title    = f"beta-lb x entry +/-z - {METRIC_LABEL[metric]}  (z-lb={zs_snap}d)",
+            grid     = g2,
+            x_labels = Z_VALS, y_labels = BETA_LB_VALS,
+            x_title  = "entry threshold +/-z",
+            y_title  = "beta lookback (days)",
+            metric   = metric,
+            cur_x    = entry_z if entry_z in Z_VALS else None,
+            cur_y    = beta_lb if beta_lb in BETA_LB_VALS else None,
+        )
 
     return fig_h1, fig_h2
-
 
 # ── entry ─────────────────────────────────────────────────────────────────────
 
