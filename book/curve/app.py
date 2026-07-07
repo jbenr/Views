@@ -564,18 +564,8 @@ def _grid2(
 # ── value parsers ─────────────────────────────────────────────────────────────
 
 
-def _resid_metric(
-    pdf: pd.DataFrame,
-    metric: str,
-    entry_bps: float,
-    exit_policy: str = "zero",
-    target_frac: float = 0.5,
-    hl_mult: float = 1.0,
-) -> float:
-    """Heatmap metric for the residual-bps strategy."""
-    _, _, _, _, trades, daily_pnl, equity_curve = _simulate_resid(
-        pdf, entry_bps, exit_policy=exit_policy, target_frac=target_frac, hl_mult=hl_mult
-    )
+def _metric_from_results(trades: pd.DataFrame, daily_pnl: pd.Series, equity_curve: pd.Series, metric: str) -> float:
+    """Extract a heatmap/distribution metric from a completed simulation run."""
     if metric == "sharpe":
         return _daily_sharpe(daily_pnl)
     if metric == "pnl":
@@ -596,6 +586,43 @@ def _resid_metric(
                 vals.append(float((sub["pnl"] > 0).mean()))
         return float(np.mean(vals)) if vals else np.nan
     return np.nan
+
+
+def _resid_metric(
+    pdf: pd.DataFrame,
+    metric: str,
+    entry_bps: float,
+    exit_policy: str = "zero",
+    target_frac: float = 0.5,
+    hl_mult: float = 1.0,
+) -> float:
+    """Heatmap metric for the residual-bps strategy."""
+    _, _, _, _, trades, daily_pnl, equity_curve = _simulate_resid(
+        pdf, entry_bps, exit_policy=exit_policy, target_frac=target_frac, hl_mult=hl_mult
+    )
+    return _metric_from_results(trades, daily_pnl, equity_curve, metric)
+
+
+def _mode_metric(
+    pdf: pd.DataFrame,
+    signal_mode: str,
+    metric: str,
+    entry_z: float,
+    entry_resid: float,
+    exit_policy: str = "zero",
+    target_frac: float = 0.5,
+    hl_mult: float = 1.0,
+) -> float:
+    """Heatmap/distribution metric for a given signal-mode + exit-policy combo."""
+    if signal_mode == "resid":
+        _, _, _, _, trades, daily_pnl, equity_curve = _simulate_resid(
+            pdf, entry_resid, exit_policy=exit_policy, target_frac=target_frac, hl_mult=hl_mult
+        )
+    else:
+        _, _, _, _, trades, daily_pnl, equity_curve = _simulate(
+            pdf, entry_z, exit_policy=exit_policy, target_frac=target_frac, hl_mult=hl_mult
+        )
+    return _metric_from_results(trades, daily_pnl, equity_curve, metric)
 
 
 @lru_cache(maxsize=64)
@@ -638,6 +665,33 @@ def _grid_resid_entry(
                 pass
     return tuple(tuple(float(v) if not np.isnan(v) else None for v in row)
                  for row in grid)
+
+
+@lru_cache(maxsize=64)
+def _grid_mode_exit(
+    metric: str,
+    beta_lb: int,
+    zscore_lb: int,
+    entry_z: float,
+    entry_resid: float,
+    target_frac: float,
+    hl_mult: float,
+) -> tuple:
+    """Signal mode (y) x exit policy (x) at fixed lookbacks + entry thresholds."""
+    modes = [m["value"] for m in SIGNAL_MODES]
+    policies = [p["value"] for p in EXIT_POLICIES]
+    grid = np.full((len(modes), len(policies)), np.nan)
+    pdf = _compute(beta_lb, zscore_lb)
+    for i, mode in enumerate(modes):
+        for j, policy in enumerate(policies):
+            try:
+                grid[i, j] = _mode_metric(pdf, mode, metric, entry_z, entry_resid, policy, target_frac, hl_mult)
+            except Exception:
+                pass
+    return tuple(tuple(float(v) if not np.isnan(v) else None for v in row)
+                 for row in grid)
+
+
 def _parse_lb(typed, slider, default=63) -> int:
     try:
         return max(5, int(float(typed or slider or default)))
@@ -714,6 +768,39 @@ def _heatmap_fig(
         yaxis=dict(title=y_title, showgrid=False, tickfont=dict(size=9), linecolor=BORDER),
         margin=dict(l=66, r=74, t=44, b=54),
     )
+    return fig
+
+
+def _distribution_fig(metric: str, sources: dict, current_value: float) -> go.Figure:
+    """Histogram of a metric's value across scanned parameter combos, with the
+    live selection marked — shows whether the current setup sits in a broad
+    plateau of good outcomes or is an isolated spike.
+    """
+    if metric in {"avg_hit", "hit_long", "hit_short"}:
+        fmt, xaxis_format = (lambda v: f"{v:.1%}"), ".0%"
+    elif metric == "pnl":
+        fmt, xaxis_format = (lambda v: f"{v:+.1f} bps"), ".1f"
+    else:
+        fmt, xaxis_format = (lambda v: f"{v:.2f}"), ".2f"
+
+    fig = styled_fig(f"Distribution of {METRIC_LABEL[metric]} across scanned setups",
+                      "count", height=280)
+    all_values: list[float] = []
+    for (label, grid), color in zip(sources.items(), (C2, C1, ORANGE)):
+        vals = [v for row in grid for v in row if v is not None]
+        all_values.extend(vals)
+        if vals:
+            fig.add_trace(go.Histogram(x=vals, name=label, marker_color=color,
+                                        opacity=0.55, nbinsx=24))
+    fig.update_layout(barmode="overlay", xaxis=dict(tickformat=xaxis_format))
+
+    if all_values and not np.isnan(current_value):
+        pct = float((np.array(all_values) <= current_value).mean() * 100)
+        fig.add_vline(
+            x=current_value, line=dict(color=TEXT, dash="dash", width=1.6),
+            annotation_text=f"current: {fmt(current_value)}  ({pct:.0f}th pct, n={len(all_values)})",
+            annotation_position="top",
+        )
     return fig
 
 
@@ -814,6 +901,8 @@ app = make_app(
         ]),
         # row 4: heatmaps
         html.Div(style=_ROW, children=[graph("chart-heatmap1"), graph("chart-heatmap2")]),
+        # row 5: signal-mode x exit-policy heatmap + distribution of scanned setups
+        html.Div(style=_ROW, children=[graph("chart-heatmap3"), graph("chart-distribution")]),
         html.Div(style={"padding": "20px 20px 0"}, children=[
             html.Div("trade log", style={
                 "color": DIM, "fontSize": 10, "fontWeight": "bold",
@@ -1108,6 +1197,8 @@ def update_charts(
 @app.callback(
     Output("chart-heatmap1", "figure"),
     Output("chart-heatmap2", "figure"),
+    Output("chart-heatmap3", "figure"),
+    Output("chart-distribution", "figure"),
     Input("metric-select",   "value"),
     Input("entry-z-typed",   "value"),
     Input("entry-z",         "value"),
@@ -1189,7 +1280,36 @@ def update_heatmaps(
             cur_y    = beta_lb if beta_lb in BETA_LB_VALS else None,
         )
 
-    return fig_h1, fig_h2
+    # heatmap 3: signal mode x exit policy — which combo actually works best
+    mode_label_map   = {m["value"]: m["label"] for m in SIGNAL_MODES}
+    policy_label_map = {p["value"]: p["label"] for p in EXIT_POLICIES}
+    g3 = _grid_mode_exit(metric, beta_lb, zscore_lb, round(entry_z, 2), round(entry_resid, 2),
+                         round(target_frac, 4), round(hl_mult, 4))
+    fig_h3 = _heatmap_fig(
+        title    = f"signal mode x exit policy - {METRIC_LABEL[metric]}  (beta-lb={beta_lb}d, z-lb={zscore_lb}d)",
+        grid     = g3,
+        x_labels = [p["label"] for p in EXIT_POLICIES],
+        y_labels = [m["label"] for m in SIGNAL_MODES],
+        x_title  = "exit policy",
+        y_title  = "signal mode",
+        metric   = metric,
+        cur_x    = policy_label_map.get(exit_policy),
+        cur_y    = mode_label_map.get(signal_mode),
+    )
+
+    # distribution: pool every scanned setup's metric value, mark where the
+    # current live selection falls — a broad cluster near it means the edge
+    # is robust; an isolated spike means it's likely overfit to one combo
+    pdf_cur = _compute(beta_lb, zscore_lb)
+    current_value = _mode_metric(pdf_cur, signal_mode, metric, entry_z, entry_resid,
+                                  exit_policy, target_frac, hl_mult)
+    fig_dist = _distribution_fig(
+        metric,
+        sources={"beta x lookback grid": g1, "beta x entry grid": g2, "mode x exit grid": g3},
+        current_value=current_value,
+    )
+
+    return fig_h1, fig_h2, fig_h3, fig_dist
 
 # ── entry ─────────────────────────────────────────────────────────────────────
 
