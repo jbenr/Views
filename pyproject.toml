@@ -14,7 +14,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest"]
 # GPU-accelerated fast_scan on the NVIDIA tower: pip install -e ".[gpu]"
-gpu = ["cupy-cuda12x"]
+gpu = ["cupy-cuda12x[ctk]"]
 
 [build-system]
 requires = ["setuptools"]

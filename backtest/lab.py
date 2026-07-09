@@ -22,8 +22,9 @@ Strategy contract for sweeps: the strategy module exposes
 `make_pipeline(params: dict) -> SignalPipeline`. See
 book/curve/tens_10s30s.py and book/rate_vol/template.py.
 
-GPU setup (on the tower): `pip install cupy-cuda12x`, then pass
-`device="gpu"` to fast_scan. Everything else needs no change.
+GPU setup (on the tower): `pip install -e ".[gpu]"`, then pass
+`device="gpu"` to fast_scan. The extra includes the CUDA runtime components;
+only a compatible NVIDIA GPU and driver are required.
 """
 
 from __future__ import annotations
@@ -171,14 +172,38 @@ def sweep_strategy(
 # ── fast scan: vectorized approximate backtest (GPU-ready) ──────────────────
 
 def _get_xp(device: str = "cpu"):
-    """numpy, or cupy when device='gpu' and cupy is installed."""
+    """Return numpy, or cupy when a working CUDA device is available."""
     if device == "gpu":
         try:
             import cupy
-
-            return cupy
         except ImportError:
-            warnings.warn("cupy not installed — fast_scan falling back to numpy (CPU)")
+            warnings.warn(
+                'CuPy is not installed — falling back to CPU. Install the '
+                'prebuilt CUDA extra with: pip install -e ".[gpu]" '
+                "(do not use `pip install cupy`, which builds from source)."
+            )
+            return np
+
+        try:
+            device_count = cupy.cuda.runtime.getDeviceCount()
+            if device_count > 0:
+                # Device discovery alone does not prove kernels can compile.
+                # This also catches missing CUDA runtime headers on CUDA 12.2+.
+                cupy.add(cupy.asarray([0.0]), 1.0)
+                cupy.cuda.Stream.null.synchronize()
+        except Exception as exc:
+            warnings.warn(
+                f"CuPy is installed but CUDA is unavailable ({exc}) — "
+                "fast_scan is falling back to CPU. Install the CUDA components "
+                'with: pip install "cupy-cuda12x[ctk]"'
+            )
+            return np
+        if device_count < 1:
+            warnings.warn(
+                "CuPy found no CUDA devices — fast_scan is falling back to CPU."
+            )
+            return np
+        return cupy
     return np
 
 
@@ -186,15 +211,111 @@ def _to_numpy(arr) -> np.ndarray:
     return arr.get() if hasattr(arr, "get") else np.asarray(arr)
 
 
+_CUPY_FFILL_KERNEL = None
+_CUPY_MAX_DRAWDOWN_KERNEL = None
+
+
+def _ffill_positions_cupy(events, xp):
+    """Forward-fill positions on CUDA without unsupported ufunc.accumulate."""
+    global _CUPY_FFILL_KERNEL
+
+    if _CUPY_FFILL_KERNEL is None:
+        _CUPY_FFILL_KERNEL = xp.RawKernel(
+            r"""
+            extern "C" __global__
+            void ffill_positions(
+                const double* events,
+                double* positions,
+                const int rows,
+                const int cols
+            ) {
+                const int col = blockDim.x * blockIdx.x + threadIdx.x;
+                if (col >= cols) return;
+
+                double last = 0.0;
+                for (int row = 0; row < rows; ++row) {
+                    const int idx = row * cols + col;
+                    const double value = events[idx];
+                    if (value == value) last = value;  // NaN is not equal to itself
+                    positions[idx] = last;
+                }
+            }
+            """,
+            "ffill_positions",
+        )
+
+    events = xp.ascontiguousarray(events, dtype=xp.float64)
+    positions = xp.empty_like(events)
+    rows, cols = events.shape
+    threads = 128
+    blocks = (cols + threads - 1) // threads
+    _CUPY_FFILL_KERNEL(
+        (blocks,),
+        (threads,),
+        (events, positions, np.int32(rows), np.int32(cols)),
+    )
+    return positions
+
+
 def _ffill_positions(events, xp):
     """Forward-fill a (T, K) event matrix (+1/-1/0 at decision bars, NaN
     elsewhere) into a position matrix. Vectorized — no scan loop."""
+    if xp.__name__ == "cupy":
+        return _ffill_positions_cupy(events, xp)
+
     t_len = events.shape[0]
     valid = ~xp.isnan(events)
     idx = xp.where(valid, xp.arange(t_len)[:, None], 0)
     idx = xp.maximum.accumulate(idx, axis=0)
     pos = xp.take_along_axis(events, idx, axis=0)
     return xp.where(xp.isnan(pos), 0.0, pos)
+
+
+def _max_drawdown(cumulative_pnl, xp):
+    """Maximum drawdown by column, using a CUDA scan when needed."""
+    if xp.__name__ != "cupy":
+        drawdown = cumulative_pnl - xp.maximum.accumulate(cumulative_pnl, axis=0)
+        return drawdown.min(axis=0)
+
+    global _CUPY_MAX_DRAWDOWN_KERNEL
+    if _CUPY_MAX_DRAWDOWN_KERNEL is None:
+        _CUPY_MAX_DRAWDOWN_KERNEL = xp.RawKernel(
+            r"""
+            extern "C" __global__
+            void max_drawdown(
+                const double* cumulative,
+                double* result,
+                const int rows,
+                const int cols
+            ) {
+                const int col = blockDim.x * blockIdx.x + threadIdx.x;
+                if (col >= cols) return;
+
+                double peak = cumulative[col];
+                double worst = 0.0;
+                for (int row = 0; row < rows; ++row) {
+                    const double value = cumulative[row * cols + col];
+                    if (value > peak) peak = value;
+                    const double drawdown = value - peak;
+                    if (drawdown < worst) worst = drawdown;
+                }
+                result[col] = worst;
+            }
+            """,
+            "max_drawdown",
+        )
+
+    cumulative_pnl = xp.ascontiguousarray(cumulative_pnl, dtype=xp.float64)
+    rows, cols = cumulative_pnl.shape
+    result = xp.empty(cols, dtype=xp.float64)
+    threads = 128
+    blocks = (cols + threads - 1) // threads
+    _CUPY_MAX_DRAWDOWN_KERNEL(
+        (blocks,),
+        (threads,),
+        (cumulative_pnl, result, np.int32(rows), np.int32(cols)),
+    )
+    return result
 
 
 def fast_scan(
@@ -218,7 +339,7 @@ def fast_scan(
         level: (T,) trade level in bps (composite the strategy trades).
         entries: entry thresholds to scan — the grid becomes K × len(entries).
         combos: optional K param dicts annotating z's columns.
-        device: "cpu" (numpy) or "gpu" (cupy — install cupy-cuda12x).
+        device: "cpu" (numpy) or "gpu" (cupy — install the ``gpu`` extra).
 
     Returns one row per (combo, entry_z): total_pnl_bps, sharpe, hit_rate,
     max_drawdown_bps, n_trades, n_bars_active. Best sharpe first.
@@ -261,8 +382,7 @@ def fast_scan(
             hit = xp.where(n_active > 0, wins / n_active, xp.nan)
 
         cum = xp.cumsum(pnl, axis=0)
-        dd = cum - xp.maximum.accumulate(cum, axis=0)
-        max_dd = dd.min(axis=0)
+        max_dd = _max_drawdown(cum, xp)
 
         n_trades = ((pos != pos_lag) & (pos != 0)).sum(axis=0)
 

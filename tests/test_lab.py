@@ -9,6 +9,7 @@ from backtest.lab import (
     ParamGrid,
     _ffill_positions,
     _import_strategy,
+    _max_drawdown,
     fast_scan,
     gate_scan,
     signal_matrix,
@@ -35,6 +36,40 @@ def test_ffill_positions_hand_example():
     events = np.array([[nan], [1.0], [nan], [0.0], [nan], [-1.0], [nan]])
     pos = _ffill_positions(events, np)
     assert pos[:, 0].tolist() == [0.0, 1.0, 1.0, 0.0, 0.0, -1.0, -1.0]
+
+
+def test_ffill_positions_gpu_matches_cpu():
+    cupy = pytest.importorskip("cupy")
+    try:
+        if cupy.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("no CUDA device")
+        cupy.add(cupy.asarray([0.0]), 1.0)
+    except Exception as exc:
+        pytest.skip(f"CUDA unavailable: {exc}")
+
+    nan = np.nan
+    events = np.array([
+        [nan, nan],
+        [1.0, -1.0],
+        [nan, nan],
+        [0.0, nan],
+        [nan, 1.0],
+        [-1.0, nan],
+        [nan, 0.0],
+    ])
+    expected = _ffill_positions(events, np)
+    actual = _ffill_positions(cupy.asarray(events), cupy).get()
+    np.testing.assert_array_equal(actual, expected)
+
+    cumulative = np.array([
+        [1.0, -1.0],
+        [3.0, 2.0],
+        [2.0, 1.5],
+        [-1.0, 4.0],
+    ])
+    expected_dd = _max_drawdown(cumulative, np)
+    actual_dd = _max_drawdown(cupy.asarray(cumulative), cupy).get()
+    np.testing.assert_array_equal(actual_dd, expected_dd)
 
 
 def test_fast_scan_huge_entry_never_trades():
