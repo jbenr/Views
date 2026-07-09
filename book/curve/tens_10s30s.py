@@ -156,9 +156,9 @@ SWEEP_GRID = {               # exact-engine sweep (--sweep)
     "z_lb": [63, 126, 252],
     "entry_z": [1.5, 2.0, 2.5],
 }
-FAST_BETA_LBS = [21, 42, 63, 126, 252, 504]      # coarse scan (--fast)
-FAST_Z_LBS = [21, 42, 63, 126, 252, 504]
-FAST_ENTRIES = [1.0, 1.5, 2.0, 2.5, 3.0]
+FAST_BETA_LBS = list(range(21, 505, 21))
+FAST_Z_LBS = list(range(21, 505, 21))
+FAST_ENTRIES = [round(x / 10, 1) for x in range(10, 31)]
 
 pipeline = make_pipeline()   # default-parameter pipeline (engine/tests import this)
 
