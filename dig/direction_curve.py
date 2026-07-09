@@ -14,7 +14,6 @@ Run from repo root:  python dig/direction_curve.py
 """
 
 from __future__ import annotations
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -23,10 +22,6 @@ import polars as pl
 import psycopg2
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
-
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 from utils.viz import Viz
 from stats.ols import roll_lr_diff

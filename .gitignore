@@ -48,3 +48,6 @@ data/
 .DS_Store
 .vscode/
 .idea/
+
+# backtest metric store (parquet run history)
+store/

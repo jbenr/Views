@@ -1,10 +1,40 @@
 [project]
 name = "views"
 version = "0.0.1"
+description = "Macro rates RV research framework — signals, backtests, and the Macro Signal Ledger"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "polars",
+    "psycopg",
+    "tabulate",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+# GPU-accelerated fast_scan on the NVIDIA tower: pip install -e ".[gpu]"
+gpu = ["cupy-cuda12x"]
 
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["utils", "stats", "backtest"]
+packages = [
+    "utils",
+    "stats",
+    "backtest",
+    "book",
+    "book.curve",
+    "book.cross_market_rv",
+    "book.duration",
+    "book.event_driven",
+    "book.inflation",
+    "book.rate_vol",
+    "dig",
+    "execution",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

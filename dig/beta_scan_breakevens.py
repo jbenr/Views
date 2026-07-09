@@ -1,18 +1,10 @@
 from __future__ import annotations
 
-import os
-import sys
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.append(str(ROOT))
-
 from stats import roll_lr_diff, ou_zscore
-from utils.helpers import query_db
+from utils.market_data import load_wide, pick_ticker
 from utils.viz import Viz
 
 START = "2010-01-01"
@@ -39,34 +31,7 @@ FACTOR_CANDIDATES = {
 
 
 def pull_px(tickers: list[str], start: str) -> pd.DataFrame:
-    q = """
-    SELECT ts, ticker, px_last
-    FROM md.index_eod
-    WHERE ticker = ANY(%s)
-      AND ts >= %s
-    ORDER BY ts
-    """
-    df = query_db(q, params=(tickers, start))
-    if df.empty:
-        return pd.DataFrame()
-    df["ts"] = pd.to_datetime(df["ts"])
-    return df.pivot(index="ts", columns="ticker", values="px_last").sort_index()
-
-
-def pick_ticker(candidates: list[str], start: str) -> str | None:
-    q = """
-    SELECT ticker, COUNT(*) AS n
-    FROM md.index_eod
-    WHERE ticker = ANY(%s)
-      AND ts >= %s
-    GROUP BY ticker
-    ORDER BY n DESC
-    LIMIT 1
-    """
-    out = query_db(q, params=(candidates, start))
-    if out.empty:
-        return None
-    return str(out.loc[0, "ticker"])
+    return load_wide(tickers, start=start, to_pandas=True)
 
 
 def fit_pair(px: pd.DataFrame, y_col: str, x_col: str, lookback: int) -> pd.DataFrame | None:

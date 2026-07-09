@@ -8,8 +8,6 @@ the helpers above are reusable building blocks.
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 import warnings
 from pathlib import Path
 
@@ -17,17 +15,10 @@ import matplotlib.transforms as mtransforms
 import numpy as np
 import pandas as pd
 import polars as pl
-import psycopg
 from IPython.display import display
 from statsmodels.tsa.stattools import acf, adfuller
 
 _HERE = Path(__file__).resolve().parent
-for _p in [_HERE, *_HERE.parents]:
-    if (_p / "stats").exists():
-        ROOT = _p
-        break
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 from backtest import (
     BacktestConfig,
@@ -47,6 +38,7 @@ from book.duration.signal_context import (
     oos_edge_test_fast,
 )
 from utils.helpers import timed
+from utils.market_data import load_wide
 from utils.rates import linear_5y5y_forward
 from utils.viz import Viz
 
@@ -57,7 +49,6 @@ pd.set_option("display.width", 200)
 
 # ─── config ────────────────────────────────────────────────────────────────
 
-DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets?connect_timeout=10")
 START = "2000-01-01"
 
 TICKERS = {
@@ -97,17 +88,6 @@ BPS_COLS = (
 # ─── data ──────────────────────────────────────────────────────────────────
 
 
-def _query_to_pl(sql: str) -> pl.DataFrame:
-    with psycopg.connect(DB_DSN) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            cols = [d.name for d in cur.description]
-            rows = cur.fetchall()
-    if not rows:
-        return pl.DataFrame()
-    return pl.DataFrame({c: [r[i] for r in rows] for i, c in enumerate(cols)})
-
-
 _BASKET_CACHE = _HERE / ".basket_cache.parquet"
 
 
@@ -116,22 +96,7 @@ def load_basket(tickers: dict[str, str] = TICKERS, start: str = START, cache: bo
     if cache and _BASKET_CACHE.exists():
         print(f"  (cache hit: {_BASKET_CACHE})")
         return pd.read_parquet(_BASKET_CACHE)
-    tlist = ", ".join(f"'{t}'" for t in tickers.values())
-    raw = _query_to_pl(f"""
-        SELECT ts, ticker, px_last::float AS px
-        FROM md.index_eod
-        WHERE ticker IN ({tlist}) AND ts >= '{start}'
-        ORDER BY ts
-    """)
-    wide = (
-        raw.to_pandas()
-        .pivot(index="ts", columns="ticker", values="px")
-        .sort_index()
-        .rename(columns={v: k for k, v in tickers.items()})
-    )
-    for c in BPS_COLS:
-        if c in wide:
-            wide[c] = wide[c] * 100.0
+    wide = load_wide(tickers, start=start, bps_cols=BPS_COLS, to_pandas=True)
     # derived: mortgage basis = current coupon yield - 10y (both already in bps)
     if "mtg_cc" in wide.columns and "10y" in wide.columns:
         wide["mtg_basis"] = wide["mtg_cc"] - wide["10y"]

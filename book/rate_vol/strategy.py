@@ -1,16 +1,24 @@
-from __future__ import annotations
+"""Rates volatility strategy — 1m10y implied vs realized richness (stub).
 
-import sys
-from pathlib import Path
+Is implied vol compensated vs realized after accounting for event risk?
+Blocked on swaption vol surface coverage in the DB (md.swaption_vol) — see
+notes/TODO.md ("Research - Rates Vol Signal").
+
+For the worked end-to-end pattern a new strategy should follow, see
+book/rate_vol/template.py — it runs on synthetic data.
+
+Note: strategy modules are named strategy.py (not signal.py) because a file
+named signal.py shadows the stdlib 'signal' module for any script run from
+its directory, breaking subprocess/polars/psycopg imports.
+"""
+
+from __future__ import annotations
 
 import polars as pl
 
-ROOT = Path(__file__).resolve().parent.parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
 from backtest import SignalPipeline, SignalConfig, TradeDef
 
+STRATEGY_FAMILY = "rates_vol"
 SIGNAL_NAME = "1m10y_implied_realized_richness"
 
 TICKERS = {
@@ -23,7 +31,9 @@ TICKERS = {
 
 
 def compute(data: pl.DataFrame) -> pl.DataFrame:
-    raise NotImplementedError
+    raise NotImplementedError(
+        f"{SIGNAL_NAME}: model not built — blocked on swaption vol data coverage"
+    )
 
 
 pipeline = SignalPipeline(

@@ -1,16 +1,18 @@
-from __future__ import annotations
+"""Directional duration strategy — 10Y fair value vs macro anchors (stub).
 
-import sys
-from pathlib import Path
+Is 10Y rich or cheap vs macro fundamentals (breakevens, oil, DXY, equities)?
+The residual model research lives in drill_to_the_core.py and spread_rv.py;
+regime conditioning in signal_context.py and setups.py. compute() will be
+filled in once a model wins the out-of-sample bake-off (see notes/TODO.md).
+"""
+
+from __future__ import annotations
 
 import polars as pl
 
-ROOT = Path(__file__).resolve().parent.parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
 from backtest import SignalPipeline, SignalConfig, TradeDef
 
+STRATEGY_FAMILY = "directional_duration"
 SIGNAL_NAME = "10y_duration_fair_value"
 
 TICKERS = {
@@ -25,7 +27,9 @@ TICKERS = {
 
 
 def compute(data: pl.DataFrame) -> pl.DataFrame:
-    raise NotImplementedError
+    raise NotImplementedError(
+        f"{SIGNAL_NAME}: model not finalized — see book/duration research files"
+    )
 
 
 pipeline = SignalPipeline(

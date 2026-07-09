@@ -1,16 +1,17 @@
-from __future__ import annotations
+"""Cross-market RV strategy — USD-hedged gilt vs UST (stub).
 
-import sys
-from pathlib import Path
+Is a 10Y gilt hedged back to USD cheap vs the duration-matched Treasury?
+Blocked on FX forwards and cross-currency basis data — see notes/TODO.md
+("Research - Cross-Market RV").
+"""
+
+from __future__ import annotations
 
 import polars as pl
 
-ROOT = Path(__file__).resolve().parent.parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
 from backtest import SignalPipeline, SignalConfig, TradeDef
 
+STRATEGY_FAMILY = "cross_market_rv"
 SIGNAL_NAME = "hedged_gilt_vs_ust"
 
 TICKERS = {
@@ -24,7 +25,9 @@ TICKERS = {
 
 
 def compute(data: pl.DataFrame) -> pl.DataFrame:
-    raise NotImplementedError
+    raise NotImplementedError(
+        f"{SIGNAL_NAME}: model not built — blocked on FX forward / xccy basis data"
+    )
 
 
 pipeline = SignalPipeline(

@@ -11,7 +11,6 @@ import argparse
 import io
 import json
 import logging
-import sys
 from pathlib import Path
 
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
@@ -22,8 +21,6 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from dash import Dash, Input, Output, State, ALL, ctx, dash_table, dcc, html, no_update
 
-_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_ROOT))
 from utils.helpers import _connect
 from utils.viz import Viz, PlotlyViz, _range_window
 

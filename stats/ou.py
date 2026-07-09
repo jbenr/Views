@@ -160,6 +160,55 @@ def roll_ou_zscore(
     return pl.Series("ou_zscore", z, dtype=pl.Float64)
 
 
+def hurst_exponent(
+    series: Union[pl.Series, pd.Series], max_lag: int = 20
+) -> float:
+    """Hurst exponent via variance-of-differences scaling: std(x_{t+τ} − x_t) ~ τ^H.
+
+    H < 0.5 mean-reverting, H ≈ 0.5 random walk, H > 0.5 trending.
+    Unlike half_life this doesn't require fitting an AR(1).
+    """
+    s = _to_numpy(series)
+    if len(s) < max_lag * 3:
+        return np.nan
+
+    lags = np.arange(2, max_lag)
+    tau = np.array([np.std(s[lag:] - s[:-lag]) for lag in lags])
+    if np.any(tau <= 0):
+        return np.nan
+
+    slope, _ = np.polyfit(np.log(lags), np.log(tau), 1)
+    return float(slope)
+
+
+def roll_hurst(
+    series: Union[pl.Series, pd.Series],
+    lookback: int = 252,
+    max_lag: int = 20,
+    min_periods: int = None,
+) -> pl.Series:
+    """Rolling Hurst exponent over trailing window.
+
+    Python loop over windows (the log-log fit per window can't be composed
+    from rolling sums), so slower than roll_half_life — use on residuals,
+    not full tick histories.
+    """
+    s = to_pl_series(series).cast(pl.Float64)
+    arr = s.to_numpy().astype(float)
+    n = len(arr)
+    min_p = min_periods if min_periods is not None else lookback
+
+    out = np.full(n, np.nan)
+    for i in range(min_p - 1, n):
+        w = arr[max(0, i - lookback + 1) : i + 1]
+        w = w[~np.isnan(w)]
+        if len(w) < min_p:
+            continue
+        out[i] = hurst_exponent(pl.Series(w), max_lag=max_lag)
+
+    return pl.Series("hurst", out, dtype=pl.Float64)
+
+
 def ou_summary(
     series: Union[pl.Series, pd.Series], lookback: int = None
 ) -> pl.DataFrame:

@@ -72,12 +72,16 @@ class Engine:
                   instrument columns (e.g. [ts, 2Y, 5Y, 10Y, 30Y]).
             dates_col: Name of the date column.
         """
-        # Date filtering
+        # Date filtering — parse ISO strings so they compare against Date columns
+        def _as_date(d):
+            import datetime as _dt
+            return _dt.date.fromisoformat(d) if isinstance(d, str) else d
+
         df = data
         if self.config.start_date:
-            df = df.filter(pl.col(dates_col) >= self.config.start_date)
+            df = df.filter(pl.col(dates_col) >= _as_date(self.config.start_date))
         if self.config.end_date:
-            df = df.filter(pl.col(dates_col) <= self.config.end_date)
+            df = df.filter(pl.col(dates_col) <= _as_date(self.config.end_date))
 
         # 1. Pre-compute all signals (vectorized, polars)
         signal_frames: dict[str, pl.DataFrame] = {}

@@ -1,16 +1,17 @@
-from __future__ import annotations
+"""Inflation strategy — 10Y breakeven fair value (stub).
 
-import sys
-from pathlib import Path
+Are 10Y breakevens rich or cheap vs oil, dollar, and CPI trend? Trade the
+TIPS/nominal pair. Model research not started — see notes/TODO.md
+("Research - Inflation Signal") for the build plan.
+"""
+
+from __future__ import annotations
 
 import polars as pl
 
-ROOT = Path(__file__).resolve().parent.parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
 from backtest import SignalPipeline, SignalConfig, TradeDef
 
+STRATEGY_FAMILY = "inflation"
 SIGNAL_NAME = "10y_breakeven_fair_value"
 
 TICKERS = {
@@ -25,7 +26,9 @@ TICKERS = {
 
 
 def compute(data: pl.DataFrame) -> pl.DataFrame:
-    raise NotImplementedError
+    raise NotImplementedError(
+        f"{SIGNAL_NAME}: model not built — see notes/TODO.md inflation research plan"
+    )
 
 
 pipeline = SignalPipeline(

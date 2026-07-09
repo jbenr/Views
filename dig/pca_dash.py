@@ -12,8 +12,6 @@ Usage:
 """
 from __future__ import annotations
 
-import os
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -22,10 +20,6 @@ import dash
 from dash import dcc, html, dash_table, Input, Output, callback
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.append(str(ROOT))
 
 from dig.pca_curve_signals import main as run_scanner
 

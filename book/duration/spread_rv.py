@@ -15,25 +15,14 @@ The model and the trade are the same object.
 
 from __future__ import annotations
 
-import os
-import sys
 import warnings
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import psycopg
 
-_HERE = Path(__file__).resolve().parent
-for _p in [_HERE, *_HERE.parents]:
-    if (_p / "stats").exists():
-        ROOT = _p
-        break
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from stats import half_life, roll_lr
+from stats import half_life, horizon_backtest, roll_lr
 from utils.helpers import timed
+from utils.market_data import load_wide
 from utils.rates import linear_5y5y_forward
 from utils.viz import Viz
 
@@ -42,7 +31,6 @@ pd.set_option("display.max_colwidth", None)
 
 # ---- config -----------------------------------------------------------------
 
-DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets?connect_timeout=10")
 START  = "2005-01-01"   # ZCIS data starts ~2005
 
 TICKERS = {
@@ -72,28 +60,8 @@ PAIRS = [
 # ---- data -------------------------------------------------------------------
 
 def load_data(start: str = START) -> pd.DataFrame:
-    tlist = ", ".join(f"'{t}'" for t in TICKERS.values())
-    with psycopg.connect(DB_DSN) as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                SELECT ts, ticker, px_last::float AS px
-                FROM md.index_eod
-                WHERE ticker IN ({tlist}) AND ts >= '{start}'
-                ORDER BY ts
-            """)
-            rows = cur.fetchall()
-
-    df = (
-        pd.DataFrame(rows, columns=["ts", "ticker", "px"])
-        .pivot(index="ts", columns="ticker", values="px")
-        .rename(columns={v: k for k, v in TICKERS.items()})
-        .sort_index()
-    )
+    df = load_wide(TICKERS, start=start, bps_cols=BPS_COLS, to_pandas=True)
     df.index = pd.to_datetime(df.index)
-
-    for c in BPS_COLS:
-        if c in df.columns:
-            df[c] = df[c] * 100.0
 
     if "zc5" in df.columns and "zc10" in df.columns:
         df["5y5y_ifs"] = linear_5y5y_forward(df["zc5"], df["zc10"])
@@ -122,24 +90,7 @@ def backtest_spread(pair_df: pd.DataFrame, horizons: tuple[int, ...] = (5, 20, 6
     P&L = sign(resid_t) * -(resid_{t+H} - resid_t)
     Positive when the spread reverts toward zero.
     """
-    resid = pair_df["resid"].dropna()
-    rows  = []
-    for h in horizons:
-        fwd_change = resid.diff(h).shift(-h)   # resid[t+h] - resid[t]
-        jh = pd.concat([resid.rename("s"), fwd_change.rename("f")], axis=1).dropna()
-        jh = jh[jh["s"] != 0]
-        if len(jh) < 30:
-            rows.append({"h": h, "n": len(jh)})
-            continue
-        pnl = np.sign(jh["s"]) * (-jh["f"])
-        rows.append({
-            "h":      h,
-            "n":      len(jh),
-            "ic":     round(float(jh["s"].corr(-jh["f"], method="spearman")), 3),
-            "hit":    round(float((np.sign(jh["s"]) == np.sign(-jh["f"])).mean()), 3),
-            "sharpe": round(float(pnl.mean() / pnl.std() * np.sqrt(252 / h)), 2) if pnl.std() > 0 else np.nan,
-        })
-    return pd.DataFrame(rows)
+    return horizon_backtest(pair_df["resid"].dropna(), horizons=horizons).to_pandas()
 
 
 # ---- summary across all pairs -----------------------------------------------

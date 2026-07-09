@@ -20,16 +20,11 @@ Usage:
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import psycopg
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.append(str(ROOT))
 
 from stats import roll_lr, ou_zscore, fit_pca, roll_pca, residual_from_pca, explain
 from stats.ou import half_life, ou_params

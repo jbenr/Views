@@ -1,21 +1,12 @@
 from __future__ import annotations
 
-import os
-import sys
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
-import psycopg
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.append(str(ROOT))
 
 from stats import roll_lr_diff, ou_zscore
+from utils.market_data import load_wide, pick_ticker
 from utils.viz import Viz
 
-DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets")
 START = "2010-01-01"
 LOOKBACKS = [60, 120, 252, 504]
 PLOT_LOOKBACK = 252
@@ -32,45 +23,6 @@ FACTOR_CANDIDATES = {
     "10y_swaps": ["USSWIT10 Curncy", "USSFCT10 Curncy"],
     "5s10s30s": ["BF051030 Index"],
 }
-
-
-def query_df(conn, sql: str, params: list | tuple | None = None) -> pd.DataFrame:
-    with conn.cursor() as cur:
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-        cols = [d.name for d in cur.description]
-    return pd.DataFrame(rows, columns=cols)
-
-
-def pick_ticker(conn, candidates: list[str], start: str) -> str | None:
-    q = """
-    SELECT ticker, COUNT(*) AS n
-    FROM md.index_eod
-    WHERE ticker = ANY(%s)
-      AND ts >= %s
-    GROUP BY ticker
-    ORDER BY n DESC
-    LIMIT 1
-    """
-    out = query_df(conn, q, params=(candidates, start))
-    if out.empty:
-        return None
-    return str(out.loc[0, "ticker"])
-
-
-def pull_px(conn, tickers: list[str], start: str) -> pd.DataFrame:
-    q = """
-    SELECT ts, ticker, px_last
-    FROM md.index_eod
-    WHERE ticker = ANY(%s)
-      AND ts >= %s
-    ORDER BY ts
-    """
-    df = query_df(conn, q, params=(tickers, start))
-    if df.empty:
-        return pd.DataFrame()
-    df["ts"] = pd.to_datetime(df["ts"])
-    return df.pivot(index="ts", columns="ticker", values="px_last").sort_index()
 
 
 def fit_pair(px: pd.DataFrame, y_col: str, x_col: str, lookback: int) -> pd.DataFrame | None:
@@ -150,20 +102,19 @@ def build_composite(
 
 
 def main() -> None:
-    with psycopg.connect(DB_DSN) as conn:
-        resolved: dict[str, str] = {}
-        for name, candidates in FACTOR_CANDIDATES.items():
-            t = pick_ticker(conn, candidates, START)
-            if t is None:
-                print(f"[skip] {name}: no ticker found in {candidates}")
-                continue
-            resolved[name] = t
+    resolved: dict[str, str] = {}
+    for name, candidates in FACTOR_CANDIDATES.items():
+        t = pick_ticker(candidates, START)
+        if t is None:
+            print(f"[skip] {name}: no ticker found in {candidates}")
+            continue
+        resolved[name] = t
 
-        if not resolved:
-            raise RuntimeError("No factor tickers resolved. Update FACTOR_CANDIDATES.")
+    if not resolved:
+        raise RuntimeError("No factor tickers resolved. Update FACTOR_CANDIDATES.")
 
-        all_tickers = [BASE_TICKER] + sorted(set(resolved.values()))
-        px = pull_px(conn, all_tickers, START)
+    all_tickers = [BASE_TICKER] + sorted(set(resolved.values()))
+    px = load_wide(all_tickers, start=START, to_pandas=True)
 
     if px.empty:
         raise RuntimeError("No data returned from md.index_eod.")

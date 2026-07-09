@@ -1,16 +1,17 @@
-from __future__ import annotations
+"""Event-driven strategy — post-CPI 10Y continuation (stub).
 
-import sys
-from pathlib import Path
+Does a hot CPI surprise with strong first-15-minute bearish price action
+show continuation? Needs an event calendar with consensus/actual/surprise —
+see notes/TODO.md ("Research - Event-Driven").
+"""
+
+from __future__ import annotations
 
 import polars as pl
 
-ROOT = Path(__file__).resolve().parent.parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
 from backtest import SignalPipeline, SignalConfig, TradeDef
 
+STRATEGY_FAMILY = "event_driven_macro"
 SIGNAL_NAME = "post_cpi_10y_continuation"
 
 TICKERS = {
@@ -22,7 +23,9 @@ TICKERS = {
 
 
 def compute(data: pl.DataFrame) -> pl.DataFrame:
-    raise NotImplementedError
+    raise NotImplementedError(
+        f"{SIGNAL_NAME}: model not built — needs event calendar data"
+    )
 
 
 pipeline = SignalPipeline(
