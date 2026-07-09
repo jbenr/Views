@@ -6,22 +6,13 @@ Run:  mamba run -n 2s10s python book/curve/app.py
 """
 
 from __future__ import annotations
-import sys
 from functools import lru_cache
-from pathlib import Path
-
-_here = str(Path(__file__).resolve().parent)
-sys.path = [p for p in sys.path if p != _here]
 
 import numpy as np
 import pandas as pd
 import polars as pl
 import plotly.graph_objects as go
 from dash import Input, Output, ctx, dcc, html
-
-ROOT = Path(__file__).resolve().parent.parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 from utils.helpers import query_db
 from utils.research_app import (

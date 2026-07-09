@@ -1,18 +1,19 @@
+"""Curve strategy — beta-weighted 10s30s mean reversion.
+
+Regress Δ30Y on Δ10Y to strip hidden direction from the naive spread, roll
+the residual into level space, and fade OU z-score extremes. Parameter
+choices are justified by the diagnostics in book/curve/research.py.
+"""
+
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import polars as pl
-
-ROOT = Path(__file__).resolve().parent.parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 from backtest import SignalPipeline, SignalConfig, TradeDef
 from stats.ols import roll_lr_diff
 from stats.ou import roll_ou_zscore
 
+STRATEGY_FAMILY = "curve"
 SIGNAL_NAME = "beta_weighted_10s30s"
 
 # Hedge ratio lookback. research.py diag 2: 63d σ=0.113 vs 21d σ=0.137.

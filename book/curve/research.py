@@ -1,7 +1,7 @@
 """
 Beta-weighted 10s30s curve signal research.
 
-Justifies three design choices in signal.py:
+Justifies three design choices in strategy.py:
   (1) Changes-based OLS (roll_lr_diff) not levels — 10Y and 30Y are I(1),
       levels regression is spurious. Rolling changes residual gives a
       stationary spread with directional contamination stripped out.
@@ -16,7 +16,6 @@ Run:  mamba run -n 2s10s python book/curve/research.py
 """
 
 from __future__ import annotations
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -24,11 +23,7 @@ import pandas as pd
 import polars as pl
 import matplotlib.pyplot as plt
 
-ROOT = Path(__file__).resolve().parent.parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from utils.helpers import query_db
+from utils.market_data import load_wide
 from utils.viz import Viz
 from stats.ols import roll_lr_diff
 from stats.ou import ou_params, roll_ou_zscore, roll_half_life
@@ -53,26 +48,7 @@ TICKERS = {
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def load_data() -> pl.DataFrame:
-    inv = {v: k for k, v in TICKERS.items()}
-    tickers_sql = "', '".join(TICKERS.values())
-    pdf = query_db(f"""
-        SELECT ts, ticker, px_last::float AS px
-        FROM md.index_eod
-        WHERE ticker IN ('{tickers_sql}')
-          AND ts >= '{START}'
-        ORDER BY ts
-    """)
-    wide = (
-        pl.from_pandas(pdf)
-        .with_columns(pl.col("ts").cast(pl.Date))
-        .pivot(index="ts", on="ticker", values="px")
-        .sort("ts")
-    )
-    wide = wide.rename({c: inv[c] for c in wide.columns if c in inv})
-    for col in ["10y", "30y"]:
-        if col in wide.columns:
-            wide = wide.with_columns((pl.col(col) * 100).alias(col))
-    return wide
+    return load_wide(TICKERS, start=START, bps_cols=["10y", "30y"])
 
 
 def beta_weight(df: pl.DataFrame, lookback: int) -> pl.DataFrame:

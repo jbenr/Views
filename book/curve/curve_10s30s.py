@@ -10,20 +10,11 @@ main() builds the beta-weighted residual, backtests IC/hit/Sharpe at
 
 from __future__ import annotations
 
-import sys
 import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-_HERE = Path(__file__).resolve().parent
-for _p in [_HERE, *_HERE.parents]:
-    if (_p / "stats").exists():
-        ROOT = _p
-        break
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 from stats import half_life, ou_params, roll_half_life, roll_lr, roll_ou_zscore
 from utils.helpers import query_db, timed
