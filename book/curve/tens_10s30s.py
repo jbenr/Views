@@ -1,26 +1,32 @@
-"""10s vs 10s30s — direction/curve interaction, scriptable standard output.
+"""10s vs 10s30s - direction/curve interaction, scriptable standard output.
 
 The current research thread (notes/notes.md): does the 10s30s slope explain
 the level of 10Y, and is the leftover tradable? Model: changes-based rolling
-OLS of Δ10Y on Δ10s30s (same construction as dig/beta_scan_10s_factors.py),
-roll the residual into level space, fade OU z-score extremes. Directions are
-in YIELD space: z >= +entry_z means 10Y yield rich vs the curve -> short 10s.
+OLS of d10Y on d10s30s (same construction as dig/beta_scan_10s_factors.py),
+roll the residual into level space, and fade raw residual extremes. OU state
+is used as a gate and for exits/time stops rather than as the primary entry
+threshold.
 
-Backtest parameters live in the main section (DEFAULT_PARAMS) — override per
-run via main(params={...}) or search around them with the lab modes below.
+Directions are in YIELD space: positive residual means 10Y yield is rich vs
+the curve -> short 10s; negative residual means 10Y yield is cheap -> long 10s.
+
+Backtest parameters live in DEFAULT_PARAMS. Override with main(params={...})
+or search around them with the lab modes below.
 
     python -m book.curve.tens_10s30s              # single run, live DB
     python -m book.curve.tens_10s30s --synthetic  # single run, no DB
-    python -m book.curve.tens_10s30s --sweep      # exact-engine grid, all cores
-    python -m book.curve.tens_10s30s --fast       # vectorized coarse scan (add --gpu on the tower)
+    python -m book.curve.tens_10s30s --sweep      # exact-engine grid
+    python -m book.curve.tens_10s30s --fast       # vectorized coarse scan
+    python -m book.curve.tens_10s30s --fast --gpu # GPU fast scan
     python -m book.curve.tens_10s30s --gates      # conditional edge buckets
 
-Every mode returns a dict of state for interactive chaining: `state = main()`.
+Every mode returns a dict of state for interactive chaining: state = main().
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import math
 import sys
 from functools import partial
 
@@ -37,14 +43,16 @@ from backtest import (
     add_gate_lift,
     fast_scan,
     gate_scan,
+    half_drift_residual,
     print_summary,
     signal_matrix,
     sweep_strategy,
 )
-from stats import beta_cv, horizon_backtest, roll_lr_diff, roll_ou_zscore
+from stats import beta_cv, horizon_backtest, roll_lr_diff, roll_ou_features
 import utils
 
-# ── config (identity — what this strategy is, not how it's tuned) ─────────────
+
+# -- config -----------------------------------------------------------------
 
 STRATEGY_FAMILY = "curve"
 SIGNAL_NAME = "tens_10s30s"
@@ -53,14 +61,45 @@ MODULE = "book.curve.tens_10s30s"   # importable path, used by sweep workers
 START = "2010-01-01"
 
 TICKERS = {
-    "10y":    "USGG10YR Index",   # % -> scaled to bps at load
+    "10y": "USGG10YR Index",      # % -> scaled to bps at load
     "10s30s": "USYC1030 Index",   # already quoted in bps
 }
 BPS_COLS = ["10y"]
 YIELD_COLS = ["10y", "10s30s"]
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# Backtest parameters live HERE - the first thing you touch when scripting.
+DEFAULT_PARAMS = {
+    "beta_lb": 252,              # hedge-ratio lookback
+    "ou_lb": 252,                # OU-state lookback for z/mean/half-life
+    "entry_resid_bps": 20.0,     # raw residual threshold; positive -> short 10s
+    "z_gate": 0.5,               # OU z must confirm the residual direction
+    "half_life_min": 3.0,        # block unstable / too-fast OU fits
+    "half_life_max": 120.0,      # block slow drifts masquerading as mean reversion
+    "exit_reversion_frac": 0.5,  # exit after this fraction of entry-to-OU-mean reverts
+    "time_stop_mult": 2.0,       # dynamic time stop = half_life * multiplier
+    "time_stop_min": 5.0,
+    "time_stop_max": 120.0,
+    "stop_loss_bps": 25.0,
+}
+TRANSACTION_COST_BPS = 0.1
+
+SWEEP_GRID = {
+    "beta_lb": [63, 126, 252],
+    "ou_lb": [63, 126, 252],
+    "entry_resid_bps": [15.0, 25.0, 40.0],
+    "z_gate": [0.5, 1.0, 1.5],
+}
+
+FAST_BETA_LBS = list(range(21, 505, 21))
+FAST_OU_LBS = list(range(21, 505, 21))
+FAST_ENTRIES_BPS = [float(x) for x in range(10, 151, 10)]
+FAST_EXIT_BAND_BPS = 5.0
+FAST_GATE_BUCKETS = 3
+FAST_MIN_TRADES = 30
+
+
+# -- helpers ----------------------------------------------------------------
 
 def load_data(start: str = START) -> pl.DataFrame:
     """Load 10Y and 10s30s from md.index_eod (requires access to raptor)."""
@@ -74,18 +113,17 @@ def load_data(start: str = START) -> pl.DataFrame:
 
 
 def synthetic_data(n: int = 1500, seed: int = 21) -> pl.DataFrame:
-    """Synthetic substitute: a slope random walk plus a 10Y that is beta-linked
-    to it with an OU residual — the structure the signal fades."""
+    """Synthetic substitute: slope random walk plus OU residual."""
     rng = np.random.default_rng(seed)
 
-    slope = 50.0 + np.cumsum(rng.normal(0.0, 1.5, n))     # 10s30s walk (bps)
+    slope = 50.0 + np.cumsum(rng.normal(0.0, 1.5, n))
 
-    resid = np.zeros(n)                                   # OU: half-life ≈ 14d
+    resid = np.zeros(n)  # OU: half-life around 14d
     theta, sigma = 0.05, 2.0
     for i in range(1, n):
         resid[i] = resid[i - 1] * (1 - theta) + rng.normal(0.0, sigma)
 
-    tens = 350.0 + 0.6 * slope + resid                    # 10Y yield (bps)
+    tens = 350.0 + 0.6 * slope + resid
 
     start_date = dt.date.fromisoformat(START)
     ts = pl.date_range(
@@ -99,15 +137,52 @@ def synthetic_data(n: int = 1500, seed: int = 21) -> pl.DataFrame:
     )
 
 
-def compute(data: pl.DataFrame, params: dict | None = None) -> pl.DataFrame:
-    """Signal frame: OU z of the beta-weighted 10Y-vs-curve residual.
+def _params(params: dict | None = None) -> dict:
+    """Merge params and accept old z-score names as aliases."""
+    raw = params or {}
+    p = {**DEFAULT_PARAMS, **raw}
+    if "z_lb" in raw and "ou_lb" not in raw:
+        p["ou_lb"] = raw["z_lb"]
+    if "entry_z" in raw and "entry_resid_bps" not in raw:
+        p["entry_resid_bps"] = raw["entry_z"]
+    return p
 
-    Extra columns (resid, beta, r2) flow through the engine into the trade log.
-    """
-    p = {**DEFAULT_PARAMS, **(params or {})}
+
+def _finite(value) -> bool:
+    try:
+        return value is not None and math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _entry_filter(z_gate: float, half_life_min: float, half_life_max: float):
+    """Require OU z to confirm the raw residual entry direction."""
+
+    def fn(direction: int, bar: dict) -> bool:
+        ou_z = bar.get("ou_z")
+        half_life = bar.get("half_life")
+        if not (_finite(ou_z) and _finite(half_life)):
+            return False
+        if not (half_life_min <= float(half_life) <= half_life_max):
+            return False
+
+        # direction +1 is long 10s: residual should be cheap/negative.
+        # direction -1 is short 10s: residual should be rich/positive.
+        if direction == 1:
+            return float(ou_z) <= -z_gate
+        if direction == -1:
+            return float(ou_z) >= z_gate
+        return False
+
+    return fn
+
+
+def compute(data: pl.DataFrame, params: dict | None = None) -> pl.DataFrame:
+    """Signal frame: raw beta-weighted 10Y-vs-curve residual in bps."""
+    p = _params(params)
     reg = roll_lr_diff(data["10s30s"], data["10y"], lookback=p["beta_lb"])
 
-    # roll_lr_diff drops one row (first diff) — pad back to len(data)
+    # roll_lr_diff drops one row (first diff) - pad back to len(data)
     null1 = pl.Series([None], dtype=pl.Float64)
     resid_roll = pl.concat([
         null1,
@@ -116,105 +191,112 @@ def compute(data: pl.DataFrame, params: dict | None = None) -> pl.DataFrame:
     beta = pl.concat([null1, reg["beta"]])
     r2 = pl.concat([null1, reg["r2"]])
 
-    z = roll_ou_zscore(resid_roll, lookback=p["z_lb"])
-    return pl.DataFrame({"signal": z, "resid": resid_roll, "beta": beta, "r2": r2})
+    ou = roll_ou_features(resid_roll, lookback=p["ou_lb"])
+    time_stop = (
+        (ou["half_life"] * p["time_stop_mult"])
+        .clip(p["time_stop_min"], p["time_stop_max"])
+        .alias("time_stop")
+    )
+
+    return pl.DataFrame({
+        "signal": resid_roll,
+        "resid": resid_roll,
+        "ou_z": ou["ou_z"],
+        "ou_mean": ou["ou_mean"],
+        "ou_sigma": ou["ou_sigma"],
+        "ou_rho": ou["ou_rho"],
+        "ou_theta": ou["ou_theta"],
+        "expected_delta_1d": ou["expected_delta_1d"],
+        "half_life": ou["half_life"],
+        "time_stop": time_stop,
+        "beta": beta,
+        "r2": r2,
+    })
 
 
 def make_pipeline(params: dict | None = None) -> SignalPipeline:
     """Lab contract: build the pipeline for any param combo (sweeps call this)."""
-    p = {**DEFAULT_PARAMS, **(params or {})}
+    p = _params(params)
     return SignalPipeline(
         name=SIGNAL_NAME,
         trade_def=TradeDef.spread(SIGNAL_NAME, "10s30s", "10y"),
         compute_fn=compute if params is None else partial(compute, params=p),
         config=SignalConfig(
-            entry_long=-p["entry_z"],
-            entry_short=p["entry_z"],
-            exit_long=p["exit_z"],
-            exit_short=-p["exit_z"],
+            entry_long=-p["entry_resid_bps"],
+            entry_short=p["entry_resid_bps"],
+            exit_long=None,
+            exit_short=None,
             stop_loss_bps=p["stop_loss_bps"],
-            time_stop_bars=p["time_stop_bars"],
+            time_stop_bars=None,
+            exit_fn=half_drift_residual(p["exit_reversion_frac"]),
+            entry_filter_fn=_entry_filter(
+                p["z_gate"], p["half_life_min"], p["half_life_max"]
+            ),
         ),
     )
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
-# Backtest parameters live HERE — the first thing you touch when scripting
-# runs. sweep()/fast() search around them; main(params={...}) overrides ad hoc.
+pipeline = make_pipeline()
 
-DEFAULT_PARAMS = {
-    "beta_lb": 252,          # hedge-ratio lookback — mirrors beta_scan PLOT_LOOKBACK
-    "z_lb": 252,             # z-score lookback
-    "entry_z": 1.5,          # mirrors beta_scan ACTION_Z — re-derive before going live
-    "exit_z": 0.0,           # z-cross exit level
-    "stop_loss_bps": 25.0,
-    "time_stop_bars": 40,    # ~2× residual half-life
-}
-TRANSACTION_COST_BPS = 0.1
 
-SWEEP_GRID = {               # exact-engine sweep (--sweep)
-    "beta_lb": [63, 126, 252],
-    "z_lb": [63, 126, 252],
-    "entry_z": [1.5, 2.0, 2.5],
-}
-FAST_BETA_LBS = list(range(21, 505, 21))
-FAST_Z_LBS = list(range(21, 505, 21))
-FAST_ENTRIES = [round(x / 10, 1) for x in range(10, 31)]
-FAST_GATE_BUCKETS = 3        # every combo also runs gated per (condition × bucket)
-FAST_MIN_TRADES = 30         # ignore gated cells with fewer trades when ranking
-
-pipeline = make_pipeline()   # default-parameter pipeline (engine/tests import this)
-
+# -- modes ------------------------------------------------------------------
 
 def main(use_db: bool = True, params: dict | None = None) -> dict:
-    p = {**DEFAULT_PARAMS, **(params or {})}
+    p = _params(params)
 
-    # load data
     data = load_data() if use_db else synthetic_data()
     utils.pdf(data.tail(5))
     print(
-        f"rows={len(data)}  {data['ts'].min()} → {data['ts'].max()}  "
+        f"rows={len(data)}  {data['ts'].min()} -> {data['ts'].max()}  "
         f"cols={data.columns}  (source={'db' if use_db else 'synthetic'})  params={p}"
     )
 
-    # residual diagnostics before backtesting: does fading it even work?
     sig_frame = compute(data, params=p)
     diag = horizon_backtest(sig_frame["resid"])
     print("\nresidual horizon backtest (IC / hit / Sharpe):")
     print(diag)
 
-    # backtest through the shared engine
     engine = Engine(BacktestConfig(transaction_cost_bps=TRANSACTION_COST_BPS))
-    result = engine.add_signal(make_pipeline(params)).run(data)
+    result = engine.add_signal(make_pipeline(p)).run(data)
     print_summary(result)
 
-    # latest signal state — directions in yield space, matching beta_scan
     last = sig_frame.row(-1, named=True)
-    z = last["signal"]
-    if z is None:
-        print("\nlatest signal: warmup — no signal yet")
+    resid = last["signal"]
+    ou_z = last["ou_z"]
+    half_life = last["half_life"]
+    if resid is None or not _finite(resid):
+        print("\nlatest signal: warmup - no signal yet")
     else:
-        if z >= p["entry_z"]:
+        if (
+            resid >= p["entry_resid_bps"]
+            and _finite(ou_z)
+            and ou_z >= p["z_gate"]
+            and _finite(half_life)
+            and p["half_life_min"] <= half_life <= p["half_life_max"]
+        ):
             action = "SHORT 10s (yield rich vs curve)"
-        elif z <= -p["entry_z"]:
+        elif (
+            resid <= -p["entry_resid_bps"]
+            and _finite(ou_z)
+            and ou_z <= -p["z_gate"]
+            and _finite(half_life)
+            and p["half_life_min"] <= half_life <= p["half_life_max"]
+        ):
             action = "LONG 10s (yield cheap vs curve)"
         else:
             action = "FLAT"
         print(
-            f"\nlatest signal: ts={data['ts'][-1]}  z={z:+.2f}  "
-            f"resid={last['resid']:+.1f}bps  beta={last['beta']:+.3f}  "
-            f"r2={last['r2']:.2f}  action={action} (|z|>{p['entry_z']})"
+            f"\nlatest signal: ts={data['ts'][-1]}  resid={resid:+.1f}bps  "
+            f"ou_z={ou_z:+.2f}  half_life={half_life:.1f}d  "
+            f"beta={last['beta']:+.3f}  r2={last['r2']:.2f}  action={action}  "
+            f"(abs(resid)>={p['entry_resid_bps']}bps, abs(ou_z)>={p['z_gate']})"
         )
 
     return {"data": data, "signals": sig_frame, "diag": diag, "result": result}
 
 
 def sweep(use_db: bool = True, n_jobs: int | None = None) -> dict:
-    """Exact-engine grid search over SWEEP_GRID, parallel across CPU cores.
-
-    Logs every combo to the MetricStore and prints the leaderboard plus the
-    beta_lb × z_lb sharpe matrix (best entry_z per cell).
-    """
+    """Exact-engine grid search over SWEEP_GRID, parallel across CPU cores."""
     data = load_data() if use_db else synthetic_data()
     source = "db" if use_db else "synthetic"
     print(f"sweep: {SIGNAL_NAME}  grid={SWEEP_GRID}  rows={len(data)}  (source={source})")
@@ -231,44 +313,52 @@ def sweep(use_db: bool = True, n_jobs: int | None = None) -> dict:
         "span": f"{data['ts'].min()}..{data['ts'].max()}",
     })
 
-    show = ["beta_lb", "z_lb", "entry_z", "sharpe", "total_pnl_bps",
-            "hit_rate", "n_trades", "max_drawdown_bps"]
+    show = [
+        "beta_lb", "ou_lb", "entry_resid_bps", "z_gate", "sharpe",
+        "total_pnl_bps", "hit_rate", "n_trades", "max_drawdown_bps",
+    ]
     print("\nleaderboard (top 10 by sharpe):")
-    print(results.select([c for c in show if c in results.columns]).head(10))
+    utils.pdf(results.select([c for c in show if c in results.columns]).head(10))
 
-    print("\nsharpe matrix — beta_lb (cols) × z_lb (rows), best entry_z per cell:")
-    print(store.matrix(x="beta_lb", y="z_lb", metric="sharpe",
-                       strategy=SIGNAL_NAME, agg="max"))
-    print(f"\nlogged {len(results)} runs → {store.path}")
+    print("\nsharpe matrix - beta_lb (cols) x ou_lb (rows), best entry/gate per cell:")
+    utils.pdf(store.matrix(
+        x="beta_lb", y="ou_lb", metric="sharpe",
+        strategy=SIGNAL_NAME, agg="max",
+    ))
+    print(f"\nlogged {len(results)} runs -> {store.path}")
 
     return {"data": data, "results": results, "store": store}
 
 
 def fast(use_db: bool = True, device: str = "cpu") -> dict:
-    """Vectorized coarse scan of the gated grid — the GPU funnel stage.
-
-    Every (beta_lb, z_lb, entry_z) combo runs ungated AND once per
-    (condition × quantile bucket) entry gate: r2, beta_cv, abs_beta,
-    resid_vol20, resid_mom10. Approximate mechanics (hysteresis exits, no
-    stops) — shortlist here, then verify winners through sweep(), then pin
-    the actual gate cutoffs with --gates. On the tower: --gpu.
-    """
+    """Vectorized coarse scan of raw-residual entries and quantile gates."""
     data = load_data() if use_db else synthetic_data()
-    z, combos, conditions = signal_matrix(
-        data["10s30s"], data["10y"], FAST_BETA_LBS, FAST_Z_LBS,
+    resid, combos, conditions = signal_matrix(
+        data["10s30s"], data["10y"], FAST_BETA_LBS, FAST_OU_LBS,
         return_conditions=True,
+        signal_kind="residual",
+        lookback_name="ou_lb",
     )
     level = pipeline.trade_def.composite_series(data).to_numpy()
     n_variants = 1 + len(conditions) * FAST_GATE_BUCKETS
-    n_evals = len(combos) * len(FAST_ENTRIES) * n_variants
-    print(f"fast scan: {len(combos)} signal columns × {len(FAST_ENTRIES)} entries "
-          f"× {n_variants} gate variants = {n_evals:,} evaluations  (device={device})")
+    n_evals = len(combos) * len(FAST_ENTRIES_BPS) * n_variants
+    print(
+        f"fast scan: {len(combos)} residual columns x {len(FAST_ENTRIES_BPS)} "
+        f"raw entries x {n_variants} gate variants = {n_evals:,} evaluations  "
+        f"(device={device})"
+    )
 
     with utils.timed("running vectorized gated scan"):
         results = fast_scan(
-            z, level, entries=FAST_ENTRIES, cost_bps=TRANSACTION_COST_BPS,
-            combos=combos, gates=conditions, gate_buckets=FAST_GATE_BUCKETS,
+            resid, level,
+            entries=FAST_ENTRIES_BPS,
+            exit_band=FAST_EXIT_BAND_BPS,
+            cost_bps=TRANSACTION_COST_BPS,
+            combos=combos,
+            gates=conditions,
+            gate_buckets=FAST_GATE_BUCKETS,
             device=device,
+            entry_col="entry_resid_bps",
         )
         results = add_gate_lift(results)
 
@@ -278,24 +368,33 @@ def fast(use_db: bool = True, device: str = "cpu") -> dict:
         "span": f"{data['ts'].min()}..{data['ts'].max()}",
     })
 
-    show = ["beta_lb", "z_lb", "entry_z", "gate", "gate_bucket", "sharpe",
-            "total_pnl_bps", "hit_rate", "n_trades"]
-    ungated = results.filter(pl.col("gate") == "(none)")
-    print("\ntop 10 ungated by sharpe (approximate — verify via --sweep):")
-    print(ungated.select([c for c in show if c in ungated.columns]).head(10))
+    show = [
+        "beta_lb", "ou_lb", "entry_resid_bps", "gate", "gate_bucket",
+        "sharpe", "total_pnl_bps", "hit_rate", "n_trades",
+    ]
+    valid = results.filter(
+        (pl.col("n_trades") > 0) & pl.col("sharpe").is_finite()
+    )
+    ungated = valid.filter(pl.col("gate") == "(none)")
+    print("\ntop 10 ungated by sharpe (approximate - verify via --sweep):")
+    utils.pdf(ungated.select([c for c in show if c in ungated.columns]).head(10))
 
     gated = (
-        results.filter(
-            (pl.col("gate") != "(none)") & (pl.col("n_trades") >= FAST_MIN_TRADES)
+        valid.filter(
+            (pl.col("gate") != "(none)")
+            & (pl.col("n_trades") >= FAST_MIN_TRADES)
+            & pl.col("sharpe_lift").is_finite()
         )
         .sort("sharpe_lift", descending=True, nulls_last=True)
     )
-    print(f"\ntop 10 gates by sharpe LIFT vs same combo ungated (n_trades ≥ {FAST_MIN_TRADES}):")
-    print(gated.select([*show, "base_sharpe", "sharpe_lift", "hit_lift"]).head(10))
+    print(f"\ntop 10 gates by sharpe LIFT vs same combo ungated (n_trades >= {FAST_MIN_TRADES}):")
+    utils.pdf(gated.select([*show, "base_sharpe", "sharpe_lift", "hit_lift"]).head(10))
 
     print("\nwhich gate helps most often (median lift across all combos):")
-    print(
-        results.filter(pl.col("gate") != "(none)")
+    utils.pdf(
+        valid.filter(
+            (pl.col("gate") != "(none)") & pl.col("sharpe_lift").is_finite()
+        )
         .group_by("gate", "gate_bucket")
         .agg(
             pl.col("sharpe_lift").median().alias("med_sharpe_lift"),
@@ -304,37 +403,45 @@ def fast(use_db: bool = True, device: str = "cpu") -> dict:
         )
         .sort("med_sharpe_lift", descending=True)
     )
-    print(f"\nlogged {len(results):,} runs → {store.path}")
+    print(f"\nlogged {len(results):,} runs -> {store.path}")
 
     return {"data": data, "results": results, "store": store}
 
 
 def gates(use_db: bool = True, params: dict | None = None) -> dict:
-    """Conditional edge scan: which state variables mark high-confidence entries?
-
-    Buckets model-quality and regime variables at hypothetical entry bars and
-    reports hit/PnL lift per bucket vs the unconditional baseline. Promising
-    buckets graduate into SignalConfig.entry_filter_fn gates.
-    """
-    p = {**DEFAULT_PARAMS, **(params or {})}
+    """Conditional edge scan for entry-time state variables."""
+    p = _params(params)
     data = load_data() if use_db else synthetic_data()
     sig_frame = compute(data, params=p)
     level = pipeline.trade_def.composite_series(data)
 
     conditions = pl.DataFrame({
+        "ou_z_abs": sig_frame["ou_z"].abs(),
+        "ou_z_aligned": pl.Series(
+            np.sign(sig_frame["resid"].to_numpy().astype(float))
+            * sig_frame["ou_z"].to_numpy().astype(float),
+            dtype=pl.Float64,
+        ),
+        "half_life": sig_frame["half_life"],
         "r2": sig_frame["r2"],
         "beta_cv": beta_cv(sig_frame["beta"], lookback=p["beta_lb"]),
         "resid_vol20": sig_frame["resid"].diff().rolling_std(20),
         "abs_beta": sig_frame["beta"].abs(),
     })
 
+    horizon = int(round(np.clip(
+        p["time_stop_mult"] * 14,
+        p["time_stop_min"], p["time_stop_max"],
+    )))
     table = gate_scan(
         sig_frame["signal"], level, conditions,
-        entry_z=p["entry_z"], horizon=p["time_stop_bars"] // 2,
+        entry_z=p["entry_resid_bps"], horizon=horizon,
     )
-    print(f"gate scan: entry_z={p['entry_z']}  horizon={p['time_stop_bars'] // 2}d  "
-          f"conditions={conditions.columns}")
-    print(table)
+    print(
+        f"gate scan: entry_resid_bps={p['entry_resid_bps']}  horizon={horizon}d  "
+        f"conditions={conditions.columns}"
+    )
+    utils.pdf(table)
     return {"data": data, "signals": sig_frame, "gates": table}
 
 
