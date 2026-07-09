@@ -34,6 +34,7 @@ import os
 import warnings
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
+from importlib.util import module_from_spec, spec_from_file_location
 from itertools import product
 from pathlib import Path
 from typing import Optional, Union
@@ -69,8 +70,39 @@ class ParamGrid:
 _WORKER_STATE: dict = {}
 
 
+def _import_strategy(module_name: str):
+    """Import a strategy, with a source-tree fallback for spawned workers.
+
+    On Windows, launching a strategy file directly from a nested directory
+    leaves the repository root off the spawned process's import path. Normal
+    package imports remain preferred; the fallback loads the matching source
+    file without mutating ``sys.path``.
+    """
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        top_package = module_name.partition(".")[0]
+        if exc.name != top_package:
+            raise
+
+        module_path = (
+            Path(__file__).resolve().parents[1]
+            .joinpath(*module_name.split("."))
+            .with_suffix(".py")
+        )
+        if not module_path.is_file():
+            raise
+
+        spec = spec_from_file_location(f"_sweep_{module_path.stem}", module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load sweep strategy from {module_path}")
+        module = module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+
 def _init_worker(module_name: str, data: pl.DataFrame, cost: float, slip: float):
-    _WORKER_STATE["module"] = importlib.import_module(module_name)
+    _WORKER_STATE["module"] = _import_strategy(module_name)
     _WORKER_STATE["data"] = data
     _WORKER_STATE["cost"] = cost
     _WORKER_STATE["slip"] = slip

@@ -8,6 +8,7 @@ from backtest.lab import (
     MetricStore,
     ParamGrid,
     _ffill_positions,
+    _import_strategy,
     fast_scan,
     gate_scan,
     signal_matrix,
@@ -91,6 +92,15 @@ def test_signal_matrix_shape_and_combos():
 
 
 # ── exact sweep ──────────────────────────────────────────────────────────────
+
+def test_strategy_import_falls_back_to_source_file(monkeypatch):
+    def missing_top_package(_module_name):
+        raise ModuleNotFoundError("No module named 'book'", name="book")
+
+    monkeypatch.setattr("backtest.lab.importlib.import_module", missing_top_package)
+    module = _import_strategy("book.rate_vol.template")
+    assert callable(module.make_pipeline)
+
 
 def test_sweep_strategy_serial():
     data = synthetic_data(n=800)
