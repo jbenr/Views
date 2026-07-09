@@ -12,5 +12,5 @@ from .portfolio import SpreadBook, BookConfig, SpreadDef
 from .sweep import ParameterSweep, SweepConfig
 from .lab import (
     ParamGrid, sweep_strategy, fast_scan, signal_matrix,
-    MetricStore, gate_scan,
+    MetricStore, gate_scan, add_gate_lift,
 )

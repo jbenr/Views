@@ -318,6 +318,41 @@ def _max_drawdown(cumulative_pnl, xp):
     return result
 
 
+def _evaluate_events(events, dlv, cost_bps, periods_per_year, xp) -> dict[str, np.ndarray]:
+    """Metrics for one (T, K) event matrix. All array math — CPU or GPU."""
+    k = events.shape[1]
+    pos = _ffill_positions(events, xp)
+
+    pos_lag = xp.concatenate([xp.zeros((1, k)), pos[:-1]], axis=0)
+    turnover = xp.abs(pos - pos_lag)
+    pnl = pos_lag * dlv - cost_bps * turnover
+
+    total = pnl.sum(axis=0)
+    mean, std = pnl.mean(axis=0), pnl.std(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        sharpe = xp.where(std > 0, mean / std * np.sqrt(periods_per_year), xp.nan)
+
+    active = pos_lag != 0
+    n_active = active.sum(axis=0)
+    wins = ((pnl > 0) & active).sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        hit = xp.where(n_active > 0, wins / n_active, xp.nan)
+
+    cum = xp.cumsum(pnl, axis=0)
+    max_dd = _max_drawdown(cum, xp)
+
+    n_trades = ((pos != pos_lag) & (pos != 0)).sum(axis=0)
+
+    return {
+        "total_pnl_bps": _to_numpy(total),
+        "sharpe": _to_numpy(sharpe),
+        "hit_rate": _to_numpy(hit),
+        "max_drawdown_bps": _to_numpy(max_dd),
+        "n_trades": _to_numpy(n_trades).astype(int),
+        "n_bars_active": _to_numpy(n_active).astype(int),
+    }
+
+
 def fast_scan(
     z: np.ndarray,
     level: np.ndarray,
@@ -326,6 +361,8 @@ def fast_scan(
     cost_bps: float = 0.0,
     periods_per_year: int = 252,
     combos: Optional[list[dict]] = None,
+    gates: Optional[dict[str, np.ndarray]] = None,
+    gate_buckets: int = 3,
     device: str = "cpu",
 ) -> pl.DataFrame:
     """Approximate threshold backtest of a whole signal matrix, vectorized.
@@ -334,15 +371,27 @@ def fast_scan(
     when z >= +entry, flat when |z| <= exit_band; positions carry between
     events and execute on the NEXT bar; costs charged per unit of turnover.
 
+    Gating: every (combo, entry) is additionally evaluated once per
+    (gate condition × quantile bucket) — ENTRIES are allowed only on bars
+    where the condition falls inside the bucket (exits always fire; NaN
+    condition bars never open trades). Bucket edges are per-column quantiles
+    of the condition, so labels are relative ("q2/3"); recover the actual
+    cutoff levels for a shortlisted gate with gate_scan(). The baseline rows
+    carry gate="(none)".
+
     Args:
         z: (T,) or (T, K) signal matrix — e.g. from signal_matrix().
         level: (T,) trade level in bps (composite the strategy trades).
-        entries: entry thresholds to scan — the grid becomes K × len(entries).
+        entries: entry thresholds to scan.
         combos: optional K param dicts annotating z's columns.
+        gates: optional {name: (T,) or (T, K) condition array} — e.g. the
+               conditions from signal_matrix(return_conditions=True).
+        gate_buckets: quantile buckets per gate condition.
         device: "cpu" (numpy) or "gpu" (cupy — install the ``gpu`` extra).
 
-    Returns one row per (combo, entry_z): total_pnl_bps, sharpe, hit_rate,
-    max_drawdown_bps, n_trades, n_bars_active. Best sharpe first.
+    Returns one row per (combo, entry_z, gate, gate_bucket): total_pnl_bps,
+    sharpe, hit_rate, max_drawdown_bps, n_trades, n_bars_active. Best sharpe
+    first. Total rows = K × len(entries) × (1 + n_gates × gate_buckets).
     """
     xp = _get_xp(device)
 
@@ -357,50 +406,102 @@ def fast_scan(
     dlv = xp.concatenate([xp.asarray([xp.nan]), xp.diff(lv)])[:, None]
     dlv = xp.where(xp.isnan(dlv), 0.0, dlv)
 
-    rows = []
+    # Pre-compute entry-allow masks per (gate, bucket): per-column quantile
+    # buckets of the condition. Edges computed on CPU once per gate (cupy's
+    # nanquantile support varies by version); masks are bool (T, K) — cheap.
+    gate_masks: list[tuple[str, str, object]] = []
+    qs = np.linspace(0.0, 1.0, gate_buckets + 1)
+    for name, cond in (gates or {}).items():
+        c_np = _to_numpy(cond).astype(float)
+        if c_np.ndim == 1:
+            c_np = np.broadcast_to(c_np[:, None], (t_len, k))
+        if c_np.shape != (t_len, k):
+            raise ValueError(f"gate '{name}' has shape {c_np.shape}, expected {(t_len, k)}")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN warmup columns
+            edges_np = np.nanquantile(c_np, qs, axis=0)                # (B+1, K)
+        c = xp.asarray(c_np)
+        edges = xp.asarray(edges_np)
+        for b in range(gate_buckets):
+            lo, hi = edges[b][None, :], edges[b + 1][None, :]
+            allow = (c >= lo) & ((c <= hi) if b == gate_buckets - 1 else (c < hi))
+            gate_masks.append((name, f"q{b + 1}/{gate_buckets}", allow))
+
+    combo_frame = (
+        pl.DataFrame(combos) if combos is not None
+        else pl.DataFrame({"col": list(range(k))})
+    )
+
+    def _emit(entry: float, gate: str, bucket: str, metrics: dict) -> pl.DataFrame:
+        return combo_frame.with_columns(
+            pl.lit(float(entry)).alias("entry_z"),
+            pl.lit(gate).alias("gate"),
+            pl.lit(bucket).alias("gate_bucket"),
+            *[pl.Series(m, v) for m, v in metrics.items()],
+        )
+
+    blocks: list[pl.DataFrame] = []
     for entry in entries:
         events = xp.where(
             z <= -entry, 1.0,
             xp.where(z >= entry, -1.0,
                      xp.where(xp.abs(z) <= exit_band, 0.0, xp.nan)),
         )
-        pos = _ffill_positions(events, xp)
+        blocks.append(_emit(
+            entry, "(none)", "all",
+            _evaluate_events(events, dlv, cost_bps, periods_per_year, xp),
+        ))
 
-        pos_lag = xp.concatenate([xp.zeros((1, k)), pos[:-1]], axis=0)
-        turnover = xp.abs(pos - pos_lag)
-        pnl = pos_lag * dlv - cost_bps * turnover
+        is_entry = xp.abs(events) == 1.0
+        for name, bucket, allow in gate_masks:
+            gated = xp.where(is_entry & ~allow, xp.nan, events)
+            blocks.append(_emit(
+                entry, name, bucket,
+                _evaluate_events(gated, dlv, cost_bps, periods_per_year, xp),
+            ))
 
-        total = pnl.sum(axis=0)
-        mean, std = pnl.mean(axis=0), pnl.std(axis=0)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            sharpe = xp.where(std > 0, mean / std * np.sqrt(periods_per_year), xp.nan)
+    return pl.concat(blocks).sort("sharpe", descending=True, nulls_last=True)
 
-        active = pos_lag != 0
-        n_active = active.sum(axis=0)
-        wins = ((pnl > 0) & active).sum(axis=0)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            hit = xp.where(n_active > 0, wins / n_active, xp.nan)
 
-        cum = xp.cumsum(pnl, axis=0)
-        max_dd = _max_drawdown(cum, xp)
+def add_gate_lift(
+    results: pl.DataFrame,
+    keys: Optional[list[str]] = None,
+) -> pl.DataFrame:
+    """Join each gated row to its ungated baseline and compute the lift.
 
-        n_trades = ((pos != pos_lag) & (pos != 0)).sum(axis=0)
+    keys defaults to every param column (everything except gate/gate_bucket
+    and the metric columns). Adds base_sharpe / base_hit_rate / base_n_trades
+    plus sharpe_lift and hit_lift — the gate's value-add over the same combo
+    with no gate. Sort by sharpe_lift (with an n_trades floor) to find gates
+    that improve an already-good strategy rather than just riding it.
+    """
+    metric_cols = {
+        "total_pnl_bps", "sharpe", "hit_rate", "max_drawdown_bps",
+        "n_trades", "n_bars_active", "gate", "gate_bucket",
+    }
+    if keys is None:
+        keys = [c for c in results.columns if c not in metric_cols]
 
-        metrics = {
-            "total_pnl_bps": _to_numpy(total),
-            "sharpe": _to_numpy(sharpe),
-            "hit_rate": _to_numpy(hit),
-            "max_drawdown_bps": _to_numpy(max_dd),
-            "n_trades": _to_numpy(n_trades).astype(int),
-            "n_bars_active": _to_numpy(n_active).astype(int),
-        }
-        for col in range(k):
-            row = dict(combos[col]) if combos is not None else {"col": col}
-            row["entry_z"] = float(entry)
-            row.update({m: v[col].item() for m, v in metrics.items()})
-            rows.append(row)
+    base = (
+        results.filter(pl.col("gate") == "(none)")
+        .select(
+            *keys,
+            pl.col("sharpe").alias("base_sharpe"),
+            pl.col("hit_rate").alias("base_hit_rate"),
+            pl.col("n_trades").alias("base_n_trades"),
+        )
+    )
+    return (
+        results.join(base, on=keys, how="left")
+        .with_columns(
+            (pl.col("sharpe") - pl.col("base_sharpe")).alias("sharpe_lift"),
+            (pl.col("hit_rate") - pl.col("base_hit_rate")).alias("hit_lift"),
+        )
+    )
 
-    return pl.DataFrame(rows).sort("sharpe", descending=True, nulls_last=True)
+
+# Condition matrices built alongside the signal — the gate candidates.
+CONDITION_NAMES = ("r2", "beta_cv", "abs_beta", "resid_vol20", "resid_mom10")
 
 
 def signal_matrix(
@@ -408,31 +509,59 @@ def signal_matrix(
     y: pl.Series,
     beta_lbs: list[int],
     z_lbs: list[int],
-) -> tuple[np.ndarray, list[dict]]:
+    return_conditions: bool = False,
+):
     """Build the (T, K) OU z-score matrix for the standard model family:
     changes-based rolling OLS of y on x, residual rolled into level space,
     z-scored — one column per (beta_lb, z_lb) combo, aligned to len(y).
 
-    Feed the result to fast_scan() to evaluate the whole grid at once.
+    With return_conditions=True also returns {name: (T, K) array} of gate
+    candidates aligned column-for-column with z (they vary by beta_lb):
+    r2, beta_cv, abs_beta (model quality / stability), resid_vol20 and
+    resid_mom10 (residual regime). Feed z + conditions to fast_scan() to
+    evaluate the whole gated grid at once.
+
+    Returns (z, combos) or (z, combos, conditions).
     """
+    from stats.diagnostics import beta_cv as _beta_cv
     from stats.ols import roll_lr_diff
     from stats.ou import roll_ou_zscore
 
     t_len = len(y)
     cols, combos = [], []
+    cond_cols: dict[str, list[np.ndarray]] = {name: [] for name in CONDITION_NAMES}
     null1 = pl.Series([None], dtype=pl.Float64)
+
     for beta_lb in beta_lbs:
         reg = roll_lr_diff(x, y, lookback=beta_lb)
         resid_roll = pl.concat([
             null1,
             reg["resid"].rolling_sum(beta_lb, min_samples=beta_lb),
         ])
+        if return_conditions:
+            beta = pl.concat([null1, reg["beta"]])
+            conds = {
+                "r2": pl.concat([null1, reg["r2"]]),
+                "beta_cv": _beta_cv(beta, lookback=beta_lb),
+                "abs_beta": beta.abs(),
+                "resid_vol20": resid_roll.diff().rolling_std(20),
+                "resid_mom10": resid_roll.diff(10),
+            }
         for z_lb in z_lbs:
             z = roll_ou_zscore(resid_roll, lookback=z_lb)
             cols.append(z.to_numpy().astype(float)[:t_len])
             combos.append({"beta_lb": beta_lb, "z_lb": z_lb})
+            if return_conditions:
+                for name in CONDITION_NAMES:
+                    cond_cols[name].append(
+                        conds[name].to_numpy().astype(float)[:t_len]
+                    )
 
-    return np.column_stack(cols), combos
+    z_mat = np.column_stack(cols)
+    if not return_conditions:
+        return z_mat, combos
+    conditions = {name: np.column_stack(v) for name, v in cond_cols.items()}
+    return z_mat, combos, conditions
 
 
 # ── metric store ─────────────────────────────────────────────────────────────

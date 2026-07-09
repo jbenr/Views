@@ -34,6 +34,7 @@ from backtest import (
     SignalConfig,
     SignalPipeline,
     TradeDef,
+    add_gate_lift,
     fast_scan,
     gate_scan,
     print_summary,
@@ -159,6 +160,8 @@ SWEEP_GRID = {               # exact-engine sweep (--sweep)
 FAST_BETA_LBS = list(range(21, 505, 21))
 FAST_Z_LBS = list(range(21, 505, 21))
 FAST_ENTRIES = [round(x / 10, 1) for x in range(10, 31)]
+FAST_GATE_BUCKETS = 3        # every combo also runs gated per (condition × bucket)
+FAST_MIN_TRADES = 30         # ignore gated cells with fewer trades when ranking
 
 pipeline = make_pipeline()   # default-parameter pipeline (engine/tests import this)
 
@@ -242,23 +245,32 @@ def sweep(use_db: bool = True, n_jobs: int | None = None) -> dict:
 
 
 def fast(use_db: bool = True, device: str = "cpu") -> dict:
-    """Vectorized coarse scan of the big grid — the GPU-ready funnel stage.
+    """Vectorized coarse scan of the gated grid — the GPU funnel stage.
 
-    Approximate mechanics (hysteresis exits, no stops) — shortlist here, then
-    verify winners through sweep(). On the tower: --gpu (needs cupy-cuda12x).
+    Every (beta_lb, z_lb, entry_z) combo runs ungated AND once per
+    (condition × quantile bucket) entry gate: r2, beta_cv, abs_beta,
+    resid_vol20, resid_mom10. Approximate mechanics (hysteresis exits, no
+    stops) — shortlist here, then verify winners through sweep(), then pin
+    the actual gate cutoffs with --gates. On the tower: --gpu.
     """
     data = load_data() if use_db else synthetic_data()
-    z, combos = signal_matrix(data["10s30s"], data["10y"], FAST_BETA_LBS, FAST_Z_LBS)
+    z, combos, conditions = signal_matrix(
+        data["10s30s"], data["10y"], FAST_BETA_LBS, FAST_Z_LBS,
+        return_conditions=True,
+    )
     level = pipeline.trade_def.composite_series(data).to_numpy()
-    n_evals = len(combos) * len(FAST_ENTRIES)
+    n_variants = 1 + len(conditions) * FAST_GATE_BUCKETS
+    n_evals = len(combos) * len(FAST_ENTRIES) * n_variants
     print(f"fast scan: {len(combos)} signal columns × {len(FAST_ENTRIES)} entries "
-          f"= {n_evals} evaluations  (device={device})")
+          f"× {n_variants} gate variants = {n_evals:,} evaluations  (device={device})")
 
-    with utils.timed("running vectorized scan"):
+    with utils.timed("running vectorized gated scan"):
         results = fast_scan(
             z, level, entries=FAST_ENTRIES, cost_bps=TRANSACTION_COST_BPS,
-            combos=combos, device=device,
+            combos=combos, gates=conditions, gate_buckets=FAST_GATE_BUCKETS,
+            device=device,
         )
+        results = add_gate_lift(results)
 
     store = MetricStore()
     store.log(SIGNAL_NAME, results, meta={
@@ -266,8 +278,34 @@ def fast(use_db: bool = True, device: str = "cpu") -> dict:
         "span": f"{data['ts'].min()}..{data['ts'].max()}",
     })
 
-    print("\ntop 10 by sharpe (approximate — verify via --sweep):")
-    print(results.head(10))
+    show = ["beta_lb", "z_lb", "entry_z", "gate", "gate_bucket", "sharpe",
+            "total_pnl_bps", "hit_rate", "n_trades"]
+    ungated = results.filter(pl.col("gate") == "(none)")
+    print("\ntop 10 ungated by sharpe (approximate — verify via --sweep):")
+    print(ungated.select([c for c in show if c in ungated.columns]).head(10))
+
+    gated = (
+        results.filter(
+            (pl.col("gate") != "(none)") & (pl.col("n_trades") >= FAST_MIN_TRADES)
+        )
+        .sort("sharpe_lift", descending=True, nulls_last=True)
+    )
+    print(f"\ntop 10 gates by sharpe LIFT vs same combo ungated (n_trades ≥ {FAST_MIN_TRADES}):")
+    print(gated.select([*show, "base_sharpe", "sharpe_lift", "hit_lift"]).head(10))
+
+    print("\nwhich gate helps most often (median lift across all combos):")
+    print(
+        results.filter(pl.col("gate") != "(none)")
+        .group_by("gate", "gate_bucket")
+        .agg(
+            pl.col("sharpe_lift").median().alias("med_sharpe_lift"),
+            (pl.col("sharpe_lift") > 0).mean().alias("pct_combos_improved"),
+            pl.len().alias("n_cells"),
+        )
+        .sort("med_sharpe_lift", descending=True)
+    )
+    print(f"\nlogged {len(results):,} runs → {store.path}")
+
     return {"data": data, "results": results, "store": store}
 
 
