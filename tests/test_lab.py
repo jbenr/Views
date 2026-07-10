@@ -5,11 +5,13 @@ import polars as pl
 import pytest
 
 from backtest.lab import (
+    CONDITION_NAMES,
     MetricStore,
     ParamGrid,
     _ffill_positions,
     _import_strategy,
     _max_drawdown,
+    add_gate_lift,
     fast_scan,
     gate_scan,
     signal_matrix,
@@ -124,6 +126,84 @@ def test_signal_matrix_shape_and_combos():
     out = fast_scan(z, data["target"].to_numpy(), entries=[2.0], combos=combos)
     assert len(out) == 4
     assert {"beta_lb", "z_lb", "entry_z", "sharpe"} <= set(out.columns)
+
+
+def test_signal_matrix_returns_conditions():
+    data = synthetic_data(n=800)
+    z, combos, conditions = signal_matrix(
+        data["anchor"], data["target"], [42, 63], [42, 63], return_conditions=True
+    )
+    assert set(conditions) == set(CONDITION_NAMES)
+    for name, mat in conditions.items():
+        assert mat.shape == z.shape, name
+    # conditions vary by beta_lb only: columns 0/1 share beta_lb=42, 2/3 share 63
+    r2 = conditions["r2"]
+    np.testing.assert_array_equal(r2[:, 0], r2[:, 1])
+    np.testing.assert_array_equal(r2[:, 2], r2[:, 3])
+    tail = r2[-50:]
+    assert not np.allclose(tail[:, 0], tail[:, 2], equal_nan=True)
+
+
+# ── gated fast scan ──────────────────────────────────────────────────────────
+
+def _regime_ou(n=6000, seed=5):
+    """Block-regime OU: reversion (and vol) only exist when regime=1."""
+    rng = np.random.default_rng(seed)
+    regime = (np.arange(n) // 250 % 2).astype(float)
+    resid = np.zeros(n)
+    for i in range(1, n):
+        theta, sigma = (0.15, 4.0) if regime[i] else (0.0, 1.0)
+        resid[i] = resid[i - 1] * (1 - theta) + rng.normal(0, sigma)
+    z = (resid - resid.mean()) / resid.std()
+    return z, resid, regime
+
+
+def test_fast_scan_gated_row_count_and_baseline():
+    z, resid, regime = _regime_ou()
+    gates = {"regime": regime, "noise": np.random.default_rng(9).normal(size=len(z))}
+    out = fast_scan(z, resid, entries=[1.0, 1.5], gates=gates, gate_buckets=2)
+
+    # rows = K × E × (1 + G × B) = 1 × 2 × (1 + 2×2)
+    assert len(out) == 10
+    assert {"gate", "gate_bucket", "sharpe"} <= set(out.columns)
+    assert len(out.filter(pl.col("gate") == "(none)")) == 2
+
+    # gating only removes entries — can never trade more than ungated
+    for e in (1.0, 1.5):
+        base_n = out.filter(
+            (pl.col("gate") == "(none)") & (pl.col("entry_z") == e)
+        )["n_trades"][0]
+        gated_n = out.filter(
+            (pl.col("gate") != "(none)") & (pl.col("entry_z") == e)
+        )["n_trades"]
+        assert (gated_n <= base_n).all()
+
+
+def test_fast_scan_gate_concentrates_edge():
+    z, resid, regime = _regime_ou()
+    out = fast_scan(z, resid, entries=[1.0], gates={"regime": regime}, gate_buckets=2)
+
+    base = out.filter(pl.col("gate") == "(none)")["sharpe"][0]
+    on = out.filter(pl.col("gate_bucket") == "q2/2")["sharpe"][0]   # regime=1
+    off = out.filter(pl.col("gate_bucket") == "q1/2")["sharpe"][0]  # regime=0
+    # trading only the reverting regime beats ungated beats the dead regime
+    assert on > base > off
+
+
+def test_add_gate_lift():
+    z, resid, regime = _regime_ou()
+    out = fast_scan(z, resid, entries=[1.0], gates={"regime": regime}, gate_buckets=2)
+    lifted = add_gate_lift(out)
+
+    assert {"base_sharpe", "sharpe_lift", "hit_lift"} <= set(lifted.columns)
+    base_rows = lifted.filter(pl.col("gate") == "(none)")
+    assert (base_rows["sharpe_lift"].abs() < 1e-12).all()
+
+    on = lifted.filter(pl.col("gate_bucket") == "q2/2")
+    assert on["sharpe_lift"][0] == pytest.approx(
+        on["sharpe"][0] - on["base_sharpe"][0]
+    )
+    assert on["sharpe_lift"][0] > 0
 
 
 # ── exact sweep ──────────────────────────────────────────────────────────────

@@ -169,7 +169,7 @@ signal_matrix + fast_scan   →   sweep_strategy   →   MetricStore   →   gat
  GPU-ready via cupy)             all CPU cores)       history)           edge buckets)
 ```
 
-1. **`fast_scan`** — approximate threshold backtest of an entire signal matrix in one shot. Pure array math, so on the NVIDIA tower it runs on GPU unchanged: `pip install -e ".[gpu]"`, then `device="gpu"`. Use it to carve thousands of combos down to a shortlist (approximations: hysteresis exits, no stops, next-bar fills).
+1. **`fast_scan`** — approximate threshold backtest of an entire signal matrix in one shot, **with gates as a scan dimension**: pass `gates=` (the condition matrices from `signal_matrix(..., return_conditions=True)`: r2, beta_cv, abs_beta, resid_vol20, resid_mom10) and every combo is also evaluated once per (condition × quantile bucket) entry gate — the grid becomes `K × entries × (1 + gates × buckets)`. `add_gate_lift()` then scores each gate against its own ungated baseline. Pure array math (custom CUDA kernels for the scans), so on the NVIDIA tower it runs on GPU: `pip install -e ".[gpu]"`, then `device="gpu"`. Approximations: hysteresis exits, no stops, next-bar fills, per-column relative bucket labels — pin actual cutoffs with `gate_scan`.
 2. **`sweep_strategy("book.curve.tens_10s30s", data, grid)`** — the exact row-by-row Engine per combo, parallel across every CPU core (32-core box → 32 combos at a time). Real stops, time-stops, costs, trade logs.
 3. **`MetricStore`** — every run appends to `store/backtests.parquet` (git-ignored). `leaderboard()` ranks across strategies and time; `matrix(x="beta_lb", y="z_lb", metric="sharpe", agg="max")` pivots any metric across any two parameter dimensions.
 4. **`gate_scan`** — the highest-confidence-setup layer: bucket candidate state variables (r2, beta_cv, residual vol, regime flags) at hypothetical entry bars and measure per-bucket hit/PnL lift vs the unconditional baseline. Buckets that concentrate the edge graduate into `SignalConfig.entry_filter_fn` gates.
@@ -178,7 +178,7 @@ All four are wired into the strategy modules as scriptable modes:
 
 ```bash
 python -m book.curve.tens_10s30s --sweep    # exact grid → leaderboard + matrix + store
-python -m book.curve.tens_10s30s --fast     # coarse scan (--gpu on the tower)
+python -m book.curve.tens_10s30s --fast     # gated coarse scan, ~200k evals (--gpu on the tower)
 python -m book.curve.tens_10s30s --gates    # conditional edge table
 ```
 

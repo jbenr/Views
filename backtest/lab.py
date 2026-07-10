@@ -460,7 +460,12 @@ def fast_scan(
                 _evaluate_events(gated, dlv, cost_bps, periods_per_year, xp),
             ))
 
-    return pl.concat(blocks).sort("sharpe", descending=True, nulls_last=True)
+    return (
+        pl.concat(blocks)
+        # NaN (zero-trade combos) would sort above real values — make them null
+        .with_columns(pl.col("sharpe", "hit_rate").fill_nan(None))
+        .sort("sharpe", descending=True, nulls_last=True)
+    )
 
 
 def add_gate_lift(

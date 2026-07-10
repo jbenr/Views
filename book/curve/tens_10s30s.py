@@ -390,6 +390,14 @@ def fast(use_db: bool = True, device: str = "cpu") -> dict:
     print(f"\ntop 10 gates by sharpe LIFT vs same combo ungated (n_trades >= {FAST_MIN_TRADES}):")
     utils.pdf(gated.select([*show, "base_sharpe", "sharpe_lift", "hit_lift"]).head(10))
 
+    strong = (
+        gated.filter(pl.col("base_sharpe") > 0)
+        .sort("sharpe", descending=True, nulls_last=True)
+    )
+    print("\ntop 10 gated setups by absolute sharpe (base already positive — "
+          "gate improves a working combo):")
+    print(strong.select([*show, "base_sharpe", "sharpe_lift"]).head(10))
+
     print("\nwhich gate helps most often (median lift across all combos):")
     utils.pdf(
         valid.filter(
