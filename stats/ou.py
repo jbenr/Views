@@ -160,6 +160,58 @@ def roll_ou_zscore(
     return pl.Series("ou_zscore", z, dtype=pl.Float64)
 
 
+def roll_ou_features(
+    series: Union[pl.Series, pd.Series],
+    lookback: int = 252,
+    min_periods: int = None,
+) -> pl.DataFrame:
+    """Rolling OU state from AR(1) on delta = alpha + phi * lag.
+
+    Returns an input-aligned frame with columns:
+    ou_z, ou_mean, ou_sigma, ou_rho, ou_theta, expected_delta_1d, half_life.
+    """
+    s = to_pl_series(series).cast(pl.Float64)
+    n = len(s)
+    min_p = min_periods if min_periods is not None else max(20, lookback // 4)
+    min_p = min(min_p, lookback)
+
+    reg = roll_lr(s.shift(1), s.diff(), lookback=lookback, min_periods=min_p)
+    alpha = reg["alpha"].to_numpy().astype(float)
+    phi = reg["beta"].to_numpy().astype(float)
+
+    # roll_lr drops rows with null lag/diff values; pad back to input alignment.
+    pad = n - len(alpha)
+    if pad > 0:
+        alpha = np.concatenate([np.full(pad, np.nan), alpha])
+        phi = np.concatenate([np.full(pad, np.nan), phi])
+
+    s_np = s.to_numpy().astype(float)
+    sigma = s.rolling_std(lookback, min_samples=min_p).to_numpy().astype(float)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rho = 1.0 + phi
+        mean_reverting = (phi < 0) & (rho > 0) & (rho < 1)
+        ou_mean = np.where(np.abs(phi) > 1e-12, -alpha / phi, np.nan)
+        ou_theta = np.where(mean_reverting, -np.log(rho), np.nan)
+        half_life = np.where(mean_reverting, _LN2 / ou_theta, np.nan)
+        ou_z = np.where(sigma > 0, (s_np - ou_mean) / sigma, np.nan)
+        expected_delta = alpha + phi * s_np
+
+    return pl.DataFrame(
+        {
+            "ou_z": pl.Series("ou_z", ou_z, dtype=pl.Float64),
+            "ou_mean": pl.Series("ou_mean", ou_mean, dtype=pl.Float64),
+            "ou_sigma": pl.Series("ou_sigma", sigma, dtype=pl.Float64),
+            "ou_rho": pl.Series("ou_rho", rho, dtype=pl.Float64),
+            "ou_theta": pl.Series("ou_theta", ou_theta, dtype=pl.Float64),
+            "expected_delta_1d": pl.Series(
+                "expected_delta_1d", expected_delta, dtype=pl.Float64
+            ),
+            "half_life": pl.Series("half_life", half_life, dtype=pl.Float64),
+        }
+    )
+
+
 def hurst_exponent(
     series: Union[pl.Series, pd.Series], max_lag: int = 20
 ) -> float:

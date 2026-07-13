@@ -68,36 +68,6 @@ BPS_COLS = ["10y"]
 YIELD_COLS = ["10y", "10s30s"]
 
 
-# Backtest parameters live HERE - the first thing you touch when scripting.
-DEFAULT_PARAMS = {
-    "beta_lb": 252,              # hedge-ratio lookback
-    "ou_lb": 252,                # OU-state lookback for z/mean/half-life
-    "entry_resid_bps": 20.0,     # raw residual threshold; positive -> short 10s
-    "z_gate": 0.5,               # OU z must confirm the residual direction
-    "half_life_min": 3.0,        # block unstable / too-fast OU fits
-    "half_life_max": 120.0,      # block slow drifts masquerading as mean reversion
-    "exit_reversion_frac": 0.5,  # exit after this fraction of entry-to-OU-mean reverts
-    "time_stop_mult": 2.0,       # dynamic time stop = half_life * multiplier
-    "time_stop_min": 5.0,
-    "time_stop_max": 120.0,
-    "stop_loss_bps": 25.0,
-}
-TRANSACTION_COST_BPS = 0.1
-
-SWEEP_GRID = {
-    "beta_lb": [63, 126, 252],
-    "ou_lb": [63, 126, 252],
-    "entry_resid_bps": [15.0, 25.0, 40.0],
-    "z_gate": [0.5, 1.0, 1.5],
-}
-
-FAST_BETA_LBS = list(range(21, 505, 21))
-FAST_OU_LBS = list(range(21, 505, 21))
-FAST_ENTRIES_BPS = [float(x) for x in range(10, 151, 10)]
-FAST_EXIT_BAND_BPS = 5.0
-FAST_GATE_BUCKETS = 3
-FAST_MIN_TRADES = 30
-
 
 # -- helpers ----------------------------------------------------------------
 
@@ -235,6 +205,39 @@ def make_pipeline(params: dict | None = None) -> SignalPipeline:
         ),
     )
 
+
+
+# -- strategy parameters ----------------------------------------------------
+
+# Backtest parameters live HERE - the first thing you touch when scripting.
+DEFAULT_PARAMS = {
+    "beta_lb": 252,              # hedge-ratio lookback
+    "ou_lb": 252,                # OU-state lookback for z/mean/half-life
+    "entry_resid_bps": 20.0,     # raw residual threshold; positive -> short 10s
+    "z_gate": 0.5,               # OU z must confirm the residual direction
+    "half_life_min": 3.0,        # block unstable / too-fast OU fits
+    "half_life_max": 120.0,      # block slow drifts masquerading as mean reversion
+    "exit_reversion_frac": 0.5,  # exit after this fraction of entry-to-OU-mean reverts
+    "time_stop_mult": 2.0,       # dynamic time stop = half_life * multiplier
+    "time_stop_min": 5.0,
+    "time_stop_max": 120.0,
+    "stop_loss_bps": 25.0,
+}
+TRANSACTION_COST_BPS = 0.1
+
+SWEEP_GRID = {
+    "beta_lb": [63, 126, 252],
+    "ou_lb": [63, 126, 252],
+    "entry_resid_bps": [15.0, 25.0, 40.0],
+    "z_gate": [0.5, 1.0, 1.5],
+}
+
+FAST_BETA_LBS = list(range(21, 505, 21))
+FAST_OU_LBS = list(range(21, 505, 21))
+FAST_ENTRIES_BPS = [float(x) for x in range(5, 51, 2.5)]
+FAST_EXIT_BAND_BPS = 5.0
+FAST_GATE_BUCKETS = 5
+FAST_MIN_TRADES = 30
 
 pipeline = make_pipeline()
 

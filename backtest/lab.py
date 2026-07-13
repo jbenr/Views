@@ -364,6 +364,7 @@ def fast_scan(
     gates: Optional[dict[str, np.ndarray]] = None,
     gate_buckets: int = 3,
     device: str = "cpu",
+    entry_col: str = "entry_z",
 ) -> pl.DataFrame:
     """Approximate threshold backtest of a whole signal matrix, vectorized.
 
@@ -434,7 +435,7 @@ def fast_scan(
 
     def _emit(entry: float, gate: str, bucket: str, metrics: dict) -> pl.DataFrame:
         return combo_frame.with_columns(
-            pl.lit(float(entry)).alias("entry_z"),
+            pl.lit(float(entry)).alias(entry_col),
             pl.lit(gate).alias("gate"),
             pl.lit(bucket).alias("gate_bucket"),
             *[pl.Series(m, v) for m, v in metrics.items()],
@@ -515,6 +516,8 @@ def signal_matrix(
     beta_lbs: list[int],
     z_lbs: list[int],
     return_conditions: bool = False,
+    signal_kind: str = "ou_zscore",
+    lookback_name: str = "z_lb",
 ):
     """Build the (T, K) OU z-score matrix for the standard model family:
     changes-based rolling OLS of y on x, residual rolled into level space,
@@ -531,6 +534,10 @@ def signal_matrix(
     from stats.diagnostics import beta_cv as _beta_cv
     from stats.ols import roll_lr_diff
     from stats.ou import roll_ou_zscore
+
+    valid_signal_kinds = {"ou_zscore", "zscore", "z", "residual", "resid"}
+    if signal_kind not in valid_signal_kinds:
+        raise ValueError(f"unknown signal_kind={signal_kind!r}")
 
     t_len = len(y)
     cols, combos = [], []
@@ -553,9 +560,12 @@ def signal_matrix(
                 "resid_mom10": resid_roll.diff(10),
             }
         for z_lb in z_lbs:
-            z = roll_ou_zscore(resid_roll, lookback=z_lb)
-            cols.append(z.to_numpy().astype(float)[:t_len])
-            combos.append({"beta_lb": beta_lb, "z_lb": z_lb})
+            if signal_kind in {"ou_zscore", "zscore", "z"}:
+                signal = roll_ou_zscore(resid_roll, lookback=z_lb)
+            else:
+                signal = resid_roll
+            cols.append(signal.to_numpy().astype(float)[:t_len])
+            combos.append({"beta_lb": beta_lb, lookback_name: z_lb})
             if return_conditions:
                 for name in CONDITION_NAMES:
                     cond_cols[name].append(

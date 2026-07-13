@@ -14,6 +14,7 @@ from stats import (
     quality_weight,
     roll_lr,
     roll_lr_diff,
+    roll_ou_features,
     roll_ou_zscore,
 )
 
@@ -76,6 +77,43 @@ def test_roll_ou_zscore_flags_dislocations():
     assert (z_clean.abs() < 3).mean() > 0.95
 
 
+
+
+def test_roll_ou_features_returns_aligned_state_frame():
+    s = make_ou(n=800, theta=0.08, sigma=0.7)
+    out = roll_ou_features(s, lookback=160)
+
+    assert out.columns == [
+        "ou_z",
+        "ou_mean",
+        "ou_sigma",
+        "ou_rho",
+        "ou_theta",
+        "expected_delta_1d",
+        "half_life",
+    ]
+    assert len(out) == len(s)
+
+    tail = out.tail(200)
+    z = tail["ou_z"].to_numpy()
+    half_life = tail["half_life"].to_numpy()
+    theta = tail["ou_theta"].to_numpy()
+    expected = tail["expected_delta_1d"].to_numpy()
+    level_minus_mean = s.tail(200).to_numpy() - tail["ou_mean"].to_numpy()
+
+    assert np.isfinite(z).mean() > 0.9
+    assert np.isfinite(half_life).mean() > 0.9
+
+    mask = (
+        np.isfinite(theta)
+        & np.isfinite(expected)
+        & np.isfinite(level_minus_mean)
+        & (np.abs(level_minus_mean) > 1e-9)
+    )
+    assert mask.sum() > 100
+    assert (
+        np.sign(expected[mask]) == -np.sign(level_minus_mean[mask])
+    ).mean() > 0.95
 def test_hurst_exponent_regimes():
     rng = np.random.default_rng(4)
     mean_reverting = make_ou(theta=0.2)
