@@ -21,8 +21,9 @@ or search around them with the lab modes below.
     python -m book.curve.tens_10s30s              # single run, live DB
     python -m book.curve.tens_10s30s --synthetic  # single run, no DB
     python -m book.curve.tens_10s30s --sweep      # exact-engine grid
-    python -m book.curve.tens_10s30s --fast       # vectorized coarse scan
-    python -m book.curve.tens_10s30s --fast --gpu # GPU fast scan
+    python -m book.curve.tens_10s30s --fast       # auto GPU if available, else CPU
+    python -m book.curve.tens_10s30s --fast --cpu # force CPU
+    python -m book.curve.tens_10s30s --fast --gpu # request GPU, fallback to CPU
     python -m book.curve.tens_10s30s --gates      # conditional edge buckets
 
 Every mode returns a dict of state for interactive chaining: state = main().
@@ -49,9 +50,11 @@ from backtest import (
     add_gate_lift,
     add_predict_lift,
     fast_scan,
+    gate_allow_mask,
     gate_scan,
     gate_variant_count,
     half_drift_residual,
+    parse_gate,
     predict_scan,
     print_summary,
     signal_matrix,
@@ -144,6 +147,11 @@ def _entry_filter(z_gate: float, half_life_min: float, half_life_max: float):
     """Require OU z to confirm the raw residual entry direction."""
 
     def fn(direction: int, bar: dict) -> bool:
+        # gate_allow arrives as 1.0/0.0 (engine floats extras); absent = no gate
+        gate = bar.get("gate_allow")
+        if gate is not None and gate != 1.0:
+            return False
+
         ou_z = bar.get("ou_z")
         half_life = bar.get("half_life")
         if not (_finite(ou_z) and _finite(half_life)):
@@ -160,6 +168,28 @@ def _entry_filter(z_gate: float, half_life_min: float, half_life_max: float):
         return False
 
     return fn
+
+
+def _gate_condition(frame: pl.DataFrame, p: dict) -> pl.Series:
+    """Condition series for the gate param — the same menu as the fast/predict
+    scan conditions (lab.CONDITION_NAMES), built from this signal frame."""
+    name, _, _ = parse_gate(p["gate"])
+    builders = {
+        "r2": lambda: frame["r2"],
+        "beta_cv": lambda: beta_cv(frame["beta"], lookback=p["beta_lb"]),
+        "beta": lambda: frame["beta"],
+        "beta_vol20": lambda: frame["beta"].diff().rolling_std(20),
+        "beta_mom10": lambda: frame["beta"].diff(10),
+        "r2_vol20": lambda: frame["r2"].diff().rolling_std(20),
+        "r2_mom10": lambda: frame["r2"].diff(10),
+        "resid_phi": lambda: frame["ou_rho"] - 1.0,
+        "resid_half_life": lambda: frame["half_life"],
+        "resid_vol20": lambda: frame["resid"].diff().rolling_std(20),
+        "resid_mom10": lambda: frame["resid"].diff(10),
+    }
+    if name not in builders:
+        raise ValueError(f"unknown gate condition {name!r}; known: {sorted(builders)}")
+    return builders[name]()
 
 
 def compute(data: pl.DataFrame, params: dict | None = None) -> pl.DataFrame:
@@ -186,7 +216,7 @@ def compute(data: pl.DataFrame, params: dict | None = None) -> pl.DataFrame:
         .alias("time_stop")
     )
 
-    return pl.DataFrame({
+    frame = pl.DataFrame({
         "signal": resid_roll,
         "resid": resid_roll,
         "ou_z": ou["ou_z"],
@@ -200,6 +230,10 @@ def compute(data: pl.DataFrame, params: dict | None = None) -> pl.DataFrame:
         "beta": beta,
         "r2": r2,
     })
+    if p.get("gate") is not None:
+        allow = gate_allow_mask(_gate_condition(frame, p), p["gate"])
+        frame = frame.with_columns(pl.Series("gate_allow", allow))
+    return frame
 
 
 def make_pipeline(params: dict | None = None) -> SignalPipeline:
@@ -240,23 +274,31 @@ DEFAULT_PARAMS = {
     "time_stop_min": 5.0,
     "time_stop_max": 120.0,
     "stop_loss_bps": 25.0,
+    "gate": None,                # (condition, bucket) tuple or dict — see lab.parse_gate
 }
 TRANSACTION_COST_BPS = 0.1
 
 SWEEP_GRID = {
-    "beta_lb": list(range(10, 501, 10)),
-    "ou_lb": list(range(10, 501, 10)),
-    "entry_resid_bps": list(range(5, 31, 2)),
+    "beta_lb": [60,120], # list(range(10, 501, 10)),
+    "ou_lb": [400,420], # list(range(10, 501, 10)),
+    "entry_resid_bps": list(range(21, 31, 2)),
     "z_gate": np.arange(0.5, 3.1, 0.5).tolist(),
     "exit_reversion_frac": [0.25, 0.5, 0.75],
     "time_stop_mult": [1.0, 2.0, 3.0],
     "stop_loss_bps": [15.0, 25.0, 40.0],
+    "gate": [
+        None,
+        ("r2", "low_25"),
+        ("r2_mom_10", "low_10"),
+        ("beta_cv", "below_50"),
+        ("beta_vol20", "low_10")
+    ],
 }
 
-FAST_BETA_LBS = list(range(10, 501, 10))
-FAST_OU_LBS = list(range(10, 501, 10))
+FAST_BETA_LBS = [20,60,120,200,400] # list(range(10, 501, 10))
+FAST_OU_LBS = [20,60,120,200,400,420] # list(range(10, 501, 10))
 FAST_ENTRY_SIGNALS = ["residual", "ou_z"]
-FAST_RESID_ENTRIES_BPS = list(range(5, 31, 2))
+FAST_RESID_ENTRIES_BPS = list(range(25, 31, 1))
 FAST_RESID_EXIT_BANDS_BPS = [5.0, 10.0]
 FAST_OU_Z_ENTRIES = np.arange(0.5, 3.1, 0.5).tolist()
 FAST_OU_Z_EXIT_BANDS = [0.25, 0.5]
@@ -306,11 +348,13 @@ def main(use_db: bool = True, params: dict | None = None) -> dict:
     resid = last["signal"]
     ou_z = last["ou_z"]
     half_life = last["half_life"]
+    gate_ok = bool(last.get("gate_allow", True))
     if resid is None or not _finite(resid):
         print("\nlatest signal: warmup - no signal yet")
     else:
         if (
-            resid >= p["entry_resid_bps"]
+            gate_ok
+            and resid >= p["entry_resid_bps"]
             and _finite(ou_z)
             and ou_z >= p["z_gate"]
             and _finite(half_life)
@@ -318,7 +362,8 @@ def main(use_db: bool = True, params: dict | None = None) -> dict:
         ):
             action = f"SHORT {TARGET} (curve steep/rich vs 10Y)"
         elif (
-            resid <= -p["entry_resid_bps"]
+            gate_ok
+            and resid <= -p["entry_resid_bps"]
             and _finite(ou_z)
             and ou_z <= -p["z_gate"]
             and _finite(half_life)
@@ -364,7 +409,7 @@ def sweep(use_db: bool = True, n_jobs: int | None = None) -> dict:
     })
 
     show = [
-        "beta_lb", "ou_lb", "entry_resid_bps", "z_gate", "sharpe",
+        "beta_lb", "ou_lb", "entry_resid_bps", "z_gate", "gate", "sharpe",
         "total_pnl_bps", "hit_rate", "n_trades", "max_drawdown_bps",
     ]
     print("\nleaderboard (top 10 by sharpe):")
@@ -387,7 +432,7 @@ def sweep(use_db: bool = True, n_jobs: int | None = None) -> dict:
     return {"data": data, "results": results, "store": store}
 
 
-def fast(use_db: bool = True, device: str = "cpu") -> dict:
+def fast(use_db: bool = True, device: str = "auto") -> dict:
     """Vectorized coarse scan of residual/OU-z entries and quantile gates."""
     raw_data = load_data() if use_db else synthetic_data()
     data = model_frame(raw_data)
@@ -525,7 +570,7 @@ def fast(use_db: bool = True, device: str = "cpu") -> dict:
     return {"data": data, "results": results, "store": store}
 
 
-def predict(use_db: bool = True, device: str = "cpu") -> dict:
+def predict(use_db: bool = True, device: str = "auto") -> dict:
     """GPU-friendly forward-horizon predictability scan with gate buckets."""
     raw_data = load_data() if use_db else synthetic_data()
     data = model_frame(raw_data)
@@ -689,7 +734,7 @@ def gates(use_db: bool = True, params: dict | None = None) -> dict:
         "r2_vol20": sig_frame["r2"].diff().rolling_std(20),
         "r2_mom10": sig_frame["r2"].diff(10),
         "resid_vol20": sig_frame["resid"].diff().rolling_std(20),
-        "abs_beta": sig_frame["beta"].abs(),
+        "beta": sig_frame["beta"],
     })
 
     horizon = int(round(np.clip(
@@ -710,12 +755,13 @@ def gates(use_db: bool = True, params: dict | None = None) -> dict:
 
 if __name__ == "__main__":
     use_db = "--synthetic" not in sys.argv
+    device = "cpu" if "--cpu" in sys.argv else ("gpu" if "--gpu" in sys.argv else "auto")
     if "--sweep" in sys.argv:
         state = sweep(use_db=use_db)
     elif "--predict" in sys.argv:
-        state = predict(use_db=use_db, device="gpu" if "--gpu" in sys.argv else "cpu")
+        state = predict(use_db=use_db, device=device)
     elif "--fast" in sys.argv:
-        state = fast(use_db=use_db, device="gpu" if "--gpu" in sys.argv else "cpu")
+        state = fast(use_db=use_db, device=device)
     elif "--gates" in sys.argv:
         state = gates(use_db=use_db)
     else:
