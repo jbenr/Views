@@ -378,7 +378,6 @@ pipeline = make_pipeline()
 
 # -- modes -----------------------------------------------------------------
 
-
 def main(use_db: bool = True, params: dict | None = None) -> dict:
     p = _params(params)
 
@@ -579,7 +578,7 @@ def exits(use_db: bool = True, device: str = "auto") -> dict:
         for scan in scans
     )
     print(
-        f"exit scan: signals={EXIT_ENTRY_SIGNALS}  "
+        f"exit scan: signals={FAST_ENTRY_SIGNALS}  "
         f"model_columns={sum(scan['matrix'].shape[1] for scan in scans)}  "
         f"gate variants={n_variants}  evaluations={n_evals:,}  "
         f"(device={device})"
@@ -596,7 +595,7 @@ def exits(use_db: bool = True, device: str = "auto") -> dict:
                 cost_bps=TRANSACTION_COST_BPS,
                 combos=scan["combos"],
                 gates=scan["conditions"],
-                gate_buckets=EXIT_GATE_BUCKETS,
+                gate_buckets=FAST_GATE_BUCKETS,
                 device=device,
                 entry_col="entry_threshold",
                 exit_col="exit_threshold",
@@ -668,11 +667,11 @@ def exits(use_db: bool = True, device: str = "auto") -> dict:
 
     gated = valid.filter(
         (pl.col("gate") != "(none)")
-        & (pl.col("n_trades") >= EXIT_MIN_TRADES)
+        & (pl.col("n_trades") >= FAST_MIN_TRADES)
         & pl.col("sharpe_lift").is_finite()
     ).sort("sharpe_lift", descending=True, nulls_last=True)
     print(
-        f"\ntop 10 gates by sharpe LIFT vs same combo ungated (n_trades >= {EXIT_MIN_TRADES}):"
+        f"\ntop 10 gates by sharpe LIFT vs same combo ungated (n_trades >= {FAST_MIN_TRADES}):"
     )
     utils.pdf(gated.select([*show, "base_sharpe", "sharpe_lift", "hit_lift"]).head(10))
 
@@ -868,16 +867,9 @@ def predict(use_db: bool = True, device: str = "auto") -> dict:
     return {"data": data, "results": results, "store": store}
 
 
-def gates(
-    use_db: bool = True,
-    params: dict | None = None,
-    horizon: int | None = None,
-) -> dict:
-    """Conditional edge scan for entry-time state variables, ring-fenced to
-    the GATE_SETUP setup (funnel step 2 — point GATE_SETUP/GATE_HORIZON at
-    the --predict winner; params/horizon override for one-off runs)."""
-    p = _params({**GATE_SETUP, **(params or {})})
-    horizon = GATE_HORIZON if horizon is None else int(horizon)
+def gates(use_db: bool = True, params: dict | None = None) -> dict:
+    """Conditional edge scan for entry-time state variables."""
+    p = _params(params)
     raw_data = load_data() if use_db else synthetic_data()
     data = model_frame(raw_data)
     sig_frame = compute(data, params=p)
@@ -903,6 +895,15 @@ def gates(
         }
     )
 
+    horizon = int(
+        round(
+            np.clip(
+                p["time_stop_mult"] * 14,
+                p["time_stop_min"],
+                p["time_stop_max"],
+            )
+        )
+    )
     table = gate_scan(
         sig_frame["signal"],
         level,
