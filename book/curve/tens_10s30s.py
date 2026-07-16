@@ -41,7 +41,7 @@ from functools import partial
 import numpy as np
 import polars as pl
 
-from utils.market_data import align_columns, coverage_report, load_wide
+import utils
 from backtest import (
     BacktestConfig,
     Engine,
@@ -63,20 +63,19 @@ from backtest import (
     sweep_strategy,
 )
 from stats import beta_cv, horizon_backtest, roll_lr_diff, roll_ou_features
-import utils
-
+from utils.market_data import align_columns, coverage_report, load_wide
 
 # -- config -----------------------------------------------------------------
 
 STRATEGY_FAMILY = "curve"
 SIGNAL_NAME = "tens_10s30s"
-MODULE = "book.curve.tens_10s30s"   # importable path, used by sweep workers
+MODULE = "book.curve.tens_10s30s"  # importable path, used by sweep workers
 
 START = "2010-01-01"
 
 TICKERS = {
-    "10y": "USGG10YR Index",      # % -> scaled to bps at load
-    "10s30s": "USYC1030 Index",   # already quoted in bps
+    "10y": "USGG10YR Index",  # % -> scaled to bps at load
+    "10s30s": "USYC1030 Index",  # already quoted in bps
 }
 BPS_COLS = ["10y"]
 
@@ -87,8 +86,8 @@ MODEL_COLUMNS = [TARGET, *FEATURES]
 YIELD_COLS = MODEL_COLUMNS
 
 
-
 # -- helpers ----------------------------------------------------------------
+
 
 def load_data(start: str = START) -> pl.DataFrame:
     """Load 10Y and 10s30s from md.index_eod (requires access to raptor)."""
@@ -121,9 +120,8 @@ def synthetic_data(n: int = 1500, seed: int = 21) -> pl.DataFrame:
     )
     ts = ts.filter(ts.dt.weekday() <= 5)[:n]
 
-    return (
-        pl.DataFrame({"ts": ts, "10y": tens, "10s30s": slope})
-        .with_columns(pl.col(YIELD_COLS).round(2))
+    return pl.DataFrame({"ts": ts, "10y": tens, "10s30s": slope}).with_columns(
+        pl.col(YIELD_COLS).round(2)
     )
 
 
@@ -213,10 +211,12 @@ def compute(data: pl.DataFrame, params: dict | None = None) -> pl.DataFrame:
 
     # roll_lr_diff drops one row (first diff) - pad back to len(data)
     null1 = pl.Series([None], dtype=pl.Float64)
-    resid_roll = pl.concat([
-        null1,
-        reg["resid"].rolling_sum(p["beta_lb"], min_samples=p["beta_lb"]),
-    ])
+    resid_roll = pl.concat(
+        [
+            null1,
+            reg["resid"].rolling_sum(p["beta_lb"], min_samples=p["beta_lb"]),
+        ]
+    )
     beta = pl.concat([null1, reg["beta"]])
     r2 = pl.concat([null1, reg["r2"]])
 
@@ -227,20 +227,22 @@ def compute(data: pl.DataFrame, params: dict | None = None) -> pl.DataFrame:
         .alias("time_stop")
     )
 
-    frame = pl.DataFrame({
-        "signal": resid_roll,
-        "resid": resid_roll,
-        "ou_z": ou["ou_z"],
-        "ou_mean": ou["ou_mean"],
-        "ou_sigma": ou["ou_sigma"],
-        "ou_rho": ou["ou_rho"],
-        "ou_theta": ou["ou_theta"],
-        "expected_delta_1d": ou["expected_delta_1d"],
-        "half_life": ou["half_life"],
-        "time_stop": time_stop,
-        "beta": beta,
-        "r2": r2,
-    })
+    frame = pl.DataFrame(
+        {
+            "signal": resid_roll,
+            "resid": resid_roll,
+            "ou_z": ou["ou_z"],
+            "ou_mean": ou["ou_mean"],
+            "ou_sigma": ou["ou_sigma"],
+            "ou_rho": ou["ou_rho"],
+            "ou_theta": ou["ou_theta"],
+            "expected_delta_1d": ou["expected_delta_1d"],
+            "half_life": ou["half_life"],
+            "time_stop": time_stop,
+            "beta": beta,
+            "r2": r2,
+        }
+    )
     if p.get("gate") is not None:
         allow = gate_allow_mask(_gate_condition(frame, p), p["gate"])
         frame = frame.with_columns(pl.Series("gate_allow", allow))
@@ -269,7 +271,6 @@ def make_pipeline(params: dict | None = None) -> SignalPipeline:
     )
 
 
-
 # -- strategy parameters ----------------------------------------------------
 #
 # The research funnel. Each step has its own variable block below; each step's
@@ -296,66 +297,66 @@ def make_pipeline(params: dict | None = None) -> SignalPipeline:
 
 DEFAULT_PARAMS = {
     # model fit: hedge ratio and OU state of the residual
-    "beta_lb": 252,              # hedge-ratio lookback (days)
-    "ou_lb": 252,                # OU-state lookback for z/mean/half-life
+    "beta_lb": 252,  # hedge-ratio lookback (days)
+    "ou_lb": 252,  # OU-state lookback for z/mean/half-life
     # entry: fade raw residual extremes
-    "entry_resid_bps": 20.0,     # raw residual threshold; positive -> short curve
+    "entry_resid_bps": 20.0,  # raw residual threshold; positive -> short curve
     # entry filters: what must ALSO be true at the bar to take the trade
-    "z_gate": 0.5,               # OU z must confirm direction; None = off (gate-only entries)
-    "half_life_min": 3.0,        # block unstable / too-fast OU fits
-    "half_life_max": 120.0,      # block slow drifts masquerading as mean reversion
-    "gate": None,                # quantile regime gate (condition, bucket) — see lab.parse_gate
+    "z_gate": 0.5,  # OU z must confirm direction; None = off (gate-only entries)
+    "half_life_min": 3.0,  # block unstable / too-fast OU fits
+    "half_life_max": 120.0,  # block slow drifts masquerading as mean reversion
+    "gate": None,  # quantile regime gate (condition, bucket) — see lab.parse_gate
     # exits: reversion target, time stop, hard stop
     "exit_reversion_frac": 0.5,  # exit after this fraction of entry-to-OU-mean reverts
-    "time_stop_mult": 2.0,       # dynamic time stop = half_life * multiplier...
-    "time_stop_min": 5.0,        # ...clipped to this range (days)
+    "time_stop_mult": 2.0,  # dynamic time stop = half_life * multiplier...
+    "time_stop_min": 5.0,  # ...clipped to this range (days)
     "time_stop_max": 120.0,
-    "stop_loss_bps": 25.0,       # hard stop on adverse move
+    "stop_loss_bps": 25.0,  # hard stop on adverse move
 }
 TRANSACTION_COST_BPS = 0.1
 
 # step 1 --predict: the setup search space. Wide on purpose — lookbacks x
 # entry signal x threshold x horizon, plus every gate condition/bucket as an
 # IC-lift overlay. Winners here define the setups steps 2-4 are allowed to use.
-PREDICT_ENTRY_SIGNALS = ["residual", "ou_z"]    # candidate entry signals
-PREDICT_BETA_LBS = [20,60,120,200,400] # list(range(10, 501, 10))
-PREDICT_OU_LBS = [20,60,120,200,400,420] # list(range(10, 501, 10))
-PREDICT_HORIZONS = [5, 10, 20, 40, 60]          # forward windows (days)
+PREDICT_ENTRY_SIGNALS = ["residual", "ou_z"]  # candidate entry signals
+PREDICT_BETA_LBS = [20, 60, 120, 200, 400]  # list(range(10, 501, 10))
+PREDICT_OU_LBS = [20, 60, 120, 200, 400, 420]  # list(range(10, 501, 10))
+PREDICT_HORIZONS = [5, 10, 20, 40, 60]  # forward windows (days)
 PREDICT_RESID_THRESHOLDS_BPS = list(range(5, 31, 2))
 PREDICT_OU_Z_THRESHOLDS = np.arange(0.5, 3.1, 0.5).tolist()
-PREDICT_GATE_BUCKETS = "regime"                 # named quantile regimes per condition
-PREDICT_MIN_OBS = 30                            # ignore cells with fewer events
+PREDICT_GATE_BUCKETS = "regime"  # named quantile regimes per condition
+PREDICT_MIN_OBS = 30  # ignore cells with fewer events
 
 # step 2 --gates: conditional edge on ONE setup from step 1. GATE_SETUP
 # overrides DEFAULT_PARAMS for this scan — point it at the predict winner and
 # pick the horizon that won. Output: which condition buckets concentrate
 # hit rate / PnL, i.e. the gate candidates worth carrying into steps 3-4.
 GATE_SETUP = {
-    "beta_lb": 252,              # from the --predict leaderboard
+    "beta_lb": 252,  # from the --predict leaderboard
     "ou_lb": 252,
     "entry_resid_bps": 20.0,
 }
-GATE_HORIZON = 28                # forward PnL window (days) — the winning --predict horizon
+GATE_HORIZON = 28  # forward PnL window (days) — the winning --predict horizon
 
 # step 3 --exits: exit scan over the step-1 setups, with every gate bucket
 # overlaid. Narrow the lookback/entry lists to the step-1 winners before
 # running; gate x exit interaction is read off the (gate, exit) result cells.
 EXIT_ENTRY_SIGNALS = ["residual", "ou_z"]
-EXIT_BETA_LBS = [20,60,120,200,400] # list(range(10, 501, 10))
-EXIT_OU_LBS = [20,60,120,200,400,420] # list(range(10, 501, 10))
+EXIT_BETA_LBS = [20, 60, 120, 200, 400]  # list(range(10, 501, 10))
+EXIT_OU_LBS = [20, 60, 120, 200, 400, 420]  # list(range(10, 501, 10))
 EXIT_RESID_ENTRIES_BPS = list(range(25, 31, 1))
-EXIT_RESID_BANDS_BPS = [5.0, 10.0]              # flat when |resid| <= band
+EXIT_RESID_BANDS_BPS = [5.0, 10.0]  # flat when |resid| <= band
 EXIT_OU_Z_ENTRIES = np.arange(0.5, 3.1, 0.5).tolist()
-EXIT_OU_Z_BANDS = [0.25, 0.5]                   # flat when |ou_z| <= band
+EXIT_OU_Z_BANDS = [0.25, 0.5]  # flat when |ou_z| <= band
 EXIT_GATE_BUCKETS = "regime"
-EXIT_MIN_TRADES = 30                            # floor for the gate-lift leaderboards
+EXIT_MIN_TRADES = 30  # floor for the gate-lift leaderboards
 
 # step 4 --sweep: the exact-engine grid — full trade mechanics (stops, time
 # stops, costs, trade logs). Every list here should be a survivor of steps
 # 1-3: setups from --predict, gates from --gates/--exits, exits from --exits.
 SWEEP_GRID = {
-    "beta_lb": [60,120], # list(range(10, 501, 10)),
-    "ou_lb": [400,420], # list(range(10, 501, 10)),
+    "beta_lb": [60, 120],  # list(range(10, 501, 10)),
+    "ou_lb": [400, 420],  # list(range(10, 501, 10)),
     "entry_resid_bps": list(range(21, 31, 2)),
     # None disables the OU-z confirmation so gates filter entries on their own
     "z_gate": [None, *np.arange(0.5, 3.1, 0.5).tolist()],
@@ -368,14 +369,15 @@ SWEEP_GRID = {
         ("r2", "low_25"),
         ("r2_mom10", "low_10"),
         ("beta_cv", "below_50"),
-        ("beta_vol20", "low_10")
+        ("beta_vol20", "low_10"),
     ],
 }
 
 pipeline = make_pipeline()
 
 
-# -- modes ------------------------------------------------------------------
+# -- modes -----------------------------------------------------------------
+
 
 def main(use_db: bool = True, params: dict | None = None) -> dict:
     p = _params(params)
@@ -413,8 +415,7 @@ def main(use_db: bool = True, params: dict | None = None) -> dict:
         print("\nlatest signal: warmup - no signal yet")
     else:
         hl_ok = (
-            _finite(half_life)
-            and p["half_life_min"] <= half_life <= p["half_life_max"]
+            _finite(half_life) and p["half_life_min"] <= half_life <= p["half_life_max"]
         )
         z_ok_short = p["z_gate"] is None or (_finite(ou_z) and ou_z >= p["z_gate"])
         z_ok_long = p["z_gate"] is None or (_finite(ou_z) and ou_z <= -p["z_gate"])
@@ -447,23 +448,41 @@ def sweep(use_db: bool = True, n_jobs: int | None = None) -> dict:
     raw_data = load_data() if use_db else synthetic_data()
     data = model_frame(raw_data)
     source = "db" if use_db else "synthetic"
-    print(f"sweep: {SIGNAL_NAME}  grid={SWEEP_GRID}  rows={len(data)}  (source={source})")
+    print(
+        f"sweep: {SIGNAL_NAME}  grid={SWEEP_GRID}  rows={len(data)}  (source={source})"
+    )
 
     with utils.timed("running exact-engine sweep"):
         results = sweep_strategy(
-            MODULE, data, SWEEP_GRID,
-            transaction_cost_bps=TRANSACTION_COST_BPS, n_jobs=n_jobs,
+            MODULE,
+            data,
+            SWEEP_GRID,
+            transaction_cost_bps=TRANSACTION_COST_BPS,
+            n_jobs=n_jobs,
         )
 
     store = MetricStore()
-    store.log(SIGNAL_NAME, results, meta={
-        "engine": "exact", "source": source,
-        "span": f"{data['ts'].min()}..{data['ts'].max()}",
-    })
+    store.log(
+        SIGNAL_NAME,
+        results,
+        meta={
+            "engine": "exact",
+            "source": source,
+            "span": f"{data['ts'].min()}..{data['ts'].max()}",
+        },
+    )
 
     show = [
-        "beta_lb", "ou_lb", "entry_resid_bps", "z_gate", "gate", "sharpe",
-        "total_pnl_bps", "hit_rate", "n_trades", "max_drawdown_bps",
+        "beta_lb",
+        "ou_lb",
+        "entry_resid_bps",
+        "z_gate",
+        "gate",
+        "sharpe",
+        "total_pnl_bps",
+        "hit_rate",
+        "n_trades",
+        "max_drawdown_bps",
     ]
     print("\nleaderboard (top 10 by sharpe):")
     utils.pdf(results.select([c for c in show if c in results.columns]).head(10))
@@ -482,16 +501,15 @@ def sweep(use_db: bool = True, n_jobs: int | None = None) -> dict:
     )
 
     print("\nsharpe matrix - beta_lb (cols) x ou_lb (rows), best entry/gate per cell:")
-    matrix = (
-        results.pivot(
-            index="ou_lb",
-            on="beta_lb",
-            values="sharpe",
-            aggregate_function="max",
-        )
-        .sort("ou_lb")
-    )
-    beta_cols = [str(x) for x in sorted(SWEEP_GRID["beta_lb"]) if str(x) in matrix.columns]
+    matrix = results.pivot(
+        index="ou_lb",
+        on="beta_lb",
+        values="sharpe",
+        aggregate_function="max",
+    ).sort("ou_lb")
+    beta_cols = [
+        str(x) for x in sorted(SWEEP_GRID["beta_lb"]) if str(x) in matrix.columns
+    ]
     utils.pdf(matrix.select(["ou_lb", *beta_cols]))
     print(f"\nlogged {len(results)} runs -> {store.path}")
 
@@ -509,44 +527,55 @@ def exits(use_db: bool = True, device: str = "auto") -> dict:
 
     if "residual" in EXIT_ENTRY_SIGNALS:
         resid, resid_combos, resid_conditions = signal_matrix(
-            data[FEATURE], data[TARGET], EXIT_BETA_LBS, [0],
+            data[FEATURE],
+            data[TARGET],
+            EXIT_BETA_LBS,
+            [0],
             return_conditions=True,
             signal_kind="residual",
             lookback_name="ou_lb",
         )
-        scans.append({
-            "entry_signal": "residual",
-            "units": "bps",
-            "matrix": resid,
-            "combos": resid_combos,
-            "conditions": resid_conditions,
-            "entries": EXIT_RESID_ENTRIES_BPS,
-            "exits": EXIT_RESID_BANDS_BPS,
-        })
+        scans.append(
+            {
+                "entry_signal": "residual",
+                "units": "bps",
+                "matrix": resid,
+                "combos": resid_combos,
+                "conditions": resid_conditions,
+                "entries": EXIT_RESID_ENTRIES_BPS,
+                "exits": EXIT_RESID_BANDS_BPS,
+            }
+        )
 
     if "ou_z" in EXIT_ENTRY_SIGNALS:
         ou_z, ou_combos, ou_conditions = signal_matrix(
-            data[FEATURE], data[TARGET], EXIT_BETA_LBS, EXIT_OU_LBS,
+            data[FEATURE],
+            data[TARGET],
+            EXIT_BETA_LBS,
+            EXIT_OU_LBS,
             return_conditions=True,
             signal_kind="ou_zscore",
             lookback_name="ou_lb",
         )
-        scans.append({
-            "entry_signal": "ou_z",
-            "units": "z",
-            "matrix": ou_z,
-            "combos": ou_combos,
-            "conditions": ou_conditions,
-            "entries": EXIT_OU_Z_ENTRIES,
-            "exits": EXIT_OU_Z_BANDS,
-        })
+        scans.append(
+            {
+                "entry_signal": "ou_z",
+                "units": "z",
+                "matrix": ou_z,
+                "combos": ou_combos,
+                "conditions": ou_conditions,
+                "entries": EXIT_OU_Z_ENTRIES,
+                "exits": EXIT_OU_Z_BANDS,
+            }
+        )
 
-    n_variants = 1 + len(scans[0]["conditions"]) * gate_variant_count(EXIT_GATE_BUCKETS) if scans else 1
+    n_variants = (
+        1 + len(scans[0]["conditions"]) * gate_variant_count(EXIT_GATE_BUCKETS)
+        if scans
+        else 1
+    )
     n_evals = sum(
-        scan["matrix"].shape[1]
-        * len(scan["entries"])
-        * len(scan["exits"])
-        * n_variants
+        scan["matrix"].shape[1] * len(scan["entries"]) * len(scan["exits"]) * n_variants
         for scan in scans
     )
     print(
@@ -560,7 +589,8 @@ def exits(use_db: bool = True, device: str = "auto") -> dict:
         result_blocks = []
         for scan in scans:
             block = fast_scan(
-                scan["matrix"], level,
+                scan["matrix"],
+                level,
                 entries=scan["entries"],
                 exit_band=scan["exits"],
                 cost_bps=TRANSACTION_COST_BPS,
@@ -590,19 +620,32 @@ def exits(use_db: bool = True, device: str = "auto") -> dict:
         )
 
     store = MetricStore()
-    store.log(SIGNAL_NAME, results, meta={
-        "engine": "exits", "source": "db" if use_db else "synthetic",
-        "span": f"{data['ts'].min()}..{data['ts'].max()}",
-    })
+    store.log(
+        SIGNAL_NAME,
+        results,
+        meta={
+            "engine": "exits",
+            "source": "db" if use_db else "synthetic",
+            "span": f"{data['ts'].min()}..{data['ts'].max()}",
+        },
+    )
 
     show = [
-        "entry_signal", "beta_lb", "ou_lb", "entry_threshold", "exit_threshold",
-        "threshold_units", "gate", "gate_bucket",
-        "sharpe", "total_pnl_bps", "pnl_per_trade_bps", "hit_rate", "n_trades",
+        "entry_signal",
+        "beta_lb",
+        "ou_lb",
+        "entry_threshold",
+        "exit_threshold",
+        "threshold_units",
+        "gate",
+        "gate_bucket",
+        "sharpe",
+        "total_pnl_bps",
+        "pnl_per_trade_bps",
+        "hit_rate",
+        "n_trades",
     ]
-    valid = results.filter(
-        (pl.col("n_trades") > 0) & pl.col("sharpe").is_finite()
-    )
+    valid = results.filter((pl.col("n_trades") > 0) & pl.col("sharpe").is_finite())
     ungated = valid.filter(pl.col("gate") == "(none)")
 
     exit_summary = (
@@ -623,30 +666,28 @@ def exits(use_db: bool = True, device: str = "auto") -> dict:
     print("\ntop 10 ungated by sharpe (approximate - verify via --sweep):")
     utils.pdf(ungated.select([c for c in show if c in ungated.columns]).head(10))
 
-    gated = (
-        valid.filter(
-            (pl.col("gate") != "(none)")
-            & (pl.col("n_trades") >= EXIT_MIN_TRADES)
-            & pl.col("sharpe_lift").is_finite()
-        )
-        .sort("sharpe_lift", descending=True, nulls_last=True)
+    gated = valid.filter(
+        (pl.col("gate") != "(none)")
+        & (pl.col("n_trades") >= EXIT_MIN_TRADES)
+        & pl.col("sharpe_lift").is_finite()
+    ).sort("sharpe_lift", descending=True, nulls_last=True)
+    print(
+        f"\ntop 10 gates by sharpe LIFT vs same combo ungated (n_trades >= {EXIT_MIN_TRADES}):"
     )
-    print(f"\ntop 10 gates by sharpe LIFT vs same combo ungated (n_trades >= {EXIT_MIN_TRADES}):")
     utils.pdf(gated.select([*show, "base_sharpe", "sharpe_lift", "hit_lift"]).head(10))
 
-    strong = (
-        gated.filter(pl.col("base_sharpe") > 0)
-        .sort("sharpe", descending=True, nulls_last=True)
+    strong = gated.filter(pl.col("base_sharpe") > 0).sort(
+        "sharpe", descending=True, nulls_last=True
     )
-    print("\ntop 10 gated setups by absolute sharpe (base already positive — "
-          "gate improves a working combo):")
+    print(
+        "\ntop 10 gated setups by absolute sharpe (base already positive — "
+        "gate improves a working combo):"
+    )
     utils.pdf(strong.select([*show, "base_sharpe", "sharpe_lift"]).head(10))
 
     print("\nwhich gate helps most often (median lift across all combos):")
     utils.pdf(
-        valid.filter(
-            (pl.col("gate") != "(none)") & pl.col("sharpe_lift").is_finite()
-        )
+        valid.filter((pl.col("gate") != "(none)") & pl.col("sharpe_lift").is_finite())
         .group_by("entry_signal", "gate", "gate_bucket")
         .agg(
             pl.col("sharpe_lift").median().alias("med_sharpe_lift"),
@@ -657,7 +698,12 @@ def exits(use_db: bool = True, device: str = "auto") -> dict:
     )
     print(f"\nlogged {len(results):,} runs -> {store.path}")
 
-    return {"data": data, "results": results, "exit_summary": exit_summary, "store": store}
+    return {
+        "data": data,
+        "results": results,
+        "exit_summary": exit_summary,
+        "store": store,
+    }
 
 
 def predict(use_db: bool = True, device: str = "auto") -> dict:
@@ -670,37 +716,51 @@ def predict(use_db: bool = True, device: str = "auto") -> dict:
 
     if "residual" in PREDICT_ENTRY_SIGNALS:
         resid, resid_combos, resid_conditions = signal_matrix(
-            data[FEATURE], data[TARGET], PREDICT_BETA_LBS, [0],
+            data[FEATURE],
+            data[TARGET],
+            PREDICT_BETA_LBS,
+            [0],
             return_conditions=True,
             signal_kind="residual",
             lookback_name="ou_lb",
         )
-        scans.append({
-            "entry_signal": "residual",
-            "units": "bps",
-            "matrix": resid,
-            "combos": resid_combos,
-            "conditions": resid_conditions,
-            "thresholds": PREDICT_RESID_THRESHOLDS_BPS,
-        })
+        scans.append(
+            {
+                "entry_signal": "residual",
+                "units": "bps",
+                "matrix": resid,
+                "combos": resid_combos,
+                "conditions": resid_conditions,
+                "thresholds": PREDICT_RESID_THRESHOLDS_BPS,
+            }
+        )
 
     if "ou_z" in PREDICT_ENTRY_SIGNALS:
         ou_z, ou_combos, ou_conditions = signal_matrix(
-            data[FEATURE], data[TARGET], PREDICT_BETA_LBS, PREDICT_OU_LBS,
+            data[FEATURE],
+            data[TARGET],
+            PREDICT_BETA_LBS,
+            PREDICT_OU_LBS,
             return_conditions=True,
             signal_kind="ou_zscore",
             lookback_name="ou_lb",
         )
-        scans.append({
-            "entry_signal": "ou_z",
-            "units": "z",
-            "matrix": ou_z,
-            "combos": ou_combos,
-            "conditions": ou_conditions,
-            "thresholds": PREDICT_OU_Z_THRESHOLDS,
-        })
+        scans.append(
+            {
+                "entry_signal": "ou_z",
+                "units": "z",
+                "matrix": ou_z,
+                "combos": ou_combos,
+                "conditions": ou_conditions,
+                "thresholds": PREDICT_OU_Z_THRESHOLDS,
+            }
+        )
 
-    n_variants = 1 + len(scans[0]["conditions"]) * gate_variant_count(PREDICT_GATE_BUCKETS) if scans else 1
+    n_variants = (
+        1 + len(scans[0]["conditions"]) * gate_variant_count(PREDICT_GATE_BUCKETS)
+        if scans
+        else 1
+    )
     n_evals = sum(
         scan["matrix"].shape[1]
         * len(scan["thresholds"])
@@ -720,7 +780,8 @@ def predict(use_db: bool = True, device: str = "auto") -> dict:
         result_blocks = []
         for scan in scans:
             block = predict_scan(
-                scan["matrix"], level,
+                scan["matrix"],
+                level,
                 entries=scan["thresholds"],
                 horizons=PREDICT_HORIZONS,
                 combos=scan["combos"],
@@ -741,14 +802,29 @@ def predict(use_db: bool = True, device: str = "auto") -> dict:
         )
 
     store = MetricStore()
-    store.log(SIGNAL_NAME, results, meta={
-        "engine": "predict", "source": "db" if use_db else "synthetic",
-        "span": f"{data['ts'].min()}..{data['ts'].max()}",
-    })
+    store.log(
+        SIGNAL_NAME,
+        results,
+        meta={
+            "engine": "predict",
+            "source": "db" if use_db else "synthetic",
+            "span": f"{data['ts'].min()}..{data['ts'].max()}",
+        },
+    )
 
     show = [
-        "entry_signal", "beta_lb", "ou_lb", "entry_threshold", "threshold_units",
-        "horizon", "gate", "gate_bucket", "ic", "hit_rate", "fire_rate", "n_obs",
+        "entry_signal",
+        "beta_lb",
+        "ou_lb",
+        "entry_threshold",
+        "threshold_units",
+        "horizon",
+        "gate",
+        "gate_bucket",
+        "ic",
+        "hit_rate",
+        "fire_rate",
+        "n_obs",
     ]
     valid = results.filter(
         (pl.col("n_obs") >= PREDICT_MIN_OBS) & pl.col("ic").is_finite()
@@ -757,34 +833,25 @@ def predict(use_db: bool = True, device: str = "auto") -> dict:
     print(f"\ntop 10 ungated predictability rows by IC (n_obs >= {PREDICT_MIN_OBS}):")
     utils.pdf(ungated.select([c for c in show if c in ungated.columns]).head(10))
 
-    gated = (
-        valid.filter(
-            (pl.col("gate") != "(none)")
-            & pl.col("ic_lift").is_finite()
-        )
-        .sort("ic_lift", descending=True, nulls_last=True)
-    )
+    gated = valid.filter(
+        (pl.col("gate") != "(none)") & pl.col("ic_lift").is_finite()
+    ).sort("ic_lift", descending=True, nulls_last=True)
     print(f"\ntop 10 gates by IC LIFT (n_obs >= {PREDICT_MIN_OBS}):")
     utils.pdf(
-        gated.select([*show, "base_ic", "ic_lift", "base_hit_rate", "hit_lift"])
-        .head(10)
+        gated.select([*show, "base_ic", "ic_lift", "base_hit_rate", "hit_lift"]).head(
+            10
+        )
     )
 
-    strong = (
-        gated.filter(pl.col("base_ic") > 0)
-        .sort("ic", descending=True, nulls_last=True)
+    strong = gated.filter(pl.col("base_ic") > 0).sort(
+        "ic", descending=True, nulls_last=True
     )
     print("\ntop 10 gated predictability rows (base IC already positive):")
-    utils.pdf(
-        strong.select([*show, "base_ic", "ic_lift"])
-        .head(10)
-    )
+    utils.pdf(strong.select([*show, "base_ic", "ic_lift"]).head(10))
 
     print("\nwhich gates help IC most often:")
     utils.pdf(
-        valid.filter(
-            (pl.col("gate") != "(none)") & pl.col("ic_lift").is_finite()
-        )
+        valid.filter((pl.col("gate") != "(none)") & pl.col("ic_lift").is_finite())
         .group_by("entry_signal", "horizon", "gate", "gate_bucket")
         .agg(
             pl.col("ic_lift").median().alias("med_ic_lift"),
@@ -816,27 +883,32 @@ def gates(
     sig_frame = compute(data, params=p)
     level = pipeline.trade_def.composite_series(data)
 
-    conditions = pl.DataFrame({
-        "ou_z_abs": sig_frame["ou_z"].abs(),
-        "ou_z_aligned": pl.Series(
-            np.sign(sig_frame["resid"].to_numpy().astype(float))
-            * sig_frame["ou_z"].to_numpy().astype(float),
-            dtype=pl.Float64,
-        ),
-        "half_life": sig_frame["half_life"],
-        "r2": sig_frame["r2"],
-        "beta_cv": beta_cv(sig_frame["beta"], lookback=p["beta_lb"]),
-        "beta_vol20": sig_frame["beta"].diff().rolling_std(20),
-        "beta_mom10": sig_frame["beta"].diff(10),
-        "r2_vol20": sig_frame["r2"].diff().rolling_std(20),
-        "r2_mom10": sig_frame["r2"].diff(10),
-        "resid_vol20": sig_frame["resid"].diff().rolling_std(20),
-        "beta": sig_frame["beta"],
-    })
+    conditions = pl.DataFrame(
+        {
+            "ou_z_abs": sig_frame["ou_z"].abs(),
+            "ou_z_aligned": pl.Series(
+                np.sign(sig_frame["resid"].to_numpy().astype(float))
+                * sig_frame["ou_z"].to_numpy().astype(float),
+                dtype=pl.Float64,
+            ),
+            "half_life": sig_frame["half_life"],
+            "r2": sig_frame["r2"],
+            "beta_cv": beta_cv(sig_frame["beta"], lookback=p["beta_lb"]),
+            "beta_vol20": sig_frame["beta"].diff().rolling_std(20),
+            "beta_mom10": sig_frame["beta"].diff(10),
+            "r2_vol20": sig_frame["r2"].diff().rolling_std(20),
+            "r2_mom10": sig_frame["r2"].diff(10),
+            "resid_vol20": sig_frame["resid"].diff().rolling_std(20),
+            "beta": sig_frame["beta"],
+        }
+    )
 
     table = gate_scan(
-        sig_frame["signal"], level, conditions,
-        entry_z=p["entry_resid_bps"], horizon=horizon,
+        sig_frame["signal"],
+        level,
+        conditions,
+        entry_z=p["entry_resid_bps"],
+        horizon=horizon,
     )
     print(
         f"gate scan: entry_resid_bps={p['entry_resid_bps']}  horizon={horizon}d  "
@@ -848,7 +920,9 @@ def gates(
 
 if __name__ == "__main__":
     use_db = "--synthetic" not in sys.argv
-    device = "cpu" if "--cpu" in sys.argv else ("gpu" if "--gpu" in sys.argv else "auto")
+    device = (
+        "cpu" if "--cpu" in sys.argv else ("gpu" if "--gpu" in sys.argv else "auto")
+    )
     if "--sweep" in sys.argv:
         state = sweep(use_db=use_db)
     elif "--predict" in sys.argv:
