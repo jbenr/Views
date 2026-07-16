@@ -6,7 +6,7 @@ import pandas as pd
 import polars as pl
 import pytest
 
-from utils.market_data import long_to_wide
+from utils.market_data import align_columns, coverage_report, long_to_wide
 
 LONG = pl.DataFrame({
     "ts": [dt.date(2024, 1, 1), dt.date(2024, 1, 1), dt.date(2024, 1, 2), dt.date(2024, 1, 2)],
@@ -56,3 +56,37 @@ def test_empty_input():
     empty = pl.DataFrame(schema={"ts": pl.Date, "ticker": pl.Utf8, "px": pl.Float64})
     assert long_to_wide(empty, TICKERS).is_empty()
     assert long_to_wide(empty, TICKERS, to_pandas=True).empty
+
+
+def test_align_columns_drops_rows_without_full_overlap():
+    data = pl.DataFrame(
+        {
+            "ts": [dt.date(2024, 1, 1), dt.date(2024, 1, 2), dt.date(2024, 1, 3)],
+            "target": [1.0, None, 3.0],
+            "feature": [10.0, 11.0, 12.0],
+            "unused": [100.0, 101.0, 102.0],
+        }
+    )
+
+    aligned = align_columns(data, ["target", "feature"])
+
+    assert aligned.columns == ["ts", "target", "feature"]
+    assert aligned["ts"].to_list() == [dt.date(2024, 1, 1), dt.date(2024, 1, 3)]
+
+
+def test_coverage_report_includes_overlap_row():
+    data = pl.DataFrame(
+        {
+            "ts": [dt.date(2024, 1, 1), dt.date(2024, 1, 2), dt.date(2024, 1, 3)],
+            "target": [1.0, None, 3.0],
+            "feature": [None, 11.0, 12.0],
+        }
+    )
+
+    report = coverage_report(data, ["target", "feature"])
+    rows = {r["series"]: r for r in report.to_dicts()}
+
+    assert rows["target"]["observations"] == 2
+    assert rows["feature"]["observations"] == 2
+    assert rows["OVERLAP"]["observations"] == 1
+    assert rows["OVERLAP"]["first_valid"] == dt.date(2024, 1, 3)

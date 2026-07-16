@@ -1,4 +1,4 @@
-from tabulate import tabulate, tabulate_formats
+from tabulate import tabulate
 
 try:
     import polars as pl
@@ -11,7 +11,7 @@ def pdf(df):
         df = df.to_pandas()
     elif pl is not None and isinstance(df, pl.Series):
         df = df.to_frame().to_pandas()
-    print(tabulate(df, headers='keys', tablefmt=tabulate_formats[2]))
+    print(tabulate(df, headers='keys', tablefmt="simple"))
 
 def format_tsy_price(decimal_price, is_ticks=True):
     """

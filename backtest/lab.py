@@ -1,19 +1,19 @@
-"""Parameter lab — scalable sweeps, metric stores, fast scans, and gates.
+"""Parameter lab â€” scalable sweeps, metric stores, fast scans, and gates.
 
 The research funnel, cheapest to most exact:
 
-1. `signal_matrix` + `fast_scan` — vectorized approximate backtest of an
+1. `signal_matrix` + `fast_scan` â€” vectorized approximate backtest of an
    entire parameter grid at once. Pure array math (numpy semantics), so it
    runs unchanged on an NVIDIA GPU via cupy (`device="gpu"`). Use it to carve
    a huge grid down to a shortlist. Approximations: hysteresis-band exits
    (no stops/time-stops), next-bar execution, one position at a time.
-2. `sweep_strategy` — the exact row-by-row Engine, one combo per task,
+2. `sweep_strategy` â€” the exact row-by-row Engine, one combo per task,
    parallel across CPU cores (ProcessPoolExecutor; a 32-core box runs 32
    combos at a time). Use it to verify the shortlist with real trade
    mechanics: stops, time-stops, costs, trade logs.
-3. `MetricStore` — parquet-backed history of every run: leaderboards across
+3. `MetricStore` â€” parquet-backed history of every run: leaderboards across
    strategies, metric matrices across any two parameter dimensions.
-4. `gate_scan` — conditional edge analysis: bucket candidate state variables
+4. `gate_scan` â€” conditional edge analysis: bucket candidate state variables
    (beta_cv, r2, vol, half-life, ...) and measure how the strategy's forward
    PnL differs by bucket. This is the foundation for entry gates that keep
    only the highest-confidence setups of an already-good strategy.
@@ -33,6 +33,7 @@ import datetime as dt
 import importlib
 import os
 import warnings
+import uuid
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from importlib.util import module_from_spec, spec_from_file_location
@@ -43,8 +44,23 @@ from typing import Optional, Union
 import numpy as np
 import polars as pl
 
+REGIME_GATE_BUCKETS = (
+    ("low_10", "below", 0.10),
+    ("high_90", "above", 0.90),
+    ("mid_10_90", "between", 0.10, 0.90),
+    ("tails_10_90", "outside", 0.10, 0.90),
+    ("low_25", "below", 0.25),
+    ("high_75", "above", 0.75),
+    ("mid_25_75", "between", 0.25, 0.75),
+    ("tails_25_75", "outside", 0.25, 0.75),
+    ("mid_40_60", "between", 0.40, 0.60),
+    ("tails_40_60", "outside", 0.40, 0.60),
+    ("below_50", "below", 0.50),
+    ("above_50", "above", 0.50),
+)
 
-# ── parameter grids ──────────────────────────────────────────────────────────
+
+# â”€â”€ parameter grids â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @dataclass
 class ParamGrid:
@@ -66,7 +82,7 @@ class ParamGrid:
         return n
 
 
-# ── exact sweep: Engine per combo, parallel across cores ────────────────────
+# â”€â”€ exact sweep: Engine per combo, parallel across cores â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _WORKER_STATE: dict = {}
 
@@ -109,6 +125,16 @@ def _init_worker(module_name: str, data: pl.DataFrame, cost: float, slip: float)
     _WORKER_STATE["slip"] = slip
 
 
+def _param_row(params: dict) -> dict:
+    """Result-row copy of params: structured values (e.g. gate tuples/dicts)
+    become strings so combo rows stack into one DataFrame."""
+    scalars = (bool, int, float, str, np.integer, np.floating)
+    return {
+        k: v if v is None or isinstance(v, scalars) else repr(v)
+        for k, v in params.items()
+    }
+
+
 def _run_combo(params: dict) -> dict:
     from .engine import BacktestConfig, Engine
 
@@ -119,9 +145,9 @@ def _run_combo(params: dict) -> dict:
             slippage_bps=_WORKER_STATE["slip"],
         )
         result = Engine(config).add_signal(pipeline).run(_WORKER_STATE["data"])
-        return {**params, **{k: float(v) for k, v in result.summary().items()}}
+        return {**_param_row(params), **{k: float(v) for k, v in result.summary().items()}}
     except Exception as e:  # keep the sweep alive; surface the failure in the row
-        return {**params, "error": f"{type(e).__name__}: {e}"}
+        return {**_param_row(params), "error": f"{type(e).__name__}: {e}"}
 
 
 def sweep_strategy(
@@ -169,16 +195,21 @@ def sweep_strategy(
     return out
 
 
-# ── fast scan: vectorized approximate backtest (GPU-ready) ──────────────────
+# â”€â”€ fast scan: vectorized approximate backtest (GPU-ready) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _get_xp(device: str = "cpu"):
     """Return numpy, or cupy when a working CUDA device is available."""
-    if device == "gpu":
+    device = (device or "cpu").lower()
+    if device not in {"cpu", "gpu", "auto"}:
+        raise ValueError(f"unknown device={device!r}; expected 'cpu', 'gpu', or 'auto'")
+    if device in {"gpu", "auto"}:
         try:
             import cupy
         except ImportError:
+            if device == "auto":
+                return np
             warnings.warn(
-                'CuPy is not installed — falling back to CPU. Install the '
+                'CuPy is not installed â€” falling back to CPU. Install the '
                 'prebuilt CUDA extra with: pip install -e ".[gpu]" '
                 "(do not use `pip install cupy`, which builds from source)."
             )
@@ -192,15 +223,19 @@ def _get_xp(device: str = "cpu"):
                 cupy.add(cupy.asarray([0.0]), 1.0)
                 cupy.cuda.Stream.null.synchronize()
         except Exception as exc:
+            if device == "auto":
+                return np
             warnings.warn(
-                f"CuPy is installed but CUDA is unavailable ({exc}) — "
+                f"CuPy is installed but CUDA is unavailable ({exc}) â€” "
                 "fast_scan is falling back to CPU. Install the CUDA components "
                 'with: pip install "cupy-cuda12x[ctk]"'
             )
             return np
         if device_count < 1:
+            if device == "auto":
+                return np
             warnings.warn(
-                "CuPy found no CUDA devices — fast_scan is falling back to CPU."
+                "CuPy found no CUDA devices â€” fast_scan is falling back to CPU."
             )
             return np
         return cupy
@@ -259,7 +294,7 @@ def _ffill_positions_cupy(events, xp):
 
 def _ffill_positions(events, xp):
     """Forward-fill a (T, K) event matrix (+1/-1/0 at decision bars, NaN
-    elsewhere) into a position matrix. Vectorized — no scan loop."""
+    elsewhere) into a position matrix. Vectorized â€” no scan loop."""
     if xp.__name__ == "cupy":
         return _ffill_positions_cupy(events, xp)
 
@@ -319,7 +354,7 @@ def _max_drawdown(cumulative_pnl, xp):
 
 
 def _evaluate_events(events, dlv, cost_bps, periods_per_year, xp) -> dict[str, np.ndarray]:
-    """Metrics for one (T, K) event matrix. All array math — CPU or GPU."""
+    """Metrics for one (T, K) event matrix. All array math â€” CPU or GPU."""
     k = events.shape[1]
     pos = _ffill_positions(events, xp)
 
@@ -353,27 +388,205 @@ def _evaluate_events(events, dlv, cost_bps, periods_per_year, xp) -> dict[str, n
     }
 
 
+def gate_variant_count(gate_buckets: Union[int, str, tuple, list]) -> int:
+    """Number of gate variants generated per condition."""
+    if isinstance(gate_buckets, (int, np.integer)):
+        return int(gate_buckets)
+    if isinstance(gate_buckets, str):
+        if gate_buckets.lower() in {"regime", "regimes", "tails"}:
+            return len(REGIME_GATE_BUCKETS)
+        raise ValueError(f"unknown gate_buckets={gate_buckets!r}")
+    return len(gate_buckets)
+
+
+_GATE_KIND_ARITY = {"below": 1, "above": 1, "between": 2, "outside": 2}
+_NAMED_GATE_BUCKETS = {
+    spec[0]: (spec[1], tuple(float(q) for q in spec[2:]))
+    for spec in REGIME_GATE_BUCKETS
+}
+
+
+def _lookup_gate_bucket(label: str) -> tuple[str, tuple[float, ...]]:
+    if label not in _NAMED_GATE_BUCKETS:
+        raise ValueError(
+            f"unknown gate bucket {label!r}; known: {sorted(_NAMED_GATE_BUCKETS)}"
+        )
+    return _NAMED_GATE_BUCKETS[label]
+
+
+def parse_gate(spec: Union[tuple, list, dict]) -> tuple[str, str, tuple[float, ...]]:
+    """Normalize a gate spec into (condition, kind, quantiles).
+
+    A gate names a condition column (see CONDITION_NAMES) and a quantile
+    bucket — either a REGIME_GATE_BUCKETS label or an explicit kind
+    ("below"/"above"/"between"/"outside") with its quantile(s). Accepted:
+
+        ("r2", "high_75")                                # named regime bucket
+        ("r2", "above", 0.75)                            # explicit kind + q
+        ("beta_cv", "between", 0.25, 0.75)
+        {"condition": "r2", "bucket": "high_75"}
+        {"condition": "r2", "kind": "above", "q": 0.75}
+        {"condition": "beta_cv", "kind": "between", "q": (0.25, 0.75)}
+    """
+    if isinstance(spec, dict):
+        if "condition" not in spec:
+            raise ValueError(f"gate dict needs a 'condition' key: {spec!r}")
+        condition = spec["condition"]
+        if "bucket" in spec:
+            kind, qs = _lookup_gate_bucket(spec["bucket"])
+        elif "kind" in spec and "q" in spec:
+            kind = spec["kind"]
+            q = spec["q"]
+            qs = (
+                tuple(float(x) for x in q)
+                if isinstance(q, (list, tuple))
+                else (float(q),)
+            )
+        else:
+            raise ValueError(f"gate dict needs 'bucket' or 'kind'+'q': {spec!r}")
+    elif isinstance(spec, (tuple, list)) and len(spec) >= 2:
+        condition = spec[0]
+        if len(spec) == 2:
+            kind, qs = _lookup_gate_bucket(spec[1])
+        else:
+            kind = spec[1]
+            qs = tuple(float(x) for x in spec[2:])
+    else:
+        raise ValueError(f"cannot parse gate spec: {spec!r}")
+
+    if kind not in _GATE_KIND_ARITY:
+        raise ValueError(
+            f"unknown gate kind={kind!r}; expected one of {sorted(_GATE_KIND_ARITY)}"
+        )
+    if len(qs) != _GATE_KIND_ARITY[kind]:
+        raise ValueError(
+            f"gate kind {kind!r} takes {_GATE_KIND_ARITY[kind]} quantile(s), got {qs}"
+        )
+    return condition, kind, qs
+
+
+def gate_allow_mask(
+    values: Union[pl.Series, np.ndarray], spec: Union[tuple, list, dict]
+) -> np.ndarray:
+    """Boolean entry-allow mask for one condition series under a gate spec.
+
+    Same bucket semantics as the fast_scan/predict_scan gates: quantile cuts
+    are computed on the full sample of finite condition values, and
+    non-finite bars are never allowed. Attach the mask to a strategy's
+    signal frame and check it in entry_filter_fn so the exact Engine
+    reproduces a gate shortlisted by the discovery scans.
+    """
+    _, kind, qs = parse_gate(spec)
+    c = np.asarray(
+        values.to_numpy() if isinstance(values, pl.Series) else values, dtype=float
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        cuts = np.nanquantile(c, qs)
+    finite = np.isfinite(c)
+    if kind == "below":
+        return finite & (c <= cuts[0])
+    if kind == "above":
+        return finite & (c >= cuts[0])
+    if kind == "between":
+        return finite & (c > cuts[0]) & (c < cuts[1])
+    return finite & ((c <= cuts[0]) | (c >= cuts[1]))
+
+
+def _gate_masks(
+    gates: Optional[dict[str, np.ndarray]],
+    t_len: int,
+    k: int,
+    gate_buckets: Union[int, str, tuple, list],
+    xp,
+) -> list[tuple[str, str, object]]:
+    """Build entry-allow masks per gate condition and named bucket."""
+    gate_masks: list[tuple[str, str, object]] = []
+    if not gates:
+        return gate_masks
+
+    for name, cond in gates.items():
+        c_np = _to_numpy(cond).astype(float)
+        if c_np.ndim == 1:
+            c_np = np.broadcast_to(c_np[:, None], (t_len, k))
+        if c_np.shape != (t_len, k):
+            raise ValueError(f"gate '{name}' has shape {c_np.shape}, expected {(t_len, k)}")
+        c = xp.asarray(c_np)
+
+        if isinstance(gate_buckets, (int, np.integer)):
+            n_buckets = int(gate_buckets)
+            qs = np.linspace(0.0, 1.0, n_buckets + 1)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                edges_np = np.nanquantile(c_np, qs, axis=0)
+            edges = xp.asarray(edges_np)
+            for b in range(n_buckets):
+                lo, hi = edges[b][None, :], edges[b + 1][None, :]
+                allow = (c >= lo) & ((c <= hi) if b == n_buckets - 1 else (c < hi))
+                gate_masks.append((name, f"q{b + 1}/{n_buckets}", allow))
+            continue
+
+        if isinstance(gate_buckets, str):
+            if gate_buckets.lower() not in {"regime", "regimes", "tails"}:
+                raise ValueError(f"unknown gate_buckets={gate_buckets!r}")
+            specs = REGIME_GATE_BUCKETS
+        else:
+            specs = gate_buckets
+
+        quantiles = sorted({
+            q
+            for spec in specs
+            for q in spec[2:]
+        })
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            cuts_np = np.nanquantile(c_np, quantiles, axis=0)
+        cuts = {
+            q: xp.asarray(cuts_np[i])[None, :]
+            for i, q in enumerate(quantiles)
+        }
+
+        finite = xp.isfinite(c)
+        for spec in specs:
+            label, kind, *qs = spec
+            if kind == "below":
+                allow = finite & (c <= cuts[qs[0]])
+            elif kind == "above":
+                allow = finite & (c >= cuts[qs[0]])
+            elif kind == "between":
+                allow = finite & (c > cuts[qs[0]]) & (c < cuts[qs[1]])
+            elif kind == "outside":
+                allow = finite & ((c <= cuts[qs[0]]) | (c >= cuts[qs[1]]))
+            else:
+                raise ValueError(f"unknown gate bucket kind={kind!r}")
+            gate_masks.append((name, label, allow))
+
+    return gate_masks
+
+
 def fast_scan(
     z: np.ndarray,
     level: np.ndarray,
     entries: Union[list[float], tuple[float, ...]] = (1.5, 2.0, 2.5),
-    exit_band: float = 0.25,
+    exit_band: Union[float, list[float], tuple[float, ...]] = 0.25,
     cost_bps: float = 0.0,
     periods_per_year: int = 252,
     combos: Optional[list[dict]] = None,
     gates: Optional[dict[str, np.ndarray]] = None,
-    gate_buckets: int = 3,
+    gate_buckets: Union[int, str, tuple, list] = 3,
     device: str = "cpu",
     entry_col: str = "entry_z",
+    exit_col: str = "exit_band_bps",
 ) -> pl.DataFrame:
     """Approximate threshold backtest of a whole signal matrix, vectorized.
 
     Rules per column of z (a fade signal): go long when z <= -entry, short
     when z >= +entry, flat when |z| <= exit_band; positions carry between
     events and execute on the NEXT bar; costs charged per unit of turnover.
+    Pass a list of exit bands to scan exit thresholds too.
 
     Gating: every (combo, entry) is additionally evaluated once per
-    (gate condition × quantile bucket) — ENTRIES are allowed only on bars
+    (gate condition Ã— quantile bucket) â€” ENTRIES are allowed only on bars
     where the condition falls inside the bucket (exits always fire; NaN
     condition bars never open trades). Bucket edges are per-column quantiles
     of the condition, so labels are relative ("q2/3"); recover the actual
@@ -381,18 +594,22 @@ def fast_scan(
     carry gate="(none)".
 
     Args:
-        z: (T,) or (T, K) signal matrix — e.g. from signal_matrix().
+        z: (T,) or (T, K) signal matrix â€” e.g. from signal_matrix().
         level: (T,) trade level in bps (composite the strategy trades).
         entries: entry thresholds to scan.
+        exit_band: exit threshold(s) to scan.
         combos: optional K param dicts annotating z's columns.
-        gates: optional {name: (T,) or (T, K) condition array} — e.g. the
+        gates: optional {name: (T,) or (T, K) condition array} â€” e.g. the
                conditions from signal_matrix(return_conditions=True).
-        gate_buckets: quantile buckets per gate condition.
-        device: "cpu" (numpy) or "gpu" (cupy — install the ``gpu`` extra).
-
-    Returns one row per (combo, entry_z, gate, gate_bucket): total_pnl_bps,
-    sharpe, hit_rate, max_drawdown_bps, n_trades, n_bars_active. Best sharpe
-    first. Total rows = K × len(entries) × (1 + n_gates × gate_buckets).
+        gate_buckets: int for equal quantile slices, or "regime" for named
+                      tails/middles/median regimes.
+        device: "cpu" (numpy) or "gpu" (cupy â€” install the ``gpu`` extra).
+        entry_col: output column name for the entry threshold.
+        exit_col: output column name for the exit threshold.
+    Returns one row per (combo, entry_z, exit_band, gate, gate_bucket):
+    total_pnl_bps, sharpe, hit_rate, max_drawdown_bps, n_trades,
+    n_bars_active. Best sharpe first. Total rows =
+    K Ã— len(entries) Ã— len(exit_bands) Ã— (1 + n_gates Ã— gate_buckets).
     """
     xp = _get_xp(device)
 
@@ -409,63 +626,192 @@ def fast_scan(
 
     # Pre-compute entry-allow masks per (gate, bucket): per-column quantile
     # buckets of the condition. Edges computed on CPU once per gate (cupy's
-    # nanquantile support varies by version); masks are bool (T, K) — cheap.
-    gate_masks: list[tuple[str, str, object]] = []
-    qs = np.linspace(0.0, 1.0, gate_buckets + 1)
-    for name, cond in (gates or {}).items():
-        c_np = _to_numpy(cond).astype(float)
-        if c_np.ndim == 1:
-            c_np = np.broadcast_to(c_np[:, None], (t_len, k))
-        if c_np.shape != (t_len, k):
-            raise ValueError(f"gate '{name}' has shape {c_np.shape}, expected {(t_len, k)}")
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN warmup columns
-            edges_np = np.nanquantile(c_np, qs, axis=0)                # (B+1, K)
-        c = xp.asarray(c_np)
-        edges = xp.asarray(edges_np)
-        for b in range(gate_buckets):
-            lo, hi = edges[b][None, :], edges[b + 1][None, :]
-            allow = (c >= lo) & ((c <= hi) if b == gate_buckets - 1 else (c < hi))
-            gate_masks.append((name, f"q{b + 1}/{gate_buckets}", allow))
+    # nanquantile support varies by version); masks are bool (T, K) â€” cheap.
+    gate_masks = _gate_masks(gates, t_len, k, gate_buckets, xp)
 
     combo_frame = (
         pl.DataFrame(combos) if combos is not None
         else pl.DataFrame({"col": list(range(k))})
     )
+    if isinstance(exit_band, (int, float, np.integer, np.floating)):
+        exit_bands = [float(exit_band)]
+    else:
+        exit_bands = [float(x) for x in exit_band]
 
-    def _emit(entry: float, gate: str, bucket: str, metrics: dict) -> pl.DataFrame:
+    def _emit(
+        entry: float,
+        exit_band_value: float,
+        gate: str,
+        bucket: str,
+        metrics: dict,
+    ) -> pl.DataFrame:
         return combo_frame.with_columns(
             pl.lit(float(entry)).alias(entry_col),
+            pl.lit(float(exit_band_value)).alias(exit_col),
             pl.lit(gate).alias("gate"),
             pl.lit(bucket).alias("gate_bucket"),
             *[pl.Series(m, v) for m, v in metrics.items()],
         )
 
     blocks: list[pl.DataFrame] = []
-    for entry in entries:
-        events = xp.where(
-            z <= -entry, 1.0,
-            xp.where(z >= entry, -1.0,
-                     xp.where(xp.abs(z) <= exit_band, 0.0, xp.nan)),
-        )
-        blocks.append(_emit(
-            entry, "(none)", "all",
-            _evaluate_events(events, dlv, cost_bps, periods_per_year, xp),
-        ))
-
-        is_entry = xp.abs(events) == 1.0
-        for name, bucket, allow in gate_masks:
-            gated = xp.where(is_entry & ~allow, xp.nan, events)
+    for exit_band_value in exit_bands:
+        for entry in entries:
+            events = xp.where(
+                z <= -entry, 1.0,
+                xp.where(z >= entry, -1.0,
+                         xp.where(xp.abs(z) <= exit_band_value, 0.0, xp.nan)),
+            )
             blocks.append(_emit(
-                entry, name, bucket,
-                _evaluate_events(gated, dlv, cost_bps, periods_per_year, xp),
+                entry, exit_band_value, "(none)", "all",
+                _evaluate_events(events, dlv, cost_bps, periods_per_year, xp),
             ))
+
+            is_entry = xp.abs(events) == 1.0
+            for name, bucket, allow in gate_masks:
+                gated = xp.where(is_entry & ~allow, xp.nan, events)
+                blocks.append(_emit(
+                    entry, exit_band_value, name, bucket,
+                    _evaluate_events(gated, dlv, cost_bps, periods_per_year, xp),
+                ))
 
     return (
         pl.concat(blocks)
-        # NaN (zero-trade combos) would sort above real values — make them null
+        # NaN (zero-trade combos) would sort above real values â€” make them null
         .with_columns(pl.col("sharpe", "hit_rate").fill_nan(None))
         .sort("sharpe", descending=True, nulls_last=True)
+    )
+
+
+def predict_scan(
+    z: np.ndarray,
+    level: np.ndarray,
+    entries: Union[list[float], tuple[float, ...]] = (1.5, 2.0, 2.5),
+    horizons: Union[list[int], tuple[int, ...]] = (5, 20, 60),
+    periods_per_year: int = 252,
+    combos: Optional[list[dict]] = None,
+    gates: Optional[dict[str, np.ndarray]] = None,
+    gate_buckets: Union[int, str, tuple, list] = 3,
+    device: str = "cpu",
+    entry_col: str = "entry_threshold",
+) -> pl.DataFrame:
+    """Forward-horizon predictability scan for a signal matrix.
+
+    For every signal column, entry threshold, horizon, and optional gate
+    bucket, evaluate whether larger positive signals predict lower future
+    levels, and larger negative signals predict higher future levels.
+
+    This is not a trade backtest: no exits, stops, holding state, or costs.
+    It is the GPU-friendly discovery layer for signal/threshold/horizon/regime
+    predictability. Metrics are event-bar diagnostics, not trade metrics:
+    IC, directional hit rate, observation count, and fire rate.
+    """
+    xp = _get_xp(device)
+
+    z = xp.asarray(z, dtype=xp.float64)
+    if z.ndim == 1:
+        z = z[:, None]
+    t_len, k = z.shape
+    if combos is not None and len(combos) != k:
+        raise ValueError(f"combos has {len(combos)} entries but z has {k} columns")
+
+    lv = xp.asarray(level, dtype=xp.float64)
+
+    gate_masks = _gate_masks(gates, t_len, k, gate_buckets, xp)
+    combo_frame = (
+        pl.DataFrame(combos) if combos is not None
+        else pl.DataFrame({"col": list(range(k))})
+    )
+
+    def _metrics(mask, eligible, fwd) -> dict[str, np.ndarray]:
+        directional_move = -xp.sign(z) * fwd
+        n = mask.sum(axis=0)
+        eligible_n = eligible.sum(axis=0)
+        n_float = n.astype(xp.float64)
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            hit = xp.where(n > 0, ((directional_move > 0) & mask).sum(axis=0) / n_float, xp.nan)
+            fire_rate = xp.where(eligible_n > 0, n / eligible_n.astype(xp.float64), xp.nan)
+
+        y = -fwd
+        x_masked = xp.where(mask, z, 0.0)
+        y_masked = xp.where(mask, y, 0.0)
+        sx = x_masked.sum(axis=0)
+        sy = y_masked.sum(axis=0)
+        sxy = xp.where(mask, z * y, 0.0).sum(axis=0)
+        sx2 = xp.where(mask, z * z, 0.0).sum(axis=0)
+        sy2 = xp.where(mask, y * y, 0.0).sum(axis=0)
+        cov_num = n_float * sxy - sx * sy
+        den = xp.sqrt((n_float * sx2 - sx * sx) * (n_float * sy2 - sy * sy))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ic = xp.where((n > 1) & (den > 0), cov_num / den, xp.nan)
+
+        return {
+            "n_obs": _to_numpy(n).astype(int),
+            "ic": _to_numpy(ic),
+            "hit_rate": _to_numpy(hit),
+            "fire_rate": _to_numpy(fire_rate),
+        }
+
+    def _emit(entry: float, horizon: int, gate: str, bucket: str, metrics: dict) -> pl.DataFrame:
+        return combo_frame.with_columns(
+            pl.lit(float(entry)).alias(entry_col),
+            pl.lit(int(horizon)).alias("horizon"),
+            pl.lit(gate).alias("gate"),
+            pl.lit(bucket).alias("gate_bucket"),
+            *[pl.Series(m, v) for m, v in metrics.items()],
+        )
+
+    blocks: list[pl.DataFrame] = []
+    for horizon in horizons:
+        fwd = xp.full((t_len, 1), xp.nan, dtype=xp.float64)
+        if horizon < t_len:
+            fwd[:-horizon, 0] = lv[horizon:] - lv[:-horizon]
+        valid_fwd = xp.isfinite(fwd)
+
+        for entry in entries:
+            eligible = xp.isfinite(z) & valid_fwd
+            base = eligible & (xp.abs(z) >= entry)
+            blocks.append(_emit(entry, horizon, "(none)", "all", _metrics(base, eligible, fwd)))
+            for name, bucket, allow in gate_masks:
+                gated_eligible = eligible & allow
+                gated = gated_eligible & (xp.abs(z) >= entry)
+                blocks.append(_emit(entry, horizon, name, bucket, _metrics(gated, gated_eligible, fwd)))
+
+    return (
+        pl.concat(blocks)
+        .with_columns(pl.col("ic", "hit_rate", "fire_rate").fill_nan(None))
+        .sort("ic", descending=True, nulls_last=True)
+    )
+
+
+def add_predict_lift(
+    results: pl.DataFrame,
+    keys: Optional[list[str]] = None,
+) -> pl.DataFrame:
+    """Join gated predict rows to their ungated baseline and compute lifts."""
+    metric_cols = {
+        "ic", "hit_rate", "fire_rate", "n_obs", "gate", "gate_bucket",
+    }
+    if keys is None:
+        keys = [c for c in results.columns if c not in metric_cols]
+
+    base = (
+        results.filter(pl.col("gate") == "(none)")
+        .select(
+            *keys,
+            pl.col("ic").alias("base_ic"),
+            pl.col("hit_rate").alias("base_hit_rate"),
+            pl.col("fire_rate").alias("base_fire_rate"),
+            pl.col("n_obs").alias("base_n_obs"),
+        )
+    )
+    return (
+        results.join(base, on=keys, how="left", nulls_equal=True)
+        .with_columns(
+            (pl.col("ic") - pl.col("base_ic")).alias("ic_lift"),
+            (pl.col("hit_rate") - pl.col("base_hit_rate")).alias("hit_lift"),
+            (pl.col("fire_rate") - pl.col("base_fire_rate")).alias("fire_rate_lift"),
+        )
     )
 
 
@@ -477,7 +823,7 @@ def add_gate_lift(
 
     keys defaults to every param column (everything except gate/gate_bucket
     and the metric columns). Adds base_sharpe / base_hit_rate / base_n_trades
-    plus sharpe_lift and hit_lift — the gate's value-add over the same combo
+    plus sharpe_lift and hit_lift â€” the gate's value-add over the same combo
     with no gate. Sort by sharpe_lift (with an n_trades floor) to find gates
     that improve an already-good strategy rather than just riding it.
     """
@@ -498,7 +844,7 @@ def add_gate_lift(
         )
     )
     return (
-        results.join(base, on=keys, how="left")
+        results.join(base, on=keys, how="left", nulls_equal=True)
         .with_columns(
             (pl.col("sharpe") - pl.col("base_sharpe")).alias("sharpe_lift"),
             (pl.col("hit_rate") - pl.col("base_hit_rate")).alias("hit_lift"),
@@ -506,8 +852,20 @@ def add_gate_lift(
     )
 
 
-# Condition matrices built alongside the signal — the gate candidates.
-CONDITION_NAMES = ("r2", "beta_cv", "abs_beta", "resid_vol20", "resid_mom10")
+# Condition matrices built alongside the signal â€” the gate candidates.
+CONDITION_NAMES = (
+    "r2",
+    "beta_cv",
+    "beta",
+    "beta_vol20",
+    "beta_mom10",
+    "r2_vol20",
+    "r2_mom10",
+    "resid_phi",
+    "resid_half_life",
+    "resid_vol20",
+    "resid_mom10",
+)
 
 
 def signal_matrix(
@@ -521,19 +879,21 @@ def signal_matrix(
 ):
     """Build the (T, K) OU z-score matrix for the standard model family:
     changes-based rolling OLS of y on x, residual rolled into level space,
-    z-scored — one column per (beta_lb, z_lb) combo, aligned to len(y).
+    z-scored â€” one column per (beta_lb, z_lb) combo, aligned to len(y).
 
     With return_conditions=True also returns {name: (T, K) array} of gate
     candidates aligned column-for-column with z (they vary by beta_lb):
-    r2, beta_cv, abs_beta (model quality / stability), resid_vol20 and
-    resid_mom10 (residual regime). Feed z + conditions to fast_scan() to
-    evaluate the whole gated grid at once.
+    model quality/stability (r2, beta_cv, beta), beta/r2 volatility and
+    momentum, residual Dickey-Fuller-style AR(1) state, and residual
+    volatility/momentum. Volatility is rolling 20-bar standard deviation of
+    daily changes; momentum is 10-bar change. Feed z + conditions to
+    fast_scan()/predict_scan() to evaluate gated grids.
 
     Returns (z, combos) or (z, combos, conditions).
     """
     from stats.diagnostics import beta_cv as _beta_cv
     from stats.ols import roll_lr_diff
-    from stats.ou import roll_ou_zscore
+    from stats.ou import roll_ou_features, roll_ou_zscore
 
     valid_signal_kinds = {"ou_zscore", "zscore", "z", "residual", "resid"}
     if signal_kind not in valid_signal_kinds:
@@ -552,10 +912,18 @@ def signal_matrix(
         ])
         if return_conditions:
             beta = pl.concat([null1, reg["beta"]])
+            r2 = pl.concat([null1, reg["r2"]])
+            ou_state = roll_ou_features(resid_roll, lookback=beta_lb)
             conds = {
-                "r2": pl.concat([null1, reg["r2"]]),
+                "r2": r2,
                 "beta_cv": _beta_cv(beta, lookback=beta_lb),
-                "abs_beta": beta.abs(),
+                "beta": beta,
+                "beta_vol20": beta.diff().rolling_std(20),
+                "beta_mom10": beta.diff(10),
+                "r2_vol20": r2.diff().rolling_std(20),
+                "r2_mom10": r2.diff(10),
+                "resid_phi": ou_state["ou_rho"] - 1.0,
+                "resid_half_life": ou_state["half_life"],
                 "resid_vol20": resid_roll.diff().rolling_std(20),
                 "resid_mom10": resid_roll.diff(10),
             }
@@ -579,7 +947,7 @@ def signal_matrix(
     return z_mat, combos, conditions
 
 
-# ── metric store ─────────────────────────────────────────────────────────────
+# â”€â”€ metric store â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class MetricStore:
     """Parquet-backed history of backtest runs across strategies.
@@ -619,13 +987,29 @@ class MetricStore:
             else run
         )
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        combined.write_parquet(self.path)
+        tmp_path = self.path.with_name(f".{self.path.stem}.{uuid.uuid4().hex}.tmp.parquet")
+        try:
+            combined.write_parquet(tmp_path)
+            os.replace(tmp_path, self.path)
+        except OSError as exc:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            fallback = self.path.with_name(
+                f"{self.path.stem}."
+                f"{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}."
+                f"{uuid.uuid4().hex[:8]}.parquet"
+            )
+            run.write_parquet(fallback)
+            print(
+                f"warning: could not update {self.path} ({exc}); "
+                f"wrote this run to {fallback}"
+            )
         return run
 
     def load(self) -> pl.DataFrame:
         if not self.path.exists():
             return pl.DataFrame()
-        return pl.read_parquet(self.path)
+        return pl.read_parquet(self.path, memory_map=False)
 
     def leaderboard(
         self,
@@ -651,7 +1035,7 @@ class MetricStore:
     ) -> pl.DataFrame:
         """Pivot a metric across two parameter dimensions (rows=y, cols=x).
 
-        agg ("mean"/"max"/"min"/"median") collapses the other dimensions —
+        agg ("mean"/"max"/"min"/"median") collapses the other dimensions â€”
         "max" answers "best achievable sharpe at this (x, y)".
         """
         df = self.load()
@@ -665,7 +1049,7 @@ class MetricStore:
         )
 
 
-# ── gates: conditional edge analysis ─────────────────────────────────────────
+# â”€â”€ gates: conditional edge analysis â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def gate_scan(
     signal: Union[pl.Series, np.ndarray],
@@ -679,13 +1063,13 @@ def gate_scan(
     """Which state variables separate good entries from bad ones?
 
     Takes every bar where |signal| >= entry_z as a hypothetical fade entry,
-    measures forward PnL = sign(-z) × (level[t+h] − level[t]), then buckets
+    measures forward PnL = sign(-z) Ã— (level[t+h] âˆ’ level[t]), then buckets
     each condition column into quantiles (computed on the entry sample) and
     reports per-bucket n / hit / avg_pnl / per-trade sharpe plus the lift vs
     the unconditional baseline (condition="(all)").
 
     A gate is promising when one bucket concentrates the hit rate and PnL
-    with enough n — that bucket becomes an entry_filter_fn in SignalConfig.
+    with enough n â€” that bucket becomes an entry_filter_fn in SignalConfig.
     """
     z = np.asarray(signal.to_numpy() if isinstance(signal, pl.Series) else signal, dtype=float)
     lv = np.asarray(level.to_numpy() if isinstance(level, pl.Series) else level, dtype=float)

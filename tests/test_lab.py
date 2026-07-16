@@ -9,11 +9,17 @@ from backtest.lab import (
     MetricStore,
     ParamGrid,
     _ffill_positions,
+    _get_xp,
     _import_strategy,
     _max_drawdown,
     add_gate_lift,
+    add_predict_lift,
     fast_scan,
+    gate_allow_mask,
     gate_scan,
+    gate_variant_count,
+    parse_gate,
+    predict_scan,
     signal_matrix,
     sweep_strategy,
 )
@@ -29,6 +35,11 @@ def test_param_grid_combos():
     assert len(combos) == 6
     assert {"a": 1, "b": 10} in combos
     assert {"a": 3, "b": 20} in combos
+
+
+def test_get_xp_auto_falls_back_or_uses_gpu():
+    xp = _get_xp("auto")
+    assert xp.__name__ in {"numpy", "cupy"}
 
 
 # ── fast scan ────────────────────────────────────────────────────────────────
@@ -113,6 +124,71 @@ def test_fast_scan_costs_reduce_pnl():
     assert costly["total_pnl_bps"][0] < free["total_pnl_bps"][0]
 
 
+def test_fast_scan_scans_exit_bands():
+    rng = np.random.default_rng(33)
+    n = 2000
+    resid = np.zeros(n)
+    for i in range(1, n):
+        resid[i] = resid[i - 1] * 0.95 + rng.normal(0, 1)
+    z = (resid - resid.mean()) / resid.std()
+
+    out = fast_scan(z, resid, entries=[1.5, 2.0], exit_band=[0.25, 0.75])
+
+    assert len(out) == 4
+    assert set(out["exit_band_bps"].to_list()) == {0.25, 0.75}
+    assert {"entry_z", "exit_band_bps", "sharpe"} <= set(out.columns)
+
+
+def test_predict_scan_detects_true_ou():
+    rng = np.random.default_rng(34)
+    n = 3000
+    resid = np.zeros(n)
+    for i in range(1, n):
+        resid[i] = resid[i - 1] * 0.95 + rng.normal(0, 1)
+    z = (resid - resid.mean()) / resid.std()
+
+    out = predict_scan(z, resid, entries=[1.5], horizons=[5, 20])
+
+    assert len(out) == 2
+    assert {"horizon", "ic", "hit_rate", "fire_rate", "n_obs"} <= set(out.columns)
+    assert {"avg_fwd_pnl", "fwd_sharpe", "avg_abs_signal"}.isdisjoint(out.columns)
+    assert (out["ic"] > 0).all()
+    assert (out["hit_rate"] > 0.5).all()
+    assert ((out["fire_rate"] > 0) & (out["fire_rate"] <= 1)).all()
+
+
+def test_predict_scan_gates_and_lift():
+    z, resid, regime = _regime_ou()
+    out = predict_scan(z, resid, entries=[1.0], horizons=[10], gates={"regime": regime}, gate_buckets=2)
+    lifted = add_predict_lift(out)
+
+    assert len(out) == 3
+    assert {"base_ic", "ic_lift", "base_hit_rate", "hit_lift", "base_fire_rate", "fire_rate_lift"} <= set(lifted.columns)
+    assert {"base_fwd_sharpe", "fwd_sharpe_lift"}.isdisjoint(lifted.columns)
+    assert len(lifted.filter(pl.col("gate") == "(none)")) == 1
+
+
+def test_predict_lift_matches_null_param_keys():
+    results = pl.DataFrame({
+        "entry_signal": ["residual", "residual"],
+        "beta_lb": [60, 60],
+        "ou_lb": [None, None],
+        "entry_threshold": [20.0, 20.0],
+        "horizon": [20, 20],
+        "gate": ["(none)", "resid_phi"],
+        "gate_bucket": ["all", "low_10"],
+        "n_obs": [100, 30],
+        "ic": [0.10, 0.25],
+        "hit_rate": [0.52, 0.60],
+        "fire_rate": [0.20, 0.08],
+    })
+
+    lifted = add_predict_lift(results)
+    gated = lifted.filter(pl.col("gate") == "resid_phi").row(0, named=True)
+    assert gated["base_ic"] == pytest.approx(0.10)
+    assert gated["ic_lift"] == pytest.approx(0.15)
+
+
 def test_signal_matrix_shape_and_combos():
     data = synthetic_data(n=800)
     z, combos = signal_matrix(data["anchor"], data["target"], [42, 63], [42, 63])
@@ -190,6 +266,34 @@ def test_fast_scan_gate_concentrates_edge():
     assert on > base > off
 
 
+def test_fast_scan_regime_gate_labels_and_count():
+    z, resid, regime = _regime_ou()
+    out = fast_scan(z, resid, entries=[1.0], gates={"regime": regime}, gate_buckets="regime")
+
+    expected_buckets = {
+        "low_10", "high_90", "mid_10_90", "tails_10_90",
+        "low_25", "high_75", "mid_25_75", "tails_25_75",
+        "mid_40_60", "tails_40_60",
+        "below_50", "above_50",
+    }
+    assert gate_variant_count("regime") == len(expected_buckets)
+    assert len(out) == 1 + len(expected_buckets)
+    assert set(out.filter(pl.col("gate") != "(none)")["gate_bucket"]) == expected_buckets
+
+
+def test_predict_scan_regime_gate_labels():
+    z, resid, regime = _regime_ou()
+    out = predict_scan(
+        z, resid, entries=[1.0], horizons=[10], gates={"regime": regime}, gate_buckets="regime"
+    )
+
+    assert "tails_10_90" in set(out["gate_bucket"])
+    assert "mid_25_75" in set(out["gate_bucket"])
+    assert "mid_40_60" in set(out["gate_bucket"])
+    assert "tails_40_60" in set(out["gate_bucket"])
+    assert {"ic", "fire_rate", "n_obs"} <= set(out.columns)
+
+
 def test_add_gate_lift():
     z, resid, regime = _regime_ou()
     out = fast_scan(z, resid, entries=[1.0], gates={"regime": regime}, gate_buckets=2)
@@ -204,6 +308,29 @@ def test_add_gate_lift():
         on["sharpe"][0] - on["base_sharpe"][0]
     )
     assert on["sharpe_lift"][0] > 0
+
+
+def test_gate_lift_matches_null_param_keys():
+    results = pl.DataFrame({
+        "entry_signal": ["residual", "residual"],
+        "beta_lb": [60, 60],
+        "ou_lb": [None, None],
+        "entry_threshold": [20.0, 20.0],
+        "exit_threshold": [5.0, 5.0],
+        "gate": ["(none)", "resid_phi"],
+        "gate_bucket": ["all", "low_10"],
+        "total_pnl_bps": [10.0, 15.0],
+        "sharpe": [0.20, 0.50],
+        "hit_rate": [0.51, 0.56],
+        "max_drawdown_bps": [-5.0, -4.0],
+        "n_trades": [20, 8],
+        "n_bars_active": [100, 40],
+    })
+
+    lifted = add_gate_lift(results)
+    gated = lifted.filter(pl.col("gate") == "resid_phi").row(0, named=True)
+    assert gated["base_sharpe"] == pytest.approx(0.20)
+    assert gated["sharpe_lift"] == pytest.approx(0.30)
 
 
 # ── exact sweep ──────────────────────────────────────────────────────────────
@@ -259,6 +386,58 @@ def test_metric_store_roundtrip(tmp_path):
 
     mat = store.matrix(x="beta_lb", y="z_lb", metric="sharpe")
     assert len(mat) == 2  # z_lb 42 and 63 rows
+
+
+# ── gate specs ───────────────────────────────────────────────────────────────
+
+def test_parse_gate_tuple_and_dict_forms():
+    assert parse_gate(("r2", "high_75")) == ("r2", "above", (0.75,))
+    assert parse_gate(("beta_cv", "between", 0.25, 0.75)) == ("beta_cv", "between", (0.25, 0.75))
+    assert parse_gate({"condition": "r2", "bucket": "low_10"}) == ("r2", "below", (0.10,))
+    assert parse_gate({"condition": "r2", "kind": "above", "q": 0.75}) == ("r2", "above", (0.75,))
+    assert parse_gate(
+        {"condition": "resid_phi", "kind": "outside", "q": (0.1, 0.9)}
+    ) == ("resid_phi", "outside", (0.1, 0.9))
+
+
+def test_parse_gate_rejects_bad_specs():
+    with pytest.raises(ValueError):
+        parse_gate(("r2", "nope_99"))            # unknown named bucket
+    with pytest.raises(ValueError):
+        parse_gate(("r2", "between", 0.25))      # wrong quantile arity
+    with pytest.raises(ValueError):
+        parse_gate({"condition": "r2"})          # no bucket or kind+q
+    with pytest.raises(ValueError):
+        parse_gate("r2")                         # not a tuple/dict
+
+
+def test_gate_allow_mask_bucket_semantics():
+    c = np.array([np.nan, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=float)
+    below = gate_allow_mask(c, ("c", "below", 0.5))     # q50=5 -> 0..5
+    above = gate_allow_mask(c, ("c", "above", 0.5))     # 5..10
+    between = gate_allow_mask(c, ("c", "between", 0.25, 0.75))  # strict: 3..7
+    outside = gate_allow_mask(c, ("c", "outside", 0.25, 0.75))  # 0..2, 8..10
+    assert below.sum() == 6
+    assert above.sum() == 6
+    assert between.sum() == 5
+    assert outside.sum() == 6
+    assert not (between & outside).any()
+    # NaN condition bars are never allowed
+    for mask in (below, above, between, outside):
+        assert not mask[0]
+    # named bucket matches its explicit form
+    np.testing.assert_array_equal(
+        gate_allow_mask(c, ("c", "high_75")),
+        gate_allow_mask(c, ("c", "above", 0.75)),
+    )
+
+
+def test_gate_allow_mask_accepts_polars_series():
+    s = pl.Series([None, 1.0, 2.0, 3.0, 4.0])
+    mask = gate_allow_mask(s, ("c", "above_50"))
+    assert mask.dtype == bool
+    assert not mask[0]
+    assert mask.sum() > 0
 
 
 # ── gates ────────────────────────────────────────────────────────────────────

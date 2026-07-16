@@ -11,6 +11,7 @@ from .report import print_summary, summary_table, equity_curve_pd, trade_log_pd
 from .portfolio import SpreadBook, BookConfig, SpreadDef
 from .sweep import ParameterSweep, SweepConfig
 from .lab import (
-    ParamGrid, sweep_strategy, fast_scan, signal_matrix,
-    MetricStore, gate_scan, add_gate_lift,
+    ParamGrid, sweep_strategy, fast_scan, predict_scan, signal_matrix,
+    MetricStore, gate_scan, add_gate_lift, add_predict_lift,
+    gate_variant_count, parse_gate, gate_allow_mask,
 )

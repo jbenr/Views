@@ -20,11 +20,13 @@ or search around them with the lab modes below.
 
     python -m book.curve.tens_10s30s              # single run, live DB
     python -m book.curve.tens_10s30s --synthetic  # single run, no DB
-    python -m book.curve.tens_10s30s --sweep      # exact-engine grid
-    python -m book.curve.tens_10s30s --fast       # auto GPU if available, else CPU
-    python -m book.curve.tens_10s30s --fast --cpu # force CPU
-    python -m book.curve.tens_10s30s --fast --gpu # request GPU, fallback to CPU
+    python -m book.curve.tens_10s30s --predict    # which setups predict (GPU)
     python -m book.curve.tens_10s30s --gates      # conditional edge buckets
+    python -m book.curve.tens_10s30s --exits      # which exits trade well: hit/pnl/sharpe (GPU)
+    python -m book.curve.tens_10s30s --sweep      # exact-engine backtest, gate-aware
+
+    --cpu / --gpu force the scan device for --predict/--exits (default: auto).
+    --fast is a deprecated alias for --exits.
 
 Every mode returns a dict of state for interactive chaining: state = main().
 """
@@ -143,8 +145,12 @@ def _finite(value) -> bool:
         return False
 
 
-def _entry_filter(z_gate: float, half_life_min: float, half_life_max: float):
-    """Require OU z to confirm the raw residual entry direction."""
+def _entry_filter(z_gate: float | None, half_life_min: float, half_life_max: float):
+    """Quantile gate + half-life sanity + optional OU-z confirmation.
+
+    z_gate=None drops the OU-z confirmation entirely so the quantile gate
+    (params["gate"] -> gate_allow) carries the entry filtering on its own.
+    """
 
     def fn(direction: int, bar: dict) -> bool:
         # gate_allow arrives as 1.0/0.0 (engine floats extras); absent = no gate
@@ -152,13 +158,18 @@ def _entry_filter(z_gate: float, half_life_min: float, half_life_max: float):
         if gate is not None and gate != 1.0:
             return False
 
-        ou_z = bar.get("ou_z")
         half_life = bar.get("half_life")
-        if not (_finite(ou_z) and _finite(half_life)):
+        if not _finite(half_life):
             return False
         if not (half_life_min <= float(half_life) <= half_life_max):
             return False
 
+        if z_gate is None:
+            return direction in (1, -1)
+
+        ou_z = bar.get("ou_z")
+        if not _finite(ou_z):
+            return False
         # direction +1 is long target curve: residual should be cheap/negative.
         # direction -1 is short target curve: residual should be rich/positive.
         if direction == 1:
@@ -260,57 +271,106 @@ def make_pipeline(params: dict | None = None) -> SignalPipeline:
 
 
 # -- strategy parameters ----------------------------------------------------
+#
+# The research funnel. Each step has its own variable block below; each step's
+# winners seed the next step's (narrower) block:
+#
+#   1. --predict (PREDICT_*)  cast a wide net: which (lookbacks, entry signal,
+#      threshold, horizon) cells show ANY forward predictability. No trading
+#      mechanics — just IC / hit / fire rate. GPU-vectorized.
+#   2. --gates (GATE_*)  ring-fence to the single setup that won step 1 and
+#      ask which entry-time state variables (r2, beta stability, resid vol...)
+#      separate its good entries from its bad ones.
+#   3. --exits (EXIT_*)  approximate TRADE backtest of the shortlisted setups:
+#      which exit bands pay, with hit rate / PnL / sharpe per cell. Every cell
+#      is a (setup, entry, exit, gate) combination, so gate x exit interaction
+#      is measured directly — a gate that only works with a tight exit (or an
+#      exit that only works inside a regime) shows up here, not in step 2.
+#      GPU-vectorized.
+#   4. --sweep (SWEEP_GRID)  the survivors, through the exact row-by-row
+#      engine with stops, time stops, and costs — the live-simulation check.
+#      Expensive per combo: keep the grid to what steps 1-3 earned.
+#
+# DEFAULT_PARAMS is the promoted configuration — what main() runs as the live
+# signal, and the base every mode overrides from.
 
-# Backtest parameters live HERE - the first thing you touch when scripting.
 DEFAULT_PARAMS = {
-    "beta_lb": 252,              # hedge-ratio lookback
+    # model fit: hedge ratio and OU state of the residual
+    "beta_lb": 252,              # hedge-ratio lookback (days)
     "ou_lb": 252,                # OU-state lookback for z/mean/half-life
+    # entry: fade raw residual extremes
     "entry_resid_bps": 20.0,     # raw residual threshold; positive -> short curve
-    "z_gate": 0.5,               # OU z must confirm the residual direction
+    # entry filters: what must ALSO be true at the bar to take the trade
+    "z_gate": 0.5,               # OU z must confirm direction; None = off (gate-only entries)
     "half_life_min": 3.0,        # block unstable / too-fast OU fits
     "half_life_max": 120.0,      # block slow drifts masquerading as mean reversion
+    "gate": None,                # quantile regime gate (condition, bucket) — see lab.parse_gate
+    # exits: reversion target, time stop, hard stop
     "exit_reversion_frac": 0.5,  # exit after this fraction of entry-to-OU-mean reverts
-    "time_stop_mult": 2.0,       # dynamic time stop = half_life * multiplier
-    "time_stop_min": 5.0,
+    "time_stop_mult": 2.0,       # dynamic time stop = half_life * multiplier...
+    "time_stop_min": 5.0,        # ...clipped to this range (days)
     "time_stop_max": 120.0,
-    "stop_loss_bps": 25.0,
-    "gate": None,                # (condition, bucket) tuple or dict — see lab.parse_gate
+    "stop_loss_bps": 25.0,       # hard stop on adverse move
 }
 TRANSACTION_COST_BPS = 0.1
 
+# step 1 --predict: the setup search space. Wide on purpose — lookbacks x
+# entry signal x threshold x horizon, plus every gate condition/bucket as an
+# IC-lift overlay. Winners here define the setups steps 2-4 are allowed to use.
+PREDICT_ENTRY_SIGNALS = ["residual", "ou_z"]    # candidate entry signals
+PREDICT_BETA_LBS = [20,60,120,200,400] # list(range(10, 501, 10))
+PREDICT_OU_LBS = [20,60,120,200,400,420] # list(range(10, 501, 10))
+PREDICT_HORIZONS = [5, 10, 20, 40, 60]          # forward windows (days)
+PREDICT_RESID_THRESHOLDS_BPS = list(range(5, 31, 2))
+PREDICT_OU_Z_THRESHOLDS = np.arange(0.5, 3.1, 0.5).tolist()
+PREDICT_GATE_BUCKETS = "regime"                 # named quantile regimes per condition
+PREDICT_MIN_OBS = 30                            # ignore cells with fewer events
+
+# step 2 --gates: conditional edge on ONE setup from step 1. GATE_SETUP
+# overrides DEFAULT_PARAMS for this scan — point it at the predict winner and
+# pick the horizon that won. Output: which condition buckets concentrate
+# hit rate / PnL, i.e. the gate candidates worth carrying into steps 3-4.
+GATE_SETUP = {
+    "beta_lb": 252,              # from the --predict leaderboard
+    "ou_lb": 252,
+    "entry_resid_bps": 20.0,
+}
+GATE_HORIZON = 28                # forward PnL window (days) — the winning --predict horizon
+
+# step 3 --exits: exit scan over the step-1 setups, with every gate bucket
+# overlaid. Narrow the lookback/entry lists to the step-1 winners before
+# running; gate x exit interaction is read off the (gate, exit) result cells.
+EXIT_ENTRY_SIGNALS = ["residual", "ou_z"]
+EXIT_BETA_LBS = [20,60,120,200,400] # list(range(10, 501, 10))
+EXIT_OU_LBS = [20,60,120,200,400,420] # list(range(10, 501, 10))
+EXIT_RESID_ENTRIES_BPS = list(range(25, 31, 1))
+EXIT_RESID_BANDS_BPS = [5.0, 10.0]              # flat when |resid| <= band
+EXIT_OU_Z_ENTRIES = np.arange(0.5, 3.1, 0.5).tolist()
+EXIT_OU_Z_BANDS = [0.25, 0.5]                   # flat when |ou_z| <= band
+EXIT_GATE_BUCKETS = "regime"
+EXIT_MIN_TRADES = 30                            # floor for the gate-lift leaderboards
+
+# step 4 --sweep: the exact-engine grid — full trade mechanics (stops, time
+# stops, costs, trade logs). Every list here should be a survivor of steps
+# 1-3: setups from --predict, gates from --gates/--exits, exits from --exits.
 SWEEP_GRID = {
     "beta_lb": [60,120], # list(range(10, 501, 10)),
     "ou_lb": [400,420], # list(range(10, 501, 10)),
     "entry_resid_bps": list(range(21, 31, 2)),
-    "z_gate": np.arange(0.5, 3.1, 0.5).tolist(),
+    # None disables the OU-z confirmation so gates filter entries on their own
+    "z_gate": [None, *np.arange(0.5, 3.1, 0.5).tolist()],
     "exit_reversion_frac": [0.25, 0.5, 0.75],
     "time_stop_mult": [1.0, 2.0, 3.0],
     "stop_loss_bps": [15.0, 25.0, 40.0],
+    # gates that earned their lift in --gates / --exits
     "gate": [
         None,
         ("r2", "low_25"),
-        ("r2_mom_10", "low_10"),
+        ("r2_mom10", "low_10"),
         ("beta_cv", "below_50"),
         ("beta_vol20", "low_10")
     ],
 }
-
-FAST_BETA_LBS = [20,60,120,200,400] # list(range(10, 501, 10))
-FAST_OU_LBS = [20,60,120,200,400,420] # list(range(10, 501, 10))
-FAST_ENTRY_SIGNALS = ["residual", "ou_z"]
-FAST_RESID_ENTRIES_BPS = list(range(25, 31, 1))
-FAST_RESID_EXIT_BANDS_BPS = [5.0, 10.0]
-FAST_OU_Z_ENTRIES = np.arange(0.5, 3.1, 0.5).tolist()
-FAST_OU_Z_EXIT_BANDS = [0.25, 0.5]
-FAST_GATE_BUCKETS = "regime"
-FAST_MIN_TRADES = 30
-
-PREDICT_ENTRY_SIGNALS = ["residual", "ou_z"]
-PREDICT_HORIZONS = [5, 10, 20, 40, 60]
-PREDICT_RESID_THRESHOLDS_BPS = list(range(5, 31, 2))
-PREDICT_OU_Z_THRESHOLDS = np.arange(0.5, 3.1, 0.5).tolist()
-PREDICT_GATE_BUCKETS = "regime"
-PREDICT_MIN_OBS = 30
 
 pipeline = make_pipeline()
 
@@ -352,31 +412,24 @@ def main(use_db: bool = True, params: dict | None = None) -> dict:
     if resid is None or not _finite(resid):
         print("\nlatest signal: warmup - no signal yet")
     else:
-        if (
-            gate_ok
-            and resid >= p["entry_resid_bps"]
-            and _finite(ou_z)
-            and ou_z >= p["z_gate"]
-            and _finite(half_life)
+        hl_ok = (
+            _finite(half_life)
             and p["half_life_min"] <= half_life <= p["half_life_max"]
-        ):
+        )
+        z_ok_short = p["z_gate"] is None or (_finite(ou_z) and ou_z >= p["z_gate"])
+        z_ok_long = p["z_gate"] is None or (_finite(ou_z) and ou_z <= -p["z_gate"])
+        if gate_ok and hl_ok and resid >= p["entry_resid_bps"] and z_ok_short:
             action = f"SHORT {TARGET} (curve steep/rich vs 10Y)"
-        elif (
-            gate_ok
-            and resid <= -p["entry_resid_bps"]
-            and _finite(ou_z)
-            and ou_z <= -p["z_gate"]
-            and _finite(half_life)
-            and p["half_life_min"] <= half_life <= p["half_life_max"]
-        ):
+        elif gate_ok and hl_ok and resid <= -p["entry_resid_bps"] and z_ok_long:
             action = f"LONG {TARGET} (curve flat/cheap vs 10Y)"
         else:
             action = "FLAT"
+        z_rule = "" if p["z_gate"] is None else f", abs(ou_z)>={p['z_gate']}"
         print(
             f"\nlatest signal: ts={data['ts'][-1]}  resid={resid:+.1f}bps  "
             f"ou_z={ou_z:+.2f}  half_life={half_life:.1f}d  "
             f"beta={last['beta']:+.3f}  r2={last['r2']:.2f}  action={action}  "
-            f"(abs(resid)>={p['entry_resid_bps']}bps, abs(ou_z)>={p['z_gate']})"
+            f"(abs(resid)>={p['entry_resid_bps']}bps{z_rule})"
         )
 
     return {
@@ -415,6 +468,19 @@ def sweep(use_db: bool = True, n_jobs: int | None = None) -> dict:
     print("\nleaderboard (top 10 by sharpe):")
     utils.pdf(results.select([c for c in show if c in results.columns]).head(10))
 
+    print("\ngate summary (across all combos sharing the gate; null = ungated):")
+    utils.pdf(
+        results.group_by("gate")
+        .agg(
+            pl.col("sharpe").median().alias("med_sharpe"),
+            pl.col("sharpe").max().alias("best_sharpe"),
+            pl.col("hit_rate").median().alias("med_hit_rate"),
+            pl.col("n_trades").median().alias("med_n_trades"),
+            pl.len().alias("n_combos"),
+        )
+        .sort("med_sharpe", descending=True, nulls_last=True)
+    )
+
     print("\nsharpe matrix - beta_lb (cols) x ou_lb (rows), best entry/gate per cell:")
     matrix = (
         results.pivot(
@@ -432,17 +498,18 @@ def sweep(use_db: bool = True, n_jobs: int | None = None) -> dict:
     return {"data": data, "results": results, "store": store}
 
 
-def fast(use_db: bool = True, device: str = "auto") -> dict:
-    """Vectorized coarse scan of residual/OU-z entries and quantile gates."""
+def exits(use_db: bool = True, device: str = "auto") -> dict:
+    """Vectorized exit scan: which exit thresholds trade well, with hit rate,
+    PnL, and sharpe per (entry, exit, gate) cell. GPU via device="gpu"/"auto"."""
     raw_data = load_data() if use_db else synthetic_data()
     data = model_frame(raw_data)
     level = pipeline.trade_def.composite_series(data).to_numpy()
 
     scans = []
 
-    if "residual" in FAST_ENTRY_SIGNALS:
+    if "residual" in EXIT_ENTRY_SIGNALS:
         resid, resid_combos, resid_conditions = signal_matrix(
-            data[FEATURE], data[TARGET], FAST_BETA_LBS, [0],
+            data[FEATURE], data[TARGET], EXIT_BETA_LBS, [0],
             return_conditions=True,
             signal_kind="residual",
             lookback_name="ou_lb",
@@ -453,13 +520,13 @@ def fast(use_db: bool = True, device: str = "auto") -> dict:
             "matrix": resid,
             "combos": resid_combos,
             "conditions": resid_conditions,
-            "entries": FAST_RESID_ENTRIES_BPS,
-            "exits": FAST_RESID_EXIT_BANDS_BPS,
+            "entries": EXIT_RESID_ENTRIES_BPS,
+            "exits": EXIT_RESID_BANDS_BPS,
         })
 
-    if "ou_z" in FAST_ENTRY_SIGNALS:
+    if "ou_z" in EXIT_ENTRY_SIGNALS:
         ou_z, ou_combos, ou_conditions = signal_matrix(
-            data[FEATURE], data[TARGET], FAST_BETA_LBS, FAST_OU_LBS,
+            data[FEATURE], data[TARGET], EXIT_BETA_LBS, EXIT_OU_LBS,
             return_conditions=True,
             signal_kind="ou_zscore",
             lookback_name="ou_lb",
@@ -470,11 +537,11 @@ def fast(use_db: bool = True, device: str = "auto") -> dict:
             "matrix": ou_z,
             "combos": ou_combos,
             "conditions": ou_conditions,
-            "entries": FAST_OU_Z_ENTRIES,
-            "exits": FAST_OU_Z_EXIT_BANDS,
+            "entries": EXIT_OU_Z_ENTRIES,
+            "exits": EXIT_OU_Z_BANDS,
         })
 
-    n_variants = 1 + len(scans[0]["conditions"]) * gate_variant_count(FAST_GATE_BUCKETS) if scans else 1
+    n_variants = 1 + len(scans[0]["conditions"]) * gate_variant_count(EXIT_GATE_BUCKETS) if scans else 1
     n_evals = sum(
         scan["matrix"].shape[1]
         * len(scan["entries"])
@@ -483,7 +550,7 @@ def fast(use_db: bool = True, device: str = "auto") -> dict:
         for scan in scans
     )
     print(
-        f"fast scan: signals={FAST_ENTRY_SIGNALS}  "
+        f"exit scan: signals={EXIT_ENTRY_SIGNALS}  "
         f"model_columns={sum(scan['matrix'].shape[1] for scan in scans)}  "
         f"gate variants={n_variants}  evaluations={n_evals:,}  "
         f"(device={device})"
@@ -499,7 +566,7 @@ def fast(use_db: bool = True, device: str = "auto") -> dict:
                 cost_bps=TRANSACTION_COST_BPS,
                 combos=scan["combos"],
                 gates=scan["conditions"],
-                gate_buckets=FAST_GATE_BUCKETS,
+                gate_buckets=EXIT_GATE_BUCKETS,
                 device=device,
                 entry_col="entry_threshold",
                 exit_col="exit_threshold",
@@ -511,37 +578,60 @@ def fast(use_db: bool = True, device: str = "auto") -> dict:
                 block = block.with_columns(pl.lit(None, dtype=pl.Int64).alias("ou_lb"))
             result_blocks.append(add_gate_lift(block))
 
-        results = pl.concat(result_blocks, how="diagonal_relaxed").sort(
-            "sharpe", descending=True, nulls_last=True
+        results = (
+            pl.concat(result_blocks, how="diagonal_relaxed")
+            .with_columns(
+                pl.when(pl.col("n_trades") > 0)
+                .then(pl.col("total_pnl_bps") / pl.col("n_trades"))
+                .otherwise(None)
+                .alias("pnl_per_trade_bps")
+            )
+            .sort("sharpe", descending=True, nulls_last=True)
         )
 
     store = MetricStore()
     store.log(SIGNAL_NAME, results, meta={
-        "engine": "fast", "source": "db" if use_db else "synthetic",
+        "engine": "exits", "source": "db" if use_db else "synthetic",
         "span": f"{data['ts'].min()}..{data['ts'].max()}",
     })
 
     show = [
         "entry_signal", "beta_lb", "ou_lb", "entry_threshold", "exit_threshold",
         "threshold_units", "gate", "gate_bucket",
-        "sharpe", "total_pnl_bps", "hit_rate", "n_trades",
+        "sharpe", "total_pnl_bps", "pnl_per_trade_bps", "hit_rate", "n_trades",
     ]
     valid = results.filter(
         (pl.col("n_trades") > 0) & pl.col("sharpe").is_finite()
     )
     ungated = valid.filter(pl.col("gate") == "(none)")
+
+    exit_summary = (
+        ungated.group_by("entry_signal", "threshold_units", "exit_threshold")
+        .agg(
+            pl.col("sharpe").median().alias("med_sharpe"),
+            (pl.col("sharpe") > 0).mean().alias("pct_combos_positive"),
+            pl.col("hit_rate").median().alias("med_hit_rate"),
+            pl.col("pnl_per_trade_bps").median().alias("med_pnl_per_trade_bps"),
+            pl.col("total_pnl_bps").median().alias("med_total_pnl_bps"),
+            pl.col("n_trades").median().alias("med_n_trades"),
+        )
+        .sort(["entry_signal", "exit_threshold"])
+    )
+    print("\nwhich exits work (ungated, median across entry/lookback combos):")
+    utils.pdf(exit_summary)
+
     print("\ntop 10 ungated by sharpe (approximate - verify via --sweep):")
     utils.pdf(ungated.select([c for c in show if c in ungated.columns]).head(10))
 
     gated = (
         valid.filter(
             (pl.col("gate") != "(none)")
-            & (pl.col("n_trades") >= FAST_MIN_TRADES)
+            & (pl.col("n_trades") >= EXIT_MIN_TRADES)
             & pl.col("sharpe_lift").is_finite()
         )
         .sort("sharpe_lift", descending=True, nulls_last=True)
     )
-    print(f"\ntop 10 gates by sharpe LIFT vs same combo ungated (n_trades >= {FAST_MIN_TRADES}):")
+    print(f"\ntop 10 gates by sharpe LIFT vs same combo ungated (n_trades >= {EXIT_MIN_TRADES}):")
     utils.pdf(gated.select([*show, "base_sharpe", "sharpe_lift", "hit_lift"]).head(10))
 
     strong = (
@@ -567,7 +657,7 @@ def fast(use_db: bool = True, device: str = "auto") -> dict:
     )
     print(f"\nlogged {len(results):,} runs -> {store.path}")
 
-    return {"data": data, "results": results, "store": store}
+    return {"data": data, "results": results, "exit_summary": exit_summary, "store": store}
 
 
 def predict(use_db: bool = True, device: str = "auto") -> dict:
@@ -580,7 +670,7 @@ def predict(use_db: bool = True, device: str = "auto") -> dict:
 
     if "residual" in PREDICT_ENTRY_SIGNALS:
         resid, resid_combos, resid_conditions = signal_matrix(
-            data[FEATURE], data[TARGET], FAST_BETA_LBS, [0],
+            data[FEATURE], data[TARGET], PREDICT_BETA_LBS, [0],
             return_conditions=True,
             signal_kind="residual",
             lookback_name="ou_lb",
@@ -596,7 +686,7 @@ def predict(use_db: bool = True, device: str = "auto") -> dict:
 
     if "ou_z" in PREDICT_ENTRY_SIGNALS:
         ou_z, ou_combos, ou_conditions = signal_matrix(
-            data[FEATURE], data[TARGET], FAST_BETA_LBS, FAST_OU_LBS,
+            data[FEATURE], data[TARGET], PREDICT_BETA_LBS, PREDICT_OU_LBS,
             return_conditions=True,
             signal_kind="ou_zscore",
             lookback_name="ou_lb",
@@ -711,9 +801,16 @@ def predict(use_db: bool = True, device: str = "auto") -> dict:
     return {"data": data, "results": results, "store": store}
 
 
-def gates(use_db: bool = True, params: dict | None = None) -> dict:
-    """Conditional edge scan for entry-time state variables."""
-    p = _params(params)
+def gates(
+    use_db: bool = True,
+    params: dict | None = None,
+    horizon: int | None = None,
+) -> dict:
+    """Conditional edge scan for entry-time state variables, ring-fenced to
+    the GATE_SETUP setup (funnel step 2 — point GATE_SETUP/GATE_HORIZON at
+    the --predict winner; params/horizon override for one-off runs)."""
+    p = _params({**GATE_SETUP, **(params or {})})
+    horizon = GATE_HORIZON if horizon is None else int(horizon)
     raw_data = load_data() if use_db else synthetic_data()
     data = model_frame(raw_data)
     sig_frame = compute(data, params=p)
@@ -737,10 +834,6 @@ def gates(use_db: bool = True, params: dict | None = None) -> dict:
         "beta": sig_frame["beta"],
     })
 
-    horizon = int(round(np.clip(
-        p["time_stop_mult"] * 14,
-        p["time_stop_min"], p["time_stop_max"],
-    )))
     table = gate_scan(
         sig_frame["signal"], level, conditions,
         entry_z=p["entry_resid_bps"], horizon=horizon,
@@ -760,8 +853,8 @@ if __name__ == "__main__":
         state = sweep(use_db=use_db)
     elif "--predict" in sys.argv:
         state = predict(use_db=use_db, device=device)
-    elif "--fast" in sys.argv:
-        state = fast(use_db=use_db, device=device)
+    elif "--exits" in sys.argv or "--fast" in sys.argv:  # --fast: deprecated alias
+        state = exits(use_db=use_db, device=device)
     elif "--gates" in sys.argv:
         state = gates(use_db=use_db)
     else:

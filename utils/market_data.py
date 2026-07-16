@@ -24,6 +24,63 @@ import polars as pl
 from utils.helpers import query_db
 
 
+def _require_columns(data: pl.DataFrame, columns: Iterable[str]) -> list[str]:
+    missing = [c for c in columns if c not in data.columns]
+    if missing:
+        raise ValueError(f"missing columns: {missing}")
+    return list(columns)
+
+
+def align_columns(
+    data: pl.DataFrame,
+    columns: Iterable[str],
+    date_col: str = "ts",
+) -> pl.DataFrame:
+    """Return date + required columns on the common non-null sample."""
+    col_list = list(columns)
+    cols = _require_columns(data, [date_col, *col_list])
+    return data.select(cols).drop_nulls(subset=col_list)
+
+
+def coverage_report(
+    data: pl.DataFrame,
+    columns: Iterable[str],
+    date_col: str = "ts",
+) -> pl.DataFrame:
+    """Coverage and overlap report for a set of model input columns."""
+    col_list = list(columns)
+    cols = _require_columns(data, [date_col, *col_list])
+    data = data.select(cols)
+    n_rows = len(data)
+    rows = []
+
+    for col in col_list:
+        valid = data.filter(pl.col(col).is_not_null())
+        rows.append(
+            {
+                "series": col,
+                "observations": len(valid),
+                "missing": n_rows - len(valid),
+                "pct_populated": len(valid) / n_rows if n_rows else 0.0,
+                "first_valid": valid[date_col].min() if len(valid) else None,
+                "last_valid": valid[date_col].max() if len(valid) else None,
+            }
+        )
+
+    overlap = align_columns(data, col_list, date_col=date_col)
+    rows.append(
+        {
+            "series": "OVERLAP",
+            "observations": len(overlap),
+            "missing": n_rows - len(overlap),
+            "pct_populated": len(overlap) / n_rows if n_rows else 0.0,
+            "first_valid": overlap[date_col].min() if len(overlap) else None,
+            "last_valid": overlap[date_col].max() if len(overlap) else None,
+        }
+    )
+    return pl.DataFrame(rows)
+
+
 def long_to_wide(
     long_df: Union[pl.DataFrame, pd.DataFrame],
     tickers: Union[Mapping[str, str], Iterable[str]],

@@ -14,6 +14,44 @@ import psycopg
 from typing import Union
 
 DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets?connect_timeout=10")
+WSL_KEEPALIVE_NAME = "views-wsl-keepalive"
+
+
+def _ensure_wsl_keepalive() -> None:
+    """Keep WSL attached for a bounded window so Postgres does not idle out."""
+    if os.name != "nt" or os.getenv("VIEWS_SKIP_WSL_KEEPALIVE") == "1":
+        return
+
+    distro = os.getenv("VIEWS_WSL_DISTRO", os.getenv("REF_WSL_DISTRO", "Ubuntu"))
+    seconds = int(os.getenv("VIEWS_WSL_KEEPALIVE_SECONDS", "3600"))
+    script = (
+        f"pkill -f '^{WSL_KEEPALIVE_NAME} ' >/dev/null 2>&1 || true; "
+        f"nohup bash -c 'exec -a {WSL_KEEPALIVE_NAME} sleep {seconds}' "
+        ">/dev/null 2>&1 & "
+        "nohup service postgresql start >/dev/null 2>&1 &"
+    )
+    try:
+        subprocess.run(
+            ["wsl", "-d", distro, "-u", "root", "--", "bash", "-lc", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=90,
+        )
+    except Exception:
+        # Best-effort only; _connect's normal wake/retry path will report issues.
+        return
+
+
+def _validate_conn(conn: psycopg.Connection) -> psycopg.Connection:
+    """Return conn only after a trivial query succeeds."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+    except Exception:
+        conn.close()
+        raise
+    return conn
 
 
 def _connect(dsn: str | None = None) -> psycopg.Connection:
@@ -25,10 +63,10 @@ def _connect(dsn: str | None = None) -> psycopg.Connection:
         probe += ("&" if "?" in probe else "?") + "connect_timeout=3"
 
     if os.name != "nt":
-        return psycopg.connect(dsn)
+        return _validate_conn(psycopg.connect(dsn))
 
     try:
-        return psycopg.connect(probe)
+        return _validate_conn(psycopg.connect(probe))
     except Exception as e:
         probe_err = str(e).split("\n")[0].strip()
         starting_up = "starting up" in probe_err.lower()
@@ -61,12 +99,9 @@ def _connect(dsn: str | None = None) -> psycopg.Connection:
     if not starting_up:
         _log("step 1 — waking WSL...")
         stop1 = _start_ticker("waking WSL")
-        result = subprocess.run(
-            ["wsl", "-d", "Ubuntu", "-u", "root", "--", "service", "postgresql", "start"],
-            capture_output=True, timeout=90,
-        )
+        _ensure_wsl_keepalive()
         stop1.set()
-        _log(f"step 1 done  rc={result.returncode}  [{time.time() - t0:.1f}s]")
+        _log(f"step 1 done  [{time.time() - t0:.1f}s]")
     else:
         _log("step 1 — skipped (postgres already responding, just not ready yet)")
 
@@ -78,15 +113,15 @@ def _connect(dsn: str | None = None) -> psycopg.Connection:
         for attempt in range(1, 20):
             time.sleep(2)
             try:
-                conn = psycopg.connect(dsn)
+                conn = _validate_conn(psycopg.connect(dsn))
                 stop2.set()
-                _log(f"attempt {attempt}: connected!  [{time.time() - t0:.1f}s total]")
+                _log(f"attempt {attempt}: ready!  [{time.time() - t0:.1f}s total]")
                 return conn
             except Exception as e:
                 _log(f"attempt {attempt}: {str(e).split(chr(10))[0].strip()}")
 
         stop2.set()
-        return psycopg.connect(dsn)  # final — raises naturally if still down
+        return _validate_conn(psycopg.connect(dsn))  # final - raises naturally if still down
     except Exception:
         stop2.set()
         raise
@@ -138,11 +173,22 @@ def fix_outliers(
 
 def query_db(sql: str, params: list | tuple | None = None, dsn: str | None = None) -> pd.DataFrame:
     """Run a SQL query and return a DataFrame. Opens and closes the connection for you."""
-    with _connect(dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-            cols = [d.name for d in cur.description]
+    last_err: Exception | None = None
+    for attempt in range(2):
+        try:
+            with _connect(dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    rows = cur.fetchall()
+                    cols = [d.name for d in cur.description]
+            break
+        except psycopg.OperationalError as exc:
+            last_err = exc
+            if attempt == 1:
+                raise
+            time.sleep(2)
+    else:
+        raise last_err or RuntimeError("query failed")
     return pd.DataFrame(rows, columns=cols)
 
 

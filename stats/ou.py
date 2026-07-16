@@ -136,6 +136,7 @@ def roll_ou_zscore(
     s = to_pl_series(series).cast(pl.Float64)
     n = len(s)
     min_p = min_periods if min_periods is not None else max(20, lookback // 4)
+    min_p = min(min_p, lookback)
 
     reg = roll_lr(s.shift(1), s.diff(), lookback=lookback, min_periods=min_p)
 
