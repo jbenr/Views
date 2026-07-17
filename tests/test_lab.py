@@ -20,6 +20,7 @@ from backtest.lab import (
     gate_variant_count,
     parse_gate,
     predict_scan,
+    stateful_exit_scan,
     signal_matrix,
     sweep_strategy,
 )
@@ -155,6 +156,27 @@ def test_predict_scan_detects_true_ou():
     assert (out["ic"] > 0).all()
     assert (out["hit_rate"] > 0.5).all()
     assert ((out["fire_rate"] > 0) & (out["fire_rate"] <= 1)).all()
+
+
+def test_predict_scan_counts_threshold_crossings_not_active_bars():
+    z = np.zeros(35)
+    z[2:22] = 2.0   # one long positive excursion
+    z[25:30] = -2.0  # one long negative excursion
+    level = np.arange(len(z), dtype=float)
+
+    out = predict_scan(z, level, entries=[1.5], horizons=[1])
+
+    assert out["n_obs"][0] == 2
+
+
+def test_predict_scan_each_entry_threshold_fires_when_first_crossed():
+    z = np.array([0.0, 26.0, 28.0, 31.0, 29.0, 24.0, 26.0, 0.0])
+    level = np.arange(len(z), dtype=float)
+
+    out = predict_scan(z, level, entries=[25.0, 30.0], horizons=[1])
+
+    n_by_entry = dict(zip(out["entry_threshold"], out["n_obs"]))
+    assert n_by_entry == {25.0: 2, 30.0: 1}
 
 
 def test_predict_scan_gates_and_lift():
@@ -386,6 +408,82 @@ def test_metric_store_roundtrip(tmp_path):
 
     mat = store.matrix(x="beta_lb", y="z_lb", metric="sharpe")
     assert len(mat) == 2  # z_lb 42 and 63 rows
+
+
+# ── stateful exit scan ───────────────────────────────────────────────────────
+
+def test_stateful_exit_scan_revert_frac_hand_example():
+    # enter long at z=-3 (t1); 50% reversion target = -1.5; z hits -1.4 at t3
+    z = np.array([0.0, -3.0, -2.0, -1.4, 0.0, 0.0])
+    level = np.array([0.0, 3.0, 2.0, 1.4, 0.0, 0.0])
+    out = stateful_exit_scan(
+        z, level, entries=[2.0], exit_style="revert_frac", exit_params=[0.5]
+    )
+    row = out.row(0, named=True)
+    assert row["n_trades"] == 1
+    assert row["n_bars_active"] == 2  # position live t1->t3, earns on t2, t3
+    assert row["total_pnl_bps"] == pytest.approx(-1.6)  # (2-3) + (1.4-2)
+
+
+def test_stateful_exit_scan_half_life_frac_times_out():
+    # constant dislocation: only the time stop can exit, clock = frac x hl
+    z = np.array([0.0, -3.0, -3.0, -3.0, -3.0, -3.0])
+    level = np.zeros(6)
+    hl = np.full(6, 2.0)
+    out = stateful_exit_scan(
+        z, level, entries=[2.0], exit_style="half_life_frac",
+        exit_params=[1.0, 2.0], half_life=hl,
+    )
+    # frac=1.0: exit after 2 bars -> trade t1-t3, re-enter t4 -> 2 trades
+    fast = out.filter(pl.col("exit_threshold") == 1.0).row(0, named=True)
+    assert fast["n_trades"] == 2
+    # frac=2.0: exit after 4 bars -> single trade t1-t5
+    slow = out.filter(pl.col("exit_threshold") == 2.0).row(0, named=True)
+    assert slow["n_trades"] == 1
+    # longer clock holds longer per trade
+    assert (
+        slow["n_bars_active"] / slow["n_trades"]
+        > fast["n_bars_active"] / fast["n_trades"]
+    )
+
+
+def test_stateful_exit_scan_profits_on_true_ou():
+    rng = np.random.default_rng(7)
+    n = 3000
+    resid = np.zeros(n)
+    for i in range(1, n):
+        resid[i] = resid[i - 1] * 0.95 + rng.normal(0, 1)
+    z = (resid - resid.mean()) / resid.std()
+
+    out = stateful_exit_scan(
+        z, resid, entries=[1.5], exit_style="revert_frac", exit_params=[0.5, 1.0]
+    )
+    assert len(out) == 2
+    assert (out["n_trades"] > 0).all()
+    assert (out["total_pnl_bps"] > 0).all()  # fading true OU must pay
+
+
+def test_stateful_exit_scan_validates_inputs():
+    z = np.zeros(10)
+    level = np.zeros(10)
+    with pytest.raises(ValueError):
+        stateful_exit_scan(z, level, [1.0], "nope", [0.5])
+    with pytest.raises(ValueError):  # half_life_frac needs the half-life matrix
+        stateful_exit_scan(z, level, [1.0], "half_life_frac", [1.0])
+
+
+def test_stateful_exit_scan_combo_annotation():
+    z = np.zeros((50, 2))
+    z[10:, 0] = -3.0
+    combos = [{"beta_lb": 42}, {"beta_lb": 63}]
+    out = stateful_exit_scan(
+        np.asarray(z), np.zeros(50), entries=[2.0, 2.5],
+        exit_style="revert_frac", exit_params=[0.5], combos=combos,
+    )
+    # rows = K x entries x params, combos repeated per (entry, param)
+    assert len(out) == 4
+    assert set(out["beta_lb"]) == {42, 63}
+    assert set(out["entry_threshold"]) == {2.0, 2.5}
 
 
 # ── gate specs ───────────────────────────────────────────────────────────────

@@ -34,12 +34,12 @@ import importlib
 import os
 import warnings
 import uuid
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from importlib.util import module_from_spec, spec_from_file_location
 from itertools import product
 from pathlib import Path
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import numpy as np
 import polars as pl
@@ -158,6 +158,7 @@ def sweep_strategy(
     slippage_bps: float = 0.0,
     n_jobs: Optional[int] = None,
     sort_by: str = "sharpe",
+    progress: Optional[Callable[[int, int], None]] = None,
 ) -> pl.DataFrame:
     """Exact-engine backtest of every param combo, parallel across CPU cores.
 
@@ -167,6 +168,7 @@ def sweep_strategy(
         data: wide market-data frame (shipped once to each worker process).
         grid: ParamGrid or plain {param: [values]} dict.
         n_jobs: worker processes; default = all cores. 1 = serial (debugging).
+        progress: optional callback(done, total), called as combos finish.
 
     Returns one row per combo: params + full Engine metrics, best first.
     """
@@ -180,14 +182,23 @@ def sweep_strategy(
 
     if n_jobs <= 1:
         _init_worker(module_name, data, transaction_cost_bps, slippage_bps)
-        rows = [_run_combo(p) for p in combos]
+        rows = []
+        for i, p in enumerate(combos, 1):
+            rows.append(_run_combo(p))
+            if progress is not None:
+                progress(i, len(combos))
     else:
         with ProcessPoolExecutor(
             max_workers=n_jobs,
             initializer=_init_worker,
             initargs=(module_name, data, transaction_cost_bps, slippage_bps),
         ) as pool:
-            rows = list(pool.map(_run_combo, combos))
+            futures = [pool.submit(_run_combo, p) for p in combos]
+            rows = []
+            for i, fut in enumerate(as_completed(futures), 1):
+                rows.append(fut.result())
+                if progress is not None:
+                    progress(i, len(combos))
 
     out = pl.DataFrame(rows, infer_schema_length=None)
     if sort_by in out.columns:
@@ -354,9 +365,15 @@ def _max_drawdown(cumulative_pnl, xp):
 
 
 def _evaluate_events(events, dlv, cost_bps, periods_per_year, xp) -> dict[str, np.ndarray]:
-    """Metrics for one (T, K) event matrix. All array math â€” CPU or GPU."""
-    k = events.shape[1]
-    pos = _ffill_positions(events, xp)
+    """Metrics for one (T, K) event matrix. All array math - CPU or GPU."""
+    return _position_metrics(
+        _ffill_positions(events, xp), dlv, cost_bps, periods_per_year, xp
+    )
+
+
+def _position_metrics(pos, dlv, cost_bps, periods_per_year, xp) -> dict[str, np.ndarray]:
+    """Metrics for one (T, K) position matrix. All array math - CPU or GPU."""
+    k = pos.shape[1]
 
     pos_lag = xp.concatenate([xp.zeros((1, k)), pos[:-1]], axis=0)
     turnover = xp.abs(pos - pos_lag)
@@ -682,6 +699,138 @@ def fast_scan(
     )
 
 
+def stateful_exit_scan(
+    z: np.ndarray,
+    level: np.ndarray,
+    entries: Union[list[float], tuple[float, ...]],
+    exit_style: str,
+    exit_params: Union[list[float], tuple[float, ...]],
+    half_life: Optional[np.ndarray] = None,
+    cost_bps: float = 0.0,
+    periods_per_year: int = 252,
+    combos: Optional[list[dict]] = None,
+    entry_col: str = "entry_threshold",
+    exit_col: str = "exit_threshold",
+    progress: Optional[Callable[[int, int], None]] = None,
+) -> pl.DataFrame:
+    """Approximate backtest of exits that depend on per-trade state.
+
+    Entries match fast_scan (fade: long when z <= -entry, short when
+    z >= +entry, next-bar execution, one position at a time). Exits reference
+    the state captured at entry:
+
+      - "revert_frac": exit once the signal has retraced `param` of its
+        ENTRY value back toward zero - i.e. param of the point-in-time
+        dislocation has reverted. param in (0, 1]; 1.0 = full reversion.
+      - "half_life_frac": time stop at param x the residual half-life
+        measured at entry (the expected-time-to-reversion clock). Requires
+        `half_life` aligned with z; bars with no finite half-life never open
+        trades. param may exceed 1 (e.g. 2.0 = two half-lives).
+
+    A closed position may re-enter from the NEXT bar, never the exit bar.
+    Positions are held through NaN signal bars ("revert_frac" can only exit
+    on a finite signal; "half_life_frac" fires regardless).
+
+    Runs on CPU: the state machine is sequential over bars (vectorized across
+    every (combo, entry, param) column at once), unlike fast_scan's stateless
+    event matrix. Returns one row per (combo, entry, exit_param) with the
+    fast_scan metric columns.
+    """
+    if exit_style not in {"revert_frac", "half_life_frac"}:
+        raise ValueError(
+            f"unknown exit_style={exit_style!r}; "
+            "expected 'revert_frac' or 'half_life_frac'"
+        )
+
+    z = np.asarray(z, dtype=float)
+    if z.ndim == 1:
+        z = z[:, None]
+    t_len, k = z.shape
+    if combos is not None and len(combos) != k:
+        raise ValueError(f"combos has {len(combos)} entries but z has {k} columns")
+
+    hl = None
+    if exit_style == "half_life_frac":
+        if half_life is None:
+            raise ValueError("half_life is required for exit_style='half_life_frac'")
+        hl = np.asarray(half_life, dtype=float)
+        if hl.ndim == 1:
+            hl = np.broadcast_to(hl[:, None], (t_len, k))
+        if hl.shape != (t_len, k):
+            raise ValueError(f"half_life has shape {hl.shape}, expected {(t_len, k)}")
+
+    lv = np.asarray(level, dtype=float)
+    dlv = np.concatenate([[np.nan], np.diff(lv)])[:, None]
+    dlv = np.where(np.isnan(dlv), 0.0, dlv)
+
+    entry_list = [float(e) for e in entries]
+    param_list = [float(p) for p in exit_params]
+    n_e, n_p = len(entry_list), len(param_list)
+
+    # expand columns so one state loop covers every (combo, entry, param)
+    reps = n_e * n_p
+    z_exp = np.repeat(z, reps, axis=1)
+    hl_exp = np.repeat(hl, reps, axis=1) if hl is not None else None
+    entry_vec = np.tile(np.repeat(entry_list, n_p), k)
+    param_vec = np.tile(np.tile(param_list, n_e), k)
+
+    k_exp = k * reps
+    pos = np.zeros(k_exp)
+    entry_z = np.zeros(k_exp)
+    entry_bar = np.zeros(k_exp, dtype=int)
+    hl_at_entry = np.full(k_exp, np.nan)
+    positions = np.zeros((t_len, k_exp))
+
+    for t in range(t_len):
+        zt = z_exp[t]
+        was_flat = pos == 0.0
+
+        if exit_style == "revert_frac":
+            target = entry_z * (1.0 - param_vec)
+            exit_now = (
+                ~was_flat
+                & np.isfinite(zt)
+                & (((pos > 0.0) & (zt >= target)) | ((pos < 0.0) & (zt <= target)))
+            )
+        else:
+            exit_now = ~was_flat & ((t - entry_bar) >= np.ceil(param_vec * hl_at_entry))
+        pos = np.where(exit_now, 0.0, pos)
+
+        can_enter = was_flat & np.isfinite(zt)
+        if hl_exp is not None:
+            can_enter &= np.isfinite(hl_exp[t])
+        go_long = can_enter & (zt <= -entry_vec)
+        go_short = can_enter & (zt >= entry_vec)
+        opened = go_long | go_short
+        pos = np.where(go_long, 1.0, np.where(go_short, -1.0, pos))
+        entry_z = np.where(opened, zt, entry_z)
+        entry_bar = np.where(opened, t, entry_bar)
+        if hl_exp is not None:
+            hl_at_entry = np.where(opened, hl_exp[t], hl_at_entry)
+        positions[t] = pos
+        if progress is not None and ((t + 1) % 250 == 0 or t + 1 == t_len):
+            progress(t + 1, t_len)
+
+    metrics = _position_metrics(positions, dlv, cost_bps, periods_per_year, np)
+
+    base = (
+        pl.DataFrame(combos) if combos is not None
+        else pl.DataFrame({"col": list(range(k))})
+    )
+    combo_frame = base.select(
+        pl.all().gather(np.repeat(np.arange(k), reps).tolist())
+    )
+    return (
+        combo_frame.with_columns(
+            pl.Series(entry_col, entry_vec),
+            pl.Series(exit_col, param_vec),
+            *[pl.Series(m, v) for m, v in metrics.items()],
+        )
+        .with_columns(pl.col("sharpe", "hit_rate").fill_nan(None))
+        .sort("sharpe", descending=True, nulls_last=True)
+    )
+
+
 def predict_scan(
     z: np.ndarray,
     level: np.ndarray,
@@ -702,8 +851,10 @@ def predict_scan(
 
     This is not a trade backtest: no exits, stops, holding state, or costs.
     It is the GPU-friendly discovery layer for signal/threshold/horizon/regime
-    predictability. Metrics are event-bar diagnostics, not trade metrics:
-    IC, directional hit rate, observation count, and fire rate.
+    predictability. Only the first bar that crosses each positive or negative
+    threshold is sampled; the remaining bars in that threshold excursion are
+    ignored. Metrics are trigger-event diagnostics, not trade metrics: IC,
+    directional hit rate, observation count, and fire rate.
     """
     xp = _get_xp(device)
 
@@ -715,6 +866,9 @@ def predict_scan(
         raise ValueError(f"combos has {len(combos)} entries but z has {k} columns")
 
     lv = xp.asarray(level, dtype=xp.float64)
+    prev_z = xp.concatenate(
+        [xp.full((1, k), xp.nan, dtype=xp.float64), z[:-1]], axis=0
+    )
 
     gate_masks = _gate_masks(gates, t_len, k, gate_buckets, xp)
     combo_frame = (
@@ -770,11 +924,15 @@ def predict_scan(
 
         for entry in entries:
             eligible = xp.isfinite(z) & valid_fwd
-            base = eligible & (xp.abs(z) >= entry)
+            crossed = (
+                ((z >= entry) & ~(prev_z >= entry))
+                | ((z <= -entry) & ~(prev_z <= -entry))
+            )
+            base = eligible & crossed
             blocks.append(_emit(entry, horizon, "(none)", "all", _metrics(base, eligible, fwd)))
             for name, bucket, allow in gate_masks:
                 gated_eligible = eligible & allow
-                gated = gated_eligible & (xp.abs(z) >= entry)
+                gated = gated_eligible & crossed
                 blocks.append(_emit(entry, horizon, name, bucket, _metrics(gated, gated_eligible, fwd)))
 
     return (

@@ -13,5 +13,5 @@ from .sweep import ParameterSweep, SweepConfig
 from .lab import (
     ParamGrid, sweep_strategy, fast_scan, predict_scan, signal_matrix,
     MetricStore, gate_scan, add_gate_lift, add_predict_lift,
-    gate_variant_count, parse_gate, gate_allow_mask,
+    gate_variant_count, parse_gate, gate_allow_mask, stateful_exit_scan,
 )

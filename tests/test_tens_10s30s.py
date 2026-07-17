@@ -73,42 +73,103 @@ def test_entry_filter_z_gate_none_skips_ou_confirmation():
 def test_sweep_grid_gates_are_buildable():
     frame = compute(synthetic_data(n=900))
     p = view._params({})
-    for spec in view.SWEEP_GRID["gate"]:
+    for spec in view.SWEEP_GATES:
         if spec is None:
             continue
         cond = view._gate_condition(frame, {**p, "gate": spec})
         assert len(cond) == len(frame)
 
 
-def test_exits_mode_reports_trading_stats(monkeypatch, tmp_path):
+def test_sweep_grids_keep_units_per_signal_and_style():
+    grids = view._sweep_grids()
+    assert len(grids) == len(view.SWEEP_ENTRY_SIGNALS) * len(view.SWEEP_EXIT_STYLES)
+    for grid in grids:
+        sig, style = grid["entry_signal"][0], grid["exit_style"][0]
+        expected_entries = {
+            "residual": view.SWEEP_RESID_ENTRIES_BPS,
+            "ou_z": view.SWEEP_OU_Z_ENTRIES,
+        }[sig]
+        assert grid["entry_threshold"] == expected_entries
+        if style == "band":
+            expected_exits = {
+                "residual": view.SWEEP_RESID_BANDS_BPS,
+                "ou_z": view.SWEEP_OU_Z_BANDS,
+            }[sig]
+            assert grid["exit_param"] == expected_exits
+        assert "z_gate" not in grid
+
+
+def test_compute_ou_z_entry_signal():
+    data = synthetic_data(n=900)
+    resid_frame = compute(data)
+    z_frame = compute(data, params={"entry_signal": "ou_z"})
+    assert resid_frame["signal"].equals(resid_frame["resid"])
+    assert z_frame["signal"].equals(z_frame["ou_z"])
+    with pytest.raises(ValueError, match="entry_signal"):
+        compute(data, params={"entry_signal": "nope"})
+
+
+def test_sweep_engine_runs_every_signal_and_exit_style():
+    data = view.model_frame(synthetic_data())
+    cases = [
+        ("residual", 20.0, "band", 5.0),
+        ("residual", 20.0, "revert_frac", 0.5),
+        ("residual", 20.0, "half_life_frac", 1.0),
+        ("ou_z", 1.0, "band", 0.25),
+        ("ou_z", 1.0, "revert_frac", 0.5),
+        ("ou_z", 1.0, "half_life_frac", 1.0),
+    ]
+    rows = []
+    for sig, thr, style, param in cases:
+        out = sweep_strategy(
+            "book.curve.tens_10s30s",
+            data,
+            {
+                "entry_signal": [sig],
+                "entry_threshold": [thr],
+                "exit_style": [style],
+                "exit_param": [param],
+            },
+            n_jobs=1,
+        )
+        assert "error" not in out.columns, f"{sig}/{style} errored"
+        rows.append(out)
+    combined = pl.concat(rows, how="diagonal_relaxed")
+    assert (combined["n_trades"] > 0).all()
+    assert combined["sharpe"].is_finite().all()
+
+
+def test_exit_mode_reports_exit_stats(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("VIEWS_STORE_DIR", str(tmp_path))
     monkeypatch.setattr(view, "EXIT_ENTRY_SIGNALS", ["ou_z"])
     monkeypatch.setattr(view, "EXIT_BETA_LBS", [120])
     monkeypatch.setattr(view, "EXIT_OU_LBS", [60])
     monkeypatch.setattr(view, "EXIT_OU_Z_ENTRIES", [1.0])
     monkeypatch.setattr(view, "EXIT_OU_Z_BANDS", [0.25, 0.5])
+    monkeypatch.setattr(view, "EXIT_REVERT_FRACS", [0.5])
+    monkeypatch.setattr(view, "EXIT_HALF_LIFE_FRACS", [1.0])
 
-    state = view.exits(use_db=False, device="cpu")
+    state = view.exit_scan(use_db=False, device="cpu")
     results = state["results"]
     assert {
         "sharpe", "hit_rate", "total_pnl_bps", "pnl_per_trade_bps",
-        "entry_threshold", "exit_threshold",
+        "avg_hold_bars", "entry_threshold", "exit_style", "exit_threshold",
     } <= set(results.columns)
+    assert {"gate", "gate_bucket"}.isdisjoint(results.columns)
+    assert set(results["exit_style"]) == {"band", "revert_frac", "half_life_frac"}
+    # 1 combo x 1 entry x (2 bands + 1 revert frac + 1 hl frac)
+    assert len(results) == 4
+
     summary = state["exit_summary"]
-    assert set(summary["exit_threshold"].to_list()) == {0.25, 0.5}
-    assert {"med_sharpe", "med_hit_rate", "med_pnl_per_trade_bps"} <= set(summary.columns)
+    bands = summary.filter(pl.col("exit_style") == "band")
+    assert set(bands["exit_threshold"].to_list()) == {0.25, 0.5}
+    assert {
+        "med_sharpe", "med_hit_rate", "med_pnl_per_trade_bps", "med_hold_bars",
+    } <= set(summary.columns)
 
-
-def test_gates_mode_ring_fences_to_gate_setup(monkeypatch):
-    monkeypatch.setattr(view, "GATE_SETUP", {"beta_lb": 120, "entry_resid_bps": 10.0})
-    monkeypatch.setattr(view, "GATE_HORIZON", 15)
-    state = view.gates(use_db=False)
-    table = state["gates"]
-    assert isinstance(table, pl.DataFrame)
-    assert "(all)" in table["condition"].to_list()  # baseline row present
-    # explicit horizon override beats the constant
-    state2 = view.gates(use_db=False, horizon=5)
-    assert isinstance(state2["gates"], pl.DataFrame)
+    output = capsys.readouterr().out.lower()
+    assert "which exits pay" not in output
+    assert "sharpe by entry" not in output
 
 
 def test_sweep_gate_specs_serialize_and_block_entries():
