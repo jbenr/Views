@@ -34,7 +34,6 @@ Every mode returns a dict of state for interactive chaining: state = main().
 from __future__ import annotations
 
 import datetime as dt
-import itertools
 import math
 import sys
 import time
@@ -55,6 +54,7 @@ from backtest import (
     fast_scan,
     gate_allow_mask,
     gate_variant_count,
+    neighbor_ic_stats,
     parse_gate,
     predict_scan,
     print_summary,
@@ -241,56 +241,14 @@ def _setup_name(row: dict) -> str:
 
 
 def _neighbor_stats(valid: pl.DataFrame, pool_size: int = 300) -> pl.DataFrame:
-    """nbr_ic / n_nbr for the pool_size best rows by IC: the median IC over
-    each row's grid neighborhood — same horizon and gate, within one grid
-    step in beta_lb, ou_lb, and entry_threshold, self excluded. A real
-    dislocation predicts from adjacent cells too; a lucky cell stands alone."""
-
-    def _step(values: list) -> float:
-        return float(values[1] - values[0]) if len(values) > 1 else 1.0
-
-    t_step = (
-        pl.when(pl.col("entry_signal") == "residual")
-        .then(_step(PREDICT_RESID_THRESHOLDS_BPS))
-        .otherwise(_step(PREDICT_OU_Z_THRESHOLDS))
-    )
-    t_base = (
-        pl.when(pl.col("entry_signal") == "residual")
-        .then(float(PREDICT_RESID_THRESHOLDS_BPS[0]))
-        .otherwise(float(PREDICT_OU_Z_THRESHOLDS[0]))
-    )
-    cells = valid.with_columns(
-        (pl.col("beta_lb") / _step(PREDICT_BETA_LBS))
-        .round(0).cast(pl.Int64).alias("bi"),
-        (pl.col("ou_lb").fill_null(0) / _step(PREDICT_OU_LBS))
-        .round(0).cast(pl.Int64).alias("oi"),
-        ((pl.col("entry_threshold") - t_base) / t_step)
-        .round(0).cast(pl.Int64).alias("ti"),
-    )
-    key = ["entry_signal", "gate", "gate_bucket", "horizon", "bi", "oi", "ti"]
-    pool = cells.sort("ic", descending=True).head(pool_size).with_row_index("cand")
-
-    shifts = [s for s in itertools.product((-1, 0, 1), repeat=3) if s != (0, 0, 0)]
-    probes = pl.concat(
-        [
-            pool.select(
-                "cand", "entry_signal", "gate", "gate_bucket", "horizon",
-                (pl.col("bi") + db).alias("bi"),
-                (pl.col("oi") + do).alias("oi"),
-                (pl.col("ti") + dt).alias("ti"),
-            )
-            for db, do, dt in shifts
-        ]
-    )
-    stats = (
-        probes.join(cells.select([*key, "ic"]), on=key, how="inner")
-        .group_by("cand")
-        .agg(pl.col("ic").median().alias("nbr_ic"), pl.len().alias("n_nbr"))
-    )
-    return (
-        pool.join(stats, on="cand", how="left")
-        .with_columns(pl.col("n_nbr").fill_null(0))
-        .drop("cand", "bi", "oi", "ti")
+    """lab.neighbor_ic_stats on this module's predict grid."""
+    return neighbor_ic_stats(
+        valid,
+        beta_lbs=PREDICT_BETA_LBS,
+        ou_lbs=PREDICT_OU_LBS,
+        resid_thresholds=PREDICT_RESID_THRESHOLDS_BPS,
+        z_thresholds=PREDICT_OU_Z_THRESHOLDS,
+        pool_size=pool_size,
     )
 
 

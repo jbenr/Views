@@ -970,6 +970,80 @@ def predict_scan(
     )
 
 
+def neighbor_ic_stats(
+    valid: pl.DataFrame,
+    beta_lbs: list,
+    ou_lbs: list,
+    resid_thresholds: list,
+    z_thresholds: list,
+    pool_size: int = 300,
+    extra_keys: tuple[str, ...] = (),
+) -> pl.DataFrame:
+    """nbr_ic / n_nbr for the pool_size best predict rows by IC.
+
+    nbr_ic is the median IC over a row's grid neighborhood: rows sharing the
+    horizon, gate, and any extra_keys (e.g. ("x", "y") for a multi-pair
+    scan), within one grid step in beta_lb, ou_lb, and entry_threshold, self
+    excluded. A real dislocation predicts from adjacent cells too; a lucky
+    cell stands alone. The grid lists must be the ones the scan was built
+    from - they define what "one step" means.
+
+    Expects predict_scan output columns plus entry_signal ("residual" or
+    "ou_z"); ou_lb may be null for residual rows.
+    """
+
+    def _step(values: list) -> float:
+        return float(values[1] - values[0]) if len(values) > 1 else 1.0
+
+    t_step = (
+        pl.when(pl.col("entry_signal") == "residual")
+        .then(_step(resid_thresholds))
+        .otherwise(_step(z_thresholds))
+    )
+    t_base = (
+        pl.when(pl.col("entry_signal") == "residual")
+        .then(float(resid_thresholds[0]))
+        .otherwise(float(z_thresholds[0]))
+    )
+    cells = valid.with_columns(
+        (pl.col("beta_lb") / _step(beta_lbs))
+        .round(0).cast(pl.Int64).alias("bi"),
+        (pl.col("ou_lb").fill_null(0) / _step(ou_lbs))
+        .round(0).cast(pl.Int64).alias("oi"),
+        ((pl.col("entry_threshold") - t_base) / t_step)
+        .round(0).cast(pl.Int64).alias("ti"),
+    )
+    key = [
+        *extra_keys, "entry_signal", "gate", "gate_bucket", "horizon",
+        "bi", "oi", "ti",
+    ]
+    pool = cells.sort("ic", descending=True).head(pool_size).with_row_index("cand")
+
+    shifts = [s for s in product((-1, 0, 1), repeat=3) if s != (0, 0, 0)]
+    probes = pl.concat(
+        [
+            pool.select(
+                "cand", *extra_keys, "entry_signal", "gate", "gate_bucket",
+                "horizon",
+                (pl.col("bi") + db).alias("bi"),
+                (pl.col("oi") + do).alias("oi"),
+                (pl.col("ti") + dt).alias("ti"),
+            )
+            for db, do, dt in shifts
+        ]
+    )
+    stats = (
+        probes.join(cells.select([*key, "ic"]), on=key, how="inner")
+        .group_by("cand")
+        .agg(pl.col("ic").median().alias("nbr_ic"), pl.len().alias("n_nbr"))
+    )
+    return (
+        pool.join(stats, on="cand", how="left")
+        .with_columns(pl.col("n_nbr").fill_null(0))
+        .drop("cand", "bi", "oi", "ti")
+    )
+
+
 def add_predict_lift(
     results: pl.DataFrame,
     keys: Optional[list[str]] = None,

@@ -16,7 +16,32 @@ from stats import (
     roll_lr_diff,
     roll_ou_features,
     roll_ou_zscore,
+    roll_pc1_score,
 )
+
+
+def test_roll_pc1_score_tracks_common_level_factor():
+    rng = np.random.default_rng(5)
+    n, lb = 1200, 252
+    level = np.cumsum(rng.normal(0.0, 2.0, n))
+    panel = pl.DataFrame({
+        "2y": 150 + level + np.cumsum(rng.normal(0, 0.5, n)),
+        "5y": 250 + level + np.cumsum(rng.normal(0, 0.5, n)),
+        "10y": 350 + level + np.cumsum(rng.normal(0, 0.5, n)),
+        "30y": 400 + level + np.cumsum(rng.normal(0, 0.5, n)),
+    })
+    score = roll_pc1_score(panel, lookback=lb)
+
+    assert len(score) == n
+    assert score[: lb - 1].is_null().all()  # warmup
+    assert score.slice(lb).is_not_null().all()
+
+    # sign-fixed PC1 of a yield panel is the level factor: its changes must
+    # track the average yield change POSITIVELY (no window-to-window flips)
+    avg_chg = np.diff(panel.mean_horizontal().to_numpy())[lb:]
+    pc1_chg = np.diff(score.to_numpy())[lb:]
+    corr = np.corrcoef(avg_chg, pc1_chg)[0, 1]
+    assert corr > 0.95
 
 
 def make_ou(n=2000, theta=0.05, sigma=1.0, mu=0.0, seed=1):

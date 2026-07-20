@@ -112,6 +112,46 @@ def roll_pca(
     }
 
 
+def roll_pc1_score(
+    df: Union[pl.DataFrame, pd.DataFrame],
+    lookback: int = 252,
+    min_periods: int = None,
+) -> pl.Series:
+    """Point-in-time PC1 score: at each bar, fit PCA on the trailing window
+    and project the CURRENT observation onto that window's first component.
+
+    No lookahead (each bar only sees its own window), and loadings are
+    sign-fixed (mean loading forced positive) so on a yield panel PC1 is the
+    "level" factor with a stable sign through time. Output has the same
+    length as the input; warmup rows and rows in windows containing nulls
+    are null.
+    """
+    if min_periods is None:
+        min_periods = lookback
+
+    mat = to_pl_df(df).to_numpy().astype(float)
+    n = len(mat)
+    out = np.full(n, np.nan)
+
+    for i in range(min_periods - 1, n):
+        w = mat[max(0, i - lookback + 1) : i + 1]
+        if len(w) < min_periods or np.isnan(w).any():
+            continue
+        mean = w.mean(axis=0)
+        centered = w - mean
+        cov = centered.T @ centered / (len(centered) - 1)
+        try:
+            _, evecs = np.linalg.eigh(cov)
+        except np.linalg.LinAlgError:
+            continue
+        pc1 = evecs[:, -1]  # eigh sorts ascending: last = largest eigenvalue
+        if pc1.mean() < 0:
+            pc1 = -pc1
+        out[i] = (mat[i] - mean) @ pc1
+
+    return pl.Series("pc1", out).fill_nan(None)
+
+
 def reconstruct(result: dict, n_components: int = None) -> pl.DataFrame:
     """Reconstruct data from first n components."""
     loadings = result["loadings"].drop("column").to_numpy()
