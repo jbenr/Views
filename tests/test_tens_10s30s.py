@@ -109,6 +109,16 @@ def test_compute_ou_z_entry_signal():
         compute(data, params={"entry_signal": "nope"})
 
 
+def test_predict_signal_names_normalize_ou_and_reject_unknown():
+    assert view._normalize_predict_signals(["residual", "ou"]) == [
+        "residual",
+        "ou_z",
+    ]
+    assert view._normalize_predict_signals(["ou", "ou_z"]) == ["ou_z"]
+    with pytest.raises(ValueError, match="PREDICT_ENTRY_SIGNALS"):
+        view._normalize_predict_signals(["residual", "nope"])
+
+
 def test_sweep_engine_runs_every_signal_and_exit_style():
     data = view.model_frame(synthetic_data())
     cases = [
@@ -141,10 +151,15 @@ def test_sweep_engine_runs_every_signal_and_exit_style():
 
 def test_exit_mode_reports_exit_stats(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("VIEWS_STORE_DIR", str(tmp_path))
-    monkeypatch.setattr(view, "EXIT_ENTRY_SIGNALS", ["ou_z"])
-    monkeypatch.setattr(view, "EXIT_BETA_LBS", [120])
-    monkeypatch.setattr(view, "EXIT_OU_LBS", [60])
-    monkeypatch.setattr(view, "EXIT_OU_Z_ENTRIES", [1.0])
+    monkeypatch.setattr(view, "EXIT_SETUPS", [{
+        "name": "test_ou_setup",
+        "entry_signal": "ou_z",
+        "beta_lb": 120,
+        "ou_lb": 60,
+        "entry_threshold": 1.0,
+        "predict_horizon": 20,
+        "gate": ("r2", "tails_10_90"),
+    }])
     monkeypatch.setattr(view, "EXIT_OU_Z_BANDS", [0.25, 0.5])
     monkeypatch.setattr(view, "EXIT_REVERT_FRACS", [0.5])
     monkeypatch.setattr(view, "EXIT_HALF_LIFE_FRACS", [1.0])
@@ -153,9 +168,12 @@ def test_exit_mode_reports_exit_stats(monkeypatch, tmp_path, capsys):
     results = state["results"]
     assert {
         "sharpe", "hit_rate", "total_pnl_bps", "pnl_per_trade_bps",
-        "avg_hold_bars", "entry_threshold", "exit_style", "exit_threshold",
+        "setup", "avg_hold_bars", "entry_threshold", "predict_horizon", "gate",
+        "gate_bucket", "exit_style", "exit_threshold",
     } <= set(results.columns)
-    assert {"gate", "gate_bucket"}.isdisjoint(results.columns)
+    assert set(results["gate"]) == {"r2"}
+    assert set(results["gate_bucket"]) == {"tails_10_90"}
+    assert set(results["setup"]) == {"test_ou_setup"}
     assert set(results["exit_style"]) == {"band", "revert_frac", "half_life_frac"}
     # 1 combo x 1 entry x (2 bands + 1 revert frac + 1 hl frac)
     assert len(results) == 4
@@ -170,6 +188,9 @@ def test_exit_mode_reports_exit_stats(monkeypatch, tmp_path, capsys):
     output = capsys.readouterr().out.lower()
     assert "which exits pay" not in output
     assert "sharpe by entry" not in output
+    assert "pnl/trd" in output
+    assert "threshold_units" not in output
+    assert "pnl_per_trade_bps" not in output
 
 
 def test_sweep_gate_specs_serialize_and_block_entries():

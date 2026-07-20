@@ -591,6 +591,7 @@ def fast_scan(
     combos: Optional[list[dict]] = None,
     gates: Optional[dict[str, np.ndarray]] = None,
     gate_buckets: Union[int, str, tuple, list] = 3,
+    entry_allow: Optional[np.ndarray] = None,
     device: str = "cpu",
     entry_col: str = "entry_z",
     exit_col: str = "exit_band_bps",
@@ -620,6 +621,8 @@ def fast_scan(
                conditions from signal_matrix(return_conditions=True).
         gate_buckets: int for equal quantile slices, or "regime" for named
                       tails/middles/median regimes.
+        entry_allow: optional boolean mask restricting entries; exits remain
+                     active on every bar. Shape must be (T,) or (T, K).
         device: "cpu" (numpy) or "gpu" (cupy â€” install the ``gpu`` extra).
         entry_col: output column name for the entry threshold.
         exit_col: output column name for the exit threshold.
@@ -645,6 +648,17 @@ def fast_scan(
     # buckets of the condition. Edges computed on CPU once per gate (cupy's
     # nanquantile support varies by version); masks are bool (T, K) â€” cheap.
     gate_masks = _gate_masks(gates, t_len, k, gate_buckets, xp)
+    if entry_allow is None:
+        base_allow = xp.ones((t_len, k), dtype=bool)
+    else:
+        allow_np = _to_numpy(entry_allow).astype(bool)
+        if allow_np.ndim == 1:
+            allow_np = np.broadcast_to(allow_np[:, None], (t_len, k))
+        if allow_np.shape != (t_len, k):
+            raise ValueError(
+                f"entry_allow has shape {allow_np.shape}, expected {(t_len, k)}"
+            )
+        base_allow = xp.asarray(allow_np)
 
     combo_frame = (
         pl.DataFrame(combos) if combos is not None
@@ -678,12 +692,13 @@ def fast_scan(
                 xp.where(z >= entry, -1.0,
                          xp.where(xp.abs(z) <= exit_band_value, 0.0, xp.nan)),
             )
+            is_entry = xp.abs(events) == 1.0
+            events = xp.where(is_entry & ~base_allow, xp.nan, events)
             blocks.append(_emit(
                 entry, exit_band_value, "(none)", "all",
                 _evaluate_events(events, dlv, cost_bps, periods_per_year, xp),
             ))
 
-            is_entry = xp.abs(events) == 1.0
             for name, bucket, allow in gate_masks:
                 gated = xp.where(is_entry & ~allow, xp.nan, events)
                 blocks.append(_emit(
@@ -706,6 +721,7 @@ def stateful_exit_scan(
     exit_style: str,
     exit_params: Union[list[float], tuple[float, ...]],
     half_life: Optional[np.ndarray] = None,
+    entry_allow: Optional[np.ndarray] = None,
     cost_bps: float = 0.0,
     periods_per_year: int = 252,
     combos: Optional[list[dict]] = None,
@@ -729,7 +745,8 @@ def stateful_exit_scan(
 
     A closed position may re-enter from the NEXT bar, never the exit bar.
     Positions are held through NaN signal bars ("revert_frac" can only exit
-    on a finite signal; "half_life_frac" fires regardless).
+    on a finite signal; "half_life_frac" fires regardless). ``entry_allow``
+    optionally restricts opening bars without blocking exits.
 
     Runs on CPU: the state machine is sequential over bars (vectorized across
     every (combo, entry, param) column at once), unlike fast_scan's stateless
@@ -759,6 +776,14 @@ def stateful_exit_scan(
         if hl.shape != (t_len, k):
             raise ValueError(f"half_life has shape {hl.shape}, expected {(t_len, k)}")
 
+    allow = None
+    if entry_allow is not None:
+        allow = np.asarray(entry_allow, dtype=bool)
+        if allow.ndim == 1:
+            allow = np.broadcast_to(allow[:, None], (t_len, k))
+        if allow.shape != (t_len, k):
+            raise ValueError(f"entry_allow has shape {allow.shape}, expected {(t_len, k)}")
+
     lv = np.asarray(level, dtype=float)
     dlv = np.concatenate([[np.nan], np.diff(lv)])[:, None]
     dlv = np.where(np.isnan(dlv), 0.0, dlv)
@@ -771,6 +796,7 @@ def stateful_exit_scan(
     reps = n_e * n_p
     z_exp = np.repeat(z, reps, axis=1)
     hl_exp = np.repeat(hl, reps, axis=1) if hl is not None else None
+    allow_exp = np.repeat(allow, reps, axis=1) if allow is not None else None
     entry_vec = np.tile(np.repeat(entry_list, n_p), k)
     param_vec = np.tile(np.tile(param_list, n_e), k)
 
@@ -797,6 +823,8 @@ def stateful_exit_scan(
         pos = np.where(exit_now, 0.0, pos)
 
         can_enter = was_flat & np.isfinite(zt)
+        if allow_exp is not None:
+            can_enter &= allow_exp[t]
         if hl_exp is not None:
             can_enter &= np.isfinite(hl_exp[t])
         go_long = can_enter & (zt <= -entry_vec)

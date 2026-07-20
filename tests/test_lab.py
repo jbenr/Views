@@ -140,6 +140,22 @@ def test_fast_scan_scans_exit_bands():
     assert {"entry_z", "exit_band_bps", "sharpe"} <= set(out.columns)
 
 
+def test_fast_scan_entry_allow_restricts_opening_bars():
+    z = np.array([0.0, -3.0, -3.0, 0.0, 0.0])
+    level = np.array([0.0, 3.0, 2.0, 0.0, 0.0])
+
+    blocked = fast_scan(z, level, entries=[2.0], entry_allow=np.zeros(5, dtype=bool))
+    allowed = fast_scan(
+        z,
+        level,
+        entries=[2.0],
+        entry_allow=np.array([False, True, False, False, False]),
+    )
+
+    assert blocked["n_trades"][0] == 0
+    assert allowed["n_trades"][0] == 1
+
+
 def test_predict_scan_detects_true_ou():
     rng = np.random.default_rng(34)
     n = 3000
@@ -461,6 +477,31 @@ def test_stateful_exit_scan_profits_on_true_ou():
     assert len(out) == 2
     assert (out["n_trades"] > 0).all()
     assert (out["total_pnl_bps"] > 0).all()  # fading true OU must pay
+
+
+def test_stateful_exit_scan_entry_allow_restricts_opening_bars():
+    z = np.array([0.0, -3.0, -3.0, 0.0, 0.0])
+    level = np.array([0.0, 3.0, 2.0, 0.0, 0.0])
+
+    blocked = stateful_exit_scan(
+        z,
+        level,
+        entries=[2.0],
+        exit_style="revert_frac",
+        exit_params=[1.0],
+        entry_allow=np.zeros(5, dtype=bool),
+    )
+    allowed = stateful_exit_scan(
+        z,
+        level,
+        entries=[2.0],
+        exit_style="revert_frac",
+        exit_params=[1.0],
+        entry_allow=np.array([False, True, False, False, False]),
+    )
+
+    assert blocked["n_trades"][0] == 0
+    assert allowed["n_trades"][0] == 1
 
 
 def test_stateful_exit_scan_validates_inputs():

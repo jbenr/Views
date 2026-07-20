@@ -324,7 +324,7 @@ def make_pipeline(params: dict | None = None) -> SignalPipeline:
 # step 1 --predict: the setup search space. Wide on purpose — lookbacks x
 # entry signal x threshold x horizon, plus every gate condition/bucket as an
 # IC-lift overlay. Winners here define the setups steps 2-4 are allowed to use.
-PREDICT_ENTRY_SIGNALS = ["residual"] # ["residual", "ou_z"]  # candidate entry signals
+PREDICT_ENTRY_SIGNALS = ["residual", "ou"]  # candidate entry signals
 PREDICT_BETA_LBS = list(range(10, 501, 10))
 PREDICT_OU_LBS = list(range(10, 501, 10))
 PREDICT_HORIZONS = [5, 10, 20, 40, 60, 100]  # forward windows (days)
@@ -333,8 +333,9 @@ PREDICT_OU_Z_THRESHOLDS = np.arange(0.5, 3.1, 0.2).tolist()
 PREDICT_GATE_BUCKETS = "regime"  # named quantile regimes per condition
 PREDICT_MIN_OBS = 30  # ignore cells with fewer threshold-crossing events
 
-# step 2 --exit: exit scan over the step-1 setups. Narrow the lookback/entry
-# lists to the step-1 winners before running. Three exit styles:
+# step 2 --exit: exit scan over exact step-1 winners. Each setup carries its
+# entry threshold, predictive horizon, and gate so the trade scan tests the
+# discovered event rather than an ungated lookalike. Three exit styles:
 #   band            flat when |signal| <= band. 0.0 = hold-until-reversal
 #                   benchmark; bands only make sense below the entry threshold.
 #   revert_frac     exit once this fraction of the point-in-time entry
@@ -342,16 +343,87 @@ PREDICT_MIN_OBS = 30  # ignore cells with fewer threshold-crossing events
 #   half_life_frac  time stop at frac x the residual half-life measured at
 #                   entry — frac of the expected time to reversion.
 EXIT_STYLES = ["band", "revert_frac", "half_life_frac"]
-EXIT_ENTRY_SIGNALS = ["residual", "ou_z"]
-EXIT_BETA_LBS = list(range(10, 501, 10)) # [20, 60, 120, 200, 400] 
-EXIT_OU_LBS = list(range(10, 501, 10)) # [20, 60, 120, 200, 400, 420]
-EXIT_RESID_ENTRIES_BPS = list(range(21, 31, 2))
-EXIT_RESID_BANDS_BPS = [0.0, 2.5, 5.0, 10.0, 15.0, 20.0]  # flat when |resid| <= band
-EXIT_OU_Z_ENTRIES = np.arange(0.5, 3.1, 0.5).tolist()
-EXIT_OU_Z_BANDS = [0.0, 0.25, 0.5, 0.75, 1.0]  # flat when |ou_z| <= band
-EXIT_REVERT_FRACS = np.arange(0.1, 1.6, 0.1).tolist() # [0.25, 0.5, 0.75, 1.0]  # frac of entry dislocation reverted
-EXIT_HALF_LIFE_FRACS = np.arange(0.1, 2.1, 0.1).tolist()  # x point-in-time half-life
-EXIT_MIN_TRADES = 30  # floor for the setup leaderboard
+EXIT_SETUPS = [
+    {
+        "name": "ou30/410/e2.3",
+        "entry_signal": "ou_z",
+        "beta_lb": 30,
+        "ou_lb": 410,
+        "entry_threshold": 2.3,
+        "predict_horizon": 40,
+        "gate": None,
+    },
+    {
+        "name": "ou30/460/e2.3",
+        "entry_signal": "ou_z",
+        "beta_lb": 30,
+        "ou_lb": 460,
+        "entry_threshold": 2.3,
+        "predict_horizon": 40,
+        "gate": None,
+    },
+    {
+        "name": "res100/e21",
+        "entry_signal": "residual",
+        "beta_lb": 100,
+        "entry_threshold": 21.0,
+        "predict_horizon": 40,
+        "gate": None,
+    },
+    {
+        "name": "res110/e23",
+        "entry_signal": "residual",
+        "beta_lb": 110,
+        "entry_threshold": 23.0,
+        "predict_horizon": 20,
+        "gate": None,
+    },
+    {
+        "name": "ou60/360/e1.9 r2<50",
+        "entry_signal": "ou_z",
+        "beta_lb": 60,
+        "ou_lb": 360,
+        "entry_threshold": 1.9,
+        "predict_horizon": 100,
+        "gate": ("r2", "below_50"),
+    },
+    {
+        "name": "ou330/250/e2.7 r2mom>75",
+        "entry_signal": "ou_z",
+        "beta_lb": 330,
+        "ou_lb": 250,
+        "entry_threshold": 2.7,
+        "predict_horizon": 40,
+        "gate": ("r2_mom10", "high_75"),
+    },
+    {
+        "name": "ou330/250/e2.7 bmom-tails",
+        "entry_signal": "ou_z",
+        "beta_lb": 330,
+        "ou_lb": 250,
+        "entry_threshold": 2.7,
+        "predict_horizon": 40,
+        "gate": ("beta_mom10", "tails_10_90"),
+    },
+    {
+        "name": "ou460/460/e2.3 phi-mid",
+        "entry_signal": "ou_z",
+        "beta_lb": 460,
+        "ou_lb": 460,
+        "entry_threshold": 2.3,
+        "predict_horizon": 100,
+        "gate": ("resid_phi", "mid_10_90"),
+    },
+]
+EXIT_RESID_BANDS_BPS = [
+    0.0, 2.5, 5.0, 7.5, 10.0, 12.5, 15.0, 17.5, 20.0,
+]  # per setup, only bands below its entry threshold are tested
+EXIT_OU_Z_BANDS = [
+    0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5,
+]  # per setup, only bands below its entry threshold are tested
+EXIT_REVERT_FRACS = [0.25, 0.5, 0.75, 1.0]  # frac of entry dislocation reverted
+EXIT_HALF_LIFE_FRACS = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]  # x entry-time half-life
+EXIT_MIN_TRADES = 8  # discovery floor; judge promotion using n_trades in the table
 
 # step 3 --sweep: the exact-engine grid — full trade mechanics (stops, costs,
 # trade logs). Structured like the --exit block: entry signal and exit style
@@ -405,6 +477,7 @@ pipeline = make_pipeline()
 
 
 # -- modes -----------------------------------------------------------------
+
 
 def main(use_db: bool = True, params: dict | None = None) -> dict:
     p = _params(params)
@@ -487,16 +560,18 @@ def _sweep_grids() -> list[dict]:
                 "revert_frac": SWEEP_REVERT_FRACS,
                 "half_life_frac": SWEEP_HALF_LIFE_FRACS,
             }[style]
-            grids.append({
-                "entry_signal": [sig],
-                "beta_lb": SWEEP_BETA_LBS,
-                "ou_lb": SWEEP_OU_LBS,
-                "entry_threshold": entries[sig],
-                "exit_style": [style],
-                "exit_param": exit_params,
-                "stop_loss_bps": SWEEP_STOP_LOSS_BPS,
-                "gate": SWEEP_GATES,
-            })
+            grids.append(
+                {
+                    "entry_signal": [sig],
+                    "beta_lb": SWEEP_BETA_LBS,
+                    "ou_lb": SWEEP_OU_LBS,
+                    "entry_threshold": entries[sig],
+                    "exit_style": [style],
+                    "exit_param": exit_params,
+                    "stop_loss_bps": SWEEP_STOP_LOSS_BPS,
+                    "gate": SWEEP_GATES,
+                }
+            )
     return grids
 
 
@@ -521,6 +596,7 @@ def sweep(use_db: bool = True, n_jobs: int | None = None) -> dict:
     done_base = 0
     blocks = []
     for grid in grids:
+
         def _progress(done: int, sub_total: int, base: int = done_base) -> None:
             done_all = base + done
             if done_all % 20 == 0 or done == sub_total:
@@ -553,7 +629,9 @@ def sweep(use_db: bool = True, n_jobs: int | None = None) -> dict:
     if "error" in results.columns:
         errors = results.filter(pl.col("error").is_not_null())
         if not errors.is_empty():
-            print(f"\nWARNING: {len(errors)} combos errored; first: {errors['error'][0]}")
+            print(
+                f"\nWARNING: {len(errors)} combos errored; first: {errors['error'][0]}"
+            )
         results = results.filter(pl.col("error").is_null())
 
     store = MetricStore()
@@ -619,49 +697,74 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
     level = pipeline.trade_def.composite_series(data).to_numpy()
 
     scans = []
+    for setup in EXIT_SETUPS:
+        entry_signal = setup["entry_signal"]
+        entry = float(setup["entry_threshold"])
+        predict_horizon = int(setup["predict_horizon"])
+        if entry_signal == "residual":
+            signal_kind, units, lookbacks = "residual", "bps", [0]
+            exits = [band for band in EXIT_RESID_BANDS_BPS if band < entry]
+        elif entry_signal == "ou_z":
+            signal_kind, units = "ou_zscore", "z"
+            lookbacks = [int(setup["ou_lb"])]
+            exits = [band for band in EXIT_OU_Z_BANDS if band < entry]
+        else:
+            raise ValueError(f"unknown EXIT_SETUPS entry_signal={entry_signal!r}")
 
-    if "residual" in EXIT_ENTRY_SIGNALS:
-        resid, resid_combos, resid_conditions = signal_matrix(
+        matrix, combos, conditions = signal_matrix(
             data[FEATURE],
             data[TARGET],
-            EXIT_BETA_LBS,
-            [0],
+            [int(setup["beta_lb"])],
+            lookbacks,
             return_conditions=True,
-            signal_kind="residual",
+            signal_kind=signal_kind,
             lookback_name="ou_lb",
         )
-        scans.append(
+
+        gate_spec = setup.get("gate")
+        if gate_spec is None:
+            gate_name, gate_bucket = "(none)", "all"
+            gate_ok = np.ones_like(matrix, dtype=bool)
+        else:
+            gate_name, _, _ = parse_gate(gate_spec)
+            gate_bucket = (
+                gate_spec.get("bucket", gate_spec.get("kind"))
+                if isinstance(gate_spec, dict)
+                else gate_spec[1]
+            )
+            gate_ok = gate_allow_mask(conditions[gate_name][:, 0], gate_spec)[:, None]
+
+        # Match predict_scan's trigger event exactly: the gate must be valid
+        # on the first bar crossing this setup's positive/negative threshold.
+        prev = np.concatenate([np.full((1, 1), np.nan), matrix[:-1]], axis=0)
+        crossed = (
+            ((matrix >= entry) & ~(prev >= entry))
+            | ((matrix <= -entry) & ~(prev <= -entry))
+        )
+        forward = np.full((len(matrix), 1), np.nan)
+        if predict_horizon < len(matrix):
+            forward[:-predict_horizon, 0] = (
+                level[predict_horizon:] - level[:-predict_horizon]
+            )
+        combos = [
             {
-                "entry_signal": "residual",
-                "units": "bps",
-                "matrix": resid,
-                "combos": resid_combos,
-                "entries": EXIT_RESID_ENTRIES_BPS,
-                "exits": EXIT_RESID_BANDS_BPS,
-                # point-in-time residual half-life, aligned column-for-column
-                "half_life": resid_conditions["resid_half_life"],
+                **combos[0],
+                "setup": setup["name"],
+                "predict_horizon": predict_horizon,
             }
-        )
-
-    if "ou_z" in EXIT_ENTRY_SIGNALS:
-        ou_z, ou_combos, ou_conditions = signal_matrix(
-            data[FEATURE],
-            data[TARGET],
-            EXIT_BETA_LBS,
-            EXIT_OU_LBS,
-            return_conditions=True,
-            signal_kind="ou_zscore",
-            lookback_name="ou_lb",
-        )
+        ]
         scans.append(
             {
-                "entry_signal": "ou_z",
-                "units": "z",
-                "matrix": ou_z,
-                "combos": ou_combos,
-                "entries": EXIT_OU_Z_ENTRIES,
-                "exits": EXIT_OU_Z_BANDS,
-                "half_life": ou_conditions["resid_half_life"],
+                "entry_signal": entry_signal,
+                "units": units,
+                "matrix": matrix,
+                "combos": combos,
+                "entries": [entry],
+                "exits": exits,
+                "half_life": conditions["resid_half_life"],
+                "entry_allow": crossed & gate_ok & np.isfinite(forward),
+                "gate": gate_name,
+                "gate_bucket": str(gate_bucket),
             }
         )
 
@@ -677,7 +780,7 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
         for scan in scans
     )
     print(
-        f"exit scan: signals={EXIT_ENTRY_SIGNALS}  styles={EXIT_STYLES}  "
+        f"exit scan: setups={len(EXIT_SETUPS)}  styles={EXIT_STYLES}  "
         f"model_columns={sum(scan['matrix'].shape[1] for scan in scans)}  "
         f"evaluations={n_evals:,}  (device={device})"
     )
@@ -688,6 +791,7 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
 
     def _task_progress(label: str):
         """Per-bar progress line for the stateful styles ([task i/n] bar x/y)."""
+
         def cb(bar: int, total_bars: int) -> None:
             print(
                 f"\r  [{task}/{n_tasks}] {label}: bar {bar:,}/{total_bars:,}  "
@@ -695,6 +799,7 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
                 end="",
                 flush=True,
             )
+
         return cb
 
     def _done(label: str, block_t0: float) -> None:
@@ -717,6 +822,7 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
                     exit_band=scan["exits"],
                     cost_bps=TRANSACTION_COST_BPS,
                     combos=scan["combos"],
+                    entry_allow=scan["entry_allow"],
                     device=device,
                     entry_col="entry_threshold",
                     exit_col="exit_threshold",
@@ -735,6 +841,7 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
                     entries=scan["entries"],
                     exit_style="revert_frac",
                     exit_params=EXIT_REVERT_FRACS,
+                    entry_allow=scan["entry_allow"],
                     cost_bps=TRANSACTION_COST_BPS,
                     combos=scan["combos"],
                     progress=_task_progress(f"{scan['entry_signal']} revert_frac"),
@@ -752,6 +859,7 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
                     exit_style="half_life_frac",
                     exit_params=EXIT_HALF_LIFE_FRACS,
                     half_life=scan["half_life"],
+                    entry_allow=scan["entry_allow"],
                     cost_bps=TRANSACTION_COST_BPS,
                     combos=scan["combos"],
                     progress=_task_progress(f"{scan['entry_signal']} half_life_frac"),
@@ -761,6 +869,8 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
         block = pl.concat(styled, how="diagonal_relaxed").with_columns(
             pl.lit(scan["entry_signal"]).alias("entry_signal"),
             pl.lit(scan["units"]).alias("threshold_units"),
+            pl.lit(scan["gate"]).alias("gate"),
+            pl.lit(scan["gate_bucket"]).alias("gate_bucket"),
         )
         if scan["entry_signal"] == "residual":
             block = block.with_columns(pl.lit(None, dtype=pl.Int64).alias("ou_lb"))
@@ -796,7 +906,18 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
     valid = results.filter((pl.col("n_trades") > 0) & pl.col("sharpe").is_finite())
 
     exit_summary = (
-        valid.group_by("entry_signal", "exit_style", "exit_threshold")
+        valid.group_by(
+            "setup",
+            "entry_signal",
+            "beta_lb",
+            "ou_lb",
+            "entry_threshold",
+            "predict_horizon",
+            "gate",
+            "gate_bucket",
+            "exit_style",
+            "exit_threshold",
+        )
         .agg(
             pl.col("sharpe").median().alias("med_sharpe"),
             (pl.col("sharpe") > 0).mean().alias("pct_combos_positive"),
@@ -807,38 +928,54 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
         )
         .sort("med_sharpe", descending=True, nulls_last=True)
     )
-    show = [
-        "entry_signal",
-        "beta_lb",
-        "ou_lb",
-        "entry_threshold",
-        "exit_style",
-        "exit_threshold",
-        "threshold_units",
-        "sharpe",
-        "total_pnl_bps",
-        "pnl_per_trade_bps",
-        "hit_rate",
-        "avg_hold_bars",
-        "n_trades",
-    ]
+    def _compact_board(frame: pl.DataFrame) -> pl.DataFrame:
+        """Terminal-width view; full detail remains in results/MetricStore."""
+        return frame.select(
+            "setup",
+            pl.col("predict_horizon").alias("h"),
+            pl.col("exit_style").alias("exit"),
+            pl.col("exit_threshold").round(2).alias("x"),
+            pl.col("sharpe").round(3),
+            pl.col("total_pnl_bps").round(1).alias("pnl"),
+            pl.col("pnl_per_trade_bps").round(2).alias("pnl/trd"),
+            (pl.col("hit_rate") * 100).round(1).alias("hit%"),
+            pl.col("avg_hold_bars").round(1).alias("hold"),
+            pl.col("n_trades").alias("n"),
+        )
+
     robust = valid.filter(pl.col("n_trades") >= EXIT_MIN_TRADES)
+    leaderboard = robust if not robust.is_empty() else valid
+    sample_rule = (
+        f"n_trades >= {EXIT_MIN_TRADES}"
+        if not robust.is_empty()
+        else f"all rows; none reached n_trades >= {EXIT_MIN_TRADES}"
+    )
     for label, by in [
         ("sharpe", ["sharpe"]),
         ("hit rate", ["hit_rate", "sharpe"]),
         ("total pnl", ["total_pnl_bps", "sharpe"]),
     ]:
         print(
-            f"\ntop 10 setups by {label} (n_trades >= {EXIT_MIN_TRADES}; "
+            f"\ntop 10 setups by {label} ({sample_rule}; "
             "approximate - verify via --sweep):"
         )
-        board = robust.sort(by, descending=[True] * len(by), nulls_last=True)
-        utils.pdf(board.select([c for c in show if c in board.columns]).head(10))
+        board = leaderboard.sort(by, descending=[True] * len(by), nulls_last=True)
+        utils.pdf(_compact_board(board.head(10)))
 
     # per setup (signal, lookbacks, entry), which exit takes the best sharpe
     best_exit = (
         valid.sort("sharpe", descending=True)
-        .group_by("entry_signal", "beta_lb", "ou_lb", "entry_threshold", maintain_order=True)
+        .group_by(
+            "setup",
+            "entry_signal",
+            "beta_lb",
+            "ou_lb",
+            "entry_threshold",
+            "predict_horizon",
+            "gate",
+            "gate_bucket",
+            maintain_order=True,
+        )
         .first()
     )
     print("\nwhich exit wins (count of setups where the exit has the best sharpe):")
@@ -850,6 +987,14 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
             pl.col("avg_hold_bars").median().alias("med_hold_bars"),
         )
         .sort(["entry_signal", "n_setups_won"], descending=[False, True])
+        .select(
+            pl.col("entry_signal").alias("sig"),
+            pl.col("exit_style").alias("exit"),
+            pl.col("exit_threshold").round(2).alias("x"),
+            pl.col("n_setups_won").alias("wins"),
+            pl.col("med_winning_sharpe").round(3).alias("med_sh"),
+            pl.col("med_hold_bars").round(1).alias("med_hold"),
+        )
     )
     print(f"\nlogged {len(results):,} exit rows -> {store.path}")
 
@@ -861,15 +1006,29 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
     }
 
 
+def _normalize_predict_signals(signals: list[str]) -> list[str]:
+    """Canonicalize configured predict signals and reject silent no-ops."""
+    aliases = {"ou": "ou_z"}
+    normalized = [aliases.get(signal, signal) for signal in signals]
+    unknown = sorted(set(normalized) - {"residual", "ou_z"})
+    if unknown:
+        raise ValueError(
+            f"unknown PREDICT_ENTRY_SIGNALS values: {unknown}; "
+            "expected 'residual', 'ou', or 'ou_z'"
+        )
+    return list(dict.fromkeys(normalized))
+
+
 def predict(use_db: bool = True, device: str = "auto") -> dict:
     """GPU-friendly forward-horizon predictability scan with gate buckets."""
+    entry_signals = _normalize_predict_signals(PREDICT_ENTRY_SIGNALS)
     raw_data = load_data() if use_db else synthetic_data()
     data = model_frame(raw_data)
     level = pipeline.trade_def.composite_series(data).to_numpy()
 
     scans = []
 
-    if "residual" in PREDICT_ENTRY_SIGNALS:
+    if "residual" in entry_signals:
         resid, resid_combos, resid_conditions = signal_matrix(
             data[FEATURE],
             data[TARGET],
@@ -890,7 +1049,7 @@ def predict(use_db: bool = True, device: str = "auto") -> dict:
             }
         )
 
-    if "ou_z" in PREDICT_ENTRY_SIGNALS:
+    if "ou_z" in entry_signals:
         ou_z, ou_combos, ou_conditions = signal_matrix(
             data[FEATURE],
             data[TARGET],
@@ -924,7 +1083,7 @@ def predict(use_db: bool = True, device: str = "auto") -> dict:
         for scan in scans
     )
     print(
-        f"predict scan: signals={PREDICT_ENTRY_SIGNALS}  "
+        f"predict scan: signals={entry_signals}  "
         f"horizons={PREDICT_HORIZONS}  "
         f"model_columns={sum(scan['matrix'].shape[1] for scan in scans)}  "
         f"gate variants={n_variants}  evaluations={n_evals:,}  "
@@ -1025,8 +1184,16 @@ def predict(use_db: bool = True, device: str = "auto") -> dict:
 
 if __name__ == "__main__":
     args = set(sys.argv[1:])
-    known = {"--synthetic", "--cpu", "--gpu", "--sweep", "--predict",
-             "--exit", "--exits", "--fast"}
+    known = {
+        "--synthetic",
+        "--cpu",
+        "--gpu",
+        "--sweep",
+        "--predict",
+        "--exit",
+        "--exits",
+        "--fast",
+    }
     unknown = args - known
     if unknown:
         sys.exit(
