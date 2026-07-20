@@ -146,10 +146,10 @@ The engine consumes pipelines and wide data:
 
 ```python
 from backtest import Engine, BacktestConfig, print_summary
-from book.curve.strategy import pipeline, TICKERS
+from book.curve.tens_10s30s import pipeline, TICKERS
 from utils.market_data import load_wide
 
-data = load_wide(TICKERS, start="2010-01-01", bps_cols=["10y", "30y"])
+data = load_wide(TICKERS, start="2010-01-01", bps_cols=["10y"])
 result = Engine(BacktestConfig(transaction_cost_bps=0.5)).add_signal(pipeline).run(data)
 print_summary(result)          # PnL, hit rate, Sharpe, drawdown, holding period
 result.summary()               # same as a dict

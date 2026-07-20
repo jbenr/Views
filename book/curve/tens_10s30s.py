@@ -20,9 +20,10 @@ or search around them with the lab modes below.
 
     python -m book.curve.tens_10s30s              # single run, live DB
     python -m book.curve.tens_10s30s --synthetic  # single run, no DB
-    python -m book.curve.tens_10s30s --predict    # which setups/gates predict (GPU)
-    python -m book.curve.tens_10s30s --exit       # which exit bands trade well (GPU)
-    python -m book.curve.tens_10s30s --sweep      # exact-engine backtest, gate-aware
+    python -m book.curve.tens_10s30s --predict    # setup search -> saves SETUPS_FILE
+    python -m book.curve.tens_10s30s --exit       # exits per saved setup -> EXITS_FILE
+    python -m book.curve.tens_10s30s --sweep      # exact engine + trade logs
+    python book/curve/app.py                      # compare winners' trades (Dash)
 
     --cpu / --gpu force the scan device for --predict/--exit (default: auto).
     --exits / --fast are deprecated aliases for --exit.
@@ -33,10 +34,12 @@ Every mode returns a dict of state for interactive chaining: state = main().
 from __future__ import annotations
 
 import datetime as dt
+import itertools
 import math
 import sys
 import time
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -45,12 +48,10 @@ import utils
 from backtest import (
     BacktestConfig,
     Engine,
-    MetricStore,
     ParamGrid,
     SignalConfig,
     SignalPipeline,
     TradeDef,
-    add_predict_lift,
     fast_scan,
     gate_allow_mask,
     gate_variant_count,
@@ -61,6 +62,7 @@ from backtest import (
     signal_matrix,
     stateful_exit_scan,
     sweep_strategy,
+    trade_log,
 )
 from stats import beta_cv, horizon_backtest, roll_lr_diff, roll_ou_features
 from utils.market_data import align_columns, coverage_report, load_wide
@@ -70,6 +72,21 @@ from utils.market_data import align_columns, coverage_report, load_wide
 STRATEGY_FAMILY = "curve"
 SIGNAL_NAME = "tens_10s30s"
 MODULE = "book.curve.tens_10s30s"  # importable path, used by sweep workers
+
+# funnel artifacts, kept next to this file: each mode saves its winners here
+# for the next mode to read (--predict -> SETUPS_FILE -> --exit -> EXITS_FILE
+# -> --sweep)
+SETUPS_FILE = Path(__file__).with_name(f"{SIGNAL_NAME}_setups.parquet")
+EXITS_FILE = Path(__file__).with_name(f"{SIGNAL_NAME}_exits.parquet")
+
+# full results of the latest --exit / --sweep run, overwritten each run
+# (--predict's saved results ARE the setups file above)
+EXIT_RESULTS_FILE = Path(__file__).with_name(f"{SIGNAL_NAME}_exit_results.parquet")
+SWEEP_RESULTS_FILE = Path(__file__).with_name(f"{SIGNAL_NAME}_sweep_results.parquet")
+
+# trade log from the latest --sweep: every closed trade of every winner at its
+# best stop, one engine run per winner. Feeds the comparison app (app.py).
+TRADES_FILE = Path(__file__).with_name(f"{SIGNAL_NAME}_trades.parquet")
 
 START = "2010-01-01"
 
@@ -145,11 +162,22 @@ def _finite(value) -> bool:
         return False
 
 
+def _half_life_ok(half_life, lo: float | None, hi: float | None) -> bool:
+    """Entry sanity bounds on the OU half-life; lo=hi=None disables the check."""
+    if lo is None and hi is None:
+        return True
+    if not _finite(half_life):
+        return False
+    hl = float(half_life)
+    return (lo is None or hl >= lo) and (hi is None or hl <= hi)
+
+
 def _entry_filter(z_gate: float | None, half_life_min: float, half_life_max: float):
     """Quantile gate + half-life sanity + optional OU-z confirmation.
 
     z_gate=None drops the OU-z confirmation entirely so the quantile gate
     (params["gate"] -> gate_allow) carries the entry filtering on its own.
+    half_life_min=half_life_max=None drops the half-life sanity check.
     """
 
     def fn(direction: int, bar: dict) -> bool:
@@ -158,10 +186,7 @@ def _entry_filter(z_gate: float | None, half_life_min: float, half_life_max: flo
         if gate is not None and gate != 1.0:
             return False
 
-        half_life = bar.get("half_life")
-        if not _finite(half_life):
-            return False
-        if not (half_life_min <= float(half_life) <= half_life_max):
+        if not _half_life_ok(bar.get("half_life"), half_life_min, half_life_max):
             return False
 
         if z_gate is None:
@@ -201,6 +226,134 @@ def _gate_condition(frame: pl.DataFrame, p: dict) -> pl.Series:
     if name not in builders:
         raise ValueError(f"unknown gate condition {name!r}; known: {sorted(builders)}")
     return builders[name]()
+
+
+def _setup_name(row: dict) -> str:
+    """Short label for a saved setup, e.g. 'ou330/250/e2.7 h40 r2_mom10:high_75'."""
+    if row["entry_signal"] == "residual":
+        base = f"res{row['beta_lb']}/e{row['entry_threshold']:g}"
+    else:
+        base = f"ou{row['beta_lb']}/{row['ou_lb']}/e{row['entry_threshold']:g}"
+    name = f"{base} h{row['predict_horizon']}"
+    if row["gate"] != "(none)":
+        name += f" {row['gate']}:{row['gate_bucket']}"
+    return name
+
+
+def _neighbor_stats(valid: pl.DataFrame, pool_size: int = 300) -> pl.DataFrame:
+    """nbr_ic / n_nbr for the pool_size best rows by IC: the median IC over
+    each row's grid neighborhood — same horizon and gate, within one grid
+    step in beta_lb, ou_lb, and entry_threshold, self excluded. A real
+    dislocation predicts from adjacent cells too; a lucky cell stands alone."""
+
+    def _step(values: list) -> float:
+        return float(values[1] - values[0]) if len(values) > 1 else 1.0
+
+    t_step = (
+        pl.when(pl.col("entry_signal") == "residual")
+        .then(_step(PREDICT_RESID_THRESHOLDS_BPS))
+        .otherwise(_step(PREDICT_OU_Z_THRESHOLDS))
+    )
+    t_base = (
+        pl.when(pl.col("entry_signal") == "residual")
+        .then(float(PREDICT_RESID_THRESHOLDS_BPS[0]))
+        .otherwise(float(PREDICT_OU_Z_THRESHOLDS[0]))
+    )
+    cells = valid.with_columns(
+        (pl.col("beta_lb") / _step(PREDICT_BETA_LBS))
+        .round(0).cast(pl.Int64).alias("bi"),
+        (pl.col("ou_lb").fill_null(0) / _step(PREDICT_OU_LBS))
+        .round(0).cast(pl.Int64).alias("oi"),
+        ((pl.col("entry_threshold") - t_base) / t_step)
+        .round(0).cast(pl.Int64).alias("ti"),
+    )
+    key = ["entry_signal", "gate", "gate_bucket", "horizon", "bi", "oi", "ti"]
+    pool = cells.sort("ic", descending=True).head(pool_size).with_row_index("cand")
+
+    shifts = [s for s in itertools.product((-1, 0, 1), repeat=3) if s != (0, 0, 0)]
+    probes = pl.concat(
+        [
+            pool.select(
+                "cand", "entry_signal", "gate", "gate_bucket", "horizon",
+                (pl.col("bi") + db).alias("bi"),
+                (pl.col("oi") + do).alias("oi"),
+                (pl.col("ti") + dt).alias("ti"),
+            )
+            for db, do, dt in shifts
+        ]
+    )
+    stats = (
+        probes.join(cells.select([*key, "ic"]), on=key, how="inner")
+        .group_by("cand")
+        .agg(pl.col("ic").median().alias("nbr_ic"), pl.len().alias("n_nbr"))
+    )
+    return (
+        pool.join(stats, on="cand", how="left")
+        .with_columns(pl.col("n_nbr").fill_null(0))
+        .drop("cand", "bi", "oi", "ti")
+    )
+
+
+def _select_setups(valid: pl.DataFrame) -> pl.DataFrame:
+    """Best setups by neighborhood IC, one per (signal, lookbacks, gate) cell.
+
+    Ranks on nbr_ic rather than the cell's own IC and requires at least
+    PREDICT_MIN_NEIGHBORS corroborating neighbors: after a multi-million-cell
+    search the top raw ICs are selection flukes unless the surrounding cells
+    agree. Dedupes threshold/horizon variants of the same cell so the saved
+    setups are PREDICT_TOP_N genuinely different trades."""
+    best = (
+        _neighbor_stats(valid)
+        .filter(pl.col("n_nbr") >= PREDICT_MIN_NEIGHBORS)
+        .sort("nbr_ic", descending=True)
+        .unique(
+            subset=["entry_signal", "beta_lb", "ou_lb", "gate", "gate_bucket"],
+            keep="first",
+            maintain_order=True,
+        )
+        .head(PREDICT_TOP_N)
+        .rename({"horizon": "predict_horizon"})
+        .select(
+            "entry_signal", "beta_lb", "ou_lb", "entry_threshold",
+            "predict_horizon", "gate", "gate_bucket",
+            "ic", "nbr_ic", "n_nbr", "hit_rate", "fire_rate", "n_obs",
+        )
+    )
+    names = [_setup_name(r) for r in best.iter_rows(named=True)]
+    return best.insert_column(0, pl.Series("name", names))
+
+
+def load_setups(path: Path | None = None) -> list[dict]:
+    """Setups saved by --predict, as the dicts exit_scan iterates over."""
+    path = SETUPS_FILE if path is None else path
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found - run --predict first")
+    setups = []
+    for r in pl.read_parquet(path).iter_rows(named=True):
+        setup = {
+            "name": r["name"],
+            "entry_signal": r["entry_signal"],
+            "beta_lb": int(r["beta_lb"]),
+            "entry_threshold": float(r["entry_threshold"]),
+            "predict_horizon": int(r["predict_horizon"]),
+            "gate": (
+                None
+                if r["gate"] in (None, "(none)")
+                else (r["gate"], r["gate_bucket"])
+            ),
+        }
+        if r["ou_lb"] is not None:
+            setup["ou_lb"] = int(r["ou_lb"])
+        setups.append(setup)
+    return setups
+
+
+def load_exits(path: Path | None = None) -> pl.DataFrame:
+    """Setup + exit winners saved by --exit (one row per setup)."""
+    path = EXITS_FILE if path is None else path
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found - run --exit first")
+    return pl.read_parquet(path)
 
 
 def compute(data: pl.DataFrame, params: dict | None = None) -> pl.DataFrame:
@@ -304,26 +457,29 @@ def make_pipeline(params: dict | None = None) -> SignalPipeline:
 
 # -- strategy parameters ----------------------------------------------------
 #
-# The research funnel. Each step has its own variable block below; each step's
-# winners seed the next step's (narrower) block:
+# The research funnel. Each step saves its winners to a parquet next to this
+# file; the next step reads it — no hand-copying between blocks:
 #
 #   1. --predict (PREDICT_*)  cast a wide net: which (lookbacks, entry signal,
 #      threshold, horizon) cells show ANY forward predictability, with every
-#      gate condition/bucket overlaid as an IC lift. No trading mechanics —
-#      just IC / hit / fire rate. GPU-vectorized. This is also the gate
-#      discovery layer: a gate that doesn't lift IC here isn't worth carrying.
-#   2. --exit (EXIT_*)  approximate TRADE backtest of the shortlisted setups
-#      across exit styles — threshold bands, percent-of-dislocation-reverted,
-#      and half-life-scaled time stops: which exits pay, how long they hold,
-#      at what hit rate and PnL per trade.
-#   3. --sweep (SWEEP_*)  the survivors, through the exact row-by-row
-#      engine with stops, time stops, costs, and quantile gates — the
-#      live-simulation check. Expensive per combo: keep the grid to what
-#      steps 1-2 earned.
+#      gate condition/bucket as extra candidate cells. No trading mechanics —
+#      just IC / hit / fire rate. GPU-vectorized. Gated and ungated setups
+#      compete on raw IC in one leaderboard; the PREDICT_TOP_N best distinct
+#      cells by NEIGHBORHOOD IC (median over adjacent grid cells — lone
+#      spikes are search noise and get dropped) are saved to SETUPS_FILE.
+#   2. --exit (EXIT_*)  reads SETUPS_FILE and runs an approximate TRADE
+#      backtest of each saved setup across exit styles — threshold bands,
+#      percent-of-dislocation-reverted, and half-life-scaled time stops:
+#      which exits pay, how long they hold, at what hit rate and PnL per
+#      trade. The best exit per setup is saved to EXITS_FILE.
+#   3. --sweep (SWEEP_*)  reads EXITS_FILE and runs each (setup, exit) winner
+#      through the exact row-by-row engine — stops, costs, full trade
+#      mechanics — the live-simulation check before promotion. Saves each
+#      winner's full trade log (TRADES_FILE) for the comparison app.
 
 # step 1 --predict: the setup search space. Wide on purpose — lookbacks x
-# entry signal x threshold x horizon, plus every gate condition/bucket as an
-# IC-lift overlay. Winners here define the setups steps 2-4 are allowed to use.
+# entry signal x threshold x horizon, plus every gate condition/bucket as
+# extra candidate cells. Winners here define the setups steps 2-3 may use.
 PREDICT_ENTRY_SIGNALS = ["residual", "ou"]  # candidate entry signals
 PREDICT_BETA_LBS = list(range(10, 501, 10))
 PREDICT_OU_LBS = list(range(10, 501, 10))
@@ -332,10 +488,12 @@ PREDICT_RESID_THRESHOLDS_BPS = list(range(11, 31, 2))
 PREDICT_OU_Z_THRESHOLDS = np.arange(0.5, 3.1, 0.2).tolist()
 PREDICT_GATE_BUCKETS = "regime"  # named quantile regimes per condition
 PREDICT_MIN_OBS = 30  # ignore cells with fewer threshold-crossing events
+PREDICT_TOP_N = 10  # distinct setups saved to SETUPS_FILE for --exit
+PREDICT_MIN_NEIGHBORS = 3  # corroborating grid neighbors a setup needs to be saved
 
-# step 2 --exit: exit scan over exact step-1 winners. Each setup carries its
-# entry threshold, predictive horizon, and gate so the trade scan tests the
-# discovered event rather than an ungated lookalike. Three exit styles:
+# step 2 --exit: exit scan over the setups saved by --predict. Each setup
+# carries its entry threshold, predictive horizon, and gate so the trade scan
+# tests the discovered event rather than an ungated lookalike. Three styles:
 #   band            flat when |signal| <= band. 0.0 = hold-until-reversal
 #                   benchmark; bands only make sense below the entry threshold.
 #   revert_frac     exit once this fraction of the point-in-time entry
@@ -343,78 +501,6 @@ PREDICT_MIN_OBS = 30  # ignore cells with fewer threshold-crossing events
 #   half_life_frac  time stop at frac x the residual half-life measured at
 #                   entry — frac of the expected time to reversion.
 EXIT_STYLES = ["band", "revert_frac", "half_life_frac"]
-EXIT_SETUPS = [
-    {
-        "name": "ou30/410/e2.3",
-        "entry_signal": "ou_z",
-        "beta_lb": 30,
-        "ou_lb": 410,
-        "entry_threshold": 2.3,
-        "predict_horizon": 40,
-        "gate": None,
-    },
-    {
-        "name": "ou30/460/e2.3",
-        "entry_signal": "ou_z",
-        "beta_lb": 30,
-        "ou_lb": 460,
-        "entry_threshold": 2.3,
-        "predict_horizon": 40,
-        "gate": None,
-    },
-    {
-        "name": "res100/e21",
-        "entry_signal": "residual",
-        "beta_lb": 100,
-        "entry_threshold": 21.0,
-        "predict_horizon": 40,
-        "gate": None,
-    },
-    {
-        "name": "res110/e23",
-        "entry_signal": "residual",
-        "beta_lb": 110,
-        "entry_threshold": 23.0,
-        "predict_horizon": 20,
-        "gate": None,
-    },
-    {
-        "name": "ou60/360/e1.9 r2<50",
-        "entry_signal": "ou_z",
-        "beta_lb": 60,
-        "ou_lb": 360,
-        "entry_threshold": 1.9,
-        "predict_horizon": 100,
-        "gate": ("r2", "below_50"),
-    },
-    {
-        "name": "ou330/250/e2.7 r2mom>75",
-        "entry_signal": "ou_z",
-        "beta_lb": 330,
-        "ou_lb": 250,
-        "entry_threshold": 2.7,
-        "predict_horizon": 40,
-        "gate": ("r2_mom10", "high_75"),
-    },
-    {
-        "name": "ou330/250/e2.7 bmom-tails",
-        "entry_signal": "ou_z",
-        "beta_lb": 330,
-        "ou_lb": 250,
-        "entry_threshold": 2.7,
-        "predict_horizon": 40,
-        "gate": ("beta_mom10", "tails_10_90"),
-    },
-    {
-        "name": "ou460/460/e2.3 phi-mid",
-        "entry_signal": "ou_z",
-        "beta_lb": 460,
-        "ou_lb": 460,
-        "entry_threshold": 2.3,
-        "predict_horizon": 100,
-        "gate": ("resid_phi", "mid_10_90"),
-    },
-]
 EXIT_RESID_BANDS_BPS = [
     0.0, 2.5, 5.0, 7.5, 10.0, 12.5, 15.0, 17.5, 20.0,
 ]  # per setup, only bands below its entry threshold are tested
@@ -423,33 +509,16 @@ EXIT_OU_Z_BANDS = [
 ]  # per setup, only bands below its entry threshold are tested
 EXIT_REVERT_FRACS = [0.25, 0.5, 0.75, 1.0]  # frac of entry dislocation reverted
 EXIT_HALF_LIFE_FRACS = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]  # x entry-time half-life
-EXIT_MIN_TRADES = 8  # discovery floor; judge promotion using n_trades in the table
+EXIT_MIN_TRADES = 8  # floor for the leaderboards and the winners saved to EXITS_FILE
 
-# step 3 --sweep: the exact-engine grid — full trade mechanics (stops, costs,
-# trade logs). Structured like the --exit block: entry signal and exit style
-# are first-class dimensions, and thresholds/exit params stay in each signal's
-# own units (the sweep runs one sub-grid per signal x style so units never
-# cross). Every list here should be a survivor of steps 1-2: setups and gates
-# from --predict, exit styles/params from --exit.
-SWEEP_ENTRY_SIGNALS = ["residual", "ou_z"]
-SWEEP_BETA_LBS = [60, 120]  # list(range(10, 501, 10))
-SWEEP_OU_LBS = [400, 420]  # list(range(10, 501, 10))
-SWEEP_RESID_ENTRIES_BPS = list(range(21, 31, 2))
-SWEEP_OU_Z_ENTRIES = [1.0, 1.5, 2.0, 2.5, 3.0]
-SWEEP_EXIT_STYLES = ["band", "revert_frac", "half_life_frac"]
-SWEEP_RESID_BANDS_BPS = [5.0, 10.0]  # flat when |resid| <= band
-SWEEP_OU_Z_BANDS = [0.25, 0.5]  # flat when |ou_z| <= band
-SWEEP_REVERT_FRACS = [0.25, 0.5, 0.75]  # frac of entry dislocation reverted
-SWEEP_HALF_LIFE_FRACS = [1.0, 2.0, 3.0]  # x point-in-time half-life
+# step 3 --sweep: the exact-engine check over the (setup, exit) winners saved
+# by --exit, each held fixed and crossed with the hard-stop overlay — the one
+# mechanic the approximate exit scan can't test. Promotion ranking is the
+# ROBUSTNESS board: sharpe with the best trade removed, best-trade share of
+# PnL, and per-era consistency — a setup whose backtest hinges on one lucky
+# trade (e.g. the Dec-21 flattener) must not outrank one that pays steadily.
 SWEEP_STOP_LOSS_BPS = [15.0, 25.0, 40.0]  # hard stop overlay, always on
-# gates that earned their IC lift in --predict (None = ungated baseline)
-SWEEP_GATES = [
-    None,
-    ("r2", "low_25"),
-    ("r2_mom10", "low_10"),
-    ("beta_cv", "below_50"),
-    ("beta_vol20", "low_10"),
-]
+ERA_YEARS = 4  # era length for the consistency check (pnl > 0 per era)
 
 # DEFAULT_PARAMS is the promoted configuration — what main() runs as the live
 # signal, and the base every mode overrides from.
@@ -516,9 +585,7 @@ def main(use_db: bool = True, params: dict | None = None) -> dict:
     if sig_val is None or not _finite(sig_val):
         print("\nlatest signal: warmup - no signal yet")
     else:
-        hl_ok = (
-            _finite(half_life) and p["half_life_min"] <= half_life <= p["half_life_max"]
-        )
+        hl_ok = _half_life_ok(half_life, p["half_life_min"], p["half_life_max"])
         z_gate = p["z_gate"] if p["entry_signal"] == "residual" else None
         z_ok_short = z_gate is None or (_finite(ou_z) and ou_z >= z_gate)
         z_ok_long = z_gate is None or (_finite(ou_z) and ou_z <= -z_gate)
@@ -547,48 +614,121 @@ def main(use_db: bool = True, params: dict | None = None) -> dict:
     }
 
 
-def _sweep_grids() -> list[dict]:
-    """One exact-engine sub-grid per (entry signal, exit style) so entry
-    thresholds and exit params always stay in that signal/style's units."""
-    entries = {"residual": SWEEP_RESID_ENTRIES_BPS, "ou_z": SWEEP_OU_Z_ENTRIES}
-    bands = {"residual": SWEEP_RESID_BANDS_BPS, "ou_z": SWEEP_OU_Z_BANDS}
+def _winner_params(row: dict) -> dict:
+    """Engine params for one (setup, exit) winner row from EXITS_FILE.
+    z_gate and the half-life sanity bounds are off — the discovery scans
+    never used them, and re-filtering the discovered event here starves the
+    exact engine of the very trades steps 1-2 counted."""
+    p = {
+        "entry_signal": row["entry_signal"],
+        "beta_lb": int(row["beta_lb"]),
+        "entry_threshold": float(row["entry_threshold"]),
+        "exit_style": row["exit_style"],
+        "exit_param": float(row["exit_threshold"]),
+        "gate": (
+            None
+            if row["gate"] in (None, "(none)")
+            else (row["gate"], row["gate_bucket"])
+        ),
+        "z_gate": None,
+        "half_life_min": None,
+        "half_life_max": None,
+    }
+    if row["ou_lb"] is not None:
+        p["ou_lb"] = int(row["ou_lb"])
+    return p
+
+
+def _ann_sharpe(daily_pnl: np.ndarray) -> float:
+    sd = float(daily_pnl.std())
+    return float(daily_pnl.mean()) / sd * math.sqrt(252.0) if sd > 0 else 0.0
+
+
+def _daily_pnl_from_trades(
+    trades: pl.DataFrame, date_ix: dict, dlevel: np.ndarray
+) -> np.ndarray:
+    """Gross daily re-marking of a trade log: position[t-1] x d(level)."""
+    pos = np.zeros(len(dlevel))
+    for t in trades.iter_rows(named=True):
+        i0, i1 = date_ix.get(t["entry_date"]), date_ix.get(t["exit_date"])
+        if i0 is not None and i1 is not None:
+            pos[i0:i1] = 1.0 if t["direction"] == "long" else -1.0
+    return np.concatenate([[0.0], pos[:-1]]) * dlevel
+
+
+def _robustness(trades: pl.DataFrame, data: pl.DataFrame) -> pl.DataFrame:
+    """Concentration / consistency ranking of the sweep trade log.
+
+    Per setup: pnl and sharpe with the single best trade REMOVED (a
+    promotable setup survives losing its luckiest trade), the best trade's
+    share of total pnl, the median trade, and pnl>0 per ERA_YEARS era.
+    Daily pnl is gross re-marking so with/ex-best are computed identically.
+    Ranked by sharpe_ex_best — this is the promotion ordering."""
+    dates = data["ts"].to_list()
+    date_ix = {d: i for i, d in enumerate(dates)}
+    level = pipeline.trade_def.composite_series(data).to_numpy().astype(float)
+    dlevel = np.concatenate([[0.0], np.diff(level)])
+    y0 = dates[0].year
+    n_eras = max(1, (dates[-1].year - y0 + 1) // ERA_YEARS)
+
+    rows = []
+    for setup in trades["setup"].unique(maintain_order=True).to_list():
+        st = trades.filter(pl.col("setup") == setup).sort(
+            "pnl_bps", descending=True
+        )
+        total = float(st["pnl_bps"].sum())
+        best = float(st["pnl_bps"][0])
+        era_pnl = [0.0] * n_eras
+        for t in st.iter_rows(named=True):
+            era_pnl[min((t["entry_date"].year - y0) // ERA_YEARS, n_eras - 1)] += t[
+                "pnl_bps"
+            ]
+        rows.append({
+            "setup": setup,
+            "n_trades": len(st),
+            "total_pnl_bps": round(total, 1),
+            "pnl_ex_best": round(total - best, 1),
+            "best_trade_share": round(best / total, 2) if total > 0 else None,
+            "median_trade_bps": round(float(st["pnl_bps"].median()), 2),
+            "sharpe": round(_ann_sharpe(_daily_pnl_from_trades(st, date_ix, dlevel)), 3),
+            "sharpe_ex_best": round(
+                _ann_sharpe(_daily_pnl_from_trades(st.slice(1), date_ix, dlevel)), 3
+            ),
+            "eras_pos": f"{sum(p > 0 for p in era_pnl)}/{n_eras}",
+        })
+    return pl.DataFrame(rows).sort("sharpe_ex_best", descending=True)
+
+
+def _sweep_grids(winners: pl.DataFrame | None = None) -> list[dict]:
+    """One exact-engine sub-grid per (setup, exit) winner saved by --exit:
+    the winner's params held fixed, crossed with the hard-stop overlay."""
+    if winners is None:
+        winners = load_exits()
     grids = []
-    for sig in SWEEP_ENTRY_SIGNALS:
-        for style in SWEEP_EXIT_STYLES:
-            exit_params = {
-                "band": bands[sig],
-                "revert_frac": SWEEP_REVERT_FRACS,
-                "half_life_frac": SWEEP_HALF_LIFE_FRACS,
-            }[style]
-            grids.append(
-                {
-                    "entry_signal": [sig],
-                    "beta_lb": SWEEP_BETA_LBS,
-                    "ou_lb": SWEEP_OU_LBS,
-                    "entry_threshold": entries[sig],
-                    "exit_style": [style],
-                    "exit_param": exit_params,
-                    "stop_loss_bps": SWEEP_STOP_LOSS_BPS,
-                    "gate": SWEEP_GATES,
-                }
-            )
+    for row in winners.iter_rows(named=True):
+        grid = {k: [v] for k, v in _winner_params(row).items()}
+        grid["stop_loss_bps"] = SWEEP_STOP_LOSS_BPS
+        grids.append(grid)
     return grids
+
+
 
 
 def sweep(use_db: bool = True, n_jobs: int | None = None) -> dict:
     """Exact-engine sweep: one full backtest (stops, costs, trade mechanics)
-    per (entry signal x setup x exit style x stop x gate) combo, parallel
-    across CPU cores, with live progress."""
+    per saved (setup, exit) winner x hard stop, parallel across CPU cores,
+    with live progress. Also re-runs each winner at its best stop to save the
+    full trade log (TRADES_FILE) for the comparison app."""
+    winners = load_exits()  # fail fast if --exit hasn't been run
+    grids = _sweep_grids(winners)
     raw_data = load_data() if use_db else synthetic_data()
     data = model_frame(raw_data)
     source = "db" if use_db else "synthetic"
 
-    grids = _sweep_grids()
     total = sum(len(ParamGrid(g)) for g in grids)
     print(
-        f"sweep: {SIGNAL_NAME}  signals={SWEEP_ENTRY_SIGNALS}  "
-        f"exit_styles={SWEEP_EXIT_STYLES}  gates={len(SWEEP_GATES)}  "
-        f"sub-grids={len(grids)}  combos={total:,}  rows={len(data)}  "
+        f"sweep: {SIGNAL_NAME}  winners={len(grids)} (from {EXITS_FILE.name})  "
+        f"stops={SWEEP_STOP_LOSS_BPS}  combos={total:,}  rows={len(data)}  "
         f"(source={source})"
     )
 
@@ -634,16 +774,7 @@ def sweep(use_db: bool = True, n_jobs: int | None = None) -> dict:
             )
         results = results.filter(pl.col("error").is_null())
 
-    store = MetricStore()
-    store.log(
-        SIGNAL_NAME,
-        results,
-        meta={
-            "engine": "exact",
-            "source": source,
-            "span": f"{data['ts'].min()}..{data['ts'].max()}",
-        },
-    )
+    results.write_parquet(SWEEP_RESULTS_FILE)
 
     show = [
         "entry_signal",
@@ -660,44 +791,72 @@ def sweep(use_db: bool = True, n_jobs: int | None = None) -> dict:
         "n_trades",
         "max_drawdown_bps",
     ]
-    for label, by in [
-        ("sharpe", ["sharpe"]),
-        ("hit rate", ["hit_rate", "sharpe"]),
-        ("total pnl", ["total_pnl_bps", "sharpe"]),
-    ]:
-        print(f"\ntop 10 by {label}:")
-        board = results.sort(by, descending=[True] * len(by), nulls_last=True)
-        utils.pdf(board.select([c for c in show if c in board.columns]).head(10))
+    print("\ntop 10 by sharpe (raw engine ranking):")
+    board = results.sort("sharpe", descending=True, nulls_last=True)
+    utils.pdf(board.select([c for c in show if c in board.columns]).head(10))
 
-    print("\ngate summary (across all combos sharing the gate; null = ungated):")
-    utils.pdf(
-        results.group_by("gate")
-        .agg(
-            pl.col("sharpe").median().alias("med_sharpe"),
-            pl.col("sharpe").max().alias("best_sharpe"),
-            pl.col("hit_rate").median().alias("med_hit_rate"),
-            pl.col("n_trades").median().alias("med_n_trades"),
-            pl.len().alias("n_combos"),
+    # trade log: one more engine run per winner at its best stop, so the
+    # comparison app can chart every entry/exit
+    trade_frames = []
+    for row, block in zip(winners.iter_rows(named=True), blocks):
+        ok = block
+        if "error" in ok.columns:
+            ok = ok.filter(pl.col("error").is_null())
+        if ok.is_empty():
+            continue
+        best = ok.sort("sharpe", descending=True, nulls_last=True).row(0, named=True)
+        p = {**_winner_params(row), "stop_loss_bps": float(best["stop_loss_bps"])}
+        result = (
+            Engine(BacktestConfig(transaction_cost_bps=TRANSACTION_COST_BPS))
+            .add_signal(make_pipeline(p))
+            .run(data)
         )
-        .sort("med_sharpe", descending=True, nulls_last=True)
+        trade_frames.append(
+            trade_log(result.closed_trades).with_columns(
+                pl.lit(row["setup"]).alias("setup"),
+                pl.lit(p["stop_loss_bps"]).alias("stop_loss_bps"),
+            )
+        )
+    trades = (
+        pl.concat(trade_frames, how="diagonal_relaxed")
+        if trade_frames
+        else pl.DataFrame()
+    )
+    trades.write_parquet(TRADES_FILE)
+
+    robustness = (
+        _robustness(trades, data) if not trades.is_empty() else pl.DataFrame()
+    )
+    if not robustness.is_empty():
+        print(
+            "\nrobustness - the promotion ranking (by sharpe EX best trade; "
+            "gross re-marked pnl):"
+        )
+        utils.pdf(robustness)
+
+    print(f"\nsaved {len(results)} runs -> {SWEEP_RESULTS_FILE}")
+    print(
+        f"saved {len(trades)} trades across {len(trade_frames)} setups "
+        f"-> {TRADES_FILE}"
     )
 
-    print(f"\nlogged {len(results)} runs -> {store.path}")
-
-    return {"data": data, "results": results, "store": store}
+    return {"data": data, "results": results, "trades": trades,
+            "robustness": robustness}
 
 
 def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
     """Vectorized exit scan: every (setup, entry, exit style, exit param) as
     an approximate trade backtest — which exits pay, how long they hold, at
-    what hit rate. Bands run on device; the stateful styles (revert_frac,
-    half_life_frac) are CPU."""
+    what hit rate. Setups come from SETUPS_FILE (saved by --predict); the
+    best exit per setup is saved to EXITS_FILE for --sweep. Bands run on
+    device; the stateful styles (revert_frac, half_life_frac) are CPU."""
+    setups = load_setups()
     raw_data = load_data() if use_db else synthetic_data()
     data = model_frame(raw_data)
     level = pipeline.trade_def.composite_series(data).to_numpy()
 
     scans = []
-    for setup in EXIT_SETUPS:
+    for setup in setups:
         entry_signal = setup["entry_signal"]
         entry = float(setup["entry_threshold"])
         predict_horizon = int(setup["predict_horizon"])
@@ -709,7 +868,7 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
             lookbacks = [int(setup["ou_lb"])]
             exits = [band for band in EXIT_OU_Z_BANDS if band < entry]
         else:
-            raise ValueError(f"unknown EXIT_SETUPS entry_signal={entry_signal!r}")
+            raise ValueError(f"unknown setup entry_signal={entry_signal!r}")
 
         matrix, combos, conditions = signal_matrix(
             data[FEATURE],
@@ -780,7 +939,8 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
         for scan in scans
     )
     print(
-        f"exit scan: setups={len(EXIT_SETUPS)}  styles={EXIT_STYLES}  "
+        f"exit scan: setups={len(setups)} (from {SETUPS_FILE.name})  "
+        f"styles={EXIT_STYLES}  "
         f"model_columns={sum(scan['matrix'].shape[1] for scan in scans)}  "
         f"evaluations={n_evals:,}  (device={device})"
     )
@@ -892,16 +1052,7 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
         .sort("sharpe", descending=True, nulls_last=True)
     )
 
-    store = MetricStore()
-    store.log(
-        SIGNAL_NAME,
-        results,
-        meta={
-            "engine": "exit",
-            "source": "db" if use_db else "synthetic",
-            "span": f"{data['ts'].min()}..{data['ts'].max()}",
-        },
-    )
+    results.write_parquet(EXIT_RESULTS_FILE)
 
     valid = results.filter((pl.col("n_trades") > 0) & pl.col("sharpe").is_finite())
 
@@ -964,7 +1115,7 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
 
     # per setup (signal, lookbacks, entry), which exit takes the best sharpe
     best_exit = (
-        valid.sort("sharpe", descending=True)
+        leaderboard.sort("sharpe", descending=True)
         .group_by(
             "setup",
             "entry_signal",
@@ -978,31 +1129,23 @@ def exit_scan(use_db: bool = True, device: str = "auto") -> dict:
         )
         .first()
     )
-    print("\nwhich exit wins (count of setups where the exit has the best sharpe):")
-    utils.pdf(
-        best_exit.group_by("entry_signal", "exit_style", "exit_threshold")
-        .agg(
-            pl.len().alias("n_setups_won"),
-            pl.col("sharpe").median().alias("med_winning_sharpe"),
-            pl.col("avg_hold_bars").median().alias("med_hold_bars"),
-        )
-        .sort(["entry_signal", "n_setups_won"], descending=[False, True])
-        .select(
-            pl.col("entry_signal").alias("sig"),
-            pl.col("exit_style").alias("exit"),
-            pl.col("exit_threshold").round(2).alias("x"),
-            pl.col("n_setups_won").alias("wins"),
-            pl.col("med_winning_sharpe").round(3).alias("med_sh"),
-            pl.col("med_hold_bars").round(1).alias("med_hold"),
-        )
+    winners = best_exit.sort("sharpe", descending=True).select(
+        "setup", "entry_signal", "beta_lb", "ou_lb", "entry_threshold",
+        "predict_horizon", "gate", "gate_bucket", "exit_style", "exit_threshold",
+        "sharpe", "total_pnl_bps", "hit_rate", "pnl_per_trade_bps",
+        "avg_hold_bars", "n_trades",
     )
-    print(f"\nlogged {len(results):,} exit rows -> {store.path}")
+    winners.write_parquet(EXITS_FILE)
+    print(f"\nbest exit per setup ({sample_rule}), saved for --sweep -> {EXITS_FILE}:")
+    utils.pdf(_compact_board(winners))
+
+    print(f"\nsaved {len(results):,} exit rows -> {EXIT_RESULTS_FILE}")
 
     return {
         "data": data,
         "results": results,
         "exit_summary": exit_summary,
-        "store": store,
+        "winners": winners,
     }
 
 
@@ -1109,22 +1252,11 @@ def predict(use_db: bool = True, device: str = "auto") -> dict:
             )
             if scan["entry_signal"] == "residual":
                 block = block.with_columns(pl.lit(None, dtype=pl.Int64).alias("ou_lb"))
-            result_blocks.append(add_predict_lift(block))
+            result_blocks.append(block)
 
         results = pl.concat(result_blocks, how="diagonal_relaxed").sort(
             "ic", descending=True, nulls_last=True
         )
-
-    store = MetricStore()
-    store.log(
-        SIGNAL_NAME,
-        results,
-        meta={
-            "engine": "predict",
-            "source": "db" if use_db else "synthetic",
-            "span": f"{data['ts'].min()}..{data['ts'].max()}",
-        },
-    )
 
     show = [
         "entry_signal",
@@ -1143,43 +1275,18 @@ def predict(use_db: bool = True, device: str = "auto") -> dict:
     valid = results.filter(
         (pl.col("n_obs") >= PREDICT_MIN_OBS) & pl.col("ic").is_finite()
     )
-    ungated = valid.filter(pl.col("gate") == "(none)")
-    print(f"\ntop 10 ungated predictability rows by IC (n_obs >= {PREDICT_MIN_OBS}):")
-    utils.pdf(ungated.select([c for c in show if c in ungated.columns]).head(10))
+    print(f"\ntop 20 setups by IC, gated or ungated (n_obs >= {PREDICT_MIN_OBS}):")
+    utils.pdf(valid.select([c for c in show if c in valid.columns]).head(20))
 
-    gated = valid.filter(
-        (pl.col("gate") != "(none)") & pl.col("ic_lift").is_finite()
-    ).sort("ic_lift", descending=True, nulls_last=True)
-    print(f"\ntop 10 gates by IC LIFT (n_obs >= {PREDICT_MIN_OBS}):")
-    utils.pdf(
-        gated.select([*show, "base_ic", "ic_lift", "base_hit_rate", "hit_lift"]).head(
-            10
-        )
+    setups = _select_setups(valid)
+    setups.write_parquet(SETUPS_FILE)
+    print(
+        f"\ntop {len(setups)} distinct setups by neighborhood IC "
+        f"(>= {PREDICT_MIN_NEIGHBORS} neighbors), saved for --exit -> {SETUPS_FILE}:"
     )
+    utils.pdf(setups)
 
-    gated_by_ic = valid.filter(pl.col("gate") != "(none)").sort(
-        "ic", descending=True, nulls_last=True
-    )
-    print(f"\ntop 10 gated predictability rows by IC (n_obs >= {PREDICT_MIN_OBS}):")
-    utils.pdf(gated_by_ic.select([*show, "base_ic", "ic_lift"]).head(10))
-
-    print("\nwhich gates help IC most often:")
-    utils.pdf(
-        valid.filter((pl.col("gate") != "(none)") & pl.col("ic_lift").is_finite())
-        .group_by("entry_signal", "horizon", "gate", "gate_bucket")
-        .agg(
-            pl.col("ic_lift").median().alias("med_ic_lift"),
-            (pl.col("ic_lift") > 0).mean().alias("pct_combos_improved"),
-            pl.col("ic").median().alias("med_ic"),
-            pl.col("fire_rate").median().alias("med_fire_rate"),
-            pl.len().alias("n_cells"),
-        )
-        .sort("med_ic_lift", descending=True)
-        .head(25)
-    )
-    print(f"\nlogged {len(results):,} predict rows -> {store.path}")
-
-    return {"data": data, "results": results, "store": store}
+    return {"data": data, "results": results, "setups": setups}
 
 
 if __name__ == "__main__":
