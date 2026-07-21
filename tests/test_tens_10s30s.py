@@ -1,4 +1,4 @@
-"""10s vs 10s30s module: standard scriptable pattern, runnable without DB."""
+"""tens_10s30s on the Strategy template: config + funnel, runnable without DB."""
 
 import importlib
 
@@ -6,8 +6,10 @@ import polars as pl
 import pytest
 
 from backtest import sweep_strategy
+from backtest.strategy import _entry_filter, _normalize_predict_signals
 
 view = importlib.import_module("book.curve.tens_10s30s")
+STRATEGY = view.STRATEGY
 compute = view.compute
 main = view.main
 pipeline = view.pipeline
@@ -47,6 +49,10 @@ def test_pipeline_wiring():
     assert FEATURES == ["10y"]
     assert pipeline.trade_def.legs == {TARGET: 1.0}
     assert pipeline.name == "tens_10s30s"
+    # module aliases and artifact paths come from the Strategy instance
+    assert view.make_pipeline is STRATEGY.make_pipeline
+    assert STRATEGY.setups_file.name == "tens_10s30s_setups.parquet"
+    assert STRATEGY.trades_file == view.TRADES_FILE
 
 
 def test_compute_gate_param_adds_allow_column():
@@ -61,9 +67,9 @@ def test_compute_gate_param_adds_allow_column():
 
 def test_entry_filter_z_gate_none_skips_ou_confirmation():
     bar = {"half_life": 10.0, "ou_z": 0.0}
-    ungated = view._entry_filter(None, 3.0, 120.0)
+    ungated = _entry_filter(None, 3.0, 120.0)
     assert ungated(1, bar) and ungated(-1, bar)
-    confirmed = view._entry_filter(0.5, 3.0, 120.0)
+    confirmed = _entry_filter(0.5, 3.0, 120.0)
     assert not confirmed(1, bar) and not confirmed(-1, bar)
     # the quantile gate and half-life bounds still apply with z_gate=None
     assert not ungated(1, {**bar, "gate_allow": 0.0})
@@ -72,14 +78,14 @@ def test_entry_filter_z_gate_none_skips_ou_confirmation():
 
 def test_gate_conditions_are_buildable():
     frame = compute(synthetic_data(n=900))
-    p = view._params({})
+    p = STRATEGY._params({})
     names = [
         "r2", "beta_cv", "beta", "beta_vol20", "beta_mom10",
         "r2_vol20", "r2_mom10", "resid_phi", "resid_half_life",
         "resid_vol20", "resid_mom10",
     ]
     for name in names:
-        cond = view._gate_condition(frame, {**p, "gate": (name, "high_75")})
+        cond = STRATEGY._gate_condition(frame, {**p, "gate": (name, "high_75")})
         assert len(cond) == len(frame)
 
 
@@ -98,9 +104,9 @@ def test_sweep_grids_build_one_grid_per_saved_winner(monkeypatch, tmp_path):
     })
     path = tmp_path / "exits.parquet"
     exits.write_parquet(path)
-    monkeypatch.setattr(view, "EXITS_FILE", path)
+    monkeypatch.setattr(STRATEGY, "exits_file", path)
 
-    grids = view._sweep_grids()
+    grids = STRATEGY._sweep_grids()
     assert len(grids) == 2
     ou, res = grids
     assert ou["entry_signal"] == ["ou_z"] and ou["ou_lb"] == [60]
@@ -108,7 +114,7 @@ def test_sweep_grids_build_one_grid_per_saved_winner(monkeypatch, tmp_path):
     assert ou["exit_style"] == ["revert_frac"] and ou["exit_param"] == [0.5]
     assert res["gate"] == [None] and "ou_lb" not in res
     for grid in grids:
-        assert grid["stop_loss_bps"] == view.SWEEP_STOP_LOSS_BPS
+        assert grid["stop_loss_bps"] == STRATEGY.sweep_stop_loss_bps
         assert grid["z_gate"] == [None]
         assert grid["half_life_min"] == [None]
         assert grid["half_life_max"] == [None]
@@ -129,10 +135,10 @@ def test_sweep_mode_saves_results_and_trade_log(monkeypatch, tmp_path):
     }])
     exits_path = tmp_path / "exits.parquet"
     exits.write_parquet(exits_path)
-    monkeypatch.setattr(view, "EXITS_FILE", exits_path)
-    monkeypatch.setattr(view, "SWEEP_RESULTS_FILE", tmp_path / "sweep.parquet")
-    monkeypatch.setattr(view, "TRADES_FILE", tmp_path / "trades.parquet")
-    monkeypatch.setattr(view, "SWEEP_STOP_LOSS_BPS", [25.0])
+    monkeypatch.setattr(STRATEGY, "exits_file", exits_path)
+    monkeypatch.setattr(STRATEGY, "sweep_results_file", tmp_path / "sweep.parquet")
+    monkeypatch.setattr(STRATEGY, "trades_file", tmp_path / "trades.parquet")
+    monkeypatch.setattr(STRATEGY, "sweep_stop_loss_bps", [25.0])
 
     state = view.sweep(use_db=False, n_jobs=1)
 
@@ -179,7 +185,7 @@ def test_robustness_flags_one_trade_wonders():
         trade("steady", 1700, 1760, 13.0),
         trade("steady", 2500, 2560, 13.0),
     ])
-    rob = view._robustness(trades, data)
+    rob = STRATEGY._robustness(trades, data)
 
     lucky = rob.filter(pl.col("setup") == "lucky").row(0, named=True)
     steady = rob.filter(pl.col("setup") == "steady").row(0, named=True)
@@ -233,7 +239,7 @@ def test_predict_setups_select_save_load_roundtrip(tmp_path):
         }
         for row in cluster + spike
     ])
-    setups = view._select_setups(valid)
+    setups = STRATEGY._select_setups(valid)
 
     # the lone 0.95-IC spike has no corroborating neighbors -> dropped
     assert "ou100/100/e1.5 h40 r2_mom10:high_75" not in setups["name"].to_list()
@@ -244,7 +250,7 @@ def test_predict_setups_select_save_load_roundtrip(tmp_path):
 
     path = tmp_path / "setups.parquet"
     setups.write_parquet(path)
-    loaded = view.load_setups(path)
+    loaded = STRATEGY.load_setups(path)
     assert loaded[0]["gate"] == ("r2_mom10", "high_75")
     assert loaded[0]["beta_lb"] == 330 and loaded[0]["ou_lb"] == 250
     assert loaded[0]["entry_threshold"] == 2.5
@@ -252,9 +258,9 @@ def test_predict_setups_select_save_load_roundtrip(tmp_path):
 
 def test_load_setups_and_exits_require_prior_modes(tmp_path):
     with pytest.raises(FileNotFoundError, match="--predict"):
-        view.load_setups(tmp_path / "nope.parquet")
+        STRATEGY.load_setups(tmp_path / "nope.parquet")
     with pytest.raises(FileNotFoundError, match="--exit"):
-        view.load_exits(tmp_path / "nope.parquet")
+        STRATEGY.load_exits(tmp_path / "nope.parquet")
 
 
 def test_compute_ou_z_entry_signal():
@@ -268,13 +274,13 @@ def test_compute_ou_z_entry_signal():
 
 
 def test_predict_signal_names_normalize_ou_and_reject_unknown():
-    assert view._normalize_predict_signals(["residual", "ou"]) == [
+    assert _normalize_predict_signals(["residual", "ou"]) == [
         "residual",
         "ou_z",
     ]
-    assert view._normalize_predict_signals(["ou", "ou_z"]) == ["ou_z"]
-    with pytest.raises(ValueError, match="PREDICT_ENTRY_SIGNALS"):
-        view._normalize_predict_signals(["residual", "nope"])
+    assert _normalize_predict_signals(["ou", "ou_z"]) == ["ou_z"]
+    with pytest.raises(ValueError, match="predict_entry_signals"):
+        _normalize_predict_signals(["residual", "nope"])
 
 
 def test_sweep_engine_runs_every_signal_and_exit_style():
@@ -308,7 +314,9 @@ def test_sweep_engine_runs_every_signal_and_exit_style():
 
 
 def test_exit_mode_reports_exit_stats(monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(view, "EXIT_RESULTS_FILE", tmp_path / "exit_results.parquet")
+    monkeypatch.setattr(
+        STRATEGY, "exit_results_file", tmp_path / "exit_results.parquet"
+    )
     setups_path = tmp_path / "setups.parquet"
     pl.DataFrame([{
         "name": "test_ou_setup",
@@ -320,11 +328,11 @@ def test_exit_mode_reports_exit_stats(monkeypatch, tmp_path, capsys):
         "gate": "r2",
         "gate_bucket": "tails_10_90",
     }]).write_parquet(setups_path)
-    monkeypatch.setattr(view, "SETUPS_FILE", setups_path)
-    monkeypatch.setattr(view, "EXITS_FILE", tmp_path / "exits.parquet")
-    monkeypatch.setattr(view, "EXIT_OU_Z_BANDS", [0.25, 0.5])
-    monkeypatch.setattr(view, "EXIT_REVERT_FRACS", [0.5])
-    monkeypatch.setattr(view, "EXIT_HALF_LIFE_FRACS", [1.0])
+    monkeypatch.setattr(STRATEGY, "setups_file", setups_path)
+    monkeypatch.setattr(STRATEGY, "exits_file", tmp_path / "exits.parquet")
+    monkeypatch.setattr(STRATEGY, "exit_ou_z_bands", [0.25, 0.5])
+    monkeypatch.setattr(STRATEGY, "exit_revert_fracs", [0.5])
+    monkeypatch.setattr(STRATEGY, "exit_half_life_fracs", [1.0])
 
     state = view.exit_scan(use_db=False, device="cpu")
     results = state["results"]

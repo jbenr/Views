@@ -82,6 +82,9 @@ XY_MIN_OBS = 30  # ignore cells with fewer threshold-crossing events
 XY_MIN_ROWS = 750  # skip pairs with less aligned history (~3y)
 XY_TOP_N_PER_PAIR = 3  # setups kept per (x, y) pair
 XY_MIN_NEIGHBORS = 3  # corroborating grid neighbors a setup needs
+XY_KEEP_PER_PAIR = 200  # top valid rows kept per pair for the cross-pair board
+# (each pair produces ~7M result rows; they are reduced per pair - filtered,
+# selected, top slice kept - so 48 pairs never accumulate ~40GB in RAM)
 
 XY_SETUPS_FILE = Path(__file__).with_name(f"{SCAN_NAME}_setups.parquet")
 
@@ -216,9 +219,10 @@ def _setup_name(row: dict) -> str:
 def _select_setups(valid: pl.DataFrame) -> pl.DataFrame:
     """Top XY_TOP_N_PER_PAIR setups per (x, y) pair by neighborhood IC.
 
-    Same discipline as tens_10s30s: rank on nbr_ic (neighborhoods never
-    cross pairs), require XY_MIN_NEIGHBORS corroborating neighbors, dedupe
-    threshold/horizon variants of the same cell."""
+    Called per pair (memory discipline), but keyed on x/y regardless so
+    neighborhoods can never cross pairs. Same discipline as tens_10s30s:
+    rank on nbr_ic, require XY_MIN_NEIGHBORS corroborating neighbors,
+    dedupe threshold/horizon variants of the same cell."""
     best = (
         neighbor_ic_stats(
             valid,
@@ -226,7 +230,7 @@ def _select_setups(valid: pl.DataFrame) -> pl.DataFrame:
             ou_lbs=XY_OU_LBS,
             resid_thresholds=XY_RESID_THRESHOLDS_BPS,
             z_thresholds=XY_OU_Z_THRESHOLDS,
-            pool_size=100 * len(YS) * len(XS),
+            pool_size=300,
             extra_keys=("x", "y"),
         )
         .filter(pl.col("n_nbr") >= XY_MIN_NEIGHBORS)
@@ -267,7 +271,8 @@ def main(use_db: bool = True, device: str = "auto") -> dict:
     )
 
     t0 = time.time()
-    result_blocks = []
+    top_blocks: list[pl.DataFrame] = []
+    setup_blocks: list[pl.DataFrame] = []
     skipped = []
     for i, (y, x) in enumerate(pairs, 1):
         frame = align_columns(data, [y, x])
@@ -275,7 +280,17 @@ def main(use_db: bool = True, device: str = "auto") -> dict:
             skipped.append((y, x, len(frame)))
             continue
         bt = time.time()
-        result_blocks.extend(_pair_scan(frame, x, y, device))
+        # reduce per pair: filter, select setups, keep a top slice - the raw
+        # ~7M-row pair frame is dropped before the next pair starts
+        pair_valid = (
+            pl.concat(_pair_scan(frame, x, y, device), how="diagonal_relaxed")
+            .filter((pl.col("n_obs") >= XY_MIN_OBS) & pl.col("ic").is_finite())
+            .sort("ic", descending=True, nulls_last=True)
+        )
+        top_blocks.append(pair_valid.head(XY_KEEP_PER_PAIR))
+        pair_setups = _select_setups(pair_valid)
+        if not pair_setups.is_empty():
+            setup_blocks.append(pair_setups)
         print(
             f"\r  [{i}/{len(pairs)}] y={y} x={x} rows={len(frame)} "
             f"({time.time() - bt:.1f}s, total {time.time() - t0:.0f}s)   ",
@@ -286,11 +301,8 @@ def main(use_db: bool = True, device: str = "auto") -> dict:
     if skipped:
         print(f"  skipped {len(skipped)} pairs with < {XY_MIN_ROWS} aligned rows")
 
-    results = pl.concat(result_blocks, how="diagonal_relaxed").sort(
+    results = pl.concat(top_blocks, how="diagonal_relaxed").sort(
         "ic", descending=True, nulls_last=True
-    )
-    valid = results.filter(
-        (pl.col("n_obs") >= XY_MIN_OBS) & pl.col("ic").is_finite()
     )
 
     show = [
@@ -299,9 +311,15 @@ def main(use_db: bool = True, device: str = "auto") -> dict:
         "n_obs",
     ]
     print(f"\ntop 20 cells by raw IC, any pair (n_obs >= {XY_MIN_OBS}):")
-    utils.pdf(valid.select([c for c in show if c in valid.columns]).head(20))
+    utils.pdf(results.select([c for c in show if c in results.columns]).head(20))
 
-    setups = _select_setups(valid)
+    setups = (
+        pl.concat(setup_blocks, how="diagonal_relaxed").sort(
+            "nbr_ic", descending=True, nulls_last=True
+        )
+        if setup_blocks
+        else pl.DataFrame()
+    )
     setups.write_parquet(XY_SETUPS_FILE)
     print(
         f"\ntop {XY_TOP_N_PER_PAIR} setups per pair by neighborhood IC "
@@ -309,17 +327,18 @@ def main(use_db: bool = True, device: str = "auto") -> dict:
     )
     utils.pdf(setups.head(25))
 
-    print("\nwhich x predicts which y (best nbr_ic per pair; blank = nothing"
-          " corroborated):")
-    grid = (
-        setups.group_by("y", "x")
-        .agg(pl.col("nbr_ic").max().round(3))
-        .pivot(on="x", index="y", values="nbr_ic")
-        .sort("y")
-    )
-    utils.pdf(grid.select(["y", *[c for c in XS if c in grid.columns]]))
+    if not setups.is_empty():
+        print("\nwhich x predicts which y (best nbr_ic per pair; blank = "
+              "nothing corroborated):")
+        grid = (
+            setups.group_by("y", "x")
+            .agg(pl.col("nbr_ic").max().round(3))
+            .pivot(on="x", index="y", values="nbr_ic")
+            .sort("y")
+        )
+        utils.pdf(grid.select(["y", *[c for c in XS if c in grid.columns]]))
 
-    return {"data": data, "results": results, "valid": valid, "setups": setups}
+    return {"data": data, "results": results, "setups": setups}
 
 
 if __name__ == "__main__":

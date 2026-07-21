@@ -97,29 +97,33 @@ from stats import (
 python -m book.rate_vol.template
 ```
 
-Every strategy module follows the same contract:
+Every curve strategy module is configuration on the shared template
+(`backtest/strategy.py`), which provides the signal construction, all four
+research modes, the CLI, and the artifact files:
 
 ```python
-STRATEGY_FAMILY = "curve"                 # metadata for the ledger
-SIGNAL_NAME     = "beta_weighted_10s30s"
-TICKERS         = {"10y": "USGG10YR Index", ...}   # alias -> Bloomberg ticker
+from backtest.strategy import Strategy, synthetic_pair
 
-def compute(data: pl.DataFrame) -> pl.DataFrame:
-    # data is the wide frame from load_wide(TICKERS, ...)
-    # must return a "signal" column; optional: time_stop, size, confidence,
-    # vol, plus diagnostic columns (resid, beta, r2, ou_mean) that flow
-    # through the engine into the trade log
-    ...
-
-pipeline = SignalPipeline(
-    name=SIGNAL_NAME,
-    trade_def=TradeDef.spread("10s30s", "10y", "30y"),  # legs = TICKERS aliases
-    compute_fn=compute,
-    config=SignalConfig(entry_long=-2.0, entry_short=2.0, time_stop_bars=40),
+STRATEGY = Strategy(
+    name="twos10s_real10y",
+    module="book.curve.twos10s_real10y",   # sweep workers import this
+    path=Path(__file__),                   # funnel parquets live next to it
+    tickers={"real10y": "USGGT10Y Index", "2s10s": "USYC2Y10 Index"},
+    bps_cols=["real10y"],
+    target="2s10s", feature="real10y",
+    synthetic_fn=...,                      # no-DB substitute for tests/dev
+    feature_fn=...,                        # optional derived features (e.g. PC1)
 )
+compute, make_pipeline, pipeline = STRATEGY.compute, STRATEGY.make_pipeline, STRATEGY.pipeline
+
+if __name__ == "__main__":
+    state = STRATEGY.cli()
 ```
 
-`book/curve/strategy.py` is the reference implementation; the other families are stubs awaiting their research (see `notes/TODO.md`).
+Every Strategy grid (predict/exit/sweep search spaces, costs, params) is a
+constructor field — override per strategy as needed. Strategies with a custom
+`compute` (non-residual-fade families) can still build a raw `SignalPipeline`
+against the engine directly.
 
 **Every strategy module must also be scriptable**, with a `main(use_db: bool = True) -> dict` that prints the four standard blocks and returns its state for interactive chaining:
 
@@ -133,12 +137,12 @@ python -m book.curve.tens_10s30s              # live DB data
 python -m book.curve.tens_10s30s --synthetic  # no DB needed
 ```
 
-`book/curve/tens_10s30s.py` (the direction→curve research thread: 10Y vs 10s30s) is the live example of this pattern; `book/rate_vol/template.py` is the copyable starting point.
+`book/curve/tens_10s30s.py` (the direction→curve research thread: 10Y vs 10s30s) is the live example of this pattern; `book/curve/twos10s_real10y.py` and `book/curve/tens30s_pc1.py` are graduates of the cross-pair explorer (`book/curve/xy_scan.py`, funnel step 0).
 
 Two conventions inside a strategy module:
 
-- **Identity config at the top** (family, name, `TICKERS`) — what the strategy *is*.
-- **Backtest parameters in the main section** (`DEFAULT_PARAMS`, `SWEEP_GRID`) — how it's *tuned*. `main(params={...})` overrides ad hoc; `make_pipeline(params)` is the contract the parameter lab uses to sweep it.
+- **Identity config at the top** (family, name, `TICKERS`, target/feature) — what the strategy *is*.
+- **Tuning goes through the Strategy fields** (`default_params`, the grid lists) — how it's *tuned*. `main(params={...})` overrides ad hoc; `make_pipeline(params)` is the contract the parameter lab uses to sweep it.
 
 ## Backtesting
 

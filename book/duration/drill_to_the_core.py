@@ -28,7 +28,7 @@ from backtest import (
     TradeDef,
     half_drift_residual,
 )
-from backtest.metrics import trade_log as engine_trade_log
+from backtest import trade_log as engine_trade_log
 from stats import half_life, ou_params, roll_half_life, roll_lr, roll_ou_zscore
 from book.duration.signal_context import (
     build_signal_features,
