@@ -24,6 +24,7 @@ costs); see the Strategy docstring for the funnel and every knob.
     python -m book.curve.tens_10s30s --predict    # setup search -> setups parquet
     python -m book.curve.tens_10s30s --exit       # exits per setup -> exits parquet
     python -m book.curve.tens_10s30s --sweep      # exact engine + trade logs
+    python -m book.curve.tens_10s30s --cook       # all three, in order
     python book/curve/app.py                      # compare winners' trades (Dash)
 
     --cpu / --gpu force the scan device for --predict/--exit (default: auto).

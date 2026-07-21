@@ -164,6 +164,32 @@ def test_sweep_mode_saves_results_and_trade_log(monkeypatch, tmp_path):
     assert len(robustness) == 1
 
 
+def test_cook_runs_the_whole_funnel(monkeypatch, tmp_path):
+    # shrink the search so predict -> exit -> sweep chains in seconds
+    monkeypatch.setattr(STRATEGY, "setups_file", tmp_path / "setups.parquet")
+    monkeypatch.setattr(STRATEGY, "exits_file", tmp_path / "exits.parquet")
+    monkeypatch.setattr(STRATEGY, "exit_results_file", tmp_path / "exit_res.parquet")
+    monkeypatch.setattr(STRATEGY, "sweep_results_file", tmp_path / "sweep.parquet")
+    monkeypatch.setattr(STRATEGY, "trades_file", tmp_path / "trades.parquet")
+    monkeypatch.setattr(STRATEGY, "predict_beta_lbs", [60, 120])
+    monkeypatch.setattr(STRATEGY, "predict_ou_lbs", [120])
+    monkeypatch.setattr(STRATEGY, "predict_horizons", [20])
+    monkeypatch.setattr(STRATEGY, "predict_top_n", 2)
+    monkeypatch.setattr(STRATEGY, "predict_min_neighbors", 0)
+    monkeypatch.setattr(STRATEGY, "sweep_stop_loss_bps", [25.0])
+
+    state = STRATEGY.cook(use_db=False, device="cpu", n_jobs=1)
+
+    assert set(state) == {"predict", "exit", "sweep"}
+    # every handoff artifact was written by its step
+    for f in ["setups.parquet", "exits.parquet", "exit_res.parquet",
+              "sweep.parquet", "trades.parquet"]:
+        assert (tmp_path / f).exists(), f
+    assert len(state["predict"]["setups"]) > 0
+    assert len(state["exit"]["winners"]) > 0
+    assert len(state["sweep"]["results"]) > 0
+
+
 def test_robustness_flags_one_trade_wonders():
     data = view.model_frame(synthetic_data(n=3000))
     dates = data["ts"].to_list()

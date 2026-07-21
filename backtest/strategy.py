@@ -1221,25 +1221,48 @@ class Strategy:
         return {"data": data, "results": results, "trades": trades,
                 "robustness": robustness}
 
+    def cook(
+        self,
+        use_db: bool = True,
+        device: str = "auto",
+        n_jobs: int | None = None,
+    ) -> dict:
+        """The whole funnel in one shot: --predict -> --exit -> --sweep.
+
+        Each step saves its winners for the next, exactly as when run
+        separately; the returned dict carries all three states."""
+        line = "=" * 72
+        print(f"{line}\ncooking {self.name}  [1/3] --predict\n{line}")
+        predict_state = self.predict(use_db=use_db, device=device)
+        print(f"\n{line}\ncooking {self.name}  [2/3] --exit\n{line}")
+        exit_state = self.exit_scan(use_db=use_db, device=device)
+        print(f"\n{line}\ncooking {self.name}  [3/3] --sweep\n{line}")
+        sweep_state = self.sweep(use_db=use_db, n_jobs=n_jobs)
+        print(f"\n{line}\n{self.name} cooked.\n{line}")
+        return {"predict": predict_state, "exit": exit_state, "sweep": sweep_state}
+
     # -- CLI ----------------------------------------------------------------
 
     def cli(self, argv: list[str] | None = None) -> dict:
-        """Standard strategy-module CLI: modes --predict | --exit | --sweep
-        (default: single run), flags --synthetic --cpu --gpu."""
+        """Standard strategy-module CLI: modes --predict | --exit | --sweep |
+        --cook (all three) (default: single run), flags --synthetic --cpu
+        --gpu."""
         args = set(sys.argv[1:] if argv is None else argv)
         known = {
             "--synthetic", "--cpu", "--gpu",
-            "--sweep", "--predict", "--exit", "--exits", "--fast",
+            "--sweep", "--predict", "--exit", "--exits", "--fast", "--cook",
         }
         unknown = args - known
         if unknown:
             sys.exit(
                 f"unknown argument(s): {sorted(unknown)}\n"
-                "modes: --predict | --exit | --sweep (default: single run)  "
-                "flags: --synthetic --cpu --gpu"
+                "modes: --predict | --exit | --sweep | --cook (all three) "
+                "(default: single run)  flags: --synthetic --cpu --gpu"
             )
         use_db = "--synthetic" not in args
         device = "cpu" if "--cpu" in args else ("gpu" if "--gpu" in args else "auto")
+        if "--cook" in args:
+            return self.cook(use_db=use_db, device=device)
         if "--sweep" in args:
             return self.sweep(use_db=use_db)
         if "--predict" in args:

@@ -16,6 +16,7 @@ configuration. Same funnel as every curve strategy:
     python -m book.curve.twos10s_real10y --predict    # setup search
     python -m book.curve.twos10s_real10y --exit       # exits per saved setup
     python -m book.curve.twos10s_real10y --sweep      # exact engine + trade logs
+    python -m book.curve.twos10s_real10y --cook       # all three, in order
 """
 
 from __future__ import annotations

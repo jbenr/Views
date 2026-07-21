@@ -17,6 +17,7 @@ configuration plus the PC1 feature hook. Same funnel as every curve strategy:
     python -m book.curve.tens30s_pc1 --predict    # setup search
     python -m book.curve.tens30s_pc1 --exit       # exits per saved setup
     python -m book.curve.tens30s_pc1 --sweep      # exact engine + trade logs
+    python -m book.curve.tens30s_pc1 --cook       # all three, in order
 """
 
 from __future__ import annotations
