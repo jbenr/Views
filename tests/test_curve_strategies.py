@@ -1,6 +1,7 @@
 """Graduated curve strategies on the Strategy template - no DB required."""
 
 import importlib
+from pathlib import Path
 
 import polars as pl
 import pytest
@@ -25,7 +26,16 @@ def test_pipeline_wiring(module_name):
     assert mod.pipeline.name == mod.SIGNAL_NAME
     assert mod.pipeline.trade_def.legs == {mod.TARGET: 1.0}
     assert mod.STRATEGY.module == module_name
-    assert mod.STRATEGY.setups_file.parent.name == "curve"
+    assert mod.STRATEGY.data_dir == (
+        mod.STRATEGY.path.parent / "data" / mod.SIGNAL_NAME
+    )
+    assert mod.STRATEGY.setups_file.parent == mod.STRATEGY.data_dir
+
+
+def test_xy_scan_uses_shared_curve_data_directory():
+    mod = importlib.import_module("book.curve.xy_scan")
+    assert mod.XY_DATA_DIR == Path(mod.__file__).parent / "data"
+    assert mod.XY_SETUPS_FILE.parent == mod.XY_DATA_DIR
 
 
 def test_pc1_feature_hook_adds_point_in_time_score():

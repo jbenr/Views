@@ -11,7 +11,7 @@ a book module is just configuration:
     STRATEGY = Strategy(
         name="tens_10s30s",
         module="book.curve.tens_10s30s",   # sweep workers import this
-        path=Path(__file__),               # artifacts live next to it
+        path=Path(__file__),               # artifacts live in data/<name>/
         tickers={"10y": "USGG10YR Index", "10s30s": "USYC1030 Index"},
         bps_cols=["10y"],
         target="10s30s",
@@ -24,8 +24,9 @@ a book module is just configuration:
     if __name__ == "__main__":
         STRATEGY.cli()
 
-The research funnel. Each step saves its winners to a parquet next to the
-strategy file; the next step reads it — no hand-copying between runs:
+The research funnel. Each step saves its winners to a parquet in the strategy
+module's ``data/<strategy name>/`` directory; the next step reads it — no
+hand-copying between runs:
 
   1. --predict  cast a wide net: which (lookbacks, entry signal, threshold,
      horizon) cells show ANY forward predictability, with every gate
@@ -238,7 +239,7 @@ class Strategy:
     # identity
     name: str
     module: str  # importable path, used by sweep workers
-    path: Path  # the strategy module file; artifacts live next to it
+    path: Path  # strategy module file; artifacts live in data/<name>/ below it
     tickers: dict[str, str]
     target: str
     feature: str
@@ -299,16 +300,17 @@ class Strategy:
     era_years: int = 4  # era length for the consistency check (pnl > 0 per era)
 
     def __post_init__(self):
-        # funnel artifacts, next to the strategy file
-        self.setups_file = self.path.with_name(f"{self.name}_setups.parquet")
-        self.exits_file = self.path.with_name(f"{self.name}_exits.parquet")
-        self.exit_results_file = self.path.with_name(
-            f"{self.name}_exit_results.parquet"
+        # Keep generated funnel artifacts grouped by strategy instead of
+        # allowing them to accumulate beside the strategy modules.
+        self.data_dir = self.path.parent / "data" / self.name
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.setups_file = self.data_dir / f"{self.name}_setups.parquet"
+        self.exits_file = self.data_dir / f"{self.name}_exits.parquet"
+        self.exit_results_file = self.data_dir / f"{self.name}_exit_results.parquet"
+        self.sweep_results_file = (
+            self.data_dir / f"{self.name}_sweep_results.parquet"
         )
-        self.sweep_results_file = self.path.with_name(
-            f"{self.name}_sweep_results.parquet"
-        )
-        self.trades_file = self.path.with_name(f"{self.name}_trades.parquet")
+        self.trades_file = self.data_dir / f"{self.name}_trades.parquet"
 
         # bind once so module-level aliases and pipeline.compute_fn are the
         # same objects across every access (identity matters to the lab

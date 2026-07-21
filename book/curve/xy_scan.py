@@ -86,7 +86,8 @@ XY_KEEP_PER_PAIR = 200  # top valid rows kept per pair for the cross-pair board
 # (each pair produces ~7M result rows; they are reduced per pair - filtered,
 # selected, top slice kept - so 48 pairs never accumulate ~40GB in RAM)
 
-XY_SETUPS_FILE = Path(__file__).with_name(f"{SCAN_NAME}_setups.parquet")
+XY_DATA_DIR = Path(__file__).with_name("data")
+XY_SETUPS_FILE = XY_DATA_DIR / f"{SCAN_NAME}_setups.parquet"
 
 
 # -- helpers ----------------------------------------------------------------
@@ -320,6 +321,7 @@ def main(use_db: bool = True, device: str = "auto") -> dict:
         if setup_blocks
         else pl.DataFrame()
     )
+    XY_DATA_DIR.mkdir(parents=True, exist_ok=True)
     setups.write_parquet(XY_SETUPS_FILE)
     print(
         f"\ntop {XY_TOP_N_PER_PAIR} setups per pair by neighborhood IC "

@@ -48,7 +48,7 @@ def synthetic_data(n: int = 1500, seed: int = 11):
 STRATEGY = Strategy(
     name=SIGNAL_NAME,
     module="book.curve.twos10s_real10y",  # sweep workers import this
-    path=Path(__file__),  # funnel artifacts live next to this file
+    path=Path(__file__),  # funnel artifacts live in data/twos10s_real10y/
     tickers=TICKERS,
     bps_cols=["real10y"],
     target=TARGET,

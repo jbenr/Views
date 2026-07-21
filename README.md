@@ -107,7 +107,7 @@ from backtest.strategy import Strategy, synthetic_pair
 STRATEGY = Strategy(
     name="twos10s_real10y",
     module="book.curve.twos10s_real10y",   # sweep workers import this
-    path=Path(__file__),                   # funnel parquets live next to it
+    path=Path(__file__),                   # funnel parquets: data/<name>/
     tickers={"real10y": "USGGT10Y Index", "2s10s": "USYC2Y10 Index"},
     bps_cols=["real10y"],
     target="2s10s", feature="real10y",

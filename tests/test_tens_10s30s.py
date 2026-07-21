@@ -52,6 +52,9 @@ def test_pipeline_wiring():
     # module aliases and artifact paths come from the Strategy instance
     assert view.make_pipeline is STRATEGY.make_pipeline
     assert STRATEGY.setups_file.name == "tens_10s30s_setups.parquet"
+    assert STRATEGY.setups_file.parent == (
+        STRATEGY.path.parent / "data" / STRATEGY.name
+    )
     assert STRATEGY.trades_file == view.TRADES_FILE
 
 

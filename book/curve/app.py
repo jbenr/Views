@@ -9,7 +9,8 @@ The question: do the signals diversify each other (low overlap, higher
 combined sharpe) or are they the same trade in different clothes?
 
 PnL here is gross of costs, marked daily as position[t-1] x d(level); the
-engine's official numbers live in tens_10s30s_sweep_results.parquet.
+engine's official numbers live in
+data/tens_10s30s/tens_10s30s_sweep_results.parquet.
 
 Run:  mamba run -n 2s10s python book/curve/app.py
       Open http://localhost:8051
