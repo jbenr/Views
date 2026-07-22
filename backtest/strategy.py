@@ -93,6 +93,12 @@ from .lab import (
     stateful_exit_scan,
     sweep_strategy,
 )
+from .validation import (
+    deflated_sharpe_ratio,
+    effective_number_of_trials,
+    event_overlap_diagnostics,
+    probability_of_backtest_overfitting,
+)
 
 # the promoted-configuration shape every strategy starts from
 DEFAULT_PARAMS = {
@@ -270,7 +276,9 @@ class Strategy:
         default_factory=lambda: np.arange(0.5, 3.1, 0.2).tolist()
     )
     predict_gate_buckets: object = "regime"  # named quantile regimes per condition
+    gate_min_history: int = 252  # causal percentile warmup before gates may fire
     predict_min_obs: int = 30  # ignore cells with fewer threshold-crossing events
+    predict_min_independent_events: int = 8  # non-overlapping forecast windows
     predict_top_n: int = 10  # distinct setups saved to setups_file for --exit
     predict_min_neighbors: int = 3  # corroborating grid neighbors a setup needs
 
@@ -298,6 +306,7 @@ class Strategy:
     # step 3 --sweep: hard-stop overlay + robustness ranking
     sweep_stop_loss_bps: list = field(default_factory=lambda: [15.0, 25.0, 40.0])
     era_years: int = 4  # era length for the consistency check (pnl > 0 per era)
+    validation_slices: int = 8  # CSCV partitions for finalist PBO
 
     def __post_init__(self):
         # Keep generated funnel artifacts grouped by strategy instead of
@@ -311,6 +320,7 @@ class Strategy:
             self.data_dir / f"{self.name}_sweep_results.parquet"
         )
         self.trades_file = self.data_dir / f"{self.name}_trades.parquet"
+        self.validation_file = self.data_dir / f"{self.name}_validation.parquet"
 
         # bind once so module-level aliases and pipeline.compute_fn are the
         # same objects across every access (identity matters to the lab
@@ -435,7 +445,11 @@ class Strategy:
                 (ou["half_life"] * p["exit_param"]).alias("time_stop")
             )
         if p.get("gate") is not None:
-            allow = gate_allow_mask(self._gate_condition(frame, p), p["gate"])
+            allow = gate_allow_mask(
+                self._gate_condition(frame, p),
+                p["gate"],
+                min_history=self.gate_min_history,
+            )
             frame = frame.with_columns(pl.Series("gate_allow", allow))
         return frame
 
@@ -494,7 +508,9 @@ class Strategy:
             pool_size=pool_size,
         )
 
-    def _select_setups(self, valid: pl.DataFrame) -> pl.DataFrame:
+    def _select_setups(
+        self, valid: pl.DataFrame, limit: int | None = None
+    ) -> pl.DataFrame:
         """Best setups by neighborhood IC, one per (signal, lookbacks, gate)
         cell. Ranks on nbr_ic rather than the cell's own IC and requires at
         least predict_min_neighbors corroborating neighbors: after a
@@ -510,7 +526,7 @@ class Strategy:
                 keep="first",
                 maintain_order=True,
             )
-            .head(self.predict_top_n)
+            .head(self.predict_top_n if limit is None else limit)
             .rename({"horizon": "predict_horizon"})
             .select(
                 "entry_signal", "beta_lb", "ou_lb", "entry_threshold",
@@ -520,6 +536,83 @@ class Strategy:
         )
         names = [_setup_name(r) for r in best.iter_rows(named=True)]
         return best.insert_column(0, pl.Series("name", names))
+
+    def _add_overlap_diagnostics(
+        self,
+        setups: pl.DataFrame,
+        data: pl.DataFrame,
+        scans: list[dict] | None = None,
+    ) -> pl.DataFrame:
+        """Measure independent forecast episodes for shortlisted setups."""
+        scan_lookup = {}
+        if scans is not None:
+            for scan in scans:
+                for column, combo in enumerate(scan["combos"]):
+                    scan_lookup[
+                        (
+                            scan["entry_signal"],
+                            int(combo["beta_lb"]),
+                            int(combo.get("ou_lb", 0)),
+                        )
+                    ] = (scan, column)
+
+        rows = []
+        for setup in setups.iter_rows(named=True):
+            entry_signal = setup["entry_signal"]
+            ou_lb = 0 if entry_signal == "residual" else int(setup["ou_lb"])
+            cached = scan_lookup.get(
+                (entry_signal, int(setup["beta_lb"]), ou_lb)
+            )
+            if cached is None:
+                signal_kind = (
+                    "residual" if entry_signal == "residual" else "ou_zscore"
+                )
+                matrix, _, conditions = signal_matrix(
+                    data[self.feature],
+                    data[self.target],
+                    [int(setup["beta_lb"])],
+                    [ou_lb],
+                    return_conditions=True,
+                    signal_kind=signal_kind,
+                    lookback_name="ou_lb",
+                )
+                column = 0
+            else:
+                scan, column = cached
+                matrix, conditions = scan["matrix"], scan["conditions"]
+            signal = matrix[:, column]
+            previous = np.concatenate([[np.nan], signal[:-1]])
+            entry = float(setup["entry_threshold"])
+            crossed = (
+                ((signal >= entry) & ~(previous >= entry))
+                | ((signal <= -entry) & ~(previous <= -entry))
+            )
+            gate = setup["gate"]
+            if gate in (None, "(none)"):
+                gate_ok = np.ones(len(signal), dtype=bool)
+            else:
+                gate_ok = gate_allow_mask(
+                    conditions[gate][:, column],
+                    (gate, setup["gate_bucket"]),
+                    min_history=self.gate_min_history,
+                )
+            horizon = int(setup["predict_horizon"])
+            valid_forward = np.arange(len(signal)) < len(signal) - horizon
+            indices = np.flatnonzero(crossed & gate_ok & valid_forward)
+            rows.append(event_overlap_diagnostics(indices, horizon))
+        if not rows:
+            return setups.with_columns(
+                pl.lit(None, dtype=pl.Int64).alias("n_non_overlapping"),
+                pl.lit(None, dtype=pl.Float64).alias("overlap_fraction"),
+                pl.lit(None, dtype=pl.Float64).alias("median_event_spacing"),
+            )
+        return setups.with_columns(
+            pl.Series(
+                "n_non_overlapping", [row["n_non_overlapping"] for row in rows]
+            ),
+            pl.Series("overlap_fraction", [row["overlap_fraction"] for row in rows]),
+            pl.Series("median_event_spacing", [row["median_spacing"] for row in rows]),
+        )
 
     def load_setups(self, path: Path | None = None) -> list[dict]:
         """Setups saved by --predict, as the dicts exit_scan iterates over."""
@@ -703,6 +796,7 @@ class Strategy:
                     combos=scan["combos"],
                     gates=scan["conditions"],
                     gate_buckets=self.predict_gate_buckets,
+                    gate_min_history=self.gate_min_history,
                     device=device,
                     entry_col="entry_threshold",
                 ).with_columns(
@@ -732,14 +826,32 @@ class Strategy:
         )
         utils.pdf(valid.select([c for c in show if c in valid.columns]).head(20))
 
-        setups = self._select_setups(valid)
+        candidate_limit = max(self.predict_top_n * 10, self.predict_top_n)
+        candidates = self._select_setups(valid, limit=candidate_limit)
+        candidates = self._add_overlap_diagnostics(candidates, data, scans=scans)
+        rejected = candidates.filter(
+            pl.col("n_non_overlapping") < self.predict_min_independent_events
+        )
+        setups = (
+            candidates.filter(
+                pl.col("n_non_overlapping") >= self.predict_min_independent_events
+            )
+            .head(self.predict_top_n)
+        )
         setups.write_parquet(self.setups_file)
         print(
             f"\ntop {len(setups)} distinct setups by neighborhood IC "
-            f"(>= {self.predict_min_neighbors} neighbors), saved for --exit "
+            f"(>= {self.predict_min_neighbors} neighbors, >= "
+            f"{self.predict_min_independent_events} non-overlapping events), "
+            f"saved for --exit "
             f"-> {self.setups_file}:"
         )
         utils.pdf(setups)
+        if not rejected.is_empty():
+            print(
+                f"  rejected {len(rejected)} shortlisted cells with fewer than "
+                f"{self.predict_min_independent_events} independent forecast windows"
+            )
 
         return {"data": data, "results": results, "setups": setups}
 
@@ -791,7 +903,11 @@ class Strategy:
                     if isinstance(gate_spec, dict)
                     else gate_spec[1]
                 )
-                gate_ok = gate_allow_mask(conditions[gate_name][:, 0], gate_spec)[:, None]
+                gate_ok = gate_allow_mask(
+                    conditions[gate_name][:, 0],
+                    gate_spec,
+                    min_history=self.gate_min_history,
+                )[:, None]
 
             # Match predict_scan's trigger event exactly: the gate must be
             # valid on the first bar crossing this setup's threshold.
@@ -1102,6 +1218,67 @@ class Strategy:
             })
         return pl.DataFrame(rows).sort("sharpe_ex_best", descending=True)
 
+    def _selection_validation(self, results: pl.DataFrame) -> pl.DataFrame:
+        """DSR/PBO diagnostics for the exact finalist selection stage.
+
+        This deliberately says *finalists*: the predict and exit scans are
+        earlier selection stages whose full candidate return paths are not in
+        this matrix. These figures are therefore a lower bound on the full
+        research process's selection penalty, not a clean bill of health.
+        """
+        if "daily_pnl" not in results.columns or results.is_empty():
+            return pl.DataFrame()
+        paths = np.column_stack(
+            [np.asarray(path, dtype=float) for path in results["daily_pnl"].to_list()]
+        )
+        sharpes = results["sharpe"].to_numpy().astype(float)
+        n_eff, mean_corr = effective_number_of_trials(paths)
+        selected = paths[:, 0]  # results are already sorted by exact Sharpe
+        dsr_effective = deflated_sharpe_ratio(
+            selected, sharpes, independent_trials=n_eff
+        )
+        dsr_raw = deflated_sharpe_ratio(
+            selected, sharpes, independent_trials=float(len(sharpes))
+        )
+
+        row = {
+            "scope": "exact_finalists_only",
+            "n_trials": len(sharpes),
+            "implied_independent_trials": n_eff,
+            "mean_trial_correlation": mean_corr,
+            "selected_sharpe": dsr_effective["selected_sharpe"],
+            "expected_max_sharpe": dsr_effective["expected_max_sharpe"],
+            "dsr": dsr_effective["dsr"],
+            "expected_max_sharpe_raw_n": dsr_raw["expected_max_sharpe"],
+            "dsr_raw_n": dsr_raw["dsr"],
+            "return_skewness": dsr_effective["skewness"],
+            "return_kurtosis": dsr_effective["kurtosis"],
+            "n_observations": int(dsr_effective["n_obs"]),
+            "pbo": None,
+            "probability_oos_loss": None,
+            "mean_is_sharpe": None,
+            "mean_oos_sharpe": None,
+            "mean_degradation": None,
+            "median_oos_rank": None,
+            "cscv_combinations": 0,
+        }
+        if len(sharpes) >= 2:
+            n_slices = min(self.validation_slices, len(selected))
+            n_slices -= n_slices % 2
+            pbo = probability_of_backtest_overfitting(
+                paths, n_slices=max(2, n_slices)
+            )
+            row.update({
+                "pbo": pbo.pbo,
+                "probability_oos_loss": pbo.probability_of_loss,
+                "mean_is_sharpe": pbo.mean_is_sharpe,
+                "mean_oos_sharpe": pbo.mean_oos_sharpe,
+                "mean_degradation": pbo.mean_degradation,
+                "median_oos_rank": pbo.median_oos_rank,
+                "cscv_combinations": pbo.n_combinations,
+            })
+        return pl.DataFrame([row])
+
     def sweep(self, use_db: bool = True, n_jobs: int | None = None) -> dict:
         """Exact-engine sweep: one full backtest (stops, costs, trade
         mechanics) per saved (setup, exit) winner x hard stop, parallel
@@ -1147,6 +1324,7 @@ class Strategy:
                     transaction_cost_bps=self.transaction_cost_bps,
                     n_jobs=n_jobs,
                     progress=_progress,
+                    return_paths=True,
                 )
             )
             done_base += len(blocks[-1])
@@ -1164,7 +1342,10 @@ class Strategy:
                 )
             results = results.filter(pl.col("error").is_null())
 
+        validation = self._selection_validation(results)
+        results = results.drop("daily_pnl")
         results.write_parquet(self.sweep_results_file)
+        validation.write_parquet(self.validation_file)
 
         show = [
             "entry_signal", "beta_lb", "ou_lb", "entry_threshold", "exit_style",
@@ -1214,14 +1395,32 @@ class Strategy:
             )
             utils.pdf(robustness)
 
+        if not validation.is_empty():
+            print(
+                "\nselection diagnostics - exact finalists only "
+                "(earlier funnel trials are not included):"
+            )
+            utils.pdf(validation.select(
+                "n_trials",
+                pl.col("implied_independent_trials").round(1).alias("n_eff"),
+                pl.col("mean_trial_correlation").round(3).alias("avg_corr"),
+                pl.col("selected_sharpe").round(3).alias("sr"),
+                pl.col("expected_max_sharpe").round(3).alias("sr_hurdle"),
+                pl.col("dsr").round(3),
+                pl.col("pbo").cast(pl.Float64).round(3),
+                pl.col("probability_oos_loss").cast(pl.Float64).round(3).alias("p_loss"),
+                pl.col("mean_degradation").cast(pl.Float64).round(3).alias("degradation"),
+            ))
+
         print(f"\nsaved {len(results)} runs -> {self.sweep_results_file}")
         print(
             f"saved {len(trades)} trades across {len(trade_frames)} setups "
             f"-> {self.trades_file}"
         )
+        print(f"saved selection diagnostics -> {self.validation_file}")
 
         return {"data": data, "results": results, "trades": trades,
-                "robustness": robustness}
+                "robustness": robustness, "validation": validation}
 
     def cook(
         self,

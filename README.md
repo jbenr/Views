@@ -22,7 +22,7 @@ The core research loop:
 |---|---|---|
 | `stats/` | production | Quant primitives: rolling OLS (`ols.py`), OU/half-life/Hurst (`ou.py`), PCA (`pca.py`), residual diagnostics (`diagnostics.py`) |
 | `utils/` | production | DB access (`helpers.py`), market-data loaders (`market_data.py`), rate construction (`rates.py`), ticker universes (`tickers.py`), formatting, `Viz` plotting (`viz.py`), Dash helpers (`research_app.py`), DB browser (`peep.py`) |
-| `backtest/` | production | The single shared backtest/signal engine: `Engine`, `SignalPipeline`, `TradeDef`, sizing, metrics, parameter sweep / walk-forward, cross-sectional `SpreadBook` |
+| `backtest/` | production | The single shared backtest/signal engine: `Engine`, `SignalPipeline`, `TradeDef`, sizing, metrics, parameter scans, selection diagnostics, cross-sectional `SpreadBook` |
 | `book/` | production | Strategy families: `duration/`, `curve/`, `inflation/`, `rate_vol/`, `cross_market_rv/`, `event_driven/`. Each has a `strategy.py` (or `pipeline.py`) with the standard strategy layout; research scripts live alongside. (Named `strategy.py`, not `signal.py` — that shadows the stdlib `signal` module) |
 | `execution/` | boilerplate | Interactive Brokers adapter — dry-run only, see [`execution/README.md`](execution/README.md) |
 | `data_pull/` | ingestion | Bloomberg → PostgreSQL ingestion scripts. Run on the data box; nothing in research imports from here except `berg.py` for live Bloomberg work |
@@ -159,7 +159,7 @@ print_summary(result)          # PnL, hit rate, Sharpe, drawdown, holding period
 result.summary()               # same as a dict
 ```
 
-Signals are computed vectorially (polars); position management (entries, signal/stop/time/trailing exits, custom `exit_fn`/`entry_filter_fn`) is a row-by-row state machine. Also available: `backtest.sweep.ParameterSweep` (grid search + walk-forward), `backtest.portfolio.SpreadBook` (cross-sectional ranking + risk parity), `backtest.sizing` (DV01-neutral / beta-weighted legs).
+Signals are computed vectorially (polars); position management (entries, signal/stop/time/trailing exits, custom `exit_fn`/`entry_filter_fn`) is a row-by-row state machine. The parameter lab in `backtest.lab` supplies vectorized and exact grid searches; `backtest.validation` supplies selection-aware Sharpe and overfitting diagnostics.
 
 Two conventions keep backtests honest: signals on generics, P&L on OTRs; and no lookahead — every rolling stat in `stats/` uses trailing windows only.
 
@@ -173,7 +173,7 @@ signal_matrix + fast_scan   →   sweep_strategy   →   MetricStore   →   gat
  GPU-ready via cupy)             all CPU cores)       history)           edge buckets)
 ```
 
-1. **`fast_scan`** — approximate threshold backtest of an entire signal matrix in one shot, **with gates as a scan dimension**: pass `gates=` (the condition matrices from `signal_matrix(..., return_conditions=True)`: r2, beta_cv, abs_beta, resid_vol20, resid_mom10) and every combo is also evaluated once per (condition × quantile bucket) entry gate — the grid becomes `K × entries × (1 + gates × buckets)`. `add_gate_lift()` then scores each gate against its own ungated baseline. Pure array math (custom CUDA kernels for the scans), so on the NVIDIA tower it runs on GPU: `pip install -e ".[gpu]"`, then `device="gpu"`. Approximations: hysteresis exits, no stops, next-bar fills, per-column relative bucket labels — pin actual cutoffs with `gate_scan`.
+1. **`fast_scan`** — approximate threshold backtest of an entire signal matrix in one shot, **with gates as a scan dimension**: pass `gates=` (the condition matrices from `signal_matrix(..., return_conditions=True)`: r2, beta_cv, abs_beta, resid_vol20, resid_mom10) and every combo is also evaluated once per (condition × quantile bucket) entry gate — the grid becomes `K × entries × (1 + gates × buckets)`. Gate buckets are causal expanding percentiles with a configurable history warmup, so future observations never alter earlier entry decisions. `add_gate_lift()` then scores each gate against its own ungated baseline. Pure array math (custom CUDA kernels for the scans), so on the NVIDIA tower it runs on GPU: `pip install -e ".[gpu]"`, then `device="gpu"`. Approximations: hysteresis exits, no stops, next-bar fills, and per-column relative percentile labels.
 2. **`sweep_strategy("book.curve.tens_10s30s", data, grid)`** — the exact row-by-row Engine per combo, parallel across every CPU core (32-core box → 32 combos at a time). Real stops, time-stops, costs, trade logs.
 3. **`MetricStore`** — every run appends to `store/backtests.parquet` (git-ignored). `leaderboard()` ranks across strategies and time; `matrix(x="beta_lb", y="z_lb", metric="sharpe", agg="max")` pivots any metric across any two parameter dimensions.
 4. **`gate_scan`** — the highest-confidence-setup layer: bucket candidate state variables (r2, beta_cv, residual vol, regime flags) at hypothetical entry bars and measure per-bucket hit/PnL lift vs the unconditional baseline. Buckets that concentrate the edge graduate into `SignalConfig.entry_filter_fn` gates.
@@ -186,7 +186,7 @@ python -m book.curve.tens_10s30s --fast     # gated coarse scan, ~200k evals (--
 python -m book.curve.tens_10s30s --gates    # conditional edge table
 ```
 
-Guardrails: a sharpe that only exists in one grid cell is an overfit candidate, not a finding — validate winners with `backtest.sweep.ParameterSweep.walk_forward()` before believing them, and treat `fast_scan` output as a shortlist generator only.
+Guardrails: a Sharpe that only exists in one grid cell is an overfit candidate, not a finding. The strategy funnel requires at least eight non-overlapping forecast windows before a setup advances. Its exact sweep saves `*_validation.parquet` with the Probabilistic/Deflated Sharpe Ratio and CSCV Probability of Backtest Overfitting for the exact finalists. Those statistics are deliberately labeled `exact_finalists_only`: they do not account for candidates discarded during `--predict` or `--exit`, so they are lower bounds on the full research process's selection penalty. Treat `fast_scan` output as a shortlist generator only, retain every attempted path for full-funnel DSR/PBO, and require a purged, embargoed walk-forward rerun of the entire selection funnel before promotion.
 
 ## Ledger and execution (the intended live path)
 

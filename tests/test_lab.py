@@ -551,29 +551,46 @@ def test_parse_gate_rejects_bad_specs():
 
 
 def test_gate_allow_mask_bucket_semantics():
-    c = np.array([np.nan, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=float)
-    below = gate_allow_mask(c, ("c", "below", 0.5))     # q50=5 -> 0..5
-    above = gate_allow_mask(c, ("c", "above", 0.5))     # 5..10
-    between = gate_allow_mask(c, ("c", "between", 0.25, 0.75))  # strict: 3..7
-    outside = gate_allow_mask(c, ("c", "outside", 0.25, 0.75))  # 0..2, 8..10
-    assert below.sum() == 6
+    # Expanding ranks for the finite values are 1, .5, .667, .5, .6, .167, 1.
+    c = np.array([np.nan, 5, 1, 4, 2, 3, 0, 6], dtype=float)
+    below = gate_allow_mask(c, ("c", "below", 0.5), min_history=1)
+    above = gate_allow_mask(c, ("c", "above", 0.5), min_history=1)
+    between = gate_allow_mask(
+        c, ("c", "between", 0.25, 0.75), min_history=1
+    )
+    outside = gate_allow_mask(
+        c, ("c", "outside", 0.25, 0.75), min_history=1
+    )
+    assert below.sum() == 3
     assert above.sum() == 6
-    assert between.sum() == 5
-    assert outside.sum() == 6
+    assert between.sum() == 4
+    assert outside.sum() == 3
     assert not (between & outside).any()
     # NaN condition bars are never allowed
     for mask in (below, above, between, outside):
         assert not mask[0]
     # named bucket matches its explicit form
     np.testing.assert_array_equal(
-        gate_allow_mask(c, ("c", "high_75")),
-        gate_allow_mask(c, ("c", "above", 0.75)),
+        gate_allow_mask(c, ("c", "high_75"), min_history=1),
+        gate_allow_mask(c, ("c", "above", 0.75), min_history=1),
     )
+
+
+def test_gate_allow_mask_is_prefix_stable_and_honors_warmup():
+    prefix = np.array([3.0, 1.0, 4.0, 2.0, 5.0, 0.0])
+    full = np.concatenate([prefix, [1000.0, -1000.0, 7.0]])
+    spec = ("c", "low_25")
+
+    prefix_mask = gate_allow_mask(prefix, spec, min_history=3)
+    full_mask = gate_allow_mask(full, spec, min_history=3)
+
+    np.testing.assert_array_equal(full_mask[: len(prefix)], prefix_mask)
+    assert not full_mask[:2].any()
 
 
 def test_gate_allow_mask_accepts_polars_series():
     s = pl.Series([None, 1.0, 2.0, 3.0, 4.0])
-    mask = gate_allow_mask(s, ("c", "above_50"))
+    mask = gate_allow_mask(s, ("c", "above_50"), min_history=1)
     assert mask.dtype == bool
     assert not mask[0]
     assert mask.sum() > 0

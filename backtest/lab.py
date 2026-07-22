@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Callable, Optional, Union
 
 import numpy as np
+import pandas as pd
 import polars as pl
 
 REGIME_GATE_BUCKETS = (
@@ -118,11 +119,18 @@ def _import_strategy(module_name: str):
         return module
 
 
-def _init_worker(module_name: str, data: pl.DataFrame, cost: float, slip: float):
+def _init_worker(
+    module_name: str,
+    data: pl.DataFrame,
+    cost: float,
+    slip: float,
+    return_paths: bool = False,
+):
     _WORKER_STATE["module"] = _import_strategy(module_name)
     _WORKER_STATE["data"] = data
     _WORKER_STATE["cost"] = cost
     _WORKER_STATE["slip"] = slip
+    _WORKER_STATE["return_paths"] = return_paths
 
 
 def _param_row(params: dict) -> dict:
@@ -145,7 +153,13 @@ def _run_combo(params: dict) -> dict:
             slippage_bps=_WORKER_STATE["slip"],
         )
         result = Engine(config).add_signal(pipeline).run(_WORKER_STATE["data"])
-        return {**_param_row(params), **{k: float(v) for k, v in result.summary().items()}}
+        row = {
+            **_param_row(params),
+            **{k: float(v) for k, v in result.summary().items()},
+        }
+        if _WORKER_STATE.get("return_paths", False):
+            row["daily_pnl"] = result.equity_curve["pnl_bps"].to_list()
+        return row
     except Exception as e:  # keep the sweep alive; surface the failure in the row
         return {**_param_row(params), "error": f"{type(e).__name__}: {e}"}
 
@@ -159,6 +173,7 @@ def sweep_strategy(
     n_jobs: Optional[int] = None,
     sort_by: str = "sharpe",
     progress: Optional[Callable[[int, int], None]] = None,
+    return_paths: bool = False,
 ) -> pl.DataFrame:
     """Exact-engine backtest of every param combo, parallel across CPU cores.
 
@@ -169,6 +184,8 @@ def sweep_strategy(
         grid: ParamGrid or plain {param: [values]} dict.
         n_jobs: worker processes; default = all cores. 1 = serial (debugging).
         progress: optional callback(done, total), called as combos finish.
+        return_paths: include each combo's synchronous daily PnL as a list
+                      column for selection-aware validation diagnostics.
 
     Returns one row per combo: params + full Engine metrics, best first.
     """
@@ -181,7 +198,9 @@ def sweep_strategy(
     n_jobs = min(n_jobs, len(combos))
 
     if n_jobs <= 1:
-        _init_worker(module_name, data, transaction_cost_bps, slippage_bps)
+        _init_worker(
+            module_name, data, transaction_cost_bps, slippage_bps, return_paths
+        )
         rows = []
         for i, p in enumerate(combos, 1):
             rows.append(_run_combo(p))
@@ -191,7 +210,13 @@ def sweep_strategy(
         with ProcessPoolExecutor(
             max_workers=n_jobs,
             initializer=_init_worker,
-            initargs=(module_name, data, transaction_cost_bps, slippage_bps),
+            initargs=(
+                module_name,
+                data,
+                transaction_cost_bps,
+                slippage_bps,
+                return_paths,
+            ),
         ) as pool:
             futures = [pool.submit(_run_combo, p) for p in combos]
             rows = []
@@ -483,31 +508,72 @@ def parse_gate(spec: Union[tuple, list, dict]) -> tuple[str, str, tuple[float, .
 
 
 def gate_allow_mask(
-    values: Union[pl.Series, np.ndarray], spec: Union[tuple, list, dict]
+    values: Union[pl.Series, np.ndarray],
+    spec: Union[tuple, list, dict],
+    min_history: int = 252,
 ) -> np.ndarray:
     """Boolean entry-allow mask for one condition series under a gate spec.
 
-    Same bucket semantics as the fast_scan/predict_scan gates: quantile cuts
-    are computed on the full sample of finite condition values, and
-    non-finite bars are never allowed. Attach the mask to a strategy's
-    signal frame and check it in entry_filter_fn so the exact Engine
-    reproduces a gate shortlisted by the discovery scans.
+    Same bucket semantics as the fast_scan/predict_scan gates: each value is
+    ranked against the finite history available through that bar. Future
+    observations therefore cannot change an earlier gate decision. Bars with
+    less than ``min_history`` observations, and non-finite bars, are never
+    allowed. Attach the mask to a strategy's signal frame and check it in
+    entry_filter_fn so the exact Engine reproduces a shortlisted gate.
     """
     _, kind, qs = parse_gate(spec)
     c = np.asarray(
         values.to_numpy() if isinstance(values, pl.Series) else values, dtype=float
     )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        cuts = np.nanquantile(c, qs)
-    finite = np.isfinite(c)
+    ranks = _causal_percentile_rank(c, min_history=min_history)
+    finite = np.isfinite(ranks)
     if kind == "below":
-        return finite & (c <= cuts[0])
+        return finite & (ranks <= qs[0])
     if kind == "above":
-        return finite & (c >= cuts[0])
+        return finite & (ranks >= qs[0])
     if kind == "between":
-        return finite & (c > cuts[0]) & (c < cuts[1])
-    return finite & ((c <= cuts[0]) | (c >= cuts[1]))
+        return finite & (ranks > qs[0]) & (ranks < qs[1])
+    return finite & ((ranks <= qs[0]) | (ranks >= qs[1]))
+
+
+def _causal_percentile_rank(values: np.ndarray, min_history: int = 252) -> np.ndarray:
+    """Expanding percentile rank using information available at each bar.
+
+    The current observation is included because it is known when the entry
+    decision is made. ``Expanding.rank`` is prefix-stable: appending future
+    data cannot alter any rank already emitted.
+    """
+    if min_history < 1:
+        raise ValueError("min_history must be >= 1")
+    c = np.asarray(values, dtype=float)
+    if c.ndim not in {1, 2}:
+        raise ValueError(f"gate values must be 1D or 2D, got shape {c.shape}")
+    was_1d = c.ndim == 1
+    matrix = c[:, None] if was_1d else c
+
+    # signal_matrix repeats each beta-dependent gate once per OU lookback.
+    # Collapse consecutive identical columns before the expanding rank; this
+    # is exact and typically turns 2,500 histories into only 50.
+    inverse = None
+    if matrix.shape[1] > 1:
+        left, right = matrix[:, :-1], matrix[:, 1:]
+        same = np.all(
+            (left == right) | (np.isnan(left) & np.isnan(right)), axis=0
+        )
+        starts = np.concatenate([[0], np.flatnonzero(~same) + 1])
+        if len(starts) < matrix.shape[1]:
+            inverse = np.cumsum(np.concatenate([[0], (~same).astype(int)]))
+            matrix = matrix[:, starts]
+
+    frame = pd.DataFrame(matrix)
+    ranks = (
+        frame.expanding(min_periods=min_history)
+        .rank(method="average", pct=True)
+        .to_numpy()
+    )
+    if inverse is not None:
+        ranks = ranks[:, inverse]
+    return ranks[:, 0] if was_1d else ranks
 
 
 def _gate_masks(
@@ -516,8 +582,9 @@ def _gate_masks(
     k: int,
     gate_buckets: Union[int, str, tuple, list],
     xp,
+    min_history: int = 252,
 ) -> list[tuple[str, str, object]]:
-    """Build entry-allow masks per gate condition and named bucket."""
+    """Build causal entry-allow masks per gate condition and named bucket."""
     gate_masks: list[tuple[str, str, object]] = []
     if not gates:
         return gate_masks
@@ -528,18 +595,19 @@ def _gate_masks(
             c_np = np.broadcast_to(c_np[:, None], (t_len, k))
         if c_np.shape != (t_len, k):
             raise ValueError(f"gate '{name}' has shape {c_np.shape}, expected {(t_len, k)}")
-        c = xp.asarray(c_np)
+        ranks = xp.asarray(
+            _causal_percentile_rank(c_np, min_history=min_history)
+        )
+        finite = xp.isfinite(ranks)
 
         if isinstance(gate_buckets, (int, np.integer)):
             n_buckets = int(gate_buckets)
-            qs = np.linspace(0.0, 1.0, n_buckets + 1)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                edges_np = np.nanquantile(c_np, qs, axis=0)
-            edges = xp.asarray(edges_np)
+            if n_buckets < 1:
+                raise ValueError("gate_buckets must be >= 1")
+            edges = np.linspace(0.0, 1.0, n_buckets + 1)
             for b in range(n_buckets):
-                lo, hi = edges[b][None, :], edges[b + 1][None, :]
-                allow = (c >= lo) & ((c <= hi) if b == n_buckets - 1 else (c < hi))
+                lo, hi = edges[b], edges[b + 1]
+                allow = finite & (ranks > lo) & (ranks <= hi)
                 gate_masks.append((name, f"q{b + 1}/{n_buckets}", allow))
             continue
 
@@ -550,30 +618,16 @@ def _gate_masks(
         else:
             specs = gate_buckets
 
-        quantiles = sorted({
-            q
-            for spec in specs
-            for q in spec[2:]
-        })
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            cuts_np = np.nanquantile(c_np, quantiles, axis=0)
-        cuts = {
-            q: xp.asarray(cuts_np[i])[None, :]
-            for i, q in enumerate(quantiles)
-        }
-
-        finite = xp.isfinite(c)
         for spec in specs:
             label, kind, *qs = spec
             if kind == "below":
-                allow = finite & (c <= cuts[qs[0]])
+                allow = finite & (ranks <= qs[0])
             elif kind == "above":
-                allow = finite & (c >= cuts[qs[0]])
+                allow = finite & (ranks >= qs[0])
             elif kind == "between":
-                allow = finite & (c > cuts[qs[0]]) & (c < cuts[qs[1]])
+                allow = finite & (ranks > qs[0]) & (ranks < qs[1])
             elif kind == "outside":
-                allow = finite & ((c <= cuts[qs[0]]) | (c >= cuts[qs[1]]))
+                allow = finite & ((ranks <= qs[0]) | (ranks >= qs[1]))
             else:
                 raise ValueError(f"unknown gate bucket kind={kind!r}")
             gate_masks.append((name, label, allow))
@@ -595,6 +649,7 @@ def fast_scan(
     device: str = "cpu",
     entry_col: str = "entry_z",
     exit_col: str = "exit_band_bps",
+    gate_min_history: int = 252,
 ) -> pl.DataFrame:
     """Approximate threshold backtest of a whole signal matrix, vectorized.
 
@@ -606,10 +661,10 @@ def fast_scan(
     Gating: every (combo, entry) is additionally evaluated once per
     (gate condition Ã— quantile bucket) â€” ENTRIES are allowed only on bars
     where the condition falls inside the bucket (exits always fire; NaN
-    condition bars never open trades). Bucket edges are per-column quantiles
-    of the condition, so labels are relative ("q2/3"); recover the actual
-    cutoff levels for a shortlisted gate with gate_scan(). The baseline rows
-    carry gate="(none)".
+    condition bars never open trades). Buckets are causal expanding
+    percentiles per column, so labels are relative ("q2/3") and future data
+    cannot alter an earlier entry decision. The baseline rows carry
+    gate="(none)".
 
     Args:
         z: (T,) or (T, K) signal matrix â€” e.g. from signal_matrix().
@@ -621,6 +676,7 @@ def fast_scan(
                conditions from signal_matrix(return_conditions=True).
         gate_buckets: int for equal quantile slices, or "regime" for named
                       tails/middles/median regimes.
+        gate_min_history: finite observations required before a gate can fire.
         entry_allow: optional boolean mask restricting entries; exits remain
                      active on every bar. Shape must be (T,) or (T, K).
         device: "cpu" (numpy) or "gpu" (cupy â€” install the ``gpu`` extra).
@@ -644,10 +700,11 @@ def fast_scan(
     dlv = xp.concatenate([xp.asarray([xp.nan]), xp.diff(lv)])[:, None]
     dlv = xp.where(xp.isnan(dlv), 0.0, dlv)
 
-    # Pre-compute entry-allow masks per (gate, bucket): per-column quantile
-    # buckets of the condition. Edges computed on CPU once per gate (cupy's
-    # nanquantile support varies by version); masks are bool (T, K) â€” cheap.
-    gate_masks = _gate_masks(gates, t_len, k, gate_buckets, xp)
+    # Pre-compute causal percentile masks on CPU once per gate; masks are
+    # transferred to the selected array backend for the vectorized scan.
+    gate_masks = _gate_masks(
+        gates, t_len, k, gate_buckets, xp, min_history=gate_min_history
+    )
     if entry_allow is None:
         base_allow = xp.ones((t_len, k), dtype=bool)
     else:
@@ -870,6 +927,7 @@ def predict_scan(
     gate_buckets: Union[int, str, tuple, list] = 3,
     device: str = "cpu",
     entry_col: str = "entry_threshold",
+    gate_min_history: int = 252,
 ) -> pl.DataFrame:
     """Forward-horizon predictability scan for a signal matrix.
 
@@ -898,7 +956,9 @@ def predict_scan(
         [xp.full((1, k), xp.nan, dtype=xp.float64), z[:-1]], axis=0
     )
 
-    gate_masks = _gate_masks(gates, t_len, k, gate_buckets, xp)
+    gate_masks = _gate_masks(
+        gates, t_len, k, gate_buckets, xp, min_history=gate_min_history
+    )
     combo_frame = (
         pl.DataFrame(combos) if combos is not None
         else pl.DataFrame({"col": list(range(k))})
@@ -1319,14 +1379,15 @@ def gate_scan(
     horizon: int = 20,
     n_buckets: int = 3,
     min_n: int = 20,
+    gate_min_history: int = 252,
 ) -> pl.DataFrame:
     """Which state variables separate good entries from bad ones?
 
     Takes every bar where |signal| >= entry_z as a hypothetical fade entry,
     measures forward PnL = sign(-z) Ã— (level[t+h] âˆ’ level[t]), then buckets
-    each condition column into quantiles (computed on the entry sample) and
-    reports per-bucket n / hit / avg_pnl / per-trade sharpe plus the lift vs
-    the unconditional baseline (condition="(all)").
+    each condition by its causal expanding percentile and reports per-bucket
+    n / hit / avg_pnl / per-trade sharpe plus the lift vs the unconditional
+    baseline (condition="(all)").
 
     A gate is promising when one bucket concentrates the hit rate and PnL
     with enough n â€” that bucket becomes an entry_filter_fn in SignalConfig.
@@ -1355,7 +1416,8 @@ def gate_scan(
     rows = [{"condition": "(all)", "bucket": "all", **base, "hit_lift": 0.0, "pnl_lift": 0.0}]
 
     for cond in conditions.columns:
-        c = np.asarray(conditions[cond].to_numpy(), dtype=float)[entry]
+        raw_c = np.asarray(conditions[cond].to_numpy(), dtype=float)
+        c = raw_c[entry]
         ok = np.isfinite(c)
         if ok.sum() < min_n:
             continue
@@ -1366,13 +1428,15 @@ def gate_scan(
         if len(uniq) <= n_buckets:
             buckets = [(f"={u:g}", ok & (c == u)) for u in uniq]
         else:
-            edges = np.unique(np.nanquantile(c[ok], np.linspace(0, 1, n_buckets + 1)))
-            n_b = len(edges) - 1
+            ranks = _causal_percentile_rank(
+                raw_c, min_history=gate_min_history
+            )[entry]
+            rank_ok = np.isfinite(ranks)
             buckets = []
-            for b in range(n_b):
-                lo, hi = edges[b], edges[b + 1]
-                mask = ok & (c >= lo) & (c <= hi if b == n_b - 1 else c < hi)
-                buckets.append((f"q{b + 1}/{n_b} [{lo:.3g}, {hi:.3g}]", mask))
+            for b in range(n_buckets):
+                lo, hi = b / n_buckets, (b + 1) / n_buckets
+                mask = rank_ok & (ranks > lo) & (ranks <= hi)
+                buckets.append((f"q{b + 1}/{n_buckets}", mask))
 
         for label, in_b in buckets:
             if in_b.sum() < min_n:

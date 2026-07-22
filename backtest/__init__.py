@@ -15,3 +15,14 @@ from .lab import (
     gate_variant_count, parse_gate, gate_allow_mask, stateful_exit_scan,
     neighbor_ic_stats,
 )
+from .validation import (
+    PBOResult,
+    annualized_sharpe,
+    deflated_sharpe_ratio,
+    effective_number_of_trials,
+    event_overlap_diagnostics,
+    expected_maximum_sharpe,
+    probability_of_backtest_overfitting,
+    probabilistic_sharpe_ratio,
+    return_moments,
+)
