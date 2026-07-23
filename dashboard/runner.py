@@ -1,0 +1,126 @@
+"""Pulls fresh data and runs the live analysis for a promoted signal.
+
+Two distinct actions map to the dashboard's two buttons:
+
+    pull_data(module)      fresh Strategy.load_data(), cached to disk.
+                            No ledger write -- just refreshes the inputs.
+    run_analysis(module)   Strategy.compute() on the cached data, checked
+                            against the promoted entry threshold, ONE row
+                            appended to the signal ledger.
+
+compute_signal() is the shared, non-logging core both the dashboard's
+chart rendering and run_analysis() use -- rendering a card must not itself
+be an auditable event, only an explicit "re-run analysis" click is.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import os
+from pathlib import Path
+
+import polars as pl
+
+from .ledger import SignalLedger
+from .params import params_from_row
+from .registry import LiveRegistry, load_strategy
+
+
+def _store_dir() -> Path:
+    return Path(
+        os.getenv("VIEWS_STORE_DIR", str(Path(__file__).resolve().parents[1] / "store"))
+    )
+
+
+def _data_cache_path(name: str) -> Path:
+    return _store_dir() / "live_data" / f"{name}.parquet"
+
+
+def _f(value):
+    return float(value) if value is not None else None
+
+
+def pull_data(module: str) -> dict:
+    """Fresh Strategy.load_data(), cached to store/live_data/<name>.parquet."""
+    strategy = load_strategy(module)
+    data = strategy.model_frame(strategy.load_data())
+    cache_path = _data_cache_path(strategy.name)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    data.write_parquet(cache_path)
+    return {
+        "data": data,
+        "pulled_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "data_asof": data["ts"][-1],
+    }
+
+
+def cached_data(module: str) -> pl.DataFrame | None:
+    strategy = load_strategy(module)
+    cache_path = _data_cache_path(strategy.name)
+    if not cache_path.exists():
+        return None
+    return pl.read_parquet(cache_path)
+
+
+def compute_signal(module: str) -> dict:
+    """Recompute the promoted signal on cached data. No ledger write --
+    used to render charts on every card refresh, not just on demand."""
+    strategy = load_strategy(module)
+    data = cached_data(module)
+    if data is None:
+        raise RuntimeError(f"{module}: no cached data -- click 'Re-pull data' first")
+
+    row = LiveRegistry().get(module)
+    if row is None:
+        raise RuntimeError(f"{module}: not promoted -- run dashboard.registry --promote first")
+    params = params_from_row(row)
+
+    sig = strategy.compute(data, params=params)
+    last = sig.tail(1).to_dicts()[0]
+    threshold = params["entry_threshold"]
+    reading = last.get("signal")
+
+    fired = "flat"
+    if reading is not None:
+        if reading <= -threshold:
+            fired = "long"
+        elif reading >= threshold:
+            fired = "short"
+    if fired != "flat" and last.get("gate_allow") is False:
+        fired = "flat (gated)"
+
+    return {
+        "strategy": strategy,
+        "data": data,
+        "signal_frame": sig,
+        "params": params,
+        "last": last,
+        "fired": fired,
+        "data_asof": data["ts"][-1],
+    }
+
+
+def run_analysis(module: str) -> dict:
+    """compute_signal() plus one auditable row appended to the ledger."""
+    state = compute_signal(module)
+    last, params = state["last"], state["params"]
+
+    entry = {
+        "module": module,
+        "name": state["strategy"].name,
+        "run_ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "data_asof_ts": str(state["data_asof"]),
+        "level": _f(state["data"][state["strategy"].target][-1]),
+        "signal": _f(last.get("signal")),
+        "resid": _f(last.get("resid")),
+        "ou_z": _f(last.get("ou_z")),
+        "beta": _f(last.get("beta")),
+        "r2": _f(last.get("r2")),
+        "half_life": _f(last.get("half_life")),
+        "entry_signal": params["entry_signal"],
+        "entry_threshold": _f(params["entry_threshold"]),
+        "gate_allow": last.get("gate_allow"),
+        "fired": state["fired"],
+    }
+    SignalLedger().log(entry)
+    return {**state, "ledger_entry": entry}
