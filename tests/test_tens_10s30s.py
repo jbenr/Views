@@ -61,10 +61,12 @@ def test_pipeline_wiring():
 def test_compute_gate_param_adds_allow_column():
     data = synthetic_data(n=900)
     gated = compute(data, params={"gate": ("r2", "high_75")})
-    assert "gate_allow" in gated.columns
+    assert {"gate_value", "gate_percentile", "gate_allow"} <= set(gated.columns)
     assert gated["gate_allow"].dtype == pl.Boolean
     assert gated["gate_allow"].sum() > 0          # some bars allowed
     assert not gated["gate_allow"].all()          # ...but not all
+    finite_ranks = gated["gate_percentile"].drop_nans().drop_nulls()
+    assert finite_ranks.is_between(0.0, 1.0).all()
     assert "gate_allow" not in compute(data).columns
 
 

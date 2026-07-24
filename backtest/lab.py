@@ -522,10 +522,7 @@ def gate_allow_mask(
     entry_filter_fn so the exact Engine reproduces a shortlisted gate.
     """
     _, kind, qs = parse_gate(spec)
-    c = np.asarray(
-        values.to_numpy() if isinstance(values, pl.Series) else values, dtype=float
-    )
-    ranks = _causal_percentile_rank(c, min_history=min_history)
+    ranks = gate_percentile_rank(values, min_history=min_history)
     finite = np.isfinite(ranks)
     if kind == "below":
         return finite & (ranks <= qs[0])
@@ -534,6 +531,21 @@ def gate_allow_mask(
     if kind == "between":
         return finite & (ranks > qs[0]) & (ranks < qs[1])
     return finite & ((ranks <= qs[0]) | (ranks >= qs[1]))
+
+
+def gate_percentile_rank(
+    values: Union[pl.Series, np.ndarray],
+    min_history: int = 252,
+) -> np.ndarray:
+    """Causal expanding percentile used by every gate decision.
+
+    Exposed separately so diagnostics and dashboards can explain why a gate
+    is open without recomputing a different, potentially non-causal rank.
+    """
+    c = np.asarray(
+        values.to_numpy() if isinstance(values, pl.Series) else values, dtype=float
+    )
+    return _causal_percentile_rank(c, min_history=min_history)
 
 
 def _causal_percentile_rank(values: np.ndarray, min_history: int = 252) -> np.ndarray:

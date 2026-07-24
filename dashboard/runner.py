@@ -105,8 +105,10 @@ def trade_history(module: str, state: dict | None = None) -> tuple[pl.DataFrame,
     closed trade log -- always derived from the same `data` the charts
     render, so markers/table can never disagree with the chart. Costs one
     full Engine.run() (a Python loop over cached history) per call; not
-    cached. Returns (closed_trades, open_entry) -- open_entry describes the
-    live position if the promoted config is currently in a trade (else None).
+    cached. The exact daily equity curve is attached to ``state`` for the
+    dashboard PnL chart. Returns (closed_trades, open_entry) -- open_entry
+    describes the live position if the promoted config is currently in a
+    trade (else None).
     """
     from backtest.engine import BacktestConfig, Engine, trade_log
 
@@ -115,6 +117,7 @@ def trade_history(module: str, state: dict | None = None) -> tuple[pl.DataFrame,
 
     engine = Engine(BacktestConfig(transaction_cost_bps=strategy.transaction_cost_bps))
     result = engine.add_signal(strategy.make_pipeline(params)).run(data)
+    state["equity_curve"] = result.equity_curve
 
     log = trade_log(result.closed_trades)
     if not log.is_empty():
@@ -175,6 +178,8 @@ def run_analysis(module: str) -> dict:
         "half_life": _f(last.get("half_life")),
         "entry_signal": params["entry_signal"],
         "entry_threshold": _f(params["entry_threshold"]),
+        "gate_value": _f(last.get("gate_value")),
+        "gate_percentile": _f(last.get("gate_percentile")),
         "gate_allow": last.get("gate_allow"),
         "fired": state["fired"],
     }

@@ -85,6 +85,7 @@ from .lab import (
     ParamGrid,
     fast_scan,
     gate_allow_mask,
+    gate_percentile_rank,
     gate_variant_count,
     neighbor_ic_stats,
     parse_gate,
@@ -445,12 +446,20 @@ class Strategy:
                 (ou["half_life"] * p["exit_param"]).alias("time_stop")
             )
         if p.get("gate") is not None:
+            condition = self._gate_condition(frame, p)
+            percentile = gate_percentile_rank(
+                condition, min_history=self.gate_min_history
+            )
             allow = gate_allow_mask(
-                self._gate_condition(frame, p),
+                condition,
                 p["gate"],
                 min_history=self.gate_min_history,
             )
-            frame = frame.with_columns(pl.Series("gate_allow", allow))
+            frame = frame.with_columns(
+                condition.alias("gate_value"),
+                pl.Series("gate_percentile", percentile),
+                pl.Series("gate_allow", allow),
+            )
         return frame
 
     def make_pipeline(self, params: dict | None = None) -> SignalPipeline:

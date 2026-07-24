@@ -50,7 +50,8 @@ itself is never logged, only an explicit "re-run analysis" click is.
   `stop_loss_bps`) plus the backtest metrics it was promoted on.
 - `signal_ledger.parquet` -- append-only: one row per "re-run analysis"
   click (`run_ts`, `data_asof_ts`, `level`, `signal`, `resid`, `ou_z`,
-  `beta`, `r2`, `half_life`, `fired`).
+  `beta`, `r2`, `half_life`, `gate_value`, `gate_percentile`,
+  `gate_allow`, `fired`).
 - `live_data/<name>.parquet` -- the last data pulled per signal, so the
   dashboard can render without hitting the DB on every page load.
 
@@ -60,9 +61,17 @@ All three follow `backtest.lab.MetricStore`'s atomic-write pattern
 ## Card layout
 
 Name / pair / module, a stat row (data as-of, last analysis run, current
-reading, param summary), then two charts side by side: the tradable level,
-and the entry signal (residual or OU z-score) with `±entry_threshold` bands
-and the current reading flagged. Charts are rendered through `utils.viz.Viz`
+reading, gate state, and an explanatory param summary), then two charts side
+by side: the tradable level and the entry signal (residual or OU z-score)
+with `±entry_threshold` bands and the current reading flagged. Gated signals
+also show a compact causal-percentile chart identifying the gate rule and
+whether it is currently open or closed. The fourth chart is the exact
+engine's cumulative daily marked-to-market PnL, including open-position
+movements rather than only realized trade exits, rebased to zero at the
+left edge of the selected chart window. The chart-window controls sit
+immediately above the chart grid. "Snap chart to view" includes five
+business days before the earliest visible entry. Trade-table directions
+are green for long and red for short. Charts are rendered through `utils.viz.Viz`
 (`dashboard/charts.py`'s `_PngViz` renders straight to a PNG instead of
 Viz's own live-server registry, since refresh here is button-driven, not a
 background loop) -- same colors, endpoint flags, and residual fill as every

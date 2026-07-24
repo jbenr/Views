@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Root launcher for the exact command ``python data_pull.ref``.
+
+Python treats this argument as a filename rather than module notation. The
+refresh implementation remains in ``data_pull/ref.py``; this extensionless
+launcher only forwards execution and command-line arguments.
+"""
+
+from pathlib import Path
+from runpy import run_path
+
+
+if __name__ == "__main__":
+    run_path(
+        str(Path(__file__).resolve().parent / "data_pull" / "ref.py"),
+        run_name="__main__",
+    )

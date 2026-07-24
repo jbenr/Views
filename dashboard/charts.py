@@ -12,10 +12,14 @@ from __future__ import annotations
 import base64
 from io import BytesIO
 
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import polars as pl
+from matplotlib.collections import LineCollection
 
+from backtest.lab import parse_gate
 from utils.research_app import C0, C1, DIM
 from utils.viz import Viz
 
@@ -27,13 +31,20 @@ class _PngViz(Viz):
     """Viz, but _make_time_nav renders to a base64 PNG instead of a
     notebook widget / PlotlyViz's live-server registry."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, fig_height: float | None = None, **kwargs):
         plt.switch_backend("Agg")  # safe off the Dash callback thread
         super().__init__(*args, **kwargs)
+        self.fig_height = fig_height
 
     def _make_time_nav(self, df, render_fn, title=None, nrows=1,
                         height_ratios=None, fig_height=None):
-        h = fig_height if fig_height is not None else (5.4 if nrows == 1 else 4.2 * nrows)
+        h = (
+            fig_height
+            if fig_height is not None
+            else self.fig_height
+            if self.fig_height is not None
+            else (5.4 if nrows == 1 else 4.2 * nrows)
+        )
         fig, axes = plt.subplots(
             nrows, 1, figsize=(9, h), sharex=(nrows > 1),
             gridspec_kw={"height_ratios": height_ratios} if height_ratios else {},
@@ -156,4 +167,136 @@ def signal_chart(
             (-entry_threshold, f"-{entry_threshold:g}"),
         ],
         line_colors=line_colors,
+    )
+
+
+def _gate_bucket_description(kind: str, qs: tuple[float, ...]) -> str:
+    pct = [round(q * 100) for q in qs]
+    if kind == "below":
+        return f"BELOW {pct[0]}TH PCT"
+    if kind == "above":
+        return f"ABOVE {pct[0]}TH PCT"
+    if kind == "between":
+        return f"BETWEEN {pct[0]}TH–{pct[1]}TH PCT"
+    return f"OUTSIDE {pct[0]}TH–{pct[1]}TH PCT"
+
+
+def gate_chart(
+    data: pl.DataFrame,
+    sig_frame: pl.DataFrame,
+    gate_spec,
+    window_bars: int | None = WINDOW_PRESETS[DEFAULT_WINDOW],
+    date_range: tuple | None = None,
+) -> str | None:
+    """Causal historical percentile of the promoted gate condition.
+
+    The title explicitly reports the current gate state and bucket rule.
+    Threshold lines are the same percentile boundaries used by the strategy.
+    """
+    if gate_spec is None or "gate_percentile" not in sig_frame.columns:
+        return None
+
+    name, kind, qs = parse_gate(gate_spec)
+    combined = data.select("ts").with_columns(
+        (sig_frame["gate_percentile"] * 100.0).alias("historical percentile"),
+        sig_frame["gate_allow"].alias("gate_allow"),
+    )
+    frame = _pandas_indexed(combined, ["historical percentile", "gate_allow"])
+    frame = _slice_window(frame, window_bars, date_range)
+    finite = frame["historical percentile"].dropna()
+    allow = frame["gate_allow"].fillna(False).astype(bool)
+    if finite.empty:
+        state = "WARMING UP"
+        current = ""
+    else:
+        is_open = bool(allow.loc[finite.index[-1]])
+        state = "OPEN" if is_open else "CLOSED"
+        current = f" @ {finite.iloc[-1]:.0f}TH PCT"
+
+    title = (
+        f"gate: {name} · {_gate_bucket_description(kind, qs)} · "
+        f"{state}{current}"
+    )
+    viz = _PngViz(fig_height=3.2)
+
+    def render(fig, ax, start, end):
+        subset = frame.loc[start:end]
+        values = subset["historical percentile"].to_numpy(dtype=float)
+        states = subset["gate_allow"].fillna(False).to_numpy(dtype=bool)
+        x = mdates.date2num(subset.index.to_pydatetime())
+        points = np.column_stack([x, values])
+        valid = np.isfinite(values[:-1]) & np.isfinite(values[1:])
+        segments = np.stack([points[:-1], points[1:]], axis=1)[valid]
+        segment_states = states[1:][valid]
+        if len(segments):
+            ax.add_collection(
+                LineCollection(
+                    segments,
+                    colors=np.where(segment_states, C1, C0),
+                    linewidths=1.6,
+                    zorder=3,
+                )
+            )
+        # Empty handles give the LineCollection a conventional dashboard legend.
+        ax.plot([], [], color=C1, linewidth=1.6, label="gate open")
+        ax.plot([], [], color=C0, linewidth=1.6, label="gate closed")
+        for q in qs:
+            pct = q * 100.0
+            ax.axhline(
+                pct,
+                color=DIM,
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.7,
+                label=f"{round(pct)}th pct",
+                zorder=2,
+            )
+        ax.set_ylim(0.0, 100.0)
+        viz._style_ax(ax, yaxis_title="percentile")
+        viz._format_dates(ax, start, end)
+        viz._legend(ax)
+        ax.set_xlim(start, end)
+        fig.subplots_adjust(bottom=0.18)
+
+    return viz._make_time_nav(frame, render, title=title)
+
+
+def _window_pnl_frame(
+    equity_curve: pl.DataFrame,
+    window_bars: int | None = WINDOW_PRESETS[DEFAULT_WINDOW],
+    date_range: tuple | None = None,
+) -> pd.DataFrame:
+    """Slice the exact equity curve and rebase the visible window to zero."""
+    frame = _pandas_indexed(equity_curve, ["cumulative_pnl"])
+    frame = _slice_window(frame, window_bars, date_range)
+    finite = frame["cumulative_pnl"].dropna()
+    if not finite.empty:
+        frame = frame.copy()
+        frame["cumulative_pnl"] -= finite.iloc[0]
+    return frame
+
+
+def pnl_chart(
+    equity_curve: pl.DataFrame,
+    window_bars: int | None = WINDOW_PRESETS[DEFAULT_WINDOW],
+    date_range: tuple | None = None,
+) -> str:
+    """Exact-engine marked-to-market PnL, rebased at the visible window."""
+    frame = _window_pnl_frame(equity_curve, window_bars, date_range)
+    latest = frame["cumulative_pnl"].dropna()
+    color = C1 if latest.empty or latest.iloc[-1] >= 0 else C0
+    return _PngViz(fig_height=3.2).line(
+        frame,
+        cols=["cumulative_pnl"],
+        title="cumulative pnl · window reset",
+        yaxis_title="bps",
+        hlines=[
+            {
+                "value": 0.0,
+                "style": "solid",
+                "color": DIM,
+                "alpha": 0.5,
+            }
+        ],
+        line_colors={"cumulative_pnl": color},
     )

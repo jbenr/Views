@@ -30,7 +30,14 @@ import pandas as pd
 from dash import Input, Output, State, ctx, dash_table, dcc, html
 
 from dashboard import runner
-from dashboard.charts import DEFAULT_WINDOW, WINDOW_PRESETS, level_chart, signal_chart
+from dashboard.charts import (
+    DEFAULT_WINDOW,
+    WINDOW_PRESETS,
+    gate_chart,
+    level_chart,
+    pnl_chart,
+    signal_chart,
+)
 from dashboard.ledger import SignalLedger
 from dashboard.registry import LiveRegistry
 from utils.research_app import (
@@ -41,6 +48,7 @@ REGISTRY = LiveRegistry()
 LEDGER = SignalLedger()
 
 TRADES_PER_PAGE = 6
+SNAP_LEFT_BUFFER_BDAYS = 5
 
 TRADE_TABLE_COLS = [
     "entry_date", "exit_date", "direction",
@@ -51,7 +59,7 @@ TRADE_TABLE_HEADERS = {
     "entry_date": "Entry", "exit_date": "Exit", "direction": "Dir",
     "entry_level": "Entry Lvl", "exit_level": "Exit Lvl",
     "target_lvl": "Target Lvl", "expected_return_bps": "Exp Ret (bps)",
-    "pnl_bps": "PnL (bps)", "entry_half_life": "Half-life (d)",
+    "pnl_bps": "Net PnL (bps)", "entry_half_life": "Half-life (d)",
     "bars_held": "Held (d)", "exit_reason": "Exit Reason",
 }
 TRADE_TABLE_ROUND = {
@@ -64,12 +72,30 @@ def _slug(module: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", module.lower()).strip("-")
 
 
+def _exit_summary(row: dict) -> str:
+    style = row["exit_style"]
+    param = float(row["exit_param"])
+    if style == "revert_frac":
+        return (
+            f"exit=revert_frac={param:g} "
+            f"(after {param:.0%} of entry signal reverts toward zero)"
+        )
+    if style == "half_life_frac":
+        return f"exit=half_life_frac={param:g} ({param:g}× entry half-life)"
+    if style == "band":
+        units = "bps" if row["entry_signal"] == "residual" else "z"
+        return f"exit=band={param:g}{units} (inside ±{param:g}{units})"
+    return f"exit={style}={param:g}"
+
+
 def _param_summary(row: dict) -> str:
     bits = [f"{row['entry_signal']} beta_lb={row['beta_lb']}"]
     if row.get("ou_lb"):
         bits.append(f"ou_lb={row['ou_lb']}")
     bits.append(f"entry={row['entry_threshold']:g}")
-    bits.append(f"exit={row['exit_style']}/{row['exit_param']:g}")
+    bits.append(_exit_summary(row))
+    if row.get("stop_loss_bps") is not None:
+        bits.append(f"hard stop={float(row['stop_loss_bps']):g}bps")
     if row.get("gate") and row["gate"] != "(none)":
         bits.append(f"gate={row['gate']}")
     return "  ·  ".join(bits)
@@ -147,7 +173,24 @@ def _visible_trade_range(trades, open_entry: dict | None, page: int, data_asof):
     dates = [d for d in dates if d is not None]
     if not dates:
         return None
-    return min(dates), max(dates)
+    start = pd.Timestamp(min(dates)) - pd.offsets.BDay(SNAP_LEFT_BUFFER_BDAYS)
+    return start, max(dates)
+
+
+def _gate_status(state: dict) -> str:
+    params = state["params"]
+    if params.get("gate") is None:
+        return "none"
+    last = state["last"]
+    percentile = last.get("gate_percentile")
+    if percentile is None or percentile != percentile:
+        return "warming up"
+    status = "open" if bool(last.get("gate_allow")) else "closed"
+    pct = round(float(percentile) * 100)
+    suffix = "th" if 10 <= pct % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(
+        pct % 10, "th"
+    )
+    return f"{status} · {pct}{suffix} pct"
 
 
 def _trade_table_block(trades, page: int, open_entry: dict | None, slug: str) -> html.Div:
@@ -176,6 +219,22 @@ def _trade_table_block(trades, page: int, open_entry: dict | None, slug: str) ->
                     "border": f"1px solid {BORDER}",
                 },
                 style_data_conditional=[
+                    {
+                        "if": {
+                            "filter_query": '{direction} = "long"',
+                            "column_id": "direction",
+                        },
+                        "color": C1,
+                        "fontWeight": "bold",
+                    },
+                    {
+                        "if": {
+                            "filter_query": '{direction} = "short"',
+                            "column_id": "direction",
+                        },
+                        "color": C0,
+                        "fontWeight": "bold",
+                    },
                     {"if": {"filter_query": "{pnl_bps} > 0", "column_id": "pnl_bps"},
                      "color": C1, "fontWeight": "bold"},
                     {"if": {"filter_query": "{pnl_bps} < 0", "column_id": "pnl_bps"},
@@ -201,7 +260,7 @@ def _trade_table_block(trades, page: int, open_entry: dict | None, slug: str) ->
     )
 
 
-def _card_body(
+def _card_sections(
     module: str,
     state: dict | None = None,
     trades=None,
@@ -209,10 +268,13 @@ def _card_body(
     window: str = DEFAULT_WINDOW,
     page: int = 0,
     date_range: tuple | None = None,
-) -> html.Div:
+) -> tuple[html.Div, html.Div]:
     row = REGISTRY.get(module)
     if row is None:
-        return html.Div(f"{module}: no longer promoted", style={"color": DIM})
+        return (
+            html.Div(),
+            html.Div(f"{module}: no longer promoted", style={"color": DIM}),
+        )
 
     ledger_row = LEDGER.latest(module)
     error = None
@@ -233,6 +295,11 @@ def _card_body(
             "reading",
             state["fired"] if state else "—",
             alert=bool(state and state["fired"] not in ("flat", "flat (gated)")),
+        ),
+        *(
+            [stat_block("gate", _gate_status(state))]
+            if state and state["params"].get("gate") is not None
+            else []
         ),
         stat_block("live pnl", _fnum(live_pnl, "+.1f", " bps"),
                     alert=bool(live_pnl and live_pnl < 0)),
@@ -263,28 +330,45 @@ def _card_body(
             state["params"]["entry_signal"], state["params"]["entry_threshold"],
             window_bars=window_bars, date_range=date_range, fired=state["fired"],
         )
+        gate_png = gate_chart(
+            state["data"],
+            state["signal_frame"],
+            state["params"].get("gate"),
+            window_bars=window_bars,
+            date_range=date_range,
+        )
+        pnl_png = pnl_chart(
+            state["equity_curve"],
+            window_bars=window_bars,
+            date_range=date_range,
+        )
+        chart_pngs = [level_png, sig_png]
+        if gate_png is not None:
+            chart_pngs.append(gate_png)
+        chart_pngs.append(pnl_png)
         body = [
             html.Div(
                 style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": 10},
                 children=[
-                    html.Img(src=f"data:image/png;base64,{level_png}",
-                              style={"width": "100%", "border": f"1px solid {BORDER}"}),
-                    html.Img(src=f"data:image/png;base64,{sig_png}",
-                              style={"width": "100%", "border": f"1px solid {BORDER}"}),
+                    html.Img(
+                        src=f"data:image/png;base64,{png}",
+                        style={"width": "100%", "border": f"1px solid {BORDER}"},
+                    )
+                    for png in chart_pngs
                 ],
             ),
             _trade_table_block(trades, page, open_entry, _slug(module)),
         ]
 
-    return html.Div([
+    summary = html.Div([
         html.Div(stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
                                 "padding": "8px 2px 8px"}),
         html.Div(backtest_stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
                                          "padding": "0 2px 14px",
                                          "borderTop": f"1px solid {BORDER}",
                                          "marginTop": 4, "paddingTop": 8}),
-        *body,
     ])
+    return summary, html.Div(body)
 
 
 def _btn_style(primary: bool = False) -> dict:
@@ -300,6 +384,7 @@ def _btn_style(primary: bool = False) -> dict:
 def _card(row: dict) -> html.Div:
     module = row["module"]
     slug = _slug(module)
+    summary, analysis = _card_sections(module)
     return html.Div(
         style={"border": f"1px solid {BORDER}", "background": PANEL,
                "padding": "14px 18px", "marginBottom": 18},
@@ -324,17 +409,38 @@ def _card(row: dict) -> html.Div:
                                 style=_btn_style()),
                     html.Button("Re-run analysis", id=f"run-{slug}", n_clicks=0,
                                 style=_btn_style(primary=True)),
-                    *[
-                        html.Button(key, id=f"window-{slug}-{key}", n_clicks=0,
-                                    style=_btn_style(primary=(key == DEFAULT_WINDOW)))
-                        for key in WINDOW_PRESETS
-                    ],
                     dcc.Store(id=f"window-{slug}", data=DEFAULT_WINDOW),
                     dcc.Store(id=f"snap-range-{slug}", data=None),
                     dcc.Store(id=f"trades-page-{slug}", data=0),
                 ],
             ),
-            html.Div(id=f"card-body-{slug}", children=_card_body(module)),
+            html.Div(id=f"card-summary-{slug}", children=summary),
+            html.Div(
+                style={
+                    "display": "flex",
+                    "gap": 8,
+                    "marginBottom": 8,
+                    "alignItems": "center",
+                    "flexWrap": "wrap",
+                },
+                children=[
+                    html.Span(
+                        "Chart window",
+                        style={
+                            "fontSize": 10,
+                            "color": DIM,
+                            "textTransform": "uppercase",
+                            "marginRight": 2,
+                        },
+                    ),
+                    *[
+                        html.Button(key, id=f"window-{slug}-{key}", n_clicks=0,
+                                    style=_btn_style(primary=(key == DEFAULT_WINDOW)))
+                        for key in WINDOW_PRESETS
+                    ],
+                ],
+            ),
+            html.Div(id=f"card-analysis-{slug}", children=analysis),
         ],
     )
 
@@ -389,7 +495,7 @@ def build_app() -> dash.Dash:
                 trades, open_entry = runner.trade_history(module, state)
             except RuntimeError as exc:
                 err = html.Div(str(exc), style={"color": ORANGE, "padding": "12px 0"})
-                return (err, 0, window, snap_range, *no_btn_styles)
+                return (html.Div(), err, 0, window, snap_range, *no_btn_styles)
 
             n = 0 if trades is None or trades.is_empty() else len(trades)
             last_page = max(0, (n - 1) // TRADES_PER_PAGE * TRADES_PER_PAGE) if n else 0
@@ -408,13 +514,21 @@ def build_app() -> dash.Dash:
             if snap_range:
                 date_range = (pd.Timestamp(snap_range[0]), pd.Timestamp(snap_range[1]))
 
-            body = _card_body(module, state=state, trades=trades, open_entry=open_entry,
-                               window=window, page=page, date_range=date_range)
+            summary, analysis = _card_sections(
+                module,
+                state=state,
+                trades=trades,
+                open_entry=open_entry,
+                window=window,
+                page=page,
+                date_range=date_range,
+            )
             btn_styles = [_btn_style(primary=(k == window)) for k in window_keys]
-            return body, page, window, snap_range, *btn_styles
+            return summary, analysis, page, window, snap_range, *btn_styles
 
         app.callback(
-            Output(f"card-body-{slug}", "children"),
+            Output(f"card-summary-{slug}", "children"),
+            Output(f"card-analysis-{slug}", "children"),
             Output(f"trades-page-{slug}", "data"),
             Output(f"window-{slug}", "data"),
             Output(f"snap-range-{slug}", "data"),
