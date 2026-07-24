@@ -129,10 +129,28 @@ def trade_history(module: str, state: dict | None = None) -> tuple[pl.DataFrame,
     open_entry = None
     if result.open_trades:  # max_positions=1 by default -- at most one
         pos = result.open_trades[0]
+        current_level = float(data[strategy.target][-1])
+        direction_sign = 1 if pos.direction == 1 else -1
+        entry_resid = pos.entry_extras.get("resid")
+        entry_ou_mean = pos.entry_extras.get("ou_mean")
+        target_lvl = expected_return_bps = None
+        if entry_resid is not None and entry_ou_mean is not None:
+            target_lvl = pos.entry_level - entry_resid + entry_ou_mean
+            expected_return_bps = direction_sign * (entry_ou_mean - entry_resid)
         open_entry = {
             "date": pos.entry_date,
             "level": pos.entry_level,
             "direction": "long" if pos.direction == 1 else "short",
+            "entry_date": pos.entry_date,
+            "exit_date": None,
+            "entry_level": pos.entry_level,
+            "exit_level": current_level,
+            "target_lvl": target_lvl,
+            "expected_return_bps": expected_return_bps,
+            "pnl_bps": pos.unrealized_pnl(current_level),
+            "entry_half_life": pos.entry_extras.get("half_life"),
+            "bars_held": pos.bars_held,
+            "exit_reason": "active",
         }
 
     return log, open_entry

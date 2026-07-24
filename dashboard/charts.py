@@ -56,6 +56,20 @@ def _pandas_indexed(data: pl.DataFrame, cols: list[str]) -> pd.DataFrame:
     return out.set_index("ts")
 
 
+def _slice_window(
+    frame: pd.DataFrame,
+    window_bars: int | None,
+    date_range: tuple | None,
+) -> pd.DataFrame:
+    """date_range (explicit start/end) wins over the window_bars tail preset."""
+    if date_range is not None:
+        start, end = date_range
+        return frame.loc[start:end]
+    if window_bars is not None:
+        return frame.tail(window_bars)
+    return frame
+
+
 def _trade_markers(
     trades: pl.DataFrame | None,
     open_entry: dict | None,
@@ -94,11 +108,11 @@ def level_chart(
     trades: pl.DataFrame | None = None,
     open_entry: dict | None = None,
     window_bars: int | None = WINDOW_PRESETS[DEFAULT_WINDOW],
+    date_range: tuple | None = None,
 ) -> str:
     """Tradable level, recent window, with trade entry/exit markers -- base64 PNG."""
     frame = _pandas_indexed(data, [target])
-    if window_bars is not None:
-        frame = frame.tail(window_bars)
+    frame = _slice_window(frame, window_bars, date_range)
     markers = _trade_markers(trades, open_entry, frame.index.min(), frame.index.max())
     return _PngViz().line(frame, cols=[target], title=target, yaxis_title="bps",
                            markers=markers)
@@ -110,15 +124,22 @@ def signal_chart(
     entry_signal: str,
     entry_threshold: float,
     window_bars: int | None = WINDOW_PRESETS[DEFAULT_WINDOW],
+    date_range: tuple | None = None,
+    fired: str = "flat",
 ) -> str:
     """Residual/OU-z chart with entry threshold bands and the current
-    reading flagged -- base64 PNG."""
+    reading flagged -- base64 PNG. Line is colored red while a sell (short)
+    signal is firing, green while a buy (long) signal is firing."""
     col = "resid" if entry_signal == "residual" else "ou_z"
     combined = data.select("ts").with_columns(sig_frame[col].alias(col))
     frame = _pandas_indexed(combined, [col])
-    if window_bars is not None:
-        frame = frame.tail(window_bars)
+    frame = _slice_window(frame, window_bars, date_range)
     units = "bps" if entry_signal == "residual" else "z"
+    line_colors = None
+    if fired == "short":
+        line_colors = {col: C0}
+    elif fired == "long":
+        line_colors = {col: C1}
     return _PngViz().line(
         frame, cols=[col],
         title=f"{entry_signal} vs entry ({entry_threshold:g} {units})",
@@ -128,4 +149,5 @@ def signal_chart(
             (entry_threshold, f"+{entry_threshold:g}"),
             (-entry_threshold, f"-{entry_threshold:g}"),
         ],
+        line_colors=line_colors,
     )

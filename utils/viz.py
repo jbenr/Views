@@ -529,6 +529,7 @@ class Viz:
         linestyles: Optional[dict] = None,
         bar: bool = False,
         markers: Optional[List[dict]] = None,
+        line_colors: Optional[dict] = None,
     ):
         """Line chart with interactive time navigation.
 
@@ -556,10 +557,13 @@ class Viz:
                Example:
                    markers=[{"x": entry_dates, "y": entry_levels,
                              "label": "long entry", "color": "#27AE60", "marker": "^"}]
+        line_colors : optional {col_name: hex_color} override for a series' line
+               (and its endpoint flag), replacing the default palette color.
         """
         cols = cols or df.select_dtypes(include=[np.number]).columns.tolist()
         left = left or []
         ls_map = linestyles or {}
+        color_overrides = line_colors or {}
         if not isinstance(df.index, pd.DatetimeIndex):
             df = df.copy()
             df.index = pd.to_datetime(df.index)
@@ -578,7 +582,7 @@ class Viz:
                 ax2.grid(False)
 
             for i, col in enumerate(cols):
-                color = self.colors[i % len(self.colors)]
+                color = color_overrides.get(col, self.colors[i % len(self.colors)])
                 target = ax2 if col in left else ax
                 series = subset[col].dropna()
                 if series.empty:

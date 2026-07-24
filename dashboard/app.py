@@ -8,10 +8,10 @@ card drive everything else:
     Re-run analysis     Strategy.compute() on the cached data, logged as
                         one timestamped row in the signal ledger.
 
-No background loop or auto-refresh -- nothing changes until you click. A
-per-card time-frame dropdown and trade-table pager also trigger a re-render,
-but touch neither the DB nor the ledger -- they just re-slice/re-page what's
-already cached.
+No background loop or auto-refresh -- nothing changes until you click. Per-card
+time-frame buttons, the trade-table pager, and a "snap chart to view" zoom
+button also trigger a re-render, but touch neither the DB nor the ledger --
+they just re-slice/re-page what's already cached.
 
     python -m dashboard.registry --promote book.curve.tens_10s30s
     mamba run -n 2s10s python -m dashboard.app
@@ -26,6 +26,7 @@ import argparse
 import re
 
 import dash
+import pandas as pd
 from dash import Input, Output, State, ctx, dash_table, dcc, html
 
 from dashboard import runner
@@ -104,18 +105,55 @@ def _trade_page_rows(trades, page: int) -> list[dict]:
     return rows
 
 
-def _trade_table_block(trades, page: int) -> html.Div:
+def _open_trade_row(open_entry: dict) -> dict:
+    """Format the live open position as a table row, same shape as
+    _trade_page_rows() output -- pinned above the paginated closed trades."""
+    out = {}
+    for col in TRADE_TABLE_COLS:
+        val = open_entry.get(col)
+        if col == "exit_date":
+            out[col] = "open"
+        elif col == "entry_date" and val is not None:
+            out[col] = str(val)
+        elif col in TRADE_TABLE_ROUND and val is not None:
+            out[col] = round(val, TRADE_TABLE_ROUND[col])
+        else:
+            out[col] = val
+    return out
+
+
+def _visible_trade_range(trades, open_entry: dict | None, page: int, data_asof):
+    """Date span covering exactly what's currently shown in the trade table --
+    the pinned open row plus the current page of closed trades."""
+    dates = []
+    if trades is not None and not trades.is_empty():
+        for row in trades.slice(page, TRADES_PER_PAGE).to_dicts():
+            dates.append(row["entry_date"])
+            dates.append(row["exit_date"])
+    if open_entry is not None:
+        dates.append(open_entry["entry_date"])
+        dates.append(data_asof)
+    dates = [d for d in dates if d is not None]
+    if not dates:
+        return None
+    return min(dates), max(dates)
+
+
+def _trade_table_block(trades, page: int, open_entry: dict | None, slug: str) -> html.Div:
     n = 0 if trades is None or trades.is_empty() else len(trades)
-    if n == 0:
+    if n == 0 and open_entry is None:
         return html.Div("no closed trades yet", style={"color": DIM, "padding": "8px 0"})
 
-    lo, hi = page + 1, min(page + TRADES_PER_PAGE, n)
+    rows = ([_open_trade_row(open_entry)] if open_entry is not None else [])
+    rows += _trade_page_rows(trades, page) if n else []
+    lo, hi = (page + 1, min(page + TRADES_PER_PAGE, n)) if n else (0, 0)
+
     return html.Div(
         style={"marginTop": 14},
         children=[
             dash_table.DataTable(
                 columns=[{"name": TRADE_TABLE_HEADERS[c], "id": c} for c in TRADE_TABLE_COLS],
-                data=_trade_page_rows(trades, page),
+                data=rows,
                 style_table={"overflowX": "auto"},
                 style_cell={
                     "backgroundColor": PANEL, "color": TEXT,
@@ -129,11 +167,28 @@ def _trade_table_block(trades, page: int) -> html.Div:
                 style_data_conditional=[
                     {"if": {"filter_query": '{direction} = "long"'}, "color": C1},
                     {"if": {"filter_query": '{direction} = "short"'}, "color": C0},
+                    {"if": {"filter_query": "{pnl_bps} > 0", "column_id": "pnl_bps"},
+                     "color": C1, "fontWeight": "bold"},
+                    {"if": {"filter_query": "{pnl_bps} < 0", "column_id": "pnl_bps"},
+                     "color": C0, "fontWeight": "bold"},
+                    {"if": {"filter_query": '{exit_reason} = "active"'}, "fontStyle": "italic"},
                 ],
             ),
-            html.Span(f"showing {lo}-{hi} of {n} trades", style={
-                "fontSize": 11, "color": DIM, "display": "block", "marginTop": 4,
-            }),
+            html.Div(
+                style={"display": "flex", "gap": 8, "alignItems": "center", "marginTop": 8},
+                children=[
+                    html.Button("< prev", id=f"trades-prev-{slug}", n_clicks=0,
+                                style=_btn_style()),
+                    html.Button("next >", id=f"trades-next-{slug}", n_clicks=0,
+                                style=_btn_style()),
+                    html.Button("Snap chart to view", id=f"snap-{slug}", n_clicks=0,
+                                style=_btn_style()),
+                    html.Span(
+                        f"showing {lo}-{hi} of {n} closed trades" if n else "no closed trades yet",
+                        style={"fontSize": 11, "color": DIM},
+                    ),
+                ],
+            ),
         ],
     )
 
@@ -145,6 +200,7 @@ def _card_body(
     open_entry: dict | None = None,
     window: str = DEFAULT_WINDOW,
     page: int = 0,
+    date_range: tuple | None = None,
 ) -> html.Div:
     row = REGISTRY.get(module)
     if row is None:
@@ -185,15 +241,16 @@ def _card_body(
     if error:
         body = [html.Div(error, style={"color": ORANGE, "padding": "12px 0"})]
     else:
-        window_bars = WINDOW_PRESETS[window]
+        window_bars = WINDOW_PRESETS.get(window, WINDOW_PRESETS[DEFAULT_WINDOW])
         level_png = level_chart(
             state["data"], state["strategy"].target,
-            trades=trades, open_entry=open_entry, window_bars=window_bars,
+            trades=trades, open_entry=open_entry,
+            window_bars=window_bars, date_range=date_range,
         )
         sig_png = signal_chart(
             state["data"], state["signal_frame"],
             state["params"]["entry_signal"], state["params"]["entry_threshold"],
-            window_bars=window_bars,
+            window_bars=window_bars, date_range=date_range, fired=state["fired"],
         )
         body = [
             html.Div(
@@ -205,7 +262,7 @@ def _card_body(
                               style={"width": "100%", "border": f"1px solid {BORDER}"}),
                 ],
             ),
-            _trade_table_block(trades, page),
+            _trade_table_block(trades, page, open_entry, _slug(module)),
         ]
 
     return html.Div([
@@ -256,16 +313,13 @@ def _card(row: dict) -> html.Div:
                                 style=_btn_style()),
                     html.Button("Re-run analysis", id=f"run-{slug}", n_clicks=0,
                                 style=_btn_style(primary=True)),
-                    dcc.Dropdown(
-                        id=f"window-{slug}",
-                        options=[{"label": k, "value": k} for k in WINDOW_PRESETS],
-                        value=DEFAULT_WINDOW, clearable=False, searchable=False,
-                        style={"width": 90, "fontSize": 12},
-                    ),
-                    html.Button("< prev", id=f"trades-prev-{slug}", n_clicks=0,
-                                style=_btn_style()),
-                    html.Button("next >", id=f"trades-next-{slug}", n_clicks=0,
-                                style=_btn_style()),
+                    *[
+                        html.Button(key, id=f"window-{slug}-{key}", n_clicks=0,
+                                    style=_btn_style(primary=(key == DEFAULT_WINDOW)))
+                        for key in WINDOW_PRESETS
+                    ],
+                    dcc.Store(id=f"window-{slug}", data=DEFAULT_WINDOW),
+                    dcc.Store(id=f"snap-range-{slug}", data=None),
                     dcc.Store(id=f"trades-page-{slug}", data=0),
                 ],
             ),
@@ -298,12 +352,17 @@ def build_app() -> dash.Dash:
         body=body,
     )
 
+    window_keys = list(WINDOW_PRESETS)
+
     for row in rows:
         module = row["module"]
         slug = _slug(module)
+        window_prefix = f"window-{slug}-"
 
-        def _update(_pull, _run, _window, _prev, _next, window, page, module=module):
+        def _update(_pull, _run, *rest, module=module, slug=slug, window_prefix=window_prefix):
+            *_window_clicks, _prev, _next, _snap, window, snap_range, page = rest
             trigger = ctx.triggered_id or ""
+            no_btn_styles = [dash.no_update] * len(window_keys)
             try:
                 if trigger.startswith("pull-"):
                     runner.pull_data(module)
@@ -311,34 +370,52 @@ def build_app() -> dash.Dash:
                 elif trigger.startswith("run-"):
                     runner.run_analysis(module)
                     page = 0
-                elif trigger.startswith("window-"):
+                elif trigger.startswith(window_prefix):
+                    window = trigger[len(window_prefix):]
+                    snap_range = None
                     page = 0
                 state = runner.compute_signal(module)
                 trades, open_entry = runner.trade_history(module, state)
             except RuntimeError as exc:
-                return html.Div(str(exc), style={"color": ORANGE, "padding": "12px 0"}), 0
+                err = html.Div(str(exc), style={"color": ORANGE, "padding": "12px 0"})
+                return (err, 0, window, snap_range, *no_btn_styles)
 
             n = 0 if trades is None or trades.is_empty() else len(trades)
             last_page = max(0, (n - 1) // TRADES_PER_PAGE * TRADES_PER_PAGE) if n else 0
-            if trigger.startswith("trades-prev-"):
+            if trigger == f"trades-prev-{slug}":
                 page = max(0, page - TRADES_PER_PAGE)
-            elif trigger.startswith("trades-next-"):
+            elif trigger == f"trades-next-{slug}":
                 page = min(page + TRADES_PER_PAGE, last_page)
             page = min(page, last_page)
 
+            if trigger == f"snap-{slug}":
+                rng = _visible_trade_range(trades, open_entry, page, state["data_asof"])
+                if rng is not None:
+                    snap_range = [str(rng[0]), str(rng[1])]
+
+            date_range = None
+            if snap_range:
+                date_range = (pd.Timestamp(snap_range[0]), pd.Timestamp(snap_range[1]))
+
             body = _card_body(module, state=state, trades=trades, open_entry=open_entry,
-                               window=window, page=page)
-            return body, page
+                               window=window, page=page, date_range=date_range)
+            btn_styles = [_btn_style(primary=(k == window)) for k in window_keys]
+            return body, page, window, snap_range, *btn_styles
 
         app.callback(
             Output(f"card-body-{slug}", "children"),
             Output(f"trades-page-{slug}", "data"),
+            Output(f"window-{slug}", "data"),
+            Output(f"snap-range-{slug}", "data"),
+            *[Output(f"window-{slug}-{k}", "style") for k in window_keys],
             Input(f"pull-{slug}", "n_clicks"),
             Input(f"run-{slug}", "n_clicks"),
-            Input(f"window-{slug}", "value"),
+            *[Input(f"window-{slug}-{k}", "n_clicks") for k in window_keys],
             Input(f"trades-prev-{slug}", "n_clicks"),
             Input(f"trades-next-{slug}", "n_clicks"),
-            State(f"window-{slug}", "value"),
+            Input(f"snap-{slug}", "n_clicks"),
+            State(f"window-{slug}", "data"),
+            State(f"snap-range-{slug}", "data"),
             State(f"trades-page-{slug}", "data"),
             prevent_initial_call=True,
         )(_update)
