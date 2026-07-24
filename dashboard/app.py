@@ -40,7 +40,7 @@ from utils.research_app import (
 REGISTRY = LiveRegistry()
 LEDGER = SignalLedger()
 
-TRADES_PER_PAGE = 5
+TRADES_PER_PAGE = 6
 
 TRADE_TABLE_COLS = [
     "entry_date", "exit_date", "direction",
@@ -88,6 +88,17 @@ def _fnum(value, fmt: str, suffix: str = "") -> str:
     return format(value, fmt) + suffix
 
 
+def _live_pnl_bps(trades, open_entry: dict | None) -> float:
+    """Realized PnL from closed trades plus unrealized PnL from the open
+    position, if any -- the running live total since promotion."""
+    total = 0.0
+    if trades is not None and not trades.is_empty():
+        total += float(trades["pnl_bps"].sum())
+    if open_entry is not None:
+        total += float(open_entry["pnl_bps"])
+    return total
+
+
 def _trade_page_rows(trades, page: int) -> list[dict]:
     """5-row page slice, formatted for dash_table.DataTable's `data` prop."""
     sliced = trades.slice(page, TRADES_PER_PAGE)
@@ -124,13 +135,13 @@ def _open_trade_row(open_entry: dict) -> dict:
 
 def _visible_trade_range(trades, open_entry: dict | None, page: int, data_asof):
     """Date span covering exactly what's currently shown in the trade table --
-    the pinned open row plus the current page of closed trades."""
+    the open row (page 0 only) plus the current page of closed trades."""
     dates = []
     if trades is not None and not trades.is_empty():
         for row in trades.slice(page, TRADES_PER_PAGE).to_dicts():
             dates.append(row["entry_date"])
             dates.append(row["exit_date"])
-    if open_entry is not None:
+    if open_entry is not None and page == 0:
         dates.append(open_entry["entry_date"])
         dates.append(data_asof)
     dates = [d for d in dates if d is not None]
@@ -144,7 +155,7 @@ def _trade_table_block(trades, page: int, open_entry: dict | None, slug: str) ->
     if n == 0 and open_entry is None:
         return html.Div("no closed trades yet", style={"color": DIM, "padding": "8px 0"})
 
-    rows = ([_open_trade_row(open_entry)] if open_entry is not None else [])
+    rows = ([_open_trade_row(open_entry)] if open_entry is not None and page == 0 else [])
     rows += _trade_page_rows(trades, page) if n else []
     lo, hi = (page + 1, min(page + TRADES_PER_PAGE, n)) if n else (0, 0)
 
@@ -165,13 +176,10 @@ def _trade_table_block(trades, page: int, open_entry: dict | None, slug: str) ->
                     "border": f"1px solid {BORDER}",
                 },
                 style_data_conditional=[
-                    {"if": {"filter_query": '{direction} = "long"'}, "color": C1},
-                    {"if": {"filter_query": '{direction} = "short"'}, "color": C0},
                     {"if": {"filter_query": "{pnl_bps} > 0", "column_id": "pnl_bps"},
                      "color": C1, "fontWeight": "bold"},
                     {"if": {"filter_query": "{pnl_bps} < 0", "column_id": "pnl_bps"},
                      "color": C0, "fontWeight": "bold"},
-                    {"if": {"filter_query": '{exit_reason} = "active"'}, "fontStyle": "italic"},
                 ],
             ),
             html.Div(
@@ -217,6 +225,7 @@ def _card_body(
         except RuntimeError as exc:
             error = str(exc)
 
+    live_pnl = _live_pnl_bps(trades, open_entry) if state and not error else None
     stats = [
         stat_block("data as-of", str(state["data_asof"]) if state else "—"),
         stat_block("last analysis run", ledger_row["run_ts"] if ledger_row else "never"),
@@ -225,6 +234,8 @@ def _card_body(
             state["fired"] if state else "—",
             alert=bool(state and state["fired"] not in ("flat", "flat (gated)")),
         ),
+        stat_block("live pnl", _fnum(live_pnl, "+.1f", " bps"),
+                    alert=bool(live_pnl and live_pnl < 0)),
         stat_block("params", _param_summary(row)),
     ]
     last = state["last"] if state else {}

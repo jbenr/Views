@@ -19,7 +19,7 @@ import polars as pl
 from utils.research_app import C0, C1, DIM
 from utils.viz import Viz
 
-WINDOW_PRESETS = {"3M": 63, "6M": 126, "1Y": 252, "2Y": 504, "5Y": 1260, "All": None}
+WINDOW_PRESETS = {"3M": 63, "6M": 126, "YTD": "YTD", "1Y": 252, "2Y": 504, "5Y": 1260, "All": None}
 DEFAULT_WINDOW = "2Y"
 
 
@@ -58,12 +58,18 @@ def _pandas_indexed(data: pl.DataFrame, cols: list[str]) -> pd.DataFrame:
 
 def _slice_window(
     frame: pd.DataFrame,
-    window_bars: int | None,
+    window_bars: int | str | None,
     date_range: tuple | None,
 ) -> pd.DataFrame:
-    """date_range (explicit start/end) wins over the window_bars tail preset."""
+    """date_range (explicit start/end) wins over the window_bars tail preset.
+    window_bars is a bar count, "YTD" (Jan 1 of the latest year to date), or
+    None (all history)."""
     if date_range is not None:
         start, end = date_range
+        return frame.loc[start:end]
+    if window_bars == "YTD":
+        end = frame.index.max()
+        start = pd.Timestamp(year=end.year, month=1, day=1)
         return frame.loc[start:end]
     if window_bars is not None:
         return frame.tail(window_bars)
