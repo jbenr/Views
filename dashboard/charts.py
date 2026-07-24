@@ -16,9 +16,11 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import polars as pl
 
+from utils.research_app import C0, C1, DIM
 from utils.viz import Viz
 
-WINDOW_BARS = 500  # ~2 years of business days, plenty for a dashboard card
+WINDOW_PRESETS = {"3M": 63, "6M": 126, "1Y": 252, "2Y": 504, "5Y": 1260, "All": None}
+DEFAULT_WINDOW = "2Y"
 
 
 class _PngViz(Viz):
@@ -54,10 +56,52 @@ def _pandas_indexed(data: pl.DataFrame, cols: list[str]) -> pd.DataFrame:
     return out.set_index("ts")
 
 
-def level_chart(data: pl.DataFrame, target: str, window_bars: int = WINDOW_BARS) -> str:
-    """Tradable level, recent window -- base64 PNG."""
-    frame = _pandas_indexed(data, [target]).tail(window_bars)
-    return _PngViz().line(frame, cols=[target], title=target, yaxis_title="bps")
+def _trade_markers(
+    trades: pl.DataFrame | None,
+    open_entry: dict | None,
+    start,
+    end,
+) -> list[dict]:
+    """Entry/exit marker groups for level_chart, scoped to the visible window.
+    Entry and exit are filtered independently so a trade whose entry is
+    off-screen but exit is on-screen still shows its exit marker."""
+    groups: list[dict] = []
+    if trades is not None and not trades.is_empty():
+        t = trades.to_pandas()
+        longs = t[(t["direction"] == "long") & t["entry_date"].between(start, end)]
+        shorts = t[(t["direction"] == "short") & t["entry_date"].between(start, end)]
+        exits = t[t["exit_date"].between(start, end)]
+        if not longs.empty:
+            groups.append({"x": longs["entry_date"], "y": longs["entry_level"],
+                            "label": "long entry", "color": C1, "marker": "^"})
+        if not shorts.empty:
+            groups.append({"x": shorts["entry_date"], "y": shorts["entry_level"],
+                            "label": "short entry", "color": C0, "marker": "v"})
+        if not exits.empty:
+            groups.append({"x": exits["exit_date"], "y": exits["exit_level"],
+                            "label": "exit", "color": DIM, "marker": "x", "size": 55})
+    if open_entry and start <= pd.Timestamp(open_entry["date"]) <= end:
+        color, marker = (C1, "^") if open_entry["direction"] == "long" else (C0, "v")
+        groups.append({"x": [open_entry["date"]], "y": [open_entry["level"]],
+                        "label": "open position", "color": color, "marker": marker,
+                        "size": 110})
+    return groups
+
+
+def level_chart(
+    data: pl.DataFrame,
+    target: str,
+    trades: pl.DataFrame | None = None,
+    open_entry: dict | None = None,
+    window_bars: int | None = WINDOW_PRESETS[DEFAULT_WINDOW],
+) -> str:
+    """Tradable level, recent window, with trade entry/exit markers -- base64 PNG."""
+    frame = _pandas_indexed(data, [target])
+    if window_bars is not None:
+        frame = frame.tail(window_bars)
+    markers = _trade_markers(trades, open_entry, frame.index.min(), frame.index.max())
+    return _PngViz().line(frame, cols=[target], title=target, yaxis_title="bps",
+                           markers=markers)
 
 
 def signal_chart(
@@ -65,13 +109,15 @@ def signal_chart(
     sig_frame: pl.DataFrame,
     entry_signal: str,
     entry_threshold: float,
-    window_bars: int = WINDOW_BARS,
+    window_bars: int | None = WINDOW_PRESETS[DEFAULT_WINDOW],
 ) -> str:
     """Residual/OU-z chart with entry threshold bands and the current
     reading flagged -- base64 PNG."""
     col = "resid" if entry_signal == "residual" else "ou_z"
     combined = data.select("ts").with_columns(sig_frame[col].alias(col))
-    frame = _pandas_indexed(combined, [col]).tail(window_bars)
+    frame = _pandas_indexed(combined, [col])
+    if window_bars is not None:
+        frame = frame.tail(window_bars)
     units = "bps" if entry_signal == "residual" else "z"
     return _PngViz().line(
         frame, cols=[col],

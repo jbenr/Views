@@ -528,6 +528,7 @@ class Viz:
         hlines: Optional[list] = None,
         linestyles: Optional[dict] = None,
         bar: bool = False,
+        markers: Optional[List[dict]] = None,
     ):
         """Line chart with interactive time navigation.
 
@@ -548,6 +549,13 @@ class Viz:
         bar : if True, render as bars colored green (positive) / red (negative).
               Best for daily changes, PnL, residuals where sign is the story.
               Multi-series with bar=True bars are stacked side-by-side per date.
+        markers : optional list of point-marker groups (e.g. trade entries/exits).
+               One scatter call + one legend entry per group. Each item is a dict:
+               {"x": dates, "y": values, "label": str, "color": hex,
+                "marker": matplotlib marker char, "size": int (default 70)}.
+               Example:
+                   markers=[{"x": entry_dates, "y": entry_levels,
+                             "label": "long entry", "color": "#27AE60", "marker": "^"}]
         """
         cols = cols or df.select_dtypes(include=[np.number]).columns.tolist()
         left = left or []
@@ -647,6 +655,24 @@ class Viz:
 
                 if show_avg and avg is not None:
                     target.axhline(y=avg, color=color, linestyle='--', linewidth=1, alpha=0.7)
+
+            # Point markers (trade entries/exits, etc.) — one scatter + legend
+            # entry per group, drawn above the line/fills, below the endpoint flag.
+            if markers:
+                unfilled = {"x", "+", "1", "2", "3", "4", "|", "_"}
+                for m in markers:
+                    xs, ys = m.get("x"), m.get("y")
+                    if xs is None or ys is None or len(xs) == 0:
+                        continue
+                    marker_style = m.get("marker", "o")
+                    edge_kw = {} if marker_style in unfilled else {
+                        "edgecolors": "white", "linewidths": 0.6,
+                    }
+                    ax.scatter(
+                        xs, ys, c=m.get("color", "#333"), marker=marker_style,
+                        s=m.get("size", 70), label=m.get("label"),
+                        zorder=15, **edge_kw,
+                    )
 
             # Horizontal reference lines (z-thresholds, level markers, etc.)
             if hlines:

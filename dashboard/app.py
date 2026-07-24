@@ -8,7 +8,10 @@ card drive everything else:
     Re-run analysis     Strategy.compute() on the cached data, logged as
                         one timestamped row in the signal ledger.
 
-No background loop or auto-refresh -- nothing changes until you click.
+No background loop or auto-refresh -- nothing changes until you click. A
+per-card time-frame dropdown and trade-table pager also trigger a re-render,
+but touch neither the DB nor the ledger -- they just re-slice/re-page what's
+already cached.
 
     python -m dashboard.registry --promote book.curve.tens_10s30s
     mamba run -n 2s10s python -m dashboard.app
@@ -23,16 +26,37 @@ import argparse
 import re
 
 import dash
-from dash import Input, Output, ctx, html
+from dash import Input, Output, State, ctx, dash_table, dcc, html
 
 from dashboard import runner
-from dashboard.charts import level_chart, signal_chart
+from dashboard.charts import DEFAULT_WINDOW, WINDOW_PRESETS, level_chart, signal_chart
 from dashboard.ledger import SignalLedger
 from dashboard.registry import LiveRegistry
-from utils.research_app import BORDER, DIM, ORANGE, PANEL, TEXT, make_app, run, stat_block
+from utils.research_app import (
+    BORDER, C0, C1, DIM, ORANGE, PANEL, TEXT, make_app, run, stat_block,
+)
 
 REGISTRY = LiveRegistry()
 LEDGER = SignalLedger()
+
+TRADES_PER_PAGE = 5
+
+TRADE_TABLE_COLS = [
+    "entry_date", "exit_date", "direction",
+    "entry_level", "exit_level", "target_lvl", "expected_return_bps",
+    "pnl_bps", "entry_half_life", "bars_held", "exit_reason",
+]
+TRADE_TABLE_HEADERS = {
+    "entry_date": "Entry", "exit_date": "Exit", "direction": "Dir",
+    "entry_level": "Entry Lvl", "exit_level": "Exit Lvl",
+    "target_lvl": "Target Lvl", "expected_return_bps": "Exp Ret (bps)",
+    "pnl_bps": "PnL (bps)", "entry_half_life": "Half-life (d)",
+    "bars_held": "Held (d)", "exit_reason": "Exit Reason",
+}
+TRADE_TABLE_ROUND = {
+    "entry_level": 2, "exit_level": 2, "target_lvl": 2,
+    "expected_return_bps": 1, "pnl_bps": 1, "entry_half_life": 1,
+}
 
 
 def _slug(module: str) -> str:
@@ -50,18 +74,92 @@ def _param_summary(row: dict) -> str:
     return "  ·  ".join(bits)
 
 
-def _card_body(module: str) -> html.Div:
+def _fnum(value, fmt: str, suffix: str = "") -> str:
+    """Format a possibly-missing/NaN metric, else '—'."""
+    if value is None:
+        return "—"
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if value != value:  # NaN
+        return "—"
+    return format(value, fmt) + suffix
+
+
+def _trade_page_rows(trades, page: int) -> list[dict]:
+    """5-row page slice, formatted for dash_table.DataTable's `data` prop."""
+    sliced = trades.slice(page, TRADES_PER_PAGE)
+    rows = []
+    for row in sliced.to_dicts():
+        out = {}
+        for col in TRADE_TABLE_COLS:
+            val = row.get(col)
+            if col in ("entry_date", "exit_date") and val is not None:
+                val = str(val)
+            elif col in TRADE_TABLE_ROUND and val is not None:
+                val = round(val, TRADE_TABLE_ROUND[col])
+            out[col] = val
+        rows.append(out)
+    return rows
+
+
+def _trade_table_block(trades, page: int) -> html.Div:
+    n = 0 if trades is None or trades.is_empty() else len(trades)
+    if n == 0:
+        return html.Div("no closed trades yet", style={"color": DIM, "padding": "8px 0"})
+
+    lo, hi = page + 1, min(page + TRADES_PER_PAGE, n)
+    return html.Div(
+        style={"marginTop": 14},
+        children=[
+            dash_table.DataTable(
+                columns=[{"name": TRADE_TABLE_HEADERS[c], "id": c} for c in TRADE_TABLE_COLS],
+                data=_trade_page_rows(trades, page),
+                style_table={"overflowX": "auto"},
+                style_cell={
+                    "backgroundColor": PANEL, "color": TEXT,
+                    "border": f"1px solid {BORDER}", "fontSize": 11,
+                    "padding": "4px 8px", "textAlign": "center",
+                },
+                style_header={
+                    "backgroundColor": "#EDEDED", "fontWeight": "bold",
+                    "border": f"1px solid {BORDER}",
+                },
+                style_data_conditional=[
+                    {"if": {"filter_query": '{direction} = "long"'}, "color": C1},
+                    {"if": {"filter_query": '{direction} = "short"'}, "color": C0},
+                ],
+            ),
+            html.Span(f"showing {lo}-{hi} of {n} trades", style={
+                "fontSize": 11, "color": DIM, "display": "block", "marginTop": 4,
+            }),
+        ],
+    )
+
+
+def _card_body(
+    module: str,
+    state: dict | None = None,
+    trades=None,
+    open_entry: dict | None = None,
+    window: str = DEFAULT_WINDOW,
+    page: int = 0,
+) -> html.Div:
     row = REGISTRY.get(module)
     if row is None:
         return html.Div(f"{module}: no longer promoted", style={"color": DIM})
 
     ledger_row = LEDGER.latest(module)
-    try:
-        state = runner.compute_signal(module)
-        error = None
-    except RuntimeError as exc:
-        state = None
-        error = str(exc)
+    error = None
+    if state is None:
+        # initial non-callback render at build_app() time -- callback-driven
+        # renders always pass a precomputed state/trades pair down.
+        try:
+            state = runner.compute_signal(module)
+            trades, open_entry = runner.trade_history(module, state)
+        except RuntimeError as exc:
+            error = str(exc)
 
     stats = [
         stat_block("data as-of", str(state["data_asof"]) if state else "—"),
@@ -73,14 +171,29 @@ def _card_body(module: str) -> html.Div:
         ),
         stat_block("params", _param_summary(row)),
     ]
+    last = state["last"] if state else {}
+    backtest_stats = [
+        stat_block("sharpe", _fnum(row.get("sharpe"), ".2f")),
+        stat_block("n trades", _fnum(row.get("n_trades"), ".0f")),
+        stat_block("hit rate", _fnum(row.get("hit_rate"), ".0%")),
+        stat_block("max drawdown", _fnum(row.get("max_drawdown_bps"), "+.1f", " bps")),
+        stat_block("half-life", _fnum(last.get("half_life"), ".1f", "d")),
+        stat_block("r²", _fnum(last.get("r2"), ".2f")),
+        stat_block("beta", _fnum(last.get("beta"), "+.3f")),
+    ]
 
     if error:
         body = [html.Div(error, style={"color": ORANGE, "padding": "12px 0"})]
     else:
-        level_png = level_chart(state["data"], state["strategy"].target)
+        window_bars = WINDOW_PRESETS[window]
+        level_png = level_chart(
+            state["data"], state["strategy"].target,
+            trades=trades, open_entry=open_entry, window_bars=window_bars,
+        )
         sig_png = signal_chart(
             state["data"], state["signal_frame"],
             state["params"]["entry_signal"], state["params"]["entry_threshold"],
+            window_bars=window_bars,
         )
         body = [
             html.Div(
@@ -91,12 +204,17 @@ def _card_body(module: str) -> html.Div:
                     html.Img(src=f"data:image/png;base64,{sig_png}",
                               style={"width": "100%", "border": f"1px solid {BORDER}"}),
                 ],
-            )
+            ),
+            _trade_table_block(trades, page),
         ]
 
     return html.Div([
         html.Div(stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
-                                "padding": "8px 2px 14px"}),
+                                "padding": "8px 2px 8px"}),
+        html.Div(backtest_stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
+                                         "padding": "0 2px 14px",
+                                         "borderTop": f"1px solid {BORDER}",
+                                         "marginTop": 4, "paddingTop": 8}),
         *body,
     ])
 
@@ -131,12 +249,24 @@ def _card(row: dict) -> html.Div:
                 ],
             ),
             html.Div(
-                style={"display": "flex", "gap": 8, "marginBottom": 4},
+                style={"display": "flex", "gap": 8, "marginBottom": 4,
+                       "alignItems": "center", "flexWrap": "wrap"},
                 children=[
                     html.Button("Re-pull data", id=f"pull-{slug}", n_clicks=0,
                                 style=_btn_style()),
                     html.Button("Re-run analysis", id=f"run-{slug}", n_clicks=0,
                                 style=_btn_style(primary=True)),
+                    dcc.Dropdown(
+                        id=f"window-{slug}",
+                        options=[{"label": k, "value": k} for k in WINDOW_PRESETS],
+                        value=DEFAULT_WINDOW, clearable=False, searchable=False,
+                        style={"width": 90, "fontSize": 12},
+                    ),
+                    html.Button("< prev", id=f"trades-prev-{slug}", n_clicks=0,
+                                style=_btn_style()),
+                    html.Button("next >", id=f"trades-next-{slug}", n_clicks=0,
+                                style=_btn_style()),
+                    dcc.Store(id=f"trades-page-{slug}", data=0),
                 ],
             ),
             html.Div(id=f"card-body-{slug}", children=_card_body(module)),
@@ -172,18 +302,44 @@ def build_app() -> dash.Dash:
         module = row["module"]
         slug = _slug(module)
 
-        def _update(_pull_clicks, _run_clicks, module=module):
+        def _update(_pull, _run, _window, _prev, _next, window, page, module=module):
             trigger = ctx.triggered_id or ""
-            if trigger.startswith("pull-"):
-                runner.pull_data(module)
-            elif trigger.startswith("run-"):
-                runner.run_analysis(module)
-            return _card_body(module)
+            try:
+                if trigger.startswith("pull-"):
+                    runner.pull_data(module)
+                    page = 0
+                elif trigger.startswith("run-"):
+                    runner.run_analysis(module)
+                    page = 0
+                elif trigger.startswith("window-"):
+                    page = 0
+                state = runner.compute_signal(module)
+                trades, open_entry = runner.trade_history(module, state)
+            except RuntimeError as exc:
+                return html.Div(str(exc), style={"color": ORANGE, "padding": "12px 0"}), 0
+
+            n = 0 if trades is None or trades.is_empty() else len(trades)
+            last_page = max(0, (n - 1) // TRADES_PER_PAGE * TRADES_PER_PAGE) if n else 0
+            if trigger.startswith("trades-prev-"):
+                page = max(0, page - TRADES_PER_PAGE)
+            elif trigger.startswith("trades-next-"):
+                page = min(page + TRADES_PER_PAGE, last_page)
+            page = min(page, last_page)
+
+            body = _card_body(module, state=state, trades=trades, open_entry=open_entry,
+                               window=window, page=page)
+            return body, page
 
         app.callback(
             Output(f"card-body-{slug}", "children"),
+            Output(f"trades-page-{slug}", "data"),
             Input(f"pull-{slug}", "n_clicks"),
             Input(f"run-{slug}", "n_clicks"),
+            Input(f"window-{slug}", "value"),
+            Input(f"trades-prev-{slug}", "n_clicks"),
+            Input(f"trades-next-{slug}", "n_clicks"),
+            State(f"window-{slug}", "value"),
+            State(f"trades-page-{slug}", "data"),
             prevent_initial_call=True,
         )(_update)
 

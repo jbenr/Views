@@ -100,6 +100,44 @@ def compute_signal(module: str) -> dict:
     }
 
 
+def trade_history(module: str, state: dict | None = None) -> tuple[pl.DataFrame, dict | None]:
+    """Re-run the exact promoted pipeline against cached data to recover the
+    closed trade log -- always derived from the same `data` the charts
+    render, so markers/table can never disagree with the chart. Costs one
+    full Engine.run() (a Python loop over cached history) per call; not
+    cached. Returns (closed_trades, open_entry) -- open_entry describes the
+    live position if the promoted config is currently in a trade (else None).
+    """
+    from backtest.engine import BacktestConfig, Engine, trade_log
+
+    state = state or compute_signal(module)
+    strategy, data, params = state["strategy"], state["data"], state["params"]
+
+    engine = Engine(BacktestConfig(transaction_cost_bps=strategy.transaction_cost_bps))
+    result = engine.add_signal(strategy.make_pipeline(params)).run(data)
+
+    log = trade_log(result.closed_trades)
+    if not log.is_empty():
+        direction_sign = pl.when(pl.col("direction") == "long").then(1).otherwise(-1)
+        log = log.with_columns(
+            (pl.col("entry_level") - pl.col("entry_resid") + pl.col("entry_ou_mean"))
+            .alias("target_lvl"),
+            (direction_sign * (pl.col("entry_ou_mean") - pl.col("entry_resid")))
+            .alias("expected_return_bps"),
+        ).sort("exit_date", descending=True)
+
+    open_entry = None
+    if result.open_trades:  # max_positions=1 by default -- at most one
+        pos = result.open_trades[0]
+        open_entry = {
+            "date": pos.entry_date,
+            "level": pos.entry_level,
+            "direction": "long" if pos.direction == 1 else "short",
+        }
+
+    return log, open_entry
+
+
 def run_analysis(module: str) -> dict:
     """compute_signal() plus one auditable row appended to the ledger."""
     state = compute_signal(module)
