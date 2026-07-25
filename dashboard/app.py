@@ -1,7 +1,11 @@
-"""Live signal dashboard -- one card per promoted signal.
+"""Live signal dashboard -- trading overview plus signal deep dives.
 
-Static on load: shows whatever was last pulled / analyzed. Two buttons per
-card drive everything else:
+The Live Overview tab groups trusted signals by traded target and answers the
+desk questions first: is a position open, what does the latest reading say,
+is its gate open, and how has the frozen backtest behaved?
+
+The Signal Deep Dive tab selects one promoted signal at a time and exposes the
+full chart, gate, PnL, and trade-history card. Two buttons drive its data:
 
     Re-pull data       fresh Strategy.load_data(), cached to disk.
                         No ledger write.
@@ -67,9 +71,36 @@ TRADE_TABLE_ROUND = {
     "expected_return_bps": 1, "pnl_bps": 1, "entry_half_life": 1,
 }
 
+OVERVIEW_COLUMNS = [
+    ("name", "Signal"),
+    ("feature", "Feature"),
+    ("position", "Position"),
+    ("reading", "Latest Reading"),
+    ("signal_level", "Signal / Entry"),
+    ("gate_status", "Gate"),
+    ("live_pnl_bps", "Net PnL (bps)"),
+    ("sharpe", "Sharpe"),
+    ("n_trades", "Trades"),
+    ("hit_rate", "Hit Rate"),
+    ("max_drawdown_bps", "Max DD (bps)"),
+    ("data_asof", "Data As-Of"),
+]
 
-def _slug(module: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", module.lower()).strip("-")
+
+def _slug(signal_id: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", signal_id.lower()).strip("-")
+
+
+def _display_name(row: dict) -> str:
+    """Canonical user-facing signal name: traded target first, feature second."""
+    base = f"{row['target']}_{row['feature']}"
+    variant_label = row.get("variant_label")
+    return base if not variant_label else f"{base} · {variant_label}"
+
+
+def _row_id(row: dict) -> str:
+    """Registry identity, with module fallback for legacy/test rows."""
+    return row.get("signal_id") or row["module"]
 
 
 def _exit_summary(row: dict) -> str:
@@ -193,6 +224,166 @@ def _gate_status(state: dict) -> str:
     return f"{status} · {pct}{suffix} pct"
 
 
+def _overview_snapshot(row: dict) -> dict:
+    """One desk-level status row for a promoted signal."""
+    base = {
+        "signal_id": _row_id(row),
+        "module": row["module"],
+        "target": row["target"],
+        "name": _display_name(row),
+        "feature": row["feature"],
+        "position": "UNAVAILABLE",
+        "reading": "—",
+        "signal_level": "—",
+        "gate_status": "—",
+        "live_pnl_bps": None,
+        "sharpe": row.get("sharpe"),
+        "n_trades": row.get("n_trades"),
+        "hit_rate": row.get("hit_rate"),
+        "max_drawdown_bps": row.get("max_drawdown_bps"),
+        "data_asof": "—",
+    }
+    try:
+        signal_id = _row_id(row)
+        state = runner.compute_signal(signal_id)
+        trades, open_entry = runner.trade_history(signal_id, state)
+    except RuntimeError as exc:
+        return {**base, "reading": str(exc)}
+
+    params = state["params"]
+    signal_value = state["last"].get("signal")
+    units = "bps" if params["entry_signal"] == "residual" else "z"
+    threshold = float(params["entry_threshold"])
+    signal_level = (
+        f"{float(signal_value):+.2f}{units} / ±{threshold:g}{units}"
+        if signal_value is not None and signal_value == signal_value
+        else f"warming up / ±{threshold:g}{units}"
+    )
+    position = (
+        f"{open_entry['direction'].upper()} OPEN"
+        if open_entry is not None
+        else "FLAT"
+    )
+    return {
+        **base,
+        "position": position,
+        "reading": state["fired"].upper(),
+        "signal_level": signal_level,
+        "gate_status": _gate_status(state).upper(),
+        "live_pnl_bps": round(_live_pnl_bps(trades, open_entry), 1),
+        "data_asof": str(state["data_asof"]),
+    }
+
+
+def _overview_table(target: str, rows: list[dict]) -> html.Div:
+    snapshots = [_overview_snapshot(row) for row in rows]
+    return html.Div(
+        style={"marginBottom": 22},
+        children=[
+            html.Div(
+                style={
+                    "display": "flex",
+                    "alignItems": "baseline",
+                    "gap": 10,
+                    "marginBottom": 7,
+                },
+                children=[
+                    html.Span(
+                        target,
+                        style={
+                            "fontSize": 15,
+                            "fontWeight": "bold",
+                            "color": ORANGE,
+                            "textTransform": "uppercase",
+                        },
+                    ),
+                    html.Span(
+                        f"{len(rows)} trusted signal{'s' if len(rows) != 1 else ''}",
+                        style={"fontSize": 11, "color": DIM},
+                    ),
+                ],
+            ),
+            dash_table.DataTable(
+                columns=[{"name": label, "id": key} for key, label in OVERVIEW_COLUMNS],
+                data=snapshots,
+                sort_action="native",
+                style_table={"overflowX": "auto"},
+                style_cell={
+                    "backgroundColor": "#FFFFFF",
+                    "color": TEXT,
+                    "border": f"1px solid {BORDER}",
+                    "fontSize": 11,
+                    "padding": "7px 9px",
+                    "textAlign": "center",
+                    "whiteSpace": "nowrap",
+                },
+                style_header={
+                    "backgroundColor": "#EDEDED",
+                    "fontWeight": "bold",
+                    "border": f"1px solid {BORDER}",
+                },
+                style_data_conditional=[
+                    {
+                        "if": {"filter_query": '{position} = "LONG OPEN"', "column_id": "position"},
+                        "color": C1,
+                        "fontWeight": "bold",
+                    },
+                    {
+                        "if": {"filter_query": '{position} = "SHORT OPEN"', "column_id": "position"},
+                        "color": C0,
+                        "fontWeight": "bold",
+                    },
+                    {
+                        "if": {"filter_query": '{reading} = "LONG"', "column_id": "reading"},
+                        "color": C1,
+                        "fontWeight": "bold",
+                    },
+                    {
+                        "if": {"filter_query": '{reading} = "SHORT"', "column_id": "reading"},
+                        "color": C0,
+                        "fontWeight": "bold",
+                    },
+                    {
+                        "if": {"filter_query": '{gate_status} contains "CLOSED"', "column_id": "gate_status"},
+                        "color": C0,
+                    },
+                    {
+                        "if": {"filter_query": "{live_pnl_bps} > 0", "column_id": "live_pnl_bps"},
+                        "color": C1,
+                        "fontWeight": "bold",
+                    },
+                    {
+                        "if": {"filter_query": "{live_pnl_bps} < 0", "column_id": "live_pnl_bps"},
+                        "color": C0,
+                        "fontWeight": "bold",
+                    },
+                ],
+            ),
+        ],
+    )
+
+
+def _overview_content(rows: list[dict]) -> list:
+    if not rows:
+        return [
+            html.Div(
+                "No signals promoted yet.",
+                style={"color": DIM, "padding": "24px 0"},
+            )
+        ]
+    targets = sorted({row["target"] for row in rows})
+    return [
+        _overview_table(
+            target,
+            sorted(
+                [row for row in rows if row["target"] == target],
+                key=_display_name,
+            ),
+        )
+        for target in targets
+    ]
+
+
 def _trade_table_block(trades, page: int, open_entry: dict | None, slug: str) -> html.Div:
     n = 0 if trades is None or trades.is_empty() else len(trades)
     if n == 0 and open_entry is None:
@@ -261,7 +452,7 @@ def _trade_table_block(trades, page: int, open_entry: dict | None, slug: str) ->
 
 
 def _card_sections(
-    module: str,
+    signal_id: str,
     state: dict | None = None,
     trades=None,
     open_entry: dict | None = None,
@@ -269,21 +460,21 @@ def _card_sections(
     page: int = 0,
     date_range: tuple | None = None,
 ) -> tuple[html.Div, html.Div]:
-    row = REGISTRY.get(module)
+    row = REGISTRY.get(signal_id)
     if row is None:
         return (
             html.Div(),
-            html.Div(f"{module}: no longer promoted", style={"color": DIM}),
+            html.Div(f"{signal_id}: no longer promoted", style={"color": DIM}),
         )
 
-    ledger_row = LEDGER.latest(module)
+    ledger_row = LEDGER.latest(signal_id)
     error = None
     if state is None:
         # initial non-callback render at build_app() time -- callback-driven
         # renders always pass a precomputed state/trades pair down.
         try:
-            state = runner.compute_signal(module)
-            trades, open_entry = runner.trade_history(module, state)
+            state = runner.compute_signal(signal_id)
+            trades, open_entry = runner.trade_history(signal_id, state)
         except RuntimeError as exc:
             error = str(exc)
 
@@ -357,7 +548,7 @@ def _card_sections(
                     for png in chart_pngs
                 ],
             ),
-            _trade_table_block(trades, page, open_entry, _slug(module)),
+            _trade_table_block(trades, page, open_entry, _slug(signal_id)),
         ]
 
     summary = html.Div([
@@ -383,8 +574,9 @@ def _btn_style(primary: bool = False) -> dict:
 
 def _card(row: dict) -> html.Div:
     module = row["module"]
-    slug = _slug(module)
-    summary, analysis = _card_sections(module)
+    signal_id = _row_id(row)
+    slug = _slug(signal_id)
+    summary, analysis = _card_sections(signal_id)
     return html.Div(
         style={"border": f"1px solid {BORDER}", "background": PANEL,
                "padding": "14px 18px", "marginBottom": 18},
@@ -393,8 +585,8 @@ def _card(row: dict) -> html.Div:
                 style={"display": "flex", "alignItems": "baseline", "gap": 12,
                        "marginBottom": 4},
                 children=[
-                    html.Span(row["name"], style={"fontSize": 15, "fontWeight": "bold",
-                                                    "color": ORANGE}),
+                    html.Span(_display_name(row), style={"fontSize": 15, "fontWeight": "bold",
+                                                         "color": ORANGE}),
                     html.Span(f"{row['target']} ~ {row['feature']}",
                               style={"fontSize": 12, "color": DIM}),
                     html.Span(module, style={"fontSize": 11, "color": DIM,
@@ -447,23 +639,156 @@ def _card(row: dict) -> html.Div:
 
 def build_app() -> dash.Dash:
     reg_df = REGISTRY.list()
-    rows = [] if reg_df.is_empty() else reg_df.sort("family", "name").to_dicts()
+    rows = (
+        []
+        if reg_df.is_empty()
+        else reg_df.sort("target", "family", "name").to_dicts()
+    )
+    selected_signal = _row_id(rows[0]) if rows else None
+    tab_style = {
+        "padding": "10px 18px",
+        "fontSize": 12,
+        "fontWeight": "bold",
+        "background": PANEL,
+        "border": f"1px solid {BORDER}",
+        "color": DIM,
+    }
+    selected_tab_style = {
+        **tab_style,
+        "background": "#FFFFFF",
+        "color": ORANGE,
+        "borderTop": f"3px solid {ORANGE}",
+    }
 
-    body = html.Div(
+    overview_tab = html.Div(
+        style={"padding": "18px 24px"},
+        children=[
+            html.Div(
+                style={
+                    "display": "flex",
+                    "alignItems": "center",
+                    "marginBottom": 14,
+                },
+                children=[
+                    html.Div(
+                        [
+                            html.Div(
+                                "LIVE TRADING OVERVIEW",
+                                style={"fontSize": 14, "fontWeight": "bold"},
+                            ),
+                            html.Div(
+                                "Grouped by traded target · positions are exact-engine state",
+                                style={"fontSize": 11, "color": DIM, "marginTop": 2},
+                            ),
+                        ]
+                    ),
+                    html.Button(
+                        "Refresh live status",
+                        id="refresh-overview",
+                        n_clicks=0,
+                        style={**_btn_style(primary=True), "marginLeft": "auto"},
+                    ),
+                ],
+            ),
+            dcc.Loading(
+                html.Div(id="overview-content", children=_overview_content(rows)),
+                type="dot",
+                color=ORANGE,
+            ),
+        ],
+    )
+
+    deep_dive_tab = html.Div(
         style={"padding": "18px 24px"},
         children=(
-            [html.Div(
-                "No signals promoted yet -- "
-                "python -m dashboard.registry --promote <module>",
-                style={"color": DIM, "padding": "24px 0"},
-            )]
-            if not rows else [_card(row) for row in rows]
+            [
+                html.Div(
+                    style={
+                        "display": "flex",
+                        "alignItems": "center",
+                        "gap": 14,
+                        "marginBottom": 14,
+                    },
+                    children=[
+                        html.Div(
+                            [
+                                html.Div(
+                                    "SIGNAL DEEP DIVE",
+                                    style={"fontSize": 14, "fontWeight": "bold"},
+                                ),
+                                html.Div(
+                                    "Charts, causal gate state, exact PnL, and trade history",
+                                    style={"fontSize": 11, "color": DIM, "marginTop": 2},
+                                ),
+                            ]
+                        ),
+                        dcc.Dropdown(
+                            id="deep-dive-signal",
+                            options=[
+                                {
+                                    "label": _display_name(row),
+                                    "value": _row_id(row),
+                                }
+                                for row in rows
+                            ],
+                            value=selected_signal,
+                            clearable=False,
+                            style={"width": 360, "marginLeft": "auto", "fontSize": 12},
+                        ),
+                    ],
+                ),
+                *[
+                    html.Div(
+                        id=f"deep-card-{_slug(_row_id(row))}",
+                        style={
+                            "display": "block"
+                            if _row_id(row) == selected_signal
+                            else "none"
+                        },
+                        children=_card(row),
+                    )
+                    for row in rows
+                ],
+            ]
+            if rows
+            else [
+                html.Div(
+                    "No signals promoted yet -- "
+                    "python -m dashboard.registry --promote <module>",
+                    style={"color": DIM, "padding": "24px 0"},
+                )
+            ]
         ),
+    )
+
+    body = html.Div(
+        children=[
+            dcc.Tabs(
+                id="dashboard-tabs",
+                value="live-overview",
+                children=[
+                    dcc.Tab(
+                        label="Signal",
+                        value="live-overview",
+                        style=tab_style,
+                        selected_style=selected_tab_style,
+                        children=overview_tab,
+                    ),
+                    dcc.Tab(
+                        label="Dig",
+                        value="signal-deep-dive",
+                        style=tab_style,
+                        selected_style=selected_tab_style,
+                        children=deep_dive_tab,
+                    ),
+                ],
+            )
+        ]
     )
 
     app = make_app(
         title="LIVE",
-        subtitle="promoted signals -- data as-of / last analysis run / current reading",
+        subtitle="trusted live signals · overview and exact-engine deep dives",
         data_info=f"{len(rows)} live signal{'s' if len(rows) != 1 else ''}",
         sliders=[],
         body=body,
@@ -471,28 +796,59 @@ def build_app() -> dash.Dash:
 
     window_keys = list(WINDOW_PRESETS)
 
+    if rows:
+        app.callback(
+            *[
+                Output(f"deep-card-{_slug(_row_id(row))}", "style")
+                for row in rows
+            ],
+            Input("deep-dive-signal", "value"),
+        )(
+            lambda selected: [
+                {
+                    "display": "block"
+                    if _row_id(row) == selected
+                    else "none"
+                }
+                for row in rows
+            ]
+        )
+
+        app.callback(
+            Output("overview-content", "children"),
+            Input("refresh-overview", "n_clicks"),
+            prevent_initial_call=True,
+        )(lambda *_clicks: _overview_content(rows))
+
     for row in rows:
-        module = row["module"]
-        slug = _slug(module)
+        signal_id = _row_id(row)
+        slug = _slug(signal_id)
         window_prefix = f"window-{slug}-"
 
-        def _update(_pull, _run, *rest, module=module, slug=slug, window_prefix=window_prefix):
+        def _update(
+            _pull,
+            _run,
+            *rest,
+            signal_id=signal_id,
+            slug=slug,
+            window_prefix=window_prefix,
+        ):
             *_window_clicks, _prev, _next, _snap, window, snap_range, page = rest
             trigger = ctx.triggered_id or ""
             no_btn_styles = [dash.no_update] * len(window_keys)
             try:
                 if trigger.startswith("pull-"):
-                    runner.pull_data(module)
+                    runner.pull_data(signal_id)
                     page = 0
                 elif trigger.startswith("run-"):
-                    runner.run_analysis(module)
+                    runner.run_analysis(signal_id)
                     page = 0
                 elif trigger.startswith(window_prefix):
                     window = trigger[len(window_prefix):]
                     snap_range = None
                     page = 0
-                state = runner.compute_signal(module)
-                trades, open_entry = runner.trade_history(module, state)
+                state = runner.compute_signal(signal_id)
+                trades, open_entry = runner.trade_history(signal_id, state)
             except RuntimeError as exc:
                 err = html.Div(str(exc), style={"color": ORANGE, "padding": "12px 0"})
                 return (html.Div(), err, 0, window, snap_range, *no_btn_styles)
@@ -515,7 +871,7 @@ def build_app() -> dash.Dash:
                 date_range = (pd.Timestamp(snap_range[0]), pd.Timestamp(snap_range[1]))
 
             summary, analysis = _card_sections(
-                module,
+                signal_id,
                 state=state,
                 trades=trades,
                 open_entry=open_entry,

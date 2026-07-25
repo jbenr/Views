@@ -15,6 +15,7 @@ def test_synthetic_panel_has_all_columns():
 
 def test_add_features_builds_derived_xs():
     data = xy.add_features(xy.synthetic_data(n=900))
+    assert "2y" in xy.XS
     for col in ["5y5y", "5y5y_infl", *[f"pc1_{lb}" for lb in xy.PC1_LBS]]:
         assert col in data.columns, col
     # 5y5y nominal is the trader shortcut 2*10y - 5y

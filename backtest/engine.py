@@ -193,31 +193,47 @@ class SignalConfig:
 def generate_signals(signal_series: pl.Series, config: SignalConfig) -> pl.DataFrame:
     """Convert continuous signal into discrete entry/exit actions.
 
-    Returns DataFrame with columns: signal, action.
+    Returns DataFrame with ``signal``, legacy ``action``, and independent
+    boolean columns for each direction-specific entry/exit condition.
     Actions: "enter_long", "enter_short", "exit_long", "exit_short", or null.
+
+    The booleans are authoritative for the Engine. A single action string
+    cannot represent the central region of a hysteresis band, where both
+    ``exit_long`` and ``exit_short`` are valid depending on the position
+    currently held.
     """
     sig = pl.col("signal")
-
-    # Start with entries
-    expr = (
-        pl.when(sig < config.entry_long).then(pl.lit("enter_long"))
-        .when(sig > config.entry_short).then(pl.lit("enter_short"))
+    frame = pl.DataFrame({"signal": signal_series}).with_columns(
+        (sig < config.entry_long).fill_null(False).alias("enter_long"),
+        (sig > config.entry_short).fill_null(False).alias("enter_short"),
+        (
+            ((sig > config.exit_long) & (sig < config.entry_short))
+            if config.exit_long is not None
+            else pl.lit(False)
+        )
+        .fill_null(False)
+        .alias("exit_long"),
+        (
+            ((sig < config.exit_short) & (sig > config.entry_long))
+            if config.exit_short is not None
+            else pl.lit(False)
+        )
+        .fill_null(False)
+        .alias("exit_short"),
     )
 
-    # Add exits only if thresholds are set
-    if config.exit_long is not None:
-        expr = expr.when(
-            (sig > config.exit_long) & (sig < config.entry_short)
-        ).then(pl.lit("exit_long"))
-
-    if config.exit_short is not None:
-        expr = expr.when(
-            (sig < config.exit_short) & (sig > config.entry_long)
-        ).then(pl.lit("exit_short"))
-
-    expr = expr.otherwise(pl.lit(None)).alias("action")
-
-    return pl.DataFrame({"signal": signal_series}).with_columns(expr)
+    # Preserve the historical one-action view for callers that display it.
+    # The Engine consumes all four booleans above and therefore does not lose
+    # an overlapping direction-specific exit.
+    action = (
+        pl.when(pl.col("enter_long")).then(pl.lit("enter_long"))
+        .when(pl.col("enter_short")).then(pl.lit("enter_short"))
+        .when(pl.col("exit_long")).then(pl.lit("exit_long"))
+        .when(pl.col("exit_short")).then(pl.lit("exit_short"))
+        .otherwise(pl.lit(None))
+        .alias("action")
+    )
+    return frame.with_columns(action)
 
 
 def generate_boolean_actions(signal_frame: pl.DataFrame) -> pl.DataFrame:

@@ -2,9 +2,9 @@
 
 Two distinct actions map to the dashboard's two buttons:
 
-    pull_data(module)      fresh Strategy.load_data(), cached to disk.
+    pull_data(signal_id)   fresh Strategy.load_data(), cached per module.
                             No ledger write -- just refreshes the inputs.
-    run_analysis(module)   Strategy.compute() on the cached data, checked
+    run_analysis(signal_id) Strategy.compute() on the cached data, checked
                             against the promoted entry threshold, ONE row
                             appended to the signal ledger.
 
@@ -40,9 +40,16 @@ def _f(value):
     return float(value) if value is not None else None
 
 
-def pull_data(module: str) -> dict:
+def _resolve(signal_id: str):
+    """Return (registry row, strategy), accepting a base module for legacy use."""
+    row = LiveRegistry().get(signal_id)
+    module = row["module"] if row is not None else signal_id
+    return row, load_strategy(module)
+
+
+def pull_data(signal_id: str) -> dict:
     """Fresh Strategy.load_data(), cached to store/live_data/<name>.parquet."""
-    strategy = load_strategy(module)
+    _, strategy = _resolve(signal_id)
     data = strategy.model_frame(strategy.load_data())
     cache_path = _data_cache_path(strategy.name)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -54,25 +61,27 @@ def pull_data(module: str) -> dict:
     }
 
 
-def cached_data(module: str) -> pl.DataFrame | None:
-    strategy = load_strategy(module)
+def cached_data(signal_id: str) -> pl.DataFrame | None:
+    _, strategy = _resolve(signal_id)
     cache_path = _data_cache_path(strategy.name)
     if not cache_path.exists():
         return None
     return pl.read_parquet(cache_path)
 
 
-def compute_signal(module: str) -> dict:
+def compute_signal(signal_id: str) -> dict:
     """Recompute the promoted signal on cached data. No ledger write --
     used to render charts on every card refresh, not just on demand."""
-    strategy = load_strategy(module)
-    data = cached_data(module)
-    if data is None:
-        raise RuntimeError(f"{module}: no cached data -- click 'Re-pull data' first")
-
-    row = LiveRegistry().get(module)
+    row, strategy = _resolve(signal_id)
     if row is None:
-        raise RuntimeError(f"{module}: not promoted -- run dashboard.registry --promote first")
+        raise RuntimeError(
+            f"{signal_id}: not promoted -- run dashboard.registry --promote first"
+        )
+    data = cached_data(signal_id)
+    if data is None:
+        raise RuntimeError(
+            f"{signal_id}: no cached data -- click 'Re-pull data' first"
+        )
     params = params_from_row(row)
 
     sig = strategy.compute(data, params=params)
@@ -90,6 +99,8 @@ def compute_signal(module: str) -> dict:
         fired = "flat (gated)"
 
     return {
+        "signal_id": row["signal_id"],
+        "registry_row": row,
         "strategy": strategy,
         "data": data,
         "signal_frame": sig,
@@ -100,7 +111,7 @@ def compute_signal(module: str) -> dict:
     }
 
 
-def trade_history(module: str, state: dict | None = None) -> tuple[pl.DataFrame, dict | None]:
+def trade_history(signal_id: str, state: dict | None = None) -> tuple[pl.DataFrame, dict | None]:
     """Re-run the exact promoted pipeline against cached data to recover the
     closed trade log -- always derived from the same `data` the charts
     render, so markers/table can never disagree with the chart. Costs one
@@ -112,7 +123,7 @@ def trade_history(module: str, state: dict | None = None) -> tuple[pl.DataFrame,
     """
     from backtest.engine import BacktestConfig, Engine, trade_log
 
-    state = state or compute_signal(module)
+    state = state or compute_signal(signal_id)
     strategy, data, params = state["strategy"], state["data"], state["params"]
 
     engine = Engine(BacktestConfig(transaction_cost_bps=strategy.transaction_cost_bps))
@@ -159,13 +170,15 @@ def trade_history(module: str, state: dict | None = None) -> tuple[pl.DataFrame,
     return log, open_entry
 
 
-def run_analysis(module: str) -> dict:
+def run_analysis(signal_id: str) -> dict:
     """compute_signal() plus one auditable row appended to the ledger."""
-    state = compute_signal(module)
+    state = compute_signal(signal_id)
     last, params = state["last"], state["params"]
 
     entry = {
-        "module": module,
+        "signal_id": state["signal_id"],
+        "module": state["registry_row"]["module"],
+        "variant": state["registry_row"].get("variant"),
         "name": state["strategy"].name,
         "run_ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "data_asof_ts": str(state["data_asof"]),

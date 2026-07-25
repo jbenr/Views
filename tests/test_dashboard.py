@@ -11,12 +11,215 @@ from matplotlib.collections import LineCollection
 
 from dashboard import charts
 from dashboard.charts import _window_pnl_frame, gate_chart, pnl_chart
+from dashboard.params import params_from_row
+from dashboard.registry import LiveRegistry
 
 
 def _load_app_module(monkeypatch, tmp_path):
     monkeypatch.setenv("VIEWS_STORE_DIR", str(tmp_path))
     sys.modules.pop("dashboard.app", None)
     return importlib.import_module("dashboard.app")
+
+
+def _component_ids(component):
+    component_id = getattr(component, "id", None)
+    if component_id is not None:
+        yield component_id
+    children = getattr(component, "children", None)
+    if children is None:
+        return
+    if not isinstance(children, (list, tuple)):
+        children = [children]
+    for child in children:
+        if hasattr(child, "children") or getattr(child, "id", None) is not None:
+            yield from _component_ids(child)
+
+
+def test_dashboard_has_live_overview_and_selectable_deep_dive(monkeypatch, tmp_path):
+    pl.DataFrame(
+        [
+            {
+                "module": "book.curve.twos_10s30s",
+                "name": "twos_10s30s",
+                "family": "curve",
+                "target": "10s30s",
+                "feature": "2y",
+                "entry_signal": "ou_z",
+                "beta_lb": 90,
+                "ou_lb": 470,
+                "entry_threshold": 0.9,
+                "exit_style": "revert_frac",
+                "exit_param": 1.0,
+                "gate": None,
+                "z_gate": None,
+                "half_life_min": 3.0,
+                "half_life_max": 120.0,
+                "stop_loss_bps": 25.0,
+                "sharpe": 0.71,
+                "n_trades": 58,
+                "hit_rate": 0.707,
+                "max_drawdown_bps": -52.4,
+            }
+        ]
+    ).write_parquet(tmp_path / "live_signals.parquet")
+
+    app_module = _load_app_module(monkeypatch, tmp_path)
+    ids = set(_component_ids(app_module.app.layout))
+
+    assert {
+        "dashboard-tabs",
+        "overview-content",
+        "refresh-overview",
+        "deep-dive-signal",
+        "deep-card-book-curve-twos-10s30s",
+    } <= ids
+
+
+def test_overview_snapshot_uses_exact_open_position(monkeypatch, tmp_path):
+    app = _load_app_module(monkeypatch, tmp_path)
+    state = {
+        "params": {
+            "entry_signal": "ou_z",
+            "entry_threshold": 0.9,
+            "gate": None,
+        },
+        "last": {"signal": -1.2},
+        "fired": "long",
+        "data_asof": pd.Timestamp("2026-07-24").date(),
+    }
+    trades = pl.DataFrame({"pnl_bps": [4.0, -1.0]})
+    open_entry = {"direction": "long", "pnl_bps": 2.5}
+    monkeypatch.setattr(app.runner, "compute_signal", lambda _module: state)
+    monkeypatch.setattr(
+        app.runner,
+        "trade_history",
+        lambda _module, _state: (trades, open_entry),
+    )
+
+    snapshot = app._overview_snapshot(
+        {
+            "module": "book.curve.twos_10s30s",
+            "target": "10s30s",
+            "name": "twos_10s30s",
+            "feature": "2y",
+            "sharpe": 0.71,
+            "n_trades": 58,
+            "hit_rate": 0.707,
+            "max_drawdown_bps": -52.4,
+        }
+    )
+
+    assert snapshot["position"] == "LONG OPEN"
+    assert snapshot["reading"] == "LONG"
+    assert snapshot["signal_level"] == "-1.20z / ±0.9z"
+    assert snapshot["live_pnl_bps"] == 5.5
+
+
+def test_dashboard_signal_names_use_target_then_feature(monkeypatch, tmp_path):
+    app = _load_app_module(monkeypatch, tmp_path)
+
+    assert app._display_name({"target": "10s30s", "feature": "2y"}) == "10s30s_2y"
+    assert app._display_name(
+        {
+            "target": "10s30s",
+            "feature": "2y",
+            "variant_label": "OU430 · 0.9z",
+        }
+    ) == "10s30s_2y · OU430 · 0.9z"
+    assert (
+        app._display_name({"target": "2s10s", "feature": "real10y"})
+        == "2s10s_real10y"
+    )
+
+
+def test_registry_can_promote_curated_module_defaults(monkeypatch, tmp_path):
+    mod = importlib.import_module("book.curve.twos_10s30s")
+    monkeypatch.setattr(mod.STRATEGY, "load_data", lambda: mod.synthetic_data(n=1500))
+    monkeypatch.setattr(
+        "dashboard.registry.load_strategy",
+        lambda _module: mod.STRATEGY,
+    )
+    registry = LiveRegistry(tmp_path / "live.parquet")
+
+    entry = registry.promote_defaults("book.curve.twos_10s30s")
+    stored = registry.get("book.curve.twos_10s30s")
+
+    assert entry["selection_source"] == "curated module defaults"
+    assert stored["rank"] is None
+    assert params_from_row(stored)["beta_lb"] == 90
+    assert params_from_row(stored)["ou_lb"] == 470
+    assert params_from_row(stored).get("gate") is None
+    assert stored["n_trades"] > 0
+
+
+def test_params_from_row_preserves_explicitly_disabled_filters():
+    params = params_from_row(
+        {
+            "entry_signal": "residual",
+            "beta_lb": 50.0,
+            "ou_lb": 252.0,
+            "z_gate": None,
+            "half_life_min": None,
+            "half_life_max": None,
+            "gate": None,
+        }
+    )
+
+    assert params["z_gate"] is None
+    assert params["half_life_min"] is None
+    assert params["half_life_max"] is None
+    assert params["gate"] is None
+    assert params["beta_lb"] == 50
+    assert params["ou_lb"] == 252
+
+
+def test_params_from_row_drops_null_required_values_from_union_schema():
+    params = params_from_row(
+        {
+            "entry_signal": "residual",
+            "beta_lb": 90.0,
+            "ou_lb": None,
+            "entry_threshold": 19.0,
+            "exit_style": "revert_frac",
+            "exit_param": 1.0,
+            "stop_loss_bps": 25.0,
+            "gate": None,
+        }
+    )
+
+    assert "ou_lb" not in params
+    assert params["gate"] is None
+
+
+def test_registry_keeps_named_variants_beside_base(monkeypatch, tmp_path):
+    mod = importlib.import_module("book.curve.twos_10s30s")
+    monkeypatch.setattr(mod.STRATEGY, "load_data", lambda: mod.synthetic_data(n=1500))
+    monkeypatch.setattr(
+        "dashboard.registry.load_strategy",
+        lambda _module: mod.STRATEGY,
+    )
+    registry = LiveRegistry(tmp_path / "live.parquet")
+
+    base = registry.promote_defaults("book.curve.twos_10s30s")
+    challenger = registry.promote_variant(
+        "book.curve.twos_10s30s",
+        "ou430_e09",
+    )
+    rows = registry.list().sort("signal_id")
+
+    assert rows.height == 2
+    assert set(rows["signal_id"]) == {
+        "book.curve.twos_10s30s",
+        "book.curve.twos_10s30s::ou430_e09",
+    }
+    assert base["ou_lb"] == 470
+    assert challenger["ou_lb"] == 430
+    assert challenger["variant_label"] == "OU430 · 0.9z"
+    assert registry.get(challenger["signal_id"])["ou_lb"] == 430
+    assert registry.get("book.curve.twos_10s30s")["ou_lb"] == 470
+    assert registry.remove(challenger["signal_id"])
+    assert registry.list().height == 1
+    assert registry.get("book.curve.twos_10s30s")["ou_lb"] == 470
 
 
 def test_snap_range_adds_five_business_days_before_first_entry(

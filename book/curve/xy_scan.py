@@ -5,10 +5,10 @@ predictability? Predict-only: for every pair, the same residual / OU-z
 signal grid and gate overlay as tens_10s30s --predict, scored on raw IC and
 selected by neighborhood IC. No trading mechanics.
 
-X candidates include the 10Y level, real 10Y, breakevens, both 5y5y flavors
-(nominal 2*10y-5y and inflation 2*be10-be5), and point-in-time PC1 of the
-yield panel at several PCA lookbacks (PC1_LBS) - rolling, sign-fixed, no
-lookahead.
+X candidates include the 2Y and 10Y levels, real 10Y, breakevens, both 5y5y
+flavors (nominal 2*10y-5y and inflation 2*be10-be5), and point-in-time PC1
+of the yield panel at several PCA lookbacks (PC1_LBS) - rolling, sign-fixed,
+no lookahead.
 
 Winners graduate: clone book/curve/tens_10s30s.py for the promising pair
 and run the full --predict/--exit/--sweep funnel there. The top setups per
@@ -65,7 +65,7 @@ PC1_COLS = ["2y", "5y", "10y", "30y"]
 PC1_LBS = [126, 252, 504]  # each lookback is its own x candidate (pc1_126, ...)
 
 YS = ["2s5s", "2s10s", "2s30s", "5s10s", "5s30s", "10s30s"]
-XS = ["10y", "real10y", "be10", "5y5y", "5y5y_infl"] + [
+XS = ["2y", "10y", "real10y", "be10", "5y5y", "5y5y_infl"] + [
     f"pc1_{lb}" for lb in PC1_LBS
 ]
 

@@ -52,6 +52,53 @@ def test_generate_signals_thresholds():
     ]
 
 
+def test_overlapping_band_keeps_both_directional_exit_conditions():
+    sig = pl.Series([0.9])
+    out = generate_signals(
+        sig,
+        SignalConfig(
+            entry_long=-1.7,
+            entry_short=1.7,
+            exit_long=-1.5,
+            exit_short=1.5,
+        ),
+    )
+
+    assert out["exit_long"][0]
+    assert out["exit_short"][0]
+
+
+def test_engine_exits_short_when_signal_reenters_overlapping_band():
+    dates = [dt.date(2026, 2, 23) + dt.timedelta(days=i) for i in range(3)]
+    data = pl.DataFrame(
+        {
+            "ts": dates,
+            "level": [100.0, 100.0, 99.0],
+            "z": [0.0, 2.0, 0.9],
+        }
+    )
+    pipeline = SignalPipeline(
+        name="band_regression",
+        trade_def=TradeDef.outright("band_regression", "level"),
+        compute_fn=lambda frame: frame["z"],
+        config=SignalConfig(
+            entry_long=-1.7,
+            entry_short=1.7,
+            exit_long=-1.5,
+            exit_short=1.5,
+        ),
+    )
+
+    result = Engine().add_signal(pipeline).run(data)
+
+    assert not result.open_trades
+    assert len(result.closed_trades) == 1
+    trade = result.closed_trades[0]
+    assert trade.direction == -1
+    assert trade.entry_date == dates[1]
+    assert trade.exit_date == dates[2]
+
+
 def test_engine_smoke():
     result = Engine(BacktestConfig()).add_signal(make_pipeline()).run(make_data())
 

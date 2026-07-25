@@ -18,8 +18,13 @@ python -m book.curve.tens_10s30s --cook
 #    best by sharpe, the file's own sort order) as the frozen live config
 python -m dashboard.registry --promote book.curve.tens_10s30s
 python -m dashboard.registry --promote book.curve.tens_10s30s --rank 2  # a different row
+# Or promote a module's deliberately curated default_params:
+python -m dashboard.registry --promote book.curve.twos_10s30s --defaults
+# Named variants coexist with the base signal instead of replacing it:
+python -m dashboard.registry --promote book.curve.twos_10s30s --variant ou430_e09
+python -m dashboard.registry --promote book.curve.twos_10s30s --variant ou490_e07
 python -m dashboard.registry --list
-python -m dashboard.registry --remove book.curve.tens_10s30s
+python -m dashboard.registry --remove book.curve.twos_10s30s::ou430_e09
 
 # 3. open the dashboard
 mamba run -n 2s10s python -m dashboard.app
@@ -44,8 +49,9 @@ itself is never logged, only an explicit "re-run analysis" click is.
 
 ## Storage (`store/`)
 
-- `live_signals.parquet` -- the registry: one row per promoted module, with
-  its frozen params (`entry_signal`, `beta_lb`, `ou_lb`, `entry_threshold`,
+- `live_signals.parquet` -- the registry: one row per promoted base signal or
+  named variant, with one immutable `signal_id`, its frozen
+  params (`entry_signal`, `beta_lb`, `ou_lb`, `entry_threshold`,
   `exit_style`, `exit_param`, `gate`, `z_gate`, `half_life_min/max`,
   `stop_loss_bps`) plus the backtest metrics it was promoted on.
 - `signal_ledger.parquet` -- append-only: one row per "re-run analysis"
@@ -53,12 +59,23 @@ itself is never logged, only an explicit "re-run analysis" click is.
   `beta`, `r2`, `half_life`, `gate_value`, `gate_percentile`,
   `gate_allow`, `fired`).
 - `live_data/<name>.parquet` -- the last data pulled per signal, so the
-  dashboard can render without hitting the DB on every page load.
+  dashboard can render without hitting the DB on every page load. Named
+  variants from the same strategy module share this market-data cache while
+  retaining independent parameters, metrics, ledger history, and controls.
 
 All three follow `backtest.lab.MetricStore`'s atomic-write pattern
 (write to a temp file, `os.replace`).
 
-## Card layout
+## Dashboard layout
+
+The **Live Overview** tab is the trading surface. It groups signals into one
+table per traded target and shows the exact replayed position state, current
+threshold reading, causal gate status, current signal versus its entry level,
+net PnL, frozen backtest statistics, and data timestamp. Use **Refresh live
+status** to recompute those rows from the cached data.
+
+The **Signal Deep Dive** tab has a signal selector and renders the complete
+research card for just that strategy:
 
 Name / pair / module, a stat row (data as-of, last analysis run, current
 reading, gate state, and an explanatory param summary), then two charts side

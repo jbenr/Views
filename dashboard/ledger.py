@@ -28,7 +28,10 @@ class SignalLedger:
     def load(self) -> pl.DataFrame:
         if not self.path.exists():
             return pl.DataFrame()
-        return pl.read_parquet(self.path, memory_map=False)
+        frame = pl.read_parquet(self.path, memory_map=False)
+        if "signal_id" not in frame.columns:
+            frame = frame.with_columns(pl.col("module").alias("signal_id"))
+        return frame
 
     def log(self, entry: dict) -> None:
         row = pl.DataFrame([entry])
@@ -43,17 +46,17 @@ class SignalLedger:
         combined.write_parquet(tmp_path)
         os.replace(tmp_path, self.path)
 
-    def latest(self, module: str) -> dict | None:
+    def latest(self, signal_id: str) -> dict | None:
         df = self.load()
         if df.is_empty():
             return None
-        match = df.filter(pl.col("module") == module).sort("run_ts")
+        match = df.filter(pl.col("signal_id") == signal_id).sort("run_ts")
         if match.is_empty():
             return None
         return match.row(-1, named=True)
 
-    def history(self, module: str) -> pl.DataFrame:
+    def history(self, signal_id: str) -> pl.DataFrame:
         df = self.load()
         if df.is_empty():
             return df
-        return df.filter(pl.col("module") == module).sort("run_ts")
+        return df.filter(pl.col("signal_id") == signal_id).sort("run_ts")

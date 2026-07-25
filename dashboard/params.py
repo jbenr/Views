@@ -16,6 +16,16 @@ PARAM_COLS = [
     "half_life_min", "half_life_max", "stop_loss_bps",
 ]
 
+# Null is a meaningful, explicit "disabled" value only for these filters.
+# Other null registry cells commonly come from schema-unioning heterogeneous
+# signals and must not override a strategy's required/default parameter.
+NULLABLE_FILTER_COLS = {
+    "gate",
+    "z_gate",
+    "half_life_min",
+    "half_life_max",
+}
+
 
 def unpack_gate(value):
     if value is None or value == "(none)":
@@ -25,11 +35,18 @@ def unpack_gate(value):
 
 def params_from_row(row: dict) -> dict:
     """Rebuild a Strategy.compute()-ready params dict from a registry row."""
-    params = {c: row.get(c) for c in PARAM_COLS if row.get(c) is not None}
+    # Presence and value are distinct here. An explicit null disables optional
+    # filters such as z_gate and the half-life bounds; dropping that key would
+    # let Strategy._params() silently restore the module default.
+    params = {
+        c: row.get(c)
+        for c in PARAM_COLS
+        if c in row and (row.get(c) is not None or c in NULLABLE_FILTER_COLS)
+    }
     if "gate" in params:
         params["gate"] = unpack_gate(params["gate"])
-    if "beta_lb" in params:
+    if params.get("beta_lb") is not None:
         params["beta_lb"] = int(params["beta_lb"])
-    if "ou_lb" in params:
+    if params.get("ou_lb") is not None:
         params["ou_lb"] = int(params["ou_lb"])
     return params
