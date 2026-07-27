@@ -76,12 +76,13 @@ OVERVIEW_COLUMNS = [
     ("feature", "Feature"),
     ("position", "Position"),
     ("reading", "Latest Reading"),
-    ("signal_level", "Signal / Entry"),
+    ("signal_value", "Live Signal"),
+    ("entry_threshold", "Entry Threshold"),
     ("gate_status", "Gate"),
     ("live_pnl_bps", "Net PnL (bps)"),
     ("sharpe", "Sharpe"),
     ("n_trades", "Trades"),
-    ("hit_rate", "Hit Rate"),
+    ("hit_rate", "Hit Rate (%)"),
     ("max_drawdown_bps", "Max DD (bps)"),
     ("data_asof", "Data As-Of"),
 ]
@@ -92,10 +93,12 @@ def _slug(signal_id: str) -> str:
 
 
 def _display_name(row: dict) -> str:
-    """Canonical user-facing signal name: traded target first, feature second."""
+    """Canonical user-facing signal name: traded target first, feature second.
+    Always suffixed with a label -- curated variants use their own, sweep-top
+    promotions fall back to "default" -- so every row has the same shape."""
     base = f"{row['target']}_{row['feature']}"
-    variant_label = row.get("variant_label")
-    return base if not variant_label else f"{base} · {variant_label}"
+    variant_label = row.get("variant_label") or "default"
+    return f"{base} · {variant_label}"
 
 
 def _row_id(row: dict) -> str:
@@ -143,6 +146,20 @@ def _fnum(value, fmt: str, suffix: str = "") -> str:
     if value != value:  # NaN
         return "—"
     return format(value, fmt) + suffix
+
+
+def _round(value, ndigits: int):
+    """Round a possibly-missing/NaN metric, keeping it numeric so sortable
+    table columns still sort correctly (unlike _fnum's formatted strings)."""
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if value != value:  # NaN
+        return None
+    return round(value, ndigits)
 
 
 def _live_pnl_bps(trades, open_entry: dict | None) -> float:
@@ -234,13 +251,14 @@ def _overview_snapshot(row: dict) -> dict:
         "feature": row["feature"],
         "position": "UNAVAILABLE",
         "reading": "—",
-        "signal_level": "—",
+        "signal_value": "—",
+        "entry_threshold": "—",
         "gate_status": "—",
         "live_pnl_bps": None,
-        "sharpe": row.get("sharpe"),
-        "n_trades": row.get("n_trades"),
-        "hit_rate": row.get("hit_rate"),
-        "max_drawdown_bps": row.get("max_drawdown_bps"),
+        "sharpe": _round(row.get("sharpe"), 2),
+        "n_trades": _round(row.get("n_trades"), 0),
+        "hit_rate": _round(row.get("hit_rate") * 100 if row.get("hit_rate") is not None else None, 1),
+        "max_drawdown_bps": _round(row.get("max_drawdown_bps"), 1),
         "data_asof": "—",
     }
     try:
@@ -254,11 +272,12 @@ def _overview_snapshot(row: dict) -> dict:
     signal_value = state["last"].get("signal")
     units = "bps" if params["entry_signal"] == "residual" else "z"
     threshold = float(params["entry_threshold"])
-    signal_level = (
-        f"{float(signal_value):+.2f}{units} / ±{threshold:g}{units}"
+    reading_str = (
+        f"{float(signal_value):+.2f}{units}"
         if signal_value is not None and signal_value == signal_value
-        else f"warming up / ±{threshold:g}{units}"
+        else "warming up"
     )
+    entry_threshold_str = f"±{threshold:g}{units}"
     position = (
         f"{open_entry['direction'].upper()} OPEN"
         if open_entry is not None
@@ -268,7 +287,8 @@ def _overview_snapshot(row: dict) -> dict:
         **base,
         "position": position,
         "reading": state["fired"].upper(),
-        "signal_level": signal_level,
+        "signal_value": reading_str,
+        "entry_threshold": entry_threshold_str,
         "gate_status": _gate_status(state).upper(),
         "live_pnl_bps": round(_live_pnl_bps(trades, open_entry), 1),
         "data_asof": str(state["data_asof"]),
