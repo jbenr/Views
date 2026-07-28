@@ -383,6 +383,13 @@ def _overview_table(target: str, rows: list[dict]) -> html.Div:
     )
 
 
+def _refresh_all_data(rows: list[dict]) -> None:
+    """Fresh Strategy.load_data() for every promoted module, deduped -- named
+    variants share one cache file so each module is only pulled once."""
+    for module in {row["module"] for row in rows}:
+        runner.pull_data(module)
+
+
 def _overview_content(rows: list[dict]) -> list:
     if not rows:
         return [
@@ -834,11 +841,15 @@ def build_app() -> dash.Dash:
             ]
         )
 
+        def _refresh_overview(*_clicks):
+            _refresh_all_data(rows)
+            return _overview_content(rows)
+
         app.callback(
             Output("overview-content", "children"),
             Input("refresh-overview", "n_clicks"),
             prevent_initial_call=True,
-        )(lambda *_clicks: _overview_content(rows))
+        )(_refresh_overview)
 
     for row in rows:
         signal_id = _row_id(row)

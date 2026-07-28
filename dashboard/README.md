@@ -72,7 +72,8 @@ The **Live Overview** tab is the trading surface. It groups signals into one
 table per traded target and shows the exact replayed position state, current
 threshold reading, causal gate status, current signal versus its entry level,
 net PnL, frozen backtest statistics, and data timestamp. Use **Refresh live
-status** to recompute those rows from the cached data.
+status** to re-pull each promoted module's data from the DB (deduped, so
+named variants of the same module only pull once) and recompute those rows.
 
 The **Signal Deep Dive** tab has a signal selector and renders the complete
 research card for just that strategy:

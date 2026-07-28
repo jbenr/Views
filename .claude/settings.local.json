@@ -27,7 +27,8 @@
       "PowerShell(conda run -n 2s10s python signal/duration/_tmp_edit_nb.py)",
       "PowerShell(conda run -n 2s10s jupyter nbconvert --to script signal/duration/research.ipynb --output _verify 2>&1)",
       "Bash(mamba run *)",
-      "Bash(\"/c/Users/benjils/miniforge3/envs/2s10s/python.exe\" -c \"import ast; [ast.parse\\(open\\(f, encoding='utf-8'\\).read\\(\\), f\\) for f in ['dashboard/app.py','dashboard/charts.py','dashboard/runner.py','utils/viz.py']]; print\\('syntax OK'\\)\")"
+      "Bash(\"/c/Users/benjils/miniforge3/envs/2s10s/python.exe\" -c \"import ast; [ast.parse\\(open\\(f, encoding='utf-8'\\).read\\(\\), f\\) for f in ['dashboard/app.py','dashboard/charts.py','dashboard/runner.py','utils/viz.py']]; print\\('syntax OK'\\)\")",
+      "PowerShell(mamba run *)"
     ]
   }
 }
