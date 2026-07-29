@@ -138,18 +138,19 @@ def graph(id_: str) -> dcc.Graph:
 
 def make_app(
     title: str,
-    subtitle: str,
-    data_info: str,
     sliders: list,
     body: html.Div,
+    subtitle: str = "",
+    data_info: str = "",
     debug: bool = True,
 ) -> Dash:
     """
     Build a Dash app with a standard header + slider row(s) + body area.
 
     title     : bold coloured title in the header (e.g. "10s30s")
-    subtitle  : grey subtitle (e.g. "beta-weighted curve explorer")
-    data_info : right-aligned data range string
+    subtitle  : grey subtitle (e.g. "beta-weighted curve explorer"); omit to
+                render the header bare
+    data_info : right-aligned data range string; omit to render nothing
     sliders   : list of slider() Divs, or a list of such lists to lay out
                 as separate rows (e.g. group entry params on one row and
                 exit params on another)
@@ -192,9 +193,12 @@ def make_app(
             }, children=[
                 html.Span(title, style={"fontSize": 18, "fontWeight": "bold",
                                          "color": ORANGE, "letterSpacing": 3}),
-                html.Span(subtitle, style={"fontSize": 12, "color": DIM}),
-                html.Span(data_info, style={"marginLeft": "auto", "fontSize": 11,
-                                             "color": DIM, "fontStyle": "italic"}),
+                *([html.Span(subtitle, style={"fontSize": 12, "color": DIM})]
+                  if subtitle else []),
+                *([html.Span(data_info,
+                             style={"marginLeft": "auto", "fontSize": 11,
+                                    "color": DIM, "fontStyle": "italic"})]
+                  if data_info else []),
             ]),
             # slider rows
             html.Div(

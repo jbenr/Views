@@ -114,6 +114,7 @@ DEFAULT_PARAMS = {
     "half_life_min": 3.0,  # block unstable / too-fast OU fits
     "half_life_max": 120.0,  # block slow drifts masquerading as mean reversion
     "gate": None,  # quantile regime gate (condition, bucket) — see lab.parse_gate
+    "gate_window": None,  # gate percentile lookback; None = expanding (all history)
     # exit: one primary style from the --exit menu + hard stop on top
     "exit_style": "revert_frac",  # "band" | "revert_frac" | "half_life_frac"
     "exit_param": 0.5,  # meaning follows the style (band level / frac / x half-life)
@@ -193,7 +194,9 @@ def _setup_name(row: dict) -> str:
         base = f"ou{row['beta_lb']}/{row['ou_lb']}/e{row['entry_threshold']:g}"
     name = f"{base} h{row['predict_horizon']}"
     if row["gate"] != "(none)":
-        name += f" {row['gate']}:{row['gate_bucket']}"
+        window = row.get("gate_window")
+        basis = "exp" if window is None else f"w{int(window)}"
+        name += f" {row['gate']}:{row['gate_bucket']}@{basis}"
     return name
 
 
@@ -229,6 +232,11 @@ def _winner_params(row: dict) -> dict:
             None
             if row["gate"] in (None, "(none)")
             else (row["gate"], row["gate_bucket"])
+        ),
+        "gate_window": (
+            None
+            if row.get("gate_window") is None
+            else int(row["gate_window"])
         ),
         "z_gate": None,
         "half_life_min": None,
@@ -278,6 +286,16 @@ class Strategy:
     )
     predict_gate_buckets: object = "regime"  # named quantile regimes per condition
     gate_min_history: int = 252  # causal percentile warmup before gates may fire
+    # Percentile lookbacks a gate is tested under, in bars. A regime gate asks
+    # "is this state unusual?" — against an expanding window that means unusual
+    # versus 2010, so a regime shift is absorbed rather than re-based and the
+    # gate can stay shut for years. These are deliberately long: short enough
+    # to drop an obsolete regime, long enough to span a cycle. Include None to
+    # also test the expanding rank.
+    gate_windows: list = field(default_factory=lambda: [756, 1260, 1764])
+    # percentile lookbacks a gated setup must independently predict across
+    # before it may be shortlisted (see _select_setups)
+    gate_min_window_agreement: int = 2
     predict_min_obs: int = 30  # ignore cells with fewer threshold-crossing events
     predict_min_independent_events: int = 8  # non-overlapping forecast windows
     predict_top_n: int = 10  # distinct setups saved to setups_file for --exit
@@ -447,13 +465,15 @@ class Strategy:
             )
         if p.get("gate") is not None:
             condition = self._gate_condition(frame, p)
+            gate_window = p.get("gate_window")
             percentile = gate_percentile_rank(
-                condition, min_history=self.gate_min_history
+                condition, min_history=self.gate_min_history, window=gate_window
             )
             allow = gate_allow_mask(
                 condition,
                 p["gate"],
                 min_history=self.gate_min_history,
+                window=gate_window,
             )
             frame = frame.with_columns(
                 condition.alias("gate_value"),
@@ -515,6 +535,37 @@ class Strategy:
             resid_thresholds=self.predict_resid_thresholds_bps,
             z_thresholds=self.predict_ou_z_thresholds,
             pool_size=pool_size,
+            # a gate read against a different percentile lookback is a
+            # different gate; neighbours must share the window
+            extra_keys=("gate_window",),
+        )
+
+    def _gate_window_agreement(self, stats: pl.DataFrame) -> pl.DataFrame:
+        """How many percentile lookbacks a gate survives at.
+
+        A regime gate that only predicts when its percentile is read over one
+        particular lookback is describing that lookback, not a regime. Counting
+        the windows where the same (condition, bucket) clears the neighbourhood
+        bar turns the window set into a robustness hurdle rather than one more
+        dimension to pick a winner from.
+        """
+        gated = stats.filter(
+            (pl.col("gate") != "(none)")
+            & (pl.col("n_nbr") >= self.predict_min_neighbors)
+            & (pl.col("nbr_ic") > 0)
+        )
+        agreement = gated.group_by(
+            "entry_signal", "beta_lb", "ou_lb", "gate", "gate_bucket"
+        ).agg(pl.col("gate_window").n_unique().alias("n_gate_windows"))
+        return stats.join(
+            agreement,
+            on=["entry_signal", "beta_lb", "ou_lb", "gate", "gate_bucket"],
+            how="left",
+        ).with_columns(
+            pl.when(pl.col("gate") == "(none)")
+            .then(None)
+            .otherwise(pl.col("n_gate_windows").fill_null(0))
+            .alias("n_gate_windows")
         )
 
     def _select_setups(
@@ -525,13 +576,25 @@ class Strategy:
         least predict_min_neighbors corroborating neighbors: after a
         multi-million-cell search the top raw ICs are selection flukes unless
         the surrounding cells agree. Dedupes threshold/horizon variants of
-        the same cell so the saved setups are genuinely different trades."""
+        the same cell so the saved setups are genuinely different trades.
+
+        Gated cells must additionally clear gate_min_window_agreement: the
+        same condition/bucket has to predict across that many percentile
+        lookbacks, so a gate cannot be admitted on the strength of one
+        conveniently-chosen window."""
+        stats = self._gate_window_agreement(self._neighbor_stats(valid))
         best = (
-            self._neighbor_stats(valid)
-            .filter(pl.col("n_nbr") >= self.predict_min_neighbors)
+            stats.filter(pl.col("n_nbr") >= self.predict_min_neighbors)
+            .filter(
+                (pl.col("gate") == "(none)")
+                | (pl.col("n_gate_windows") >= self.gate_min_window_agreement)
+            )
             .sort("nbr_ic", descending=True)
             .unique(
-                subset=["entry_signal", "beta_lb", "ou_lb", "gate", "gate_bucket"],
+                subset=[
+                    "entry_signal", "beta_lb", "ou_lb", "gate", "gate_bucket",
+                    "gate_window",
+                ],
                 keep="first",
                 maintain_order=True,
             )
@@ -539,7 +602,8 @@ class Strategy:
             .rename({"horizon": "predict_horizon"})
             .select(
                 "entry_signal", "beta_lb", "ou_lb", "entry_threshold",
-                "predict_horizon", "gate", "gate_bucket",
+                "predict_horizon", "gate", "gate_bucket", "gate_window",
+                "n_gate_windows",
                 "ic", "nbr_ic", "n_nbr", "hit_rate", "fire_rate", "n_obs",
             )
         )
@@ -604,6 +668,7 @@ class Strategy:
                     conditions[gate][:, column],
                     (gate, setup["gate_bucket"]),
                     min_history=self.gate_min_history,
+                    window=setup.get("gate_window"),
                 )
             horizon = int(setup["predict_horizon"])
             valid_forward = np.arange(len(signal)) < len(signal) - horizon
@@ -640,6 +705,11 @@ class Strategy:
                     None
                     if r["gate"] in (None, "(none)")
                     else (r["gate"], r["gate_bucket"])
+                ),
+                "gate_window": (
+                    None
+                    if r.get("gate_window") is None
+                    else int(r["gate_window"])
                 ),
             }
             if r["ou_lb"] is not None:
@@ -775,7 +845,10 @@ class Strategy:
             )
 
         n_variants = (
-            1 + len(scans[0]["conditions"]) * gate_variant_count(self.predict_gate_buckets)
+            1
+            + len(scans[0]["conditions"])
+            * gate_variant_count(self.predict_gate_buckets)
+            * len(self.gate_windows)
             if scans
             else 1
         )
@@ -806,6 +879,7 @@ class Strategy:
                     gates=scan["conditions"],
                     gate_buckets=self.predict_gate_buckets,
                     gate_min_history=self.gate_min_history,
+                    gate_windows=self.gate_windows,
                     device=device,
                     entry_col="entry_threshold",
                 ).with_columns(
@@ -916,6 +990,7 @@ class Strategy:
                     conditions[gate_name][:, 0],
                     gate_spec,
                     min_history=self.gate_min_history,
+                    window=setup.get("gate_window"),
                 )[:, None]
 
             # Match predict_scan's trigger event exactly: the gate must be
@@ -948,6 +1023,7 @@ class Strategy:
                     "half_life": conditions["resid_half_life"],
                     "entry_allow": crossed & gate_ok & np.isfinite(forward),
                     "gate": gate_name,
+                    "gate_window": setup.get("gate_window"),
                     "gate_bucket": str(gate_bucket),
                 }
             )
@@ -1016,7 +1092,7 @@ class Strategy:
                         entry_col="entry_threshold",
                         exit_col="exit_threshold",
                     )
-                    .drop("gate", "gate_bucket")  # ungated scan: constant columns
+                    .drop("gate", "gate_bucket", "gate_window")  # ungated: constant
                     .with_columns(pl.lit("band").alias("exit_style"))
                 )
                 _done(f"{scan['entry_signal']} band", bt)
@@ -1061,6 +1137,7 @@ class Strategy:
                 pl.lit(scan["entry_signal"]).alias("entry_signal"),
                 pl.lit(scan["units"]).alias("threshold_units"),
                 pl.lit(scan["gate"]).alias("gate"),
+                pl.lit(scan["gate_window"], dtype=pl.Int64).alias("gate_window"),
                 pl.lit(scan["gate_bucket"]).alias("gate_bucket"),
             )
             if scan["entry_signal"] == "residual":
@@ -1090,8 +1167,8 @@ class Strategy:
         exit_summary = (
             valid.group_by(
                 "setup", "entry_signal", "beta_lb", "ou_lb", "entry_threshold",
-                "predict_horizon", "gate", "gate_bucket", "exit_style",
-                "exit_threshold",
+                "predict_horizon", "gate", "gate_bucket", "gate_window",
+                "exit_style", "exit_threshold",
             )
             .agg(
                 pl.col("sharpe").median().alias("med_sharpe"),
@@ -1143,15 +1220,15 @@ class Strategy:
             leaderboard.sort("sharpe", descending=True)
             .group_by(
                 "setup", "entry_signal", "beta_lb", "ou_lb", "entry_threshold",
-                "predict_horizon", "gate", "gate_bucket",
+                "predict_horizon", "gate", "gate_bucket", "gate_window",
                 maintain_order=True,
             )
             .first()
         )
         winners = best_exit.sort("sharpe", descending=True).select(
             "setup", "entry_signal", "beta_lb", "ou_lb", "entry_threshold",
-            "predict_horizon", "gate", "gate_bucket", "exit_style",
-            "exit_threshold", "sharpe", "total_pnl_bps", "hit_rate",
+            "predict_horizon", "gate", "gate_bucket", "gate_window",
+            "exit_style", "exit_threshold", "sharpe", "total_pnl_bps", "hit_rate",
             "pnl_per_trade_bps", "avg_hold_bars", "n_trades",
         )
         winners.write_parquet(self.exits_file)

@@ -257,40 +257,83 @@ def test_sweep_half_life_bounds_none_disable_filter():
     assert unbounded["n_trades"][0] >= bounded["n_trades"][0] > 0
 
 
-def test_predict_setups_select_save_load_roundtrip(tmp_path):
-    # a cluster of adjacent grid cells (+-1 step in beta_lb/ou_lb/threshold)
-    # and one lone high-IC spike with no neighbors
-    cluster = [
+def _gate_cluster(gate_window: int, ic_scale: float = 1.0) -> list[dict]:
+    """Adjacent grid cells (+-1 step in beta_lb/ou_lb/threshold) at one
+    percentile lookback, so every cell has corroborating neighbours."""
+    cells = [
         {"beta_lb": 330, "ou_lb": 250, "entry_threshold": 2.7, "ic": 0.80},
         {"beta_lb": 320, "ou_lb": 250, "entry_threshold": 2.7, "ic": 0.60},
         {"beta_lb": 340, "ou_lb": 250, "entry_threshold": 2.7, "ic": 0.79},
         {"beta_lb": 330, "ou_lb": 240, "entry_threshold": 2.7, "ic": 0.77},
         {"beta_lb": 330, "ou_lb": 250, "entry_threshold": 2.5, "ic": 0.76},
     ]
-    spike = [{"beta_lb": 100, "ou_lb": 100, "entry_threshold": 1.5, "ic": 0.95}]
-    valid = pl.DataFrame([
+    return [
         {
             "entry_signal": "ou_z", "horizon": 40,
             "gate": "r2_mom10", "gate_bucket": "high_75",
-            "hit_rate": 0.6, "fire_rate": 0.03, "n_obs": 35, **row,
+            "gate_window": gate_window,
+            "hit_rate": 0.6, "fire_rate": 0.03, "n_obs": 35,
+            **{**cell, "ic": cell["ic"] * ic_scale},
         }
-        for row in cluster + spike
-    ])
+        for cell in cells
+    ]
+
+
+def test_predict_setups_select_save_load_roundtrip(tmp_path):
+    spike = [{
+        "entry_signal": "ou_z", "horizon": 40,
+        "gate": "r2_mom10", "gate_bucket": "high_75", "gate_window": 756,
+        "hit_rate": 0.6, "fire_rate": 0.03, "n_obs": 35,
+        "beta_lb": 100, "ou_lb": 100, "entry_threshold": 1.5, "ic": 0.95,
+    }]
+    valid = pl.DataFrame(
+        _gate_cluster(756) + _gate_cluster(1260, ic_scale=0.9) + spike
+    )
     setups = STRATEGY._select_setups(valid)
+    names = setups["name"].to_list()
 
     # the lone 0.95-IC spike has no corroborating neighbors -> dropped
-    assert "ou100/100/e1.5 h40 r2_mom10:high_75" not in setups["name"].to_list()
-    # ranked by neighborhood IC, one row per (signal, lookbacks, gate) cell
-    assert len(setups) == 4
-    assert setups["name"][0] == "ou330/250/e2.5 h40 r2_mom10:high_75"
+    assert not any(n.startswith("ou100/100/e1.5") for n in names)
+    # the gate survives at both lookbacks, and each is kept as its own setup
+    assert setups["name"][0] == "ou330/250/e2.5 h40 r2_mom10:high_75@w756"
     assert setups["nbr_ic"][0] == pytest.approx(0.78)
+    assert set(setups["gate_window"].to_list()) == {756, 1260}
+    assert setups["n_gate_windows"].to_list() == [2] * len(setups)
 
     path = tmp_path / "setups.parquet"
     setups.write_parquet(path)
     loaded = STRATEGY.load_setups(path)
     assert loaded[0]["gate"] == ("r2_mom10", "high_75")
+    assert loaded[0]["gate_window"] == 756
     assert loaded[0]["beta_lb"] == 330 and loaded[0]["ou_lb"] == 250
     assert loaded[0]["entry_threshold"] == 2.5
+
+
+def test_gate_surviving_only_one_percentile_window_is_not_shortlisted():
+    """A gate that only predicts under one lookback is describing that
+    lookback, not a regime -- gate_min_window_agreement drops it."""
+    one_window = pl.DataFrame(_gate_cluster(756))
+
+    setups = STRATEGY._select_setups(one_window)
+
+    assert setups.is_empty()
+    # the same cells corroborated at a second lookback do get through
+    two_windows = pl.DataFrame(_gate_cluster(756) + _gate_cluster(1260, 0.9))
+    assert not STRATEGY._select_setups(two_windows).is_empty()
+
+
+def test_ungated_setups_bypass_the_window_agreement_rule():
+    """The agreement hurdle is about gates; an ungated cell has no window."""
+    ungated = pl.DataFrame([
+        {**row, "gate": "(none)", "gate_bucket": "all", "gate_window": None}
+        for row in _gate_cluster(756)
+    ])
+
+    setups = STRATEGY._select_setups(ungated)
+
+    assert not setups.is_empty()
+    assert setups["n_gate_windows"].to_list() == [None] * len(setups)
+    assert all("@" not in name for name in setups["name"].to_list())
 
 
 def test_load_setups_and_exits_require_prior_modes(tmp_path):

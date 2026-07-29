@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import time
 from pathlib import Path
 
 import polars as pl
+
+from utils.market_data import last_updated
 
 from .ledger import SignalLedger
 from .params import params_from_row
@@ -54,6 +57,7 @@ def pull_data(signal_id: str) -> dict:
     cache_path = _data_cache_path(strategy.name)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     data.write_parquet(cache_path)
+    _freshness_cache.clear()  # a pull is exactly when freshness changes
     return {
         "data": data,
         "pulled_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -67,6 +71,36 @@ def cached_data(signal_id: str) -> pl.DataFrame | None:
     if not cache_path.exists():
         return None
     return pl.read_parquet(cache_path)
+
+
+FRESHNESS_TTL_SECONDS = 60.0
+_freshness_cache: dict[tuple[str, ...], tuple[float, dict | None]] = {}
+
+
+def db_freshness(signal_id: str) -> dict | None:
+    """Newest bar and write time in md.index_eod for this signal's tickers.
+
+    Cached per ticker set for FRESHNESS_TTL_SECONDS: one overview render asks
+    this once per signal plus once per target, and the round trip costs far
+    more than the query. pull_data() clears the cache, so a Ref always shows
+    the state it just pulled.
+
+    Returns None when the database is unreachable: the dashboard renders off
+    cached parquet by design and must keep working when the DB is down, so a
+    freshness readout is never allowed to break a card.
+    """
+    _, strategy = _resolve(signal_id)
+    key = tuple(sorted(strategy.tickers.values()))
+    cached = _freshness_cache.get(key)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < FRESHNESS_TTL_SECONDS:
+        return cached[1]
+    try:
+        fresh = last_updated(strategy.tickers)
+    except Exception:
+        fresh = None
+    _freshness_cache[key] = (now, fresh)
+    return fresh
 
 
 def compute_signal(signal_id: str) -> dict:

@@ -12,7 +12,7 @@ import ast
 
 PARAM_COLS = [
     "entry_signal", "beta_lb", "ou_lb", "entry_threshold",
-    "exit_style", "exit_param", "gate", "z_gate",
+    "exit_style", "exit_param", "gate", "gate_window", "z_gate",
     "half_life_min", "half_life_max", "stop_loss_bps",
 ]
 
@@ -21,6 +21,9 @@ PARAM_COLS = [
 # signals and must not override a strategy's required/default parameter.
 NULLABLE_FILTER_COLS = {
     "gate",
+    # explicit null = expanding percentile, which must not fall back to a
+    # module default that happens to name a rolling window
+    "gate_window",
     "z_gate",
     "half_life_min",
     "half_life_max",
@@ -49,4 +52,6 @@ def params_from_row(row: dict) -> dict:
         params["beta_lb"] = int(params["beta_lb"])
     if params.get("ou_lb") is not None:
         params["ou_lb"] = int(params["ou_lb"])
+    if params.get("gate_window") is not None:
+        params["gate_window"] = int(params["gate_window"])
     return params

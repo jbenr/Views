@@ -11,12 +11,12 @@ Model:
 All machinery lives in backtest.strategy.Strategy — this module is the
 configuration. Same funnel as every curve strategy:
 
-    python -m book.curve.twos10s_real10y              # single run, live DB
-    python -m book.curve.twos10s_real10y --synthetic  # single run, no DB
-    python -m book.curve.twos10s_real10y --predict    # setup search
-    python -m book.curve.twos10s_real10y --exit       # exits per saved setup
-    python -m book.curve.twos10s_real10y --sweep      # exact engine + trade logs
-    python -m book.curve.twos10s_real10y --cook       # all three, in order
+    python -m book.curve.real10y_2s10s              # single run, live DB
+    python -m book.curve.real10y_2s10s --synthetic  # single run, no DB
+    python -m book.curve.real10y_2s10s --predict    # setup search
+    python -m book.curve.real10y_2s10s --exit       # exits per saved setup
+    python -m book.curve.real10y_2s10s --sweep      # exact engine + trade logs
+    python -m book.curve.real10y_2s10s --cook       # all three, in order
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from pathlib import Path
 from backtest.strategy import Strategy, synthetic_pair
 
 STRATEGY_FAMILY = "curve"
-SIGNAL_NAME = "twos10s_real10y"
+SIGNAL_NAME = "real10y_2s10s"
 
 TICKERS = {
     "real10y": "USGGT10Y Index",  # % -> scaled to bps at load
@@ -47,8 +47,8 @@ def synthetic_data(n: int = 1500, seed: int = 11):
 
 STRATEGY = Strategy(
     name=SIGNAL_NAME,
-    module="book.curve.twos10s_real10y",  # sweep workers import this
-    path=Path(__file__),  # funnel artifacts live in data/twos10s_real10y/
+    module="book.curve.real10y_2s10s",  # sweep workers import this
+    path=Path(__file__),  # funnel artifacts live in data/real10y_2s10s/
     tickers=TICKERS,
     bps_cols=["real10y"],
     target=TARGET,

@@ -5,12 +5,10 @@ desk questions first: is a position open, what does the latest reading say,
 is its gate open, and how has the frozen backtest behaved?
 
 The Signal Deep Dive tab selects one promoted signal at a time and exposes the
-full chart, gate, PnL, and trade-history card. Two buttons drive its data:
+full chart, gate, PnL, and trade-history card. One button drives its data:
 
-    Re-pull data       fresh Strategy.load_data(), cached to disk.
-                        No ledger write.
-    Re-run analysis     Strategy.compute() on the cached data, logged as
-                        one timestamped row in the signal ledger.
+    Ref     fresh Strategy.load_data() cached to disk, then Strategy.compute()
+            on it, logged as one timestamped row in the signal ledger.
 
 No background loop or auto-refresh -- nothing changes until you click. Per-card
 time-frame buttons, the trade-table pager, and a "snap chart to view" zoom
@@ -27,10 +25,12 @@ See README.md for the full workflow.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import re
 
 import dash
 import pandas as pd
+import polars as pl
 from dash import Input, Output, State, ctx, dash_table, dcc, html
 
 from dashboard import runner
@@ -92,13 +92,23 @@ def _slug(signal_id: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", signal_id.lower()).strip("-")
 
 
+def _auto_label(row: dict) -> str:
+    """Params-derived label for a promotion with no curated variant name, in
+    the same shorthand curated labels use: the lookback that defines the
+    signal plus its entry threshold."""
+    if row["entry_signal"] == "residual":
+        return f"RES{int(row['beta_lb'])} · {float(row['entry_threshold']):g}bps"
+    return f"OU{int(row['ou_lb'])} · {float(row['entry_threshold']):g}z"
+
+
 def _display_name(row: dict) -> str:
-    """Canonical user-facing signal name: traded target first, feature second.
-    Always suffixed with a label -- curated variants use their own, sweep-top
-    promotions fall back to "default" -- so every row has the same shape."""
-    base = f"{row['target']}_{row['feature']}"
-    variant_label = row.get("variant_label") or "default"
-    return f"{base} · {variant_label}"
+    """Canonical user-facing signal name: input feature first, traded target
+    second -- the same `<input>_<target>` order the strategy modules use, so
+    a name reads identically here and in `registry --list`. Always suffixed
+    with a label: curated variants use their own, every other promotion gets
+    one derived from its frozen params."""
+    base = f"{row['feature']}_{row['target']}"
+    return f"{base} · {row.get('variant_label') or _auto_label(row)}"
 
 
 def _row_id(row: dict) -> str:
@@ -241,6 +251,134 @@ def _gate_status(state: dict) -> str:
     return f"{status} · {pct}{suffix} pct"
 
 
+CHANGE_WINDOWS = [("1D", 1), ("1W", 7), ("1M", 30)]
+
+
+LOCAL_TZ = dt.datetime.now().astimezone().tzinfo
+
+
+def _local(when) -> pd.Timestamp:
+    """Any timestamp as local wall-clock. The ledger stores UTC and file
+    mtimes are naive local; the desk reads both in local time."""
+    when = pd.Timestamp(when)
+    return when.tz_convert(LOCAL_TZ) if when.tzinfo else when.tz_localize(LOCAL_TZ)
+
+
+def _zone(when: pd.Timestamp) -> str:
+    """Windows names the zone "Eastern Daylight Time" where the desk writes
+    "EDT"; initials recover the abbreviation platforms that already report
+    one leave alone."""
+    name = when.strftime("%Z")
+    parts = name.split()
+    return "".join(part[0] for part in parts).upper() if len(parts) > 1 else name
+
+
+def _clock(when, same_day_as=None) -> str:
+    """A timestamp as a human reads one: "9:47:50pm EDT". Prefixed with its
+    own date whenever it does not fall on `same_day_as` (default: today), so
+    the date is stated exactly when it would otherwise be ambiguous."""
+    when = _local(when)
+    reference = (
+        dt.date.today() if same_day_as is None else pd.Timestamp(same_day_as).date()
+    )
+    stamp = when.strftime("%I:%M:%S%p").lstrip("0").lower()
+    day = "" if when.date() == reference else f"{when:%Y-%m-%d} "
+    return f"{day}{stamp} {_zone(when)}".rstrip()
+
+
+def _db_asof(signal_id: str, data_asof) -> tuple[str, bool]:
+    """The bar this card is drawn on, and when that data landed in the DB.
+
+    Returns (label, stale). Stale means md.index_eod carries a newer bar than
+    the cached copy this card is drawn from -- the case where Ref is overdue.
+    """
+    fresh = runner.db_freshness(signal_id)
+    if fresh is None:
+        return f"{data_asof} · db unreachable", False
+    db_bar = pd.Timestamp(fresh["last_ts"]).date()
+    stale = db_bar > pd.Timestamp(data_asof).date()
+    written = _clock(fresh["last_written"], same_day_as=data_asof)
+    return f"{data_asof} · {written}", stale
+
+
+def _target_snapshot(target: str, rows: list[dict]) -> dict | None:
+    """Where the traded curve itself is, and how far it has come: latest level
+    plus point changes over standard windows. Read from the freshest cached
+    frame among the target's promoted signals -- the same data the signals
+    below are computed on, so the header can never disagree with the rows."""
+    sources = []
+    for row in rows:
+        frame = runner.cached_data(_row_id(row))
+        if frame is None or target not in frame.columns:
+            continue
+        frame = frame.select("ts", pl.col(target).alias("level")).drop_nulls()
+        if not frame.is_empty():
+            sources.append((_row_id(row), frame))
+    if not sources:
+        return None
+
+    # keep the winning frame's signal_id: its tickers are what dates the level
+    signal_id, frame = max(sources, key=lambda pair: pair[1]["ts"][-1])
+    ts, level = frame["ts"][-1], float(frame["level"][-1])
+
+    def _change_since(cutoff) -> float | None:
+        earlier = frame.filter(pl.col("ts") <= cutoff)
+        return None if earlier.is_empty() else level - float(earlier["level"][-1])
+
+    changes = [
+        (label, _change_since(ts - dt.timedelta(days=days)))
+        for label, days in CHANGE_WINDOWS
+    ]
+    changes.append(("YTD", _change_since(dt.date(ts.year, 1, 1) - dt.timedelta(days=1))))
+    return {"signal_id": signal_id, "ts": ts, "level": level, "changes": changes}
+
+
+def _delta_chip(label: str, value: float | None) -> html.Div:
+    color = TEXT if value is None else (C1 if value > 0 else C0 if value < 0 else TEXT)
+    return html.Div(
+        style={"display": "flex", "alignItems": "baseline", "gap": 4},
+        children=[
+            html.Span(label, style={"fontSize": 10, "color": DIM}),
+            html.Span(
+                _fnum(value, "+.1f"),
+                style={"fontSize": 12, "fontFamily": "monospace", "color": color},
+            ),
+        ],
+    )
+
+
+def _target_header(target: str, rows: list[dict]) -> html.Div:
+    snapshot = _target_snapshot(target, rows)
+    children = [
+        html.Span(
+            target,
+            style={
+                "fontSize": 15,
+                "fontWeight": "bold",
+                "color": ORANGE,
+                "textTransform": "uppercase",
+            },
+        )
+    ]
+    if snapshot is not None:
+        asof, stale = _db_asof(snapshot["signal_id"], snapshot["ts"])
+        children += [
+            html.Span(
+                f"{snapshot['level']:.1f} bps",
+                style={"fontSize": 15, "fontWeight": "bold",
+                       "fontFamily": "monospace"},
+            ),
+            html.Span(asof, style={"fontSize": 11,
+                                   "color": ORANGE if stale else DIM}),
+            *[_delta_chip(label, value) for label, value in snapshot["changes"]],
+        ]
+    return html.Div(
+        style={"display": "flex", "alignItems": "baseline", "gap": 14,
+               "marginBottom": 7},
+        children=children,
+    )
+
+
 def _overview_snapshot(row: dict) -> dict:
     """One desk-level status row for a promoted signal."""
     base = {
@@ -260,6 +398,7 @@ def _overview_snapshot(row: dict) -> dict:
         "hit_rate": _round(row.get("hit_rate") * 100 if row.get("hit_rate") is not None else None, 1),
         "max_drawdown_bps": _round(row.get("max_drawdown_bps"), 1),
         "data_asof": "—",
+        "data_stale": 0,
     }
     try:
         signal_id = _row_id(row)
@@ -268,6 +407,7 @@ def _overview_snapshot(row: dict) -> dict:
     except RuntimeError as exc:
         return {**base, "reading": str(exc)}
 
+    asof_label, asof_stale = _db_asof(signal_id, state["data_asof"])
     params = state["params"]
     signal_value = state["last"].get("signal")
     units = "bps" if params["entry_signal"] == "residual" else "z"
@@ -291,7 +431,9 @@ def _overview_snapshot(row: dict) -> dict:
         "entry_threshold": entry_threshold_str,
         "gate_status": _gate_status(state).upper(),
         "live_pnl_bps": round(_live_pnl_bps(trades, open_entry), 1),
-        "data_asof": str(state["data_asof"]),
+        "data_asof": asof_label,
+        # not a displayed column -- drives the stale conditional style below
+        "data_stale": int(asof_stale),
     }
 
 
@@ -300,29 +442,7 @@ def _overview_table(target: str, rows: list[dict]) -> html.Div:
     return html.Div(
         style={"marginBottom": 22},
         children=[
-            html.Div(
-                style={
-                    "display": "flex",
-                    "alignItems": "baseline",
-                    "gap": 10,
-                    "marginBottom": 7,
-                },
-                children=[
-                    html.Span(
-                        target,
-                        style={
-                            "fontSize": 15,
-                            "fontWeight": "bold",
-                            "color": ORANGE,
-                            "textTransform": "uppercase",
-                        },
-                    ),
-                    html.Span(
-                        f"{len(rows)} trusted signal{'s' if len(rows) != 1 else ''}",
-                        style={"fontSize": 11, "color": DIM},
-                    ),
-                ],
-            ),
+            _target_header(target, rows),
             dash_table.DataTable(
                 columns=[{"name": label, "id": key} for key, label in OVERVIEW_COLUMNS],
                 data=snapshots,
@@ -375,6 +495,12 @@ def _overview_table(target: str, rows: list[dict]) -> html.Div:
                     {
                         "if": {"filter_query": "{live_pnl_bps} < 0", "column_id": "live_pnl_bps"},
                         "color": C0,
+                        "fontWeight": "bold",
+                    },
+                    {
+                        # the db holds a newer bar than this cached row
+                        "if": {"filter_query": "{data_stale} = 1", "column_id": "data_asof"},
+                        "color": ORANGE,
                         "fontWeight": "bold",
                     },
                 ],
@@ -506,9 +632,15 @@ def _card_sections(
             error = str(exc)
 
     live_pnl = _live_pnl_bps(trades, open_entry) if state and not error else None
+    asof_label, asof_stale = (
+        _db_asof(signal_id, state["data_asof"]) if state else ("—", False)
+    )
     stats = [
-        stat_block("data as-of", str(state["data_asof"]) if state else "—"),
-        stat_block("last analysis run", ledger_row["run_ts"] if ledger_row else "never"),
+        stat_block("data as-of", asof_label, alert=asof_stale),
+        stat_block(
+            "last analysis run",
+            _clock(ledger_row["run_ts"]) if ledger_row else "never",
+        ),
         stat_block(
             "reading",
             state["fired"] if state else "—",
@@ -554,6 +686,7 @@ def _card_sections(
             state["params"].get("gate"),
             window_bars=window_bars,
             date_range=date_range,
+            gate_window=state["params"].get("gate_window"),
         )
         pnl_png = pnl_chart(
             state["equity_curve"],
@@ -624,9 +757,8 @@ def _card(row: dict) -> html.Div:
                 style={"display": "flex", "gap": 8, "marginBottom": 4,
                        "alignItems": "center", "flexWrap": "wrap"},
                 children=[
-                    html.Button("Re-pull data", id=f"pull-{slug}", n_clicks=0,
-                                style=_btn_style()),
-                    html.Button("Re-run analysis", id=f"run-{slug}", n_clicks=0,
+                    html.Button("Ref", id=f"ref-{slug}", n_clicks=0,
+                                className="ref-btn",
                                 style=_btn_style(primary=True)),
                     dcc.Store(id=f"window-{slug}", data=DEFAULT_WINDOW),
                     dcc.Store(id=f"snap-range-{slug}", data=None),
@@ -694,26 +826,20 @@ def build_app() -> dash.Dash:
                 style={
                     "display": "flex",
                     "alignItems": "center",
+                    "gap": 12,
                     "marginBottom": 14,
                 },
                 children=[
                     html.Div(
-                        [
-                            html.Div(
-                                "LIVE TRADING OVERVIEW",
-                                style={"fontSize": 14, "fontWeight": "bold"},
-                            ),
-                            html.Div(
-                                "Grouped by traded target · positions are exact-engine state",
-                                style={"fontSize": 11, "color": DIM, "marginTop": 2},
-                            ),
-                        ]
+                        "LIVE TRADING OVERVIEW",
+                        style={"fontSize": 14, "fontWeight": "bold"},
                     ),
                     html.Button(
-                        "Refresh live status",
+                        "Ref",
                         id="refresh-overview",
                         n_clicks=0,
-                        style={**_btn_style(primary=True), "marginLeft": "auto"},
+                        className="ref-btn",
+                        style=_btn_style(primary=True),
                     ),
                 ],
             ),
@@ -738,16 +864,8 @@ def build_app() -> dash.Dash:
                     },
                     children=[
                         html.Div(
-                            [
-                                html.Div(
-                                    "SIGNAL DEEP DIVE",
-                                    style={"fontSize": 14, "fontWeight": "bold"},
-                                ),
-                                html.Div(
-                                    "Charts, causal gate state, exact PnL, and trade history",
-                                    style={"fontSize": 11, "color": DIM, "marginTop": 2},
-                                ),
-                            ]
+                            "SIGNAL DEEP DIVE",
+                            style={"fontSize": 14, "fontWeight": "bold"},
                         ),
                         dcc.Dropdown(
                             id="deep-dive-signal",
@@ -813,13 +931,7 @@ def build_app() -> dash.Dash:
         ]
     )
 
-    app = make_app(
-        title="LIVE",
-        subtitle="trusted live signals · overview and exact-engine deep dives",
-        data_info=f"{len(rows)} live signal{'s' if len(rows) != 1 else ''}",
-        sliders=[],
-        body=body,
-    )
+    app = make_app(title="LIVE", sliders=[], body=body)
 
     window_keys = list(WINDOW_PRESETS)
 
@@ -857,8 +969,7 @@ def build_app() -> dash.Dash:
         window_prefix = f"window-{slug}-"
 
         def _update(
-            _pull,
-            _run,
+            _ref,
             *rest,
             signal_id=signal_id,
             slug=slug,
@@ -868,10 +979,9 @@ def build_app() -> dash.Dash:
             trigger = ctx.triggered_id or ""
             no_btn_styles = [dash.no_update] * len(window_keys)
             try:
-                if trigger.startswith("pull-"):
+                if trigger.startswith("ref-"):
+                    # one click = fresh data, then one logged analysis on it
                     runner.pull_data(signal_id)
-                    page = 0
-                elif trigger.startswith("run-"):
                     runner.run_analysis(signal_id)
                     page = 0
                 elif trigger.startswith(window_prefix):
@@ -920,8 +1030,7 @@ def build_app() -> dash.Dash:
             Output(f"window-{slug}", "data"),
             Output(f"snap-range-{slug}", "data"),
             *[Output(f"window-{slug}-{k}", "style") for k in window_keys],
-            Input(f"pull-{slug}", "n_clicks"),
-            Input(f"run-{slug}", "n_clicks"),
+            Input(f"ref-{slug}", "n_clicks"),
             *[Input(f"window-{slug}-{k}", "n_clicks") for k in window_keys],
             Input(f"trades-prev-{slug}", "n_clicks"),
             Input(f"trades-next-{slug}", "n_clicks"),

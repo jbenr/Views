@@ -10,16 +10,16 @@ import pytest
 from backtest.engine import BacktestConfig, Engine
 
 MODULES = [
-    "book.curve.twos10s_real10y",
-    "book.curve.tens30s_pc1",
+    "book.curve.real10y_2s10s",
+    "book.curve.pc1_10s30s",
     "book.curve.twos_10s30s",
 ]
 
 LIVE_MODULES = [
     "book.curve.tens_10s30s",
-    "book.curve.tens30s_pc1",
+    "book.curve.pc1_10s30s",
     "book.curve.twos_10s30s",
-    "book.curve.twos10s_real10y",
+    "book.curve.real10y_2s10s",
 ]
 
 
@@ -63,7 +63,7 @@ def test_xy_scan_uses_shared_curve_data_directory():
 
 
 def test_pc1_feature_hook_adds_point_in_time_score():
-    mod = importlib.import_module("book.curve.tens30s_pc1")
+    mod = importlib.import_module("book.curve.pc1_10s30s")
     data = mod.add_pc1(mod.synthetic_data(n=900))
     assert mod.FEATURE in data.columns
     # warmup nulls, then populated

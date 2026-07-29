@@ -102,6 +102,10 @@ def test_overview_snapshot_uses_exact_open_position(monkeypatch, tmp_path):
             "target": "10s30s",
             "name": "twos_10s30s",
             "feature": "2y",
+            "entry_signal": "ou_z",
+            "beta_lb": 90,
+            "ou_lb": 470,
+            "entry_threshold": 0.9,
             "sharpe": 0.71,
             "n_trades": 58,
             "hit_rate": 0.707,
@@ -111,25 +115,61 @@ def test_overview_snapshot_uses_exact_open_position(monkeypatch, tmp_path):
 
     assert snapshot["position"] == "LONG OPEN"
     assert snapshot["reading"] == "LONG"
-    assert snapshot["signal_level"] == "-1.20z / ±0.9z"
+    assert snapshot["signal_value"] == "-1.20z"
+    assert snapshot["entry_threshold"] == "±0.9z"
     assert snapshot["live_pnl_bps"] == 5.5
 
 
-def test_dashboard_signal_names_use_target_then_feature(monkeypatch, tmp_path):
+def test_dashboard_signal_names_match_the_module_input_target_order(
+    monkeypatch, tmp_path
+):
+    """Display names read `<input>_<target>`, the same order the strategy
+    modules are named in, so one signal has one name project-wide."""
     app = _load_app_module(monkeypatch, tmp_path)
 
-    assert app._display_name({"target": "10s30s", "feature": "2y"}) == "10s30s_2y"
     assert app._display_name(
         {
             "target": "10s30s",
             "feature": "2y",
             "variant_label": "OU430 · 0.9z",
         }
-    ) == "10s30s_2y · OU430 · 0.9z"
-    assert (
-        app._display_name({"target": "2s10s", "feature": "real10y"})
-        == "2s10s_real10y"
-    )
+    ) == "2y_10s30s · OU430 · 0.9z"
+    assert app._display_name(
+        {
+            "target": "2s10s",
+            "feature": "real10y",
+            "variant_label": "OU390 · 1.7z",
+        }
+    ) == "real10y_2s10s · OU390 · 1.7z"
+
+
+def test_unlabeled_promotions_are_named_from_their_frozen_params(
+    monkeypatch, tmp_path
+):
+    """A promotion with no curated variant name must still say what it is --
+    "default" told the desk nothing about how the signal was configured."""
+    app = _load_app_module(monkeypatch, tmp_path)
+
+    assert app._display_name(
+        {
+            "target": "10s30s",
+            "feature": "2y",
+            "entry_signal": "ou_z",
+            "beta_lb": 90,
+            "ou_lb": 470,
+            "entry_threshold": 0.9,
+        }
+    ) == "2y_10s30s · OU470 · 0.9z"
+    assert app._display_name(
+        {
+            "target": "10s30s",
+            "feature": "10y",
+            "entry_signal": "residual",
+            "beta_lb": 90,
+            "ou_lb": None,
+            "entry_threshold": 19.0,
+        }
+    ) == "10y_10s30s · RES90 · 19bps"
 
 
 def test_registry_can_promote_curated_module_defaults(monkeypatch, tmp_path):

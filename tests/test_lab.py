@@ -16,6 +16,7 @@ from backtest.lab import (
     add_predict_lift,
     fast_scan,
     gate_allow_mask,
+    gate_percentile_rank,
     gate_scan,
     gate_variant_count,
     parse_gate,
@@ -586,6 +587,55 @@ def test_gate_allow_mask_is_prefix_stable_and_honors_warmup():
 
     np.testing.assert_array_equal(full_mask[: len(prefix)], prefix_mask)
     assert not full_mask[:2].any()
+
+
+# a low regime, then a permanently higher one that oscillates in place -- the
+# level shift is what the gate should or should not keep reacting to
+_REGIME_SHIFT = np.array(
+    [1.0, 3.0, 2.0, 4.0, 0.0, 3.0, 1.0, 2.0, 4.0, 0.0]
+    + [102.0, 100.0, 104.0, 101.0, 103.0, 100.0, 104.0, 102.0, 101.0, 103.0]
+)
+
+
+def test_gate_percentile_window_ranks_against_the_trailing_window_only():
+    """A rolling gate re-centres on the recent regime; the expanding default
+    keeps ranking new bars against all history, so a level shift stays pegged."""
+    expanding = gate_percentile_rank(_REGIME_SHIFT, min_history=3)
+    rolling = gate_percentile_rank(_REGIME_SHIFT, min_history=3, window=5)
+
+    # expanding keeps the whole post-shift regime pinned near the top of all
+    # history: a gate reading "below the 50th" can never reopen
+    assert expanding[10:].min() > 0.70
+    # rolling re-bases once the old regime ages out of the lookback, so the
+    # same bars spread back across the range
+    assert rolling[10:].min() < 0.50
+
+
+def test_gate_percentile_rolling_window_is_prefix_stable():
+    prefix = np.array([3.0, 1.0, 4.0, 2.0, 5.0, 0.0, 9.0, 7.0])
+    full = np.concatenate([prefix, [1000.0, -1000.0, 7.0]])
+
+    prefix_ranks = gate_percentile_rank(prefix, min_history=3, window=5)
+    full_ranks = gate_percentile_rank(full, min_history=3, window=5)
+
+    np.testing.assert_allclose(full_ranks[: len(prefix)], prefix_ranks)
+
+
+def test_gate_window_shorter_than_min_history_is_rejected():
+    with pytest.raises(ValueError, match="shorter than min_history"):
+        gate_percentile_rank(np.arange(50.0), min_history=20, window=10)
+
+
+def test_gate_allow_mask_threads_the_window_through():
+    spec = ("c", "below_50")
+
+    expanding = gate_allow_mask(_REGIME_SHIFT, spec, min_history=3)
+    rolling = gate_allow_mask(_REGIME_SHIFT, spec, min_history=3, window=5)
+
+    # expanding locks the gate shut for the whole post-shift regime; the
+    # rolling window lets it reopen once the old regime ages out
+    assert not expanding[10:].any()
+    assert rolling[10:].any()
 
 
 def test_gate_allow_mask_accepts_polars_series():

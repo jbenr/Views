@@ -511,6 +511,7 @@ def gate_allow_mask(
     values: Union[pl.Series, np.ndarray],
     spec: Union[tuple, list, dict],
     min_history: int = 252,
+    window: Optional[int] = None,
 ) -> np.ndarray:
     """Boolean entry-allow mask for one condition series under a gate spec.
 
@@ -522,7 +523,7 @@ def gate_allow_mask(
     entry_filter_fn so the exact Engine reproduces a shortlisted gate.
     """
     _, kind, qs = parse_gate(spec)
-    ranks = gate_percentile_rank(values, min_history=min_history)
+    ranks = gate_percentile_rank(values, min_history=min_history, window=window)
     finite = np.isfinite(ranks)
     if kind == "below":
         return finite & (ranks <= qs[0])
@@ -536,8 +537,13 @@ def gate_allow_mask(
 def gate_percentile_rank(
     values: Union[pl.Series, np.ndarray],
     min_history: int = 252,
+    window: Optional[int] = None,
 ) -> np.ndarray:
-    """Causal expanding percentile used by every gate decision.
+    """Causal percentile used by every gate decision.
+
+    ``window=None`` ranks against all history to date (expanding); an int
+    ranks against the trailing ``window`` bars only. See
+    :func:`_causal_percentile_rank` for what that choice costs.
 
     Exposed separately so diagnostics and dashboards can explain why a gate
     is open without recomputing a different, potentially non-causal rank.
@@ -545,18 +551,37 @@ def gate_percentile_rank(
     c = np.asarray(
         values.to_numpy() if isinstance(values, pl.Series) else values, dtype=float
     )
-    return _causal_percentile_rank(c, min_history=min_history)
+    return _causal_percentile_rank(c, min_history=min_history, window=window)
 
 
-def _causal_percentile_rank(values: np.ndarray, min_history: int = 252) -> np.ndarray:
-    """Expanding percentile rank using information available at each bar.
+def _causal_percentile_rank(
+    values: np.ndarray,
+    min_history: int = 252,
+    window: Optional[int] = None,
+) -> np.ndarray:
+    """Percentile rank using only information available at each bar.
 
     The current observation is included because it is known when the entry
-    decision is made. ``Expanding.rank`` is prefix-stable: appending future
-    data cannot alter any rank already emitted.
+    decision is made. Both variants are prefix-stable: appending future data
+    cannot alter any rank already emitted.
+
+    ``window=None`` is expanding — every bar is ranked against all history to
+    date. No lookback to choose, but the denominator grows without bound, so
+    a persistent regime shift is absorbed rather than re-based and a gate can
+    stay shut for years. ``window=N`` ranks against the trailing N bars, which
+    re-centres on the current regime at the cost of a lookback that is itself
+    a fitted choice.
     """
     if min_history < 1:
         raise ValueError("min_history must be >= 1")
+    if window is not None:
+        if window < 1:
+            raise ValueError("window must be >= 1 or None for expanding")
+        if window < min_history:
+            raise ValueError(
+                f"window={window} is shorter than min_history={min_history}; "
+                "no bar could ever satisfy both"
+            )
     c = np.asarray(values, dtype=float)
     if c.ndim not in {1, 2}:
         raise ValueError(f"gate values must be 1D or 2D, got shape {c.shape}")
@@ -578,11 +603,12 @@ def _causal_percentile_rank(values: np.ndarray, min_history: int = 252) -> np.nd
             matrix = matrix[:, starts]
 
     frame = pd.DataFrame(matrix)
-    ranks = (
+    roller = (
         frame.expanding(min_periods=min_history)
-        .rank(method="average", pct=True)
-        .to_numpy()
+        if window is None
+        else frame.rolling(window, min_periods=min_history)
     )
+    ranks = roller.rank(method="average", pct=True).to_numpy()
     if inverse is not None:
         ranks = ranks[:, inverse]
     return ranks[:, 0] if was_1d else ranks
@@ -595,11 +621,19 @@ def _gate_masks(
     gate_buckets: Union[int, str, tuple, list],
     xp,
     min_history: int = 252,
-) -> list[tuple[str, str, object]]:
-    """Build causal entry-allow masks per gate condition and named bucket."""
-    gate_masks: list[tuple[str, str, object]] = []
+    windows: Optional[list] = None,
+) -> list[tuple[str, str, Optional[int], object]]:
+    """Build causal entry-allow masks per (condition, bucket, percentile window).
+
+    ``windows`` is the set of percentile lookbacks to evaluate each condition
+    under; ``None`` inside it means the expanding rank. One mask is produced
+    per combination, so a gate's behaviour can be compared across lookbacks
+    instead of being fixed to one.
+    """
+    gate_masks: list[tuple[str, str, Optional[int], object]] = []
     if not gates:
         return gate_masks
+    windows = [None] if windows is None else list(windows)
 
     for name, cond in gates.items():
         c_np = _to_numpy(cond).astype(float)
@@ -607,42 +641,44 @@ def _gate_masks(
             c_np = np.broadcast_to(c_np[:, None], (t_len, k))
         if c_np.shape != (t_len, k):
             raise ValueError(f"gate '{name}' has shape {c_np.shape}, expected {(t_len, k)}")
-        ranks = xp.asarray(
-            _causal_percentile_rank(c_np, min_history=min_history)
-        )
-        finite = xp.isfinite(ranks)
 
-        if isinstance(gate_buckets, (int, np.integer)):
-            n_buckets = int(gate_buckets)
-            if n_buckets < 1:
-                raise ValueError("gate_buckets must be >= 1")
-            edges = np.linspace(0.0, 1.0, n_buckets + 1)
-            for b in range(n_buckets):
-                lo, hi = edges[b], edges[b + 1]
-                allow = finite & (ranks > lo) & (ranks <= hi)
-                gate_masks.append((name, f"q{b + 1}/{n_buckets}", allow))
-            continue
+        for window in windows:
+            ranks = xp.asarray(
+                _causal_percentile_rank(c_np, min_history=min_history, window=window)
+            )
+            finite = xp.isfinite(ranks)
 
-        if isinstance(gate_buckets, str):
-            if gate_buckets.lower() not in {"regime", "regimes", "tails"}:
-                raise ValueError(f"unknown gate_buckets={gate_buckets!r}")
-            specs = REGIME_GATE_BUCKETS
-        else:
-            specs = gate_buckets
+            if isinstance(gate_buckets, (int, np.integer)):
+                n_buckets = int(gate_buckets)
+                if n_buckets < 1:
+                    raise ValueError("gate_buckets must be >= 1")
+                edges = np.linspace(0.0, 1.0, n_buckets + 1)
+                for b in range(n_buckets):
+                    lo, hi = edges[b], edges[b + 1]
+                    allow = finite & (ranks > lo) & (ranks <= hi)
+                    gate_masks.append((name, f"q{b + 1}/{n_buckets}", window, allow))
+                continue
 
-        for spec in specs:
-            label, kind, *qs = spec
-            if kind == "below":
-                allow = finite & (ranks <= qs[0])
-            elif kind == "above":
-                allow = finite & (ranks >= qs[0])
-            elif kind == "between":
-                allow = finite & (ranks > qs[0]) & (ranks < qs[1])
-            elif kind == "outside":
-                allow = finite & ((ranks <= qs[0]) | (ranks >= qs[1]))
+            if isinstance(gate_buckets, str):
+                if gate_buckets.lower() not in {"regime", "regimes", "tails"}:
+                    raise ValueError(f"unknown gate_buckets={gate_buckets!r}")
+                specs = REGIME_GATE_BUCKETS
             else:
-                raise ValueError(f"unknown gate bucket kind={kind!r}")
-            gate_masks.append((name, label, allow))
+                specs = gate_buckets
+
+            for spec in specs:
+                label, kind, *qs = spec
+                if kind == "below":
+                    allow = finite & (ranks <= qs[0])
+                elif kind == "above":
+                    allow = finite & (ranks >= qs[0])
+                elif kind == "between":
+                    allow = finite & (ranks > qs[0]) & (ranks < qs[1])
+                elif kind == "outside":
+                    allow = finite & ((ranks <= qs[0]) | (ranks >= qs[1]))
+                else:
+                    raise ValueError(f"unknown gate bucket kind={kind!r}")
+                gate_masks.append((name, label, window, allow))
 
     return gate_masks
 
@@ -662,6 +698,7 @@ def fast_scan(
     entry_col: str = "entry_z",
     exit_col: str = "exit_band_bps",
     gate_min_history: int = 252,
+    gate_windows: Optional[list] = None,
 ) -> pl.DataFrame:
     """Approximate threshold backtest of a whole signal matrix, vectorized.
 
@@ -715,7 +752,8 @@ def fast_scan(
     # Pre-compute causal percentile masks on CPU once per gate; masks are
     # transferred to the selected array backend for the vectorized scan.
     gate_masks = _gate_masks(
-        gates, t_len, k, gate_buckets, xp, min_history=gate_min_history
+        gates, t_len, k, gate_buckets, xp,
+        min_history=gate_min_history, windows=gate_windows,
     )
     if entry_allow is None:
         base_allow = xp.ones((t_len, k), dtype=bool)
@@ -743,6 +781,7 @@ def fast_scan(
         exit_band_value: float,
         gate: str,
         bucket: str,
+        gate_window: Optional[int],
         metrics: dict,
     ) -> pl.DataFrame:
         return combo_frame.with_columns(
@@ -750,6 +789,7 @@ def fast_scan(
             pl.lit(float(exit_band_value)).alias(exit_col),
             pl.lit(gate).alias("gate"),
             pl.lit(bucket).alias("gate_bucket"),
+            pl.lit(gate_window, dtype=pl.Int64).alias("gate_window"),
             *[pl.Series(m, v) for m, v in metrics.items()],
         )
 
@@ -764,14 +804,14 @@ def fast_scan(
             is_entry = xp.abs(events) == 1.0
             events = xp.where(is_entry & ~base_allow, xp.nan, events)
             blocks.append(_emit(
-                entry, exit_band_value, "(none)", "all",
+                entry, exit_band_value, "(none)", "all", None,
                 _evaluate_events(events, dlv, cost_bps, periods_per_year, xp),
             ))
 
-            for name, bucket, allow in gate_masks:
+            for name, bucket, gate_window, allow in gate_masks:
                 gated = xp.where(is_entry & ~allow, xp.nan, events)
                 blocks.append(_emit(
-                    entry, exit_band_value, name, bucket,
+                    entry, exit_band_value, name, bucket, gate_window,
                     _evaluate_events(gated, dlv, cost_bps, periods_per_year, xp),
                 ))
 
@@ -940,6 +980,7 @@ def predict_scan(
     device: str = "cpu",
     entry_col: str = "entry_threshold",
     gate_min_history: int = 252,
+    gate_windows: Optional[list] = None,
 ) -> pl.DataFrame:
     """Forward-horizon predictability scan for a signal matrix.
 
@@ -969,7 +1010,8 @@ def predict_scan(
     )
 
     gate_masks = _gate_masks(
-        gates, t_len, k, gate_buckets, xp, min_history=gate_min_history
+        gates, t_len, k, gate_buckets, xp,
+        min_history=gate_min_history, windows=gate_windows,
     )
     combo_frame = (
         pl.DataFrame(combos) if combos is not None
@@ -1006,12 +1048,20 @@ def predict_scan(
             "fire_rate": _to_numpy(fire_rate),
         }
 
-    def _emit(entry: float, horizon: int, gate: str, bucket: str, metrics: dict) -> pl.DataFrame:
+    def _emit(
+        entry: float,
+        horizon: int,
+        gate: str,
+        bucket: str,
+        gate_window: Optional[int],
+        metrics: dict,
+    ) -> pl.DataFrame:
         return combo_frame.with_columns(
             pl.lit(float(entry)).alias(entry_col),
             pl.lit(int(horizon)).alias("horizon"),
             pl.lit(gate).alias("gate"),
             pl.lit(bucket).alias("gate_bucket"),
+            pl.lit(gate_window, dtype=pl.Int64).alias("gate_window"),
             *[pl.Series(m, v) for m, v in metrics.items()],
         )
 
@@ -1029,11 +1079,17 @@ def predict_scan(
                 | ((z <= -entry) & ~(prev_z <= -entry))
             )
             base = eligible & crossed
-            blocks.append(_emit(entry, horizon, "(none)", "all", _metrics(base, eligible, fwd)))
-            for name, bucket, allow in gate_masks:
+            blocks.append(
+                _emit(entry, horizon, "(none)", "all", None,
+                      _metrics(base, eligible, fwd))
+            )
+            for name, bucket, gate_window, allow in gate_masks:
                 gated_eligible = eligible & allow
                 gated = gated_eligible & crossed
-                blocks.append(_emit(entry, horizon, name, bucket, _metrics(gated, gated_eligible, fwd)))
+                blocks.append(
+                    _emit(entry, horizon, name, bucket, gate_window,
+                          _metrics(gated, gated_eligible, fwd))
+                )
 
     return (
         pl.concat(blocks)
@@ -1105,7 +1161,10 @@ def neighbor_ic_stats(
         ]
     )
     stats = (
-        probes.join(cells.select([*key, "ic"]), on=key, how="inner")
+        # join_nulls: an extra key can be legitimately null for a whole class
+        # of rows (gate_window is null on every ungated row). Without it those
+        # rows match nothing and are silently dropped for having no neighbours.
+        probes.join(cells.select([*key, "ic"]), on=key, how="inner", join_nulls=True)
         .group_by("cand")
         .agg(pl.col("ic").median().alias("nbr_ic"), pl.len().alias("n_nbr"))
     )

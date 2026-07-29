@@ -105,8 +105,8 @@ research modes, the CLI, and the artifact files:
 from backtest.strategy import Strategy, synthetic_pair
 
 STRATEGY = Strategy(
-    name="twos10s_real10y",
-    module="book.curve.twos10s_real10y",   # sweep workers import this
+    name="real10y_2s10s",
+    module="book.curve.real10y_2s10s",   # sweep workers import this
     path=Path(__file__),                   # funnel parquets: data/<name>/
     tickers={"real10y": "USGGT10Y Index", "2s10s": "USYC2Y10 Index"},
     bps_cols=["real10y"],
@@ -137,7 +137,7 @@ python -m book.curve.tens_10s30s              # live DB data
 python -m book.curve.tens_10s30s --synthetic  # no DB needed
 ```
 
-`book/curve/tens_10s30s.py` (the direction→curve research thread: 10Y vs 10s30s) is the live example of this pattern; `book/curve/twos10s_real10y.py` and `book/curve/tens30s_pc1.py` are graduates of the cross-pair explorer (`book/curve/xy_scan.py`, funnel step 0).
+`book/curve/tens_10s30s.py` (the direction→curve research thread: 10Y vs 10s30s) is the live example of this pattern; `book/curve/real10y_2s10s.py` and `book/curve/pc1_10s30s.py` are graduates of the cross-pair explorer (`book/curve/xy_scan.py`, funnel step 0).
 
 Two conventions inside a strategy module:
 

@@ -156,6 +156,34 @@ def load_wide(
     return long_to_wide(long_df, tickers, bps_cols=bps_cols, to_pandas=to_pandas)
 
 
+def last_updated(
+    tickers: Union[Mapping[str, str], Iterable[str]],
+) -> dict | None:
+    """Freshness of md.index_eod itself for a set of tickers.
+
+    Returns the newest bar date and the newest row write time (created_at),
+    or None if the tickers have no rows. This is the database's own clock --
+    how current the source is, independent of any cached copy of it.
+    """
+    ticker_list = (
+        list(tickers.values()) if isinstance(tickers, Mapping) else list(tickers)
+    )
+    out = query_db(
+        """
+        SELECT MAX(ts) AS last_ts, MAX(created_at) AS last_written
+        FROM md.index_eod
+        WHERE ticker = ANY(%s)
+        """,
+        params=[ticker_list],
+    )
+    if out.empty or pd.isna(out.loc[0, "last_ts"]):
+        return None
+    return {
+        "last_ts": out.loc[0, "last_ts"],
+        "last_written": out.loc[0, "last_written"],
+    }
+
+
 def pick_ticker(candidates: list[str], start: str) -> str | None:
     """Pick the candidate ticker with the most md.index_eod rows since `start`.
 

@@ -12,12 +12,12 @@ Model:
 All machinery lives in backtest.strategy.Strategy — this module is the
 configuration plus the PC1 feature hook. Same funnel as every curve strategy:
 
-    python -m book.curve.tens30s_pc1              # single run, live DB
-    python -m book.curve.tens30s_pc1 --synthetic  # single run, no DB
-    python -m book.curve.tens30s_pc1 --predict    # setup search
-    python -m book.curve.tens30s_pc1 --exit       # exits per saved setup
-    python -m book.curve.tens30s_pc1 --sweep      # exact engine + trade logs
-    python -m book.curve.tens30s_pc1 --cook       # all three, in order
+    python -m book.curve.pc1_10s30s              # single run, live DB
+    python -m book.curve.pc1_10s30s --synthetic  # single run, no DB
+    python -m book.curve.pc1_10s30s --predict    # setup search
+    python -m book.curve.pc1_10s30s --exit       # exits per saved setup
+    python -m book.curve.pc1_10s30s --sweep      # exact engine + trade logs
+    python -m book.curve.pc1_10s30s --cook       # all three, in order
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from stats import roll_pc1_score
 from utils.market_data import align_columns
 
 STRATEGY_FAMILY = "curve"
-SIGNAL_NAME = "tens30s_pc1"
+SIGNAL_NAME = "pc1_10s30s"
 
 PC1_COLS = ["2y", "5y", "10y", "30y"]
 PC1_LB = 126  # xy_scan's winning PCA window for 10s30s
@@ -92,8 +92,8 @@ def synthetic_data(n: int = 1500, seed: int = 13):
 
 STRATEGY = Strategy(
     name=SIGNAL_NAME,
-    module="book.curve.tens30s_pc1",  # sweep workers import this
-    path=Path(__file__),  # funnel artifacts live in data/tens30s_pc1/
+    module="book.curve.pc1_10s30s",  # sweep workers import this
+    path=Path(__file__),  # funnel artifacts live in data/pc1_10s30s/
     tickers=TICKERS,
     bps_cols=["2y", "5y", "10y", "30y"],
     target=TARGET,

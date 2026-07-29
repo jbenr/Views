@@ -23,7 +23,7 @@ from backtest.lab import parse_gate
 from utils.research_app import C0, C1, DIM
 from utils.viz import Viz
 
-WINDOW_PRESETS = {"3M": 63, "6M": 126, "YTD": "YTD", "1Y": 252, "2Y": 504, "5Y": 1260, "All": None}
+WINDOW_PRESETS = {"1M": 21, "3M": 63, "6M": 126, "YTD": "YTD", "1Y": 252, "2Y": 504, "5Y": 1260, "All": None}
 DEFAULT_WINDOW = "2Y"
 
 
@@ -187,10 +187,13 @@ def gate_chart(
     gate_spec,
     window_bars: int | None = WINDOW_PRESETS[DEFAULT_WINDOW],
     date_range: tuple | None = None,
+    gate_window: int | None = None,
 ) -> str | None:
     """Causal historical percentile of the promoted gate condition.
 
-    The title explicitly reports the current gate state and bucket rule.
+    The title reports the current gate state, the bucket rule, and what the
+    percentile is measured against -- ``gate_window=None`` means every bar is
+    ranked against all history to date, which is not evident from the curve.
     Threshold lines are the same percentile boundaries used by the strategy.
     """
     if gate_spec is None or "gate_percentile" not in sig_frame.columns:
@@ -213,8 +216,9 @@ def gate_chart(
         state = "OPEN" if is_open else "CLOSED"
         current = f" @ {finite.iloc[-1]:.0f}TH PCT"
 
+    basis = "expanding" if gate_window is None else f"roll {gate_window}d"
     title = (
-        f"gate: {name} · {_gate_bucket_description(kind, qs)} · "
+        f"gate: {name} · {_gate_bucket_description(kind, qs)} ({basis}) · "
         f"{state}{current}"
     )
     viz = _PngViz(fig_height=3.2)
