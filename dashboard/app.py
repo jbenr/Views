@@ -273,16 +273,21 @@ def _zone(when: pd.Timestamp) -> str:
     return "".join(part[0] for part in parts).upper() if len(parts) > 1 else name
 
 
-def _clock(when, same_day_as=None) -> str:
+def _clock(when, same_day_as=None, always_date: bool = False) -> str:
     """A timestamp as a human reads one: "9:47:50pm EDT". Prefixed with its
     own date whenever it does not fall on `same_day_as` (default: today), so
-    the date is stated exactly when it would otherwise be ambiguous."""
+    the date is stated exactly when it would otherwise be ambiguous.
+
+    `always_date` forces the prefix on for readouts that stand alone, with no
+    neighbouring date to read them against.
+    """
     when = _local(when)
     reference = (
         dt.date.today() if same_day_as is None else pd.Timestamp(same_day_as).date()
     )
     stamp = when.strftime("%I:%M:%S%p").lstrip("0").lower()
-    day = "" if when.date() == reference else f"{when:%Y-%m-%d} "
+    dated = always_date or when.date() != reference
+    day = f"{when:%Y-%m-%d} " if dated else ""
     return f"{day}{stamp} {_zone(when)}".rstrip()
 
 
@@ -639,7 +644,7 @@ def _card_sections(
         stat_block("data as-of", asof_label, alert=asof_stale),
         stat_block(
             "last analysis run",
-            _clock(ledger_row["run_ts"]) if ledger_row else "never",
+            _clock(ledger_row["run_ts"], always_date=True) if ledger_row else "never",
         ),
         stat_block(
             "reading",
