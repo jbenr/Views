@@ -25,9 +25,15 @@ from pathlib import Path
 
 import polars as pl
 
-import utils
-
-from .params import PARAM_COLS
+from .params import (
+    PARAM_COLS,
+    entry_label,
+    exit_label,
+    filter_label,
+    gate_label,
+    params_from_row,
+    signal_label,
+)
 
 
 def _store_dir() -> Path:
@@ -242,6 +248,55 @@ class LiveRegistry:
         return match.row(0, named=True)
 
 
+def _metric(value, fmt: str, suffix: str = "") -> str:
+    if value is None:
+        return "—"
+    value = float(value)
+    return "—" if value != value else format(value, fmt) + suffix
+
+
+def describe(frame: pl.DataFrame) -> str:
+    """Every frozen attribute of each promoted signal, one block per signal.
+
+    A wide table cannot carry fourteen parameters without truncating them, and
+    this is the record of what is live -- it has to state the whole
+    configuration, including the filters that are switched off.
+    """
+    lines = [f"{len(frame)} live signal{'s' if len(frame) != 1 else ''}"]
+    for row in frame.sort("target", "family", "signal_id").iter_rows(named=True):
+        params = params_from_row(row)
+        model = f"{params['entry_signal']}  ·  beta_lb={params['beta_lb']}"
+        if params.get("ou_lb") is not None:
+            model += f"  ·  ou_lb={params['ou_lb']}"
+        fields = [
+            ("name", signal_label(row)),
+            ("family", row["family"]),
+            ("model", model),
+            ("entry", entry_label(params)),
+            ("exit", exit_label(params)),
+            ("stop", _metric(params.get("stop_loss_bps"), "g", "bps")),
+            ("gate", gate_label(params)),
+            ("filters", filter_label(params)),
+            (
+                "backtest",
+                f"sharpe {_metric(row.get('sharpe'), '.2f')}"
+                f"  ·  {_metric(row.get('n_trades'), '.0f')} trades"
+                f"  ·  hit {_metric((row.get('hit_rate') or 0) * 100, '.1f', '%')}"
+                f"  ·  max dd {_metric(row.get('max_drawdown_bps'), '+.1f', 'bps')}",
+            ),
+            (
+                "promoted",
+                f"{row['promoted_at']}"
+                f"  ·  {row.get('selection_source') or 'sweep rank ' + str(row.get('rank'))}",
+            ),
+        ]
+        if row.get("rationale"):
+            fields.append(("rationale", row["rationale"]))
+        lines.append(f"\n  {row['signal_id']}")
+        lines += [f"    {label:<10} {value}" for label, value in fields]
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--promote", metavar="MODULE")
@@ -281,12 +336,7 @@ def main(argv: list[str] | None = None) -> None:
         if df.is_empty():
             print("no live signals promoted yet")
         else:
-            utils.pdf(
-                df.select(
-                    "signal_id", "module", "variant_label", "family", "sharpe", "n_trades",
-                    "hit_rate", "promoted_at",
-                )
-            )
+            print(describe(df))
     else:
         parser.print_help()
 

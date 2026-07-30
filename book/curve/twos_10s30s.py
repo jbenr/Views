@@ -75,8 +75,6 @@ DASHBOARD_VARIANTS = {
             "ou_lb": 252,
             "entry_threshold": 9.0,
             "z_gate": None,
-            "half_life_min": None,
-            "half_life_max": None,
             "gate": None,
             "exit_style": "revert_frac",
             "exit_param": 0.25,

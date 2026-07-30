@@ -52,7 +52,7 @@ itself is never logged, only an explicit "re-run analysis" click is.
 - `live_signals.parquet` -- the registry: one row per promoted base signal or
   named variant, with one immutable `signal_id`, its frozen
   params (`entry_signal`, `beta_lb`, `ou_lb`, `entry_threshold`,
-  `exit_style`, `exit_param`, `gate`, `z_gate`, `half_life_min/max`,
+  `exit_style`, `exit_param`, `gate`, `gate_window`, `z_gate`,
   `stop_loss_bps`) plus the backtest metrics it was promoted on.
 - `signal_ledger.parquet` -- append-only: one row per "re-run analysis"
   click (`run_ts`, `data_asof_ts`, `level`, `signal`, `resid`, `ou_z`,

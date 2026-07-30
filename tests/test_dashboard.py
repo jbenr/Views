@@ -52,8 +52,6 @@ def test_dashboard_has_live_overview_and_selectable_deep_dive(monkeypatch, tmp_p
                 "exit_param": 1.0,
                 "gate": None,
                 "z_gate": None,
-                "half_life_min": 3.0,
-                "half_life_max": 120.0,
                 "stop_loss_bps": 25.0,
                 "sharpe": 0.71,
                 "n_trades": 58,
@@ -224,6 +222,40 @@ def test_gate_column_states_the_rule_and_its_percentile_basis(
     ) == "resid_half_life · below_50 · expanding"
 
 
+def test_registry_list_states_the_whole_frozen_configuration():
+    """--list is the record of what is live, so it has to spell out every
+    parameter -- including the gate basis and the filters that are off."""
+    from dashboard.registry import describe
+
+    frame = pl.DataFrame([{
+        "signal_id": "book.curve.tens_10s30s",
+        "module": "book.curve.tens_10s30s",
+        "name": "tens_10s30s", "family": "curve",
+        "target": "10s30s", "feature": "10y",
+        "variant": None, "variant_label": None, "rationale": None,
+        "rank": 0, "selection_source": None,
+        "promoted_at": "2026-07-29T04:33:59+00:00",
+        "entry_signal": "ou_z", "beta_lb": 80, "ou_lb": 400,
+        "entry_threshold": 1.7, "exit_style": "revert_frac", "exit_param": 1.0,
+        "gate": "('r2', 'tails_25_75')", "gate_window": 1260,
+        "z_gate": None, "stop_loss_bps": 25.0,
+        "sharpe": 0.70089, "n_trades": 17.0, "hit_rate": 0.882353,
+        "max_drawdown_bps": -22.63,
+    }])
+
+    out = describe(frame)
+
+    assert "10y_10s30s · OU400 · 1.7z" in out          # same name as the app
+    assert "beta_lb=80" in out and "ou_lb=400" in out
+    assert "|ou_z| >= 1.7z" in out
+    assert "revert_frac=1" in out
+    assert "25bps" in out
+    assert "r2 · tails_25_75 · roll 1260d" in out      # gate basis, not just bucket
+    assert "z_gate=off" in out                          # states what is NOT applied
+    assert "sharpe 0.70" in out and "17 trades" in out
+    assert "sweep rank 0" in out
+
+
 def test_registry_can_promote_curated_module_defaults(monkeypatch, tmp_path):
     mod = importlib.import_module("book.curve.twos_10s30s")
     monkeypatch.setattr(mod.STRATEGY, "load_data", lambda: mod.synthetic_data(n=1500))
@@ -251,15 +283,11 @@ def test_params_from_row_preserves_explicitly_disabled_filters():
             "beta_lb": 50.0,
             "ou_lb": 252.0,
             "z_gate": None,
-            "half_life_min": None,
-            "half_life_max": None,
             "gate": None,
         }
     )
 
     assert params["z_gate"] is None
-    assert params["half_life_min"] is None
-    assert params["half_life_max"] is None
     assert params["gate"] is None
     assert params["beta_lb"] == 50
     assert params["ou_lb"] == 252

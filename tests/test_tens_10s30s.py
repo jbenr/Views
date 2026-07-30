@@ -72,13 +72,14 @@ def test_compute_gate_param_adds_allow_column():
 
 def test_entry_filter_z_gate_none_skips_ou_confirmation():
     bar = {"half_life": 10.0, "ou_z": 0.0}
-    ungated = _entry_filter(None, 3.0, 120.0)
+    ungated = _entry_filter(None)
     assert ungated(1, bar) and ungated(-1, bar)
-    confirmed = _entry_filter(0.5, 3.0, 120.0)
+    confirmed = _entry_filter(0.5)
     assert not confirmed(1, bar) and not confirmed(-1, bar)
-    # the quantile gate and half-life bounds still apply with z_gate=None
+    # the quantile gate still applies with z_gate=None
     assert not ungated(1, {**bar, "gate_allow": 0.0})
-    assert not ungated(1, {"half_life": 500.0, "ou_z": 0.0})
+    # half-life is the gate's business now; no fixed bound blocks an entry
+    assert ungated(1, {"half_life": 500.0, "ou_z": 0.0})
 
 
 def test_gate_conditions_are_buildable():
@@ -121,8 +122,6 @@ def test_sweep_grids_build_one_grid_per_saved_winner(monkeypatch, tmp_path):
     for grid in grids:
         assert grid["stop_loss_bps"] == STRATEGY.sweep_stop_loss_bps
         assert grid["z_gate"] == [None]
-        assert grid["half_life_min"] == [None]
-        assert grid["half_life_max"] == [None]
 
 
 def test_sweep_mode_saves_results_and_trade_log(monkeypatch, tmp_path):
@@ -236,25 +235,6 @@ def test_robustness_flags_one_trade_wonders():
     # ranked by sharpe_ex_best, descending
     ex = rob["sharpe_ex_best"].to_list()
     assert ex == sorted(ex, reverse=True)
-
-
-def test_sweep_half_life_bounds_none_disable_filter():
-    data = view.model_frame(synthetic_data())
-    bounded = sweep_strategy(
-        "book.curve.tens_10s30s",
-        data,
-        {"half_life_min": [3.0], "half_life_max": [120.0]},
-        n_jobs=1,
-    )
-    unbounded = sweep_strategy(
-        "book.curve.tens_10s30s",
-        data,
-        {"half_life_min": [None], "half_life_max": [None]},
-        n_jobs=1,
-    )
-    assert "error" not in bounded.columns and "error" not in unbounded.columns
-    # dropping the half-life sanity bounds can only open up entries
-    assert unbounded["n_trades"][0] >= bounded["n_trades"][0] > 0
 
 
 def _gate_cluster(gate_window: int, ic_scale: float = 1.0) -> list[dict]:

@@ -111,8 +111,6 @@ DEFAULT_PARAMS = {
     "entry_threshold": 20.0,  # positive signal -> short target
     # entry filters: what must ALSO be true at the bar to take the trade
     "z_gate": 0.5,  # residual entries only: OU z must confirm; None = off
-    "half_life_min": 3.0,  # block unstable / too-fast OU fits
-    "half_life_max": 120.0,  # block slow drifts masquerading as mean reversion
     "gate": None,  # quantile regime gate (condition, bucket) — see lab.parse_gate
     "gate_window": None,  # gate percentile lookback; None = expanding (all history)
     # exit: one primary style from the --exit menu + hard stop on top
@@ -129,31 +127,17 @@ def _finite(value) -> bool:
         return False
 
 
-def _half_life_ok(half_life, lo: float | None, hi: float | None) -> bool:
-    """Entry sanity bounds on the OU half-life; lo=hi=None disables the check."""
-    if lo is None and hi is None:
-        return True
-    if not _finite(half_life):
-        return False
-    hl = float(half_life)
-    return (lo is None or hl >= lo) and (hi is None or hl <= hi)
-
-
-def _entry_filter(z_gate: float | None, half_life_min: float, half_life_max: float):
-    """Quantile gate + half-life sanity + optional OU-z confirmation.
+def _entry_filter(z_gate: float | None):
+    """Quantile gate plus optional OU-z confirmation.
 
     z_gate=None drops the OU-z confirmation entirely so the quantile gate
     (params["gate"] -> gate_allow) carries the entry filtering on its own.
-    half_life_min=half_life_max=None drops the half-life sanity check.
     """
 
     def fn(direction: int, bar: dict) -> bool:
         # gate_allow arrives as 1.0/0.0 (engine floats extras); absent = no gate
         gate = bar.get("gate_allow")
         if gate is not None and gate != 1.0:
-            return False
-
-        if not _half_life_ok(bar.get("half_life"), half_life_min, half_life_max):
             return False
 
         if z_gate is None:
@@ -219,9 +203,9 @@ def _daily_pnl_from_trades(
 
 def _winner_params(row: dict) -> dict:
     """Engine params for one (setup, exit) winner row from exits_file.
-    z_gate and the half-life sanity bounds are off — the discovery scans
-    never used them, and re-filtering the discovered event here starves the
-    exact engine of the very trades steps 1-2 counted."""
+    z_gate is off — the discovery scans never used it, and re-filtering the
+    discovered event here starves the exact engine of the very trades steps
+    1-2 counted."""
     p = {
         "entry_signal": row["entry_signal"],
         "beta_lb": int(row["beta_lb"]),
@@ -239,8 +223,6 @@ def _winner_params(row: dict) -> dict:
             else int(row["gate_window"])
         ),
         "z_gate": None,
-        "half_life_min": None,
-        "half_life_max": None,
     }
     if row["ou_lb"] is not None:
         p["ou_lb"] = int(row["ou_lb"])
@@ -518,9 +500,7 @@ class Strategy:
                 stop_loss_bps=p["stop_loss_bps"],
                 time_stop_bars=None,
                 exit_fn=exit_fn,
-                entry_filter_fn=_entry_filter(
-                    z_gate, p["half_life_min"], p["half_life_max"]
-                ),
+                entry_filter_fn=_entry_filter(z_gate),
             ),
         )
 
@@ -765,13 +745,12 @@ class Strategy:
         if sig_val is None or not _finite(sig_val):
             print("\nlatest signal: warmup - no signal yet")
         else:
-            hl_ok = _half_life_ok(half_life, p["half_life_min"], p["half_life_max"])
             z_gate = p["z_gate"] if p["entry_signal"] == "residual" else None
             z_ok_short = z_gate is None or (_finite(ou_z) and ou_z >= z_gate)
             z_ok_long = z_gate is None or (_finite(ou_z) and ou_z <= -z_gate)
-            if gate_ok and hl_ok and sig_val >= p["entry_threshold"] and z_ok_short:
+            if gate_ok and sig_val >= p["entry_threshold"] and z_ok_short:
                 action = f"SHORT {self.target} (rich vs {self.feature})"
-            elif gate_ok and hl_ok and sig_val <= -p["entry_threshold"] and z_ok_long:
+            elif gate_ok and sig_val <= -p["entry_threshold"] and z_ok_long:
                 action = f"LONG {self.target} (cheap vs {self.feature})"
             else:
                 action = "FLAT"

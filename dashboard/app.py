@@ -43,6 +43,9 @@ from dashboard.charts import (
     signal_chart,
 )
 from dashboard.ledger import SignalLedger
+from dashboard.params import (
+    exit_label, gate_label as _gate_rule, signal_label as _display_name,
+)
 from dashboard.registry import LiveRegistry
 from utils.research_app import (
     BORDER, C0, C1, DIM, ORANGE, PANEL, TEXT, make_app, run, stat_block,
@@ -93,44 +96,13 @@ def _slug(signal_id: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", signal_id.lower()).strip("-")
 
 
-def _auto_label(row: dict) -> str:
-    """Params-derived label for a promotion with no curated variant name, in
-    the same shorthand curated labels use: the lookback that defines the
-    signal plus its entry threshold."""
-    if row["entry_signal"] == "residual":
-        return f"RES{int(row['beta_lb'])} · {float(row['entry_threshold']):g}bps"
-    return f"OU{int(row['ou_lb'])} · {float(row['entry_threshold']):g}z"
-
-
-def _display_name(row: dict) -> str:
-    """Canonical user-facing signal name: input feature first, traded target
-    second -- the same `<input>_<target>` order the strategy modules use, so
-    a name reads identically here and in `registry --list`. Always suffixed
-    with a label: curated variants use their own, every other promotion gets
-    one derived from its frozen params."""
-    base = f"{row['feature']}_{row['target']}"
-    return f"{base} · {row.get('variant_label') or _auto_label(row)}"
-
-
 def _row_id(row: dict) -> str:
     """Registry identity, with module fallback for legacy/test rows."""
     return row.get("signal_id") or row["module"]
 
 
 def _exit_summary(row: dict) -> str:
-    style = row["exit_style"]
-    param = float(row["exit_param"])
-    if style == "revert_frac":
-        return (
-            f"exit=revert_frac={param:g} "
-            f"(after {param:.0%} of entry signal reverts toward zero)"
-        )
-    if style == "half_life_frac":
-        return f"exit=half_life_frac={param:g} ({param:g}× entry half-life)"
-    if style == "band":
-        units = "bps" if row["entry_signal"] == "residual" else "z"
-        return f"exit=band={param:g}{units} (inside ±{param:g}{units})"
-    return f"exit={style}={param:g}"
+    return f"exit={exit_label(row)}"
 
 
 def _param_summary(row: dict) -> str:
@@ -234,19 +206,6 @@ def _visible_trade_range(trades, open_entry: dict | None, page: int, data_asof):
         return None
     start = pd.Timestamp(min(dates)) - pd.offsets.BDay(SNAP_LEFT_BUFFER_BDAYS)
     return start, max(dates)
-
-
-def _gate_rule(params: dict) -> str:
-    """What the gate actually tests: condition, bucket, and what the
-    percentile is measured against. Without the basis the same condition and
-    bucket can mean two different gates."""
-    gate = params.get("gate")
-    if gate is None:
-        return "none"
-    condition, bucket = gate[0], gate[1]
-    window = params.get("gate_window")
-    basis = "expanding" if window is None else f"roll {int(window)}d"
-    return f"{condition} · {bucket} · {basis}"
 
 
 def _position_label(state: dict, open_entry: dict | None) -> str:
