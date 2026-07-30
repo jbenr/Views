@@ -22,6 +22,7 @@ import importlib
 import os
 import uuid
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -254,6 +255,11 @@ def _metric(value, fmt: str, suffix: str = "") -> str:
     return "—" if value != value else format(value, fmt) + suffix
 
 
+def _format_promoted_at(value: str) -> str:
+    ts = dt.datetime.fromisoformat(value).astimezone(ZoneInfo("America/New_York"))
+    return ts.strftime("%b %d, %Y %I:%M:%S %p %Z")
+
+
 def describe(frame: pl.DataFrame) -> str:
     """Every frozen attribute of each promoted signal, one block per signal.
 
@@ -284,7 +290,7 @@ def describe(frame: pl.DataFrame) -> str:
             ),
             (
                 "promoted",
-                f"{row['promoted_at']}"
+                f"{_format_promoted_at(row['promoted_at'])}"
                 f"  ·  {row.get('selection_source') or 'sweep rank ' + str(row.get('rank'))}",
             ),
         ]
