@@ -72,13 +72,14 @@ TRADE_TABLE_ROUND = {
 }
 
 OVERVIEW_COLUMNS = [
+    # Feature is dropped: the Signal name already leads with it. Position folds
+    # in the old "Latest Reading", and Reading pairs the live value with the
+    # threshold it is being judged against, so the four state columns become two.
     ("name", "Signal"),
-    ("feature", "Feature"),
     ("position", "Position"),
-    ("reading", "Latest Reading"),
-    ("signal_value", "Live Signal"),
-    ("entry_threshold", "Entry Threshold"),
-    ("gate_status", "Gate"),
+    ("reading", "Reading"),
+    ("gate_rule", "Gate"),
+    ("gate_status", "Gate State"),
     ("live_pnl_bps", "Net PnL (bps)"),
     ("sharpe", "Sharpe"),
     ("n_trades", "Trades"),
@@ -235,10 +236,45 @@ def _visible_trade_range(trades, open_entry: dict | None, page: int, data_asof):
     return start, max(dates)
 
 
+def _gate_rule(params: dict) -> str:
+    """What the gate actually tests: condition, bucket, and what the
+    percentile is measured against. Without the basis the same condition and
+    bucket can mean two different gates."""
+    gate = params.get("gate")
+    if gate is None:
+        return "none"
+    condition, bucket = gate[0], gate[1]
+    window = params.get("gate_window")
+    basis = "expanding" if window is None else f"roll {int(window)}d"
+    return f"{condition} · {bucket} · {basis}"
+
+
+def _position_label(state: dict, open_entry: dict | None) -> str:
+    """One column for what the book holds and what today says.
+
+    An open trade wins; otherwise report whether the signal is calling for one
+    and, if it is, why nothing happened -- a fired-but-gated signal is the case
+    a desk most needs to see, and it read as a bare "FLAT" before.
+    """
+    if open_entry is not None:
+        return f"{open_entry['direction'].upper()} OPEN"
+    signal = state["last"].get("signal")
+    threshold = float(state["params"]["entry_threshold"])
+    if signal is None or signal != signal:
+        return "WARMING UP"
+    if signal <= -threshold:
+        side = "LONG"
+    elif signal >= threshold:
+        side = "SHORT"
+    else:
+        return "FLAT"
+    return f"{side} GATED" if state["fired"] == "flat (gated)" else f"{side} SIGNAL"
+
+
 def _gate_status(state: dict) -> str:
     params = state["params"]
     if params.get("gate") is None:
-        return "none"
+        return "—"
     last = state["last"]
     percentile = last.get("gate_percentile")
     if percentile is None or percentile != percentile:
@@ -273,13 +309,15 @@ def _zone(when: pd.Timestamp) -> str:
     return "".join(part[0] for part in parts).upper() if len(parts) > 1 else name
 
 
-def _clock(when, same_day_as=None, always_date: bool = False) -> str:
-    """A timestamp as a human reads one: "9:47:50pm EDT". Prefixed with its
-    own date whenever it does not fall on `same_day_as` (default: today), so
-    the date is stated exactly when it would otherwise be ambiguous.
+def _clock_parts(
+    when, same_day_as=None, always_date: bool = False
+) -> tuple[str, str]:
+    """A timestamp split into (date, time), so a caller can join them on one
+    line or stack them on two.
 
-    `always_date` forces the prefix on for readouts that stand alone, with no
-    neighbouring date to read them against.
+    The date comes back empty when it falls on `same_day_as` (default: today)
+    and would therefore be redundant; `always_date` forces it on for readouts
+    that stand alone, with no neighbouring date to read them against.
     """
     when = _local(when)
     reference = (
@@ -287,23 +325,36 @@ def _clock(when, same_day_as=None, always_date: bool = False) -> str:
     )
     stamp = when.strftime("%I:%M:%S%p").lstrip("0").lower()
     dated = always_date or when.date() != reference
-    day = f"{when:%Y-%m-%d} " if dated else ""
-    return f"{day}{stamp} {_zone(when)}".rstrip()
+    return (f"{when:%Y-%m-%d}" if dated else ""), f"{stamp} {_zone(when)}"
 
 
-def _db_asof(signal_id: str, data_asof) -> tuple[str, bool]:
+def _clock(when, same_day_as=None, always_date: bool = False) -> str:
+    """One-line timestamp as a human reads one: "2026-07-29 9:47:50pm EDT"."""
+    day, stamp = _clock_parts(when, same_day_as, always_date)
+    return f"{day} {stamp}".strip()
+
+
+def _stacked(top: str, bottom: str):
+    """Stat-block value laid out over two lines, falling back to one when
+    there is no second line to show."""
+    return [top, html.Br(), bottom] if bottom else top
+
+
+def _db_asof(signal_id: str, data_asof) -> tuple[str, str, bool]:
     """The bar this card is drawn on, and when that data landed in the DB.
 
-    Returns (label, stale). Stale means md.index_eod carries a newer bar than
-    the cached copy this card is drawn from -- the case where Ref is overdue.
+    Returns (bar, written, stale) as separate parts so a one-line table cell
+    and a stacked stat block can each lay them out their own way. Stale means
+    md.index_eod carries a newer bar than the cached copy this card is drawn
+    from -- the case where Ref is overdue.
     """
     fresh = runner.db_freshness(signal_id)
     if fresh is None:
-        return f"{data_asof} · db unreachable", False
+        return str(data_asof), "db unreachable", False
     db_bar = pd.Timestamp(fresh["last_ts"]).date()
     stale = db_bar > pd.Timestamp(data_asof).date()
     written = _clock(fresh["last_written"], same_day_as=data_asof)
-    return f"{data_asof} · {written}", stale
+    return str(data_asof), written, stale
 
 
 def _target_snapshot(target: str, rows: list[dict]) -> dict | None:
@@ -366,7 +417,8 @@ def _target_header(target: str, rows: list[dict]) -> html.Div:
         )
     ]
     if snapshot is not None:
-        asof, stale = _db_asof(snapshot["signal_id"], snapshot["ts"])
+        bar, written, stale = _db_asof(snapshot["signal_id"], snapshot["ts"])
+        asof = f"{bar} · {written}"
         children += [
             html.Span(
                 f"{snapshot['level']:.1f} bps",
@@ -391,11 +443,9 @@ def _overview_snapshot(row: dict) -> dict:
         "module": row["module"],
         "target": row["target"],
         "name": _display_name(row),
-        "feature": row["feature"],
         "position": "UNAVAILABLE",
         "reading": "—",
-        "signal_value": "—",
-        "entry_threshold": "—",
+        "gate_rule": "—",
         "gate_status": "—",
         "live_pnl_bps": None,
         "sharpe": _round(row.get("sharpe"), 2),
@@ -412,31 +462,24 @@ def _overview_snapshot(row: dict) -> dict:
     except RuntimeError as exc:
         return {**base, "reading": str(exc)}
 
-    asof_label, asof_stale = _db_asof(signal_id, state["data_asof"])
+    asof_bar, asof_written, asof_stale = _db_asof(signal_id, state["data_asof"])
     params = state["params"]
     signal_value = state["last"].get("signal")
     units = "bps" if params["entry_signal"] == "residual" else "z"
     threshold = float(params["entry_threshold"])
     reading_str = (
-        f"{float(signal_value):+.2f}{units}"
+        f"{float(signal_value):+.2f}{units} / ±{threshold:g}{units}"
         if signal_value is not None and signal_value == signal_value
         else "warming up"
     )
-    entry_threshold_str = f"±{threshold:g}{units}"
-    position = (
-        f"{open_entry['direction'].upper()} OPEN"
-        if open_entry is not None
-        else "FLAT"
-    )
     return {
         **base,
-        "position": position,
-        "reading": state["fired"].upper(),
-        "signal_value": reading_str,
-        "entry_threshold": entry_threshold_str,
+        "position": _position_label(state, open_entry),
+        "reading": reading_str,
+        "gate_rule": _gate_rule(params),
         "gate_status": _gate_status(state).upper(),
         "live_pnl_bps": round(_live_pnl_bps(trades, open_entry), 1),
-        "data_asof": asof_label,
+        "data_asof": f"{asof_bar} · {asof_written}",
         # not a displayed column -- drives the stale conditional style below
         "data_stale": int(asof_stale),
     }
@@ -468,29 +511,34 @@ def _overview_table(target: str, rows: list[dict]) -> html.Div:
                     "border": f"1px solid {BORDER}",
                 },
                 style_data_conditional=[
+                    # long green / short red, whether held or merely signalled
+                    *[
+                        {
+                            "if": {
+                                "filter_query": f'{{position}} contains "{side}"',
+                                "column_id": "position",
+                            },
+                            "color": colour,
+                            "fontWeight": "bold",
+                        }
+                        for side, colour in (("LONG", C1), ("SHORT", C0))
+                    ],
                     {
-                        "if": {"filter_query": '{position} = "LONG OPEN"', "column_id": "position"},
-                        "color": C1,
-                        "fontWeight": "bold",
-                    },
-                    {
-                        "if": {"filter_query": '{position} = "SHORT OPEN"', "column_id": "position"},
-                        "color": C0,
-                        "fontWeight": "bold",
-                    },
-                    {
-                        "if": {"filter_query": '{reading} = "LONG"', "column_id": "reading"},
-                        "color": C1,
-                        "fontWeight": "bold",
-                    },
-                    {
-                        "if": {"filter_query": '{reading} = "SHORT"', "column_id": "reading"},
-                        "color": C0,
+                        # a signal blocked by its own gate is the case to notice
+                        "if": {
+                            "filter_query": '{position} contains "GATED"',
+                            "column_id": "position",
+                        },
+                        "color": ORANGE,
                         "fontWeight": "bold",
                     },
                     {
                         "if": {"filter_query": '{gate_status} contains "CLOSED"', "column_id": "gate_status"},
                         "color": C0,
+                    },
+                    {
+                        "if": {"filter_query": '{gate_status} contains "OPEN"', "column_id": "gate_status"},
+                        "color": C1,
                     },
                     {
                         "if": {"filter_query": "{live_pnl_bps} > 0", "column_id": "live_pnl_bps"},
@@ -637,14 +685,19 @@ def _card_sections(
             error = str(exc)
 
     live_pnl = _live_pnl_bps(trades, open_entry) if state and not error else None
-    asof_label, asof_stale = (
-        _db_asof(signal_id, state["data_asof"]) if state else ("—", False)
+    asof_bar, asof_written, asof_stale = (
+        _db_asof(signal_id, state["data_asof"]) if state else ("—", "", False)
     )
     stats = [
-        stat_block("data as-of", asof_label, alert=asof_stale),
+        stat_block(
+            # bar date on top, DB write time beneath it -- two facts, two lines
+            "data as-of", _stacked(asof_bar, asof_written), alert=asof_stale,
+        ),
         stat_block(
             "last analysis run",
-            _clock(ledger_row["run_ts"], always_date=True) if ledger_row else "never",
+            _stacked(*_clock_parts(ledger_row["run_ts"], always_date=True))
+            if ledger_row
+            else "never",
         ),
         stat_block(
             "reading",

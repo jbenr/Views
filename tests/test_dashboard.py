@@ -114,10 +114,13 @@ def test_overview_snapshot_uses_exact_open_position(monkeypatch, tmp_path):
     )
 
     assert snapshot["position"] == "LONG OPEN"
-    assert snapshot["reading"] == "LONG"
-    assert snapshot["signal_value"] == "-1.20z"
-    assert snapshot["entry_threshold"] == "±0.9z"
+    # the live value and the threshold it is judged against share one cell
+    assert snapshot["reading"] == "-1.20z / ±0.9z"
+    assert snapshot["gate_rule"] == "none"
     assert snapshot["live_pnl_bps"] == 5.5
+    # Feature is gone: the Signal name already leads with it
+    assert "feature" not in {key for key, _ in app.OVERVIEW_COLUMNS}
+    assert snapshot["name"].startswith("2y_10s30s")
 
 
 def test_dashboard_signal_names_match_the_module_input_target_order(
@@ -170,6 +173,55 @@ def test_unlabeled_promotions_are_named_from_their_frozen_params(
             "entry_threshold": 19.0,
         }
     ) == "10y_10s30s · RES90 · 19bps"
+
+
+def _state(signal, threshold=1.7, fired="flat", gate=None, gate_window=None):
+    return {
+        "params": {
+            "entry_signal": "ou_z",
+            "entry_threshold": threshold,
+            "gate": gate,
+            "gate_window": gate_window,
+        },
+        "last": {"signal": signal},
+        "fired": fired,
+    }
+
+
+def test_position_column_folds_in_what_the_signal_is_saying(monkeypatch, tmp_path):
+    """One column has to carry both what is held and what today calls for --
+    a fired-but-gated signal used to render as a bare FLAT."""
+    app = _load_app_module(monkeypatch, tmp_path)
+
+    held = {"direction": "long", "pnl_bps": 2.5}
+    assert app._position_label(_state(-2.0, fired="long"), held) == "LONG OPEN"
+    # an open trade wins even when today's reading has gone quiet
+    assert app._position_label(_state(0.1), held) == "LONG OPEN"
+
+    assert app._position_label(_state(0.1), None) == "FLAT"
+    assert app._position_label(_state(-2.0, fired="long"), None) == "LONG SIGNAL"
+    assert app._position_label(_state(2.0, fired="short"), None) == "SHORT SIGNAL"
+    assert (
+        app._position_label(_state(-2.0, fired="flat (gated)"), None)
+        == "LONG GATED"
+    )
+    assert app._position_label(_state(float("nan")), None) == "WARMING UP"
+
+
+def test_gate_column_states_the_rule_and_its_percentile_basis(
+    monkeypatch, tmp_path
+):
+    """The gate cell has to say what is being tested, and against what -- the
+    same condition and bucket mean different gates on different lookbacks."""
+    app = _load_app_module(monkeypatch, tmp_path)
+
+    assert app._gate_rule({"gate": None}) == "none"
+    assert app._gate_rule(
+        {"gate": ("r2", "tails_25_75"), "gate_window": 1260}
+    ) == "r2 · tails_25_75 · roll 1260d"
+    assert app._gate_rule(
+        {"gate": ("resid_half_life", "below_50"), "gate_window": None}
+    ) == "resid_half_life · below_50 · expanding"
 
 
 def test_registry_can_promote_curated_module_defaults(monkeypatch, tmp_path):

@@ -58,8 +58,12 @@ def styled_fig(title: str, yaxis_title: str = "", height: int = 340) -> go.Figur
 
 # ── layout components ─────────────────────────────────────────────────────────
 
-def stat_block(label: str, value: str, alert: bool = False) -> html.Div:
-    """Labeled metric block for the stats bar."""
+def stat_block(label: str, value, alert: bool = False) -> html.Div:
+    """Labeled metric block for the stats bar.
+
+    `value` is usually a string, but any Dash children work — pass a list with
+    html.Br() in it to lay a value out over more than one line.
+    """
     return html.Div([
         html.Span(label, style={
             "color": DIM, "fontSize": 10, "display": "block",
