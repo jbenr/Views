@@ -16,19 +16,17 @@ import ast
 
 PARAM_COLS = [
     "entry_signal", "beta_lb", "ou_lb", "entry_threshold",
-    "exit_style", "exit_param", "gate", "gate_window", "z_gate",
-    "stop_loss_bps",
+    "exit_style", "exit_param", "gate", "gate_window", "stop_loss_bps",
 ]
 
-# Null is a meaningful, explicit "disabled" value only for these filters.
+# Null is a meaningful, explicit "disabled" value only for these columns.
 # Other null registry cells commonly come from schema-unioning heterogeneous
 # signals and must not override a strategy's required/default parameter.
-NULLABLE_FILTER_COLS = {
+NULLABLE_COLS = {
     "gate",
     # explicit null = expanding percentile, which must not fall back to a
     # module default that happens to name a rolling window
     "gate_window",
-    "z_gate",
 }
 
 
@@ -40,13 +38,13 @@ def unpack_gate(value):
 
 def params_from_row(row: dict) -> dict:
     """Rebuild a Strategy.compute()-ready params dict from a registry row."""
-    # Presence and value are distinct here. An explicit null disables an
-    # optional filter such as z_gate; dropping that key would let
-    # Strategy._params() silently restore the module default.
+    # Presence and value are distinct here. An explicit null disables the
+    # gate; dropping that key would let Strategy._params() silently restore
+    # the module default.
     params = {
         c: row.get(c)
         for c in PARAM_COLS
-        if c in row and (row.get(c) is not None or c in NULLABLE_FILTER_COLS)
+        if c in row and (row.get(c) is not None or c in NULLABLE_COLS)
     }
     if "gate" in params:
         params["gate"] = unpack_gate(params["gate"])
@@ -115,9 +113,3 @@ def gate_label(params: dict) -> str:
     basis = "expanding" if window is None else f"roll {int(window)}d"
     return f"{condition} · {bucket} · {basis}"
 
-
-def filter_label(params: dict) -> str:
-    """The optional entry filter, including when it is switched off -- an
-    audit record has to state what is not being applied too."""
-    z_gate = params.get("z_gate")
-    return f"z_gate={'off' if z_gate is None else format(float(z_gate), 'g')}"

@@ -6,7 +6,7 @@ import polars as pl
 import pytest
 
 from backtest import sweep_strategy
-from backtest.strategy import _entry_filter, _normalize_predict_signals
+from backtest.strategy import _gate_filter, _normalize_predict_signals
 
 view = importlib.import_module("book.curve.tens_10s30s")
 STRATEGY = view.STRATEGY
@@ -70,16 +70,17 @@ def test_compute_gate_param_adds_allow_column():
     assert "gate_allow" not in compute(data).columns
 
 
-def test_entry_filter_z_gate_none_skips_ou_confirmation():
+def test_gate_filter_blocks_only_on_the_quantile_gate():
+    """The gate is the whole of entry conditioning -- nothing else may veto
+    a threshold crossing."""
+    entry = _gate_filter()
     bar = {"half_life": 10.0, "ou_z": 0.0}
-    ungated = _entry_filter(None)
-    assert ungated(1, bar) and ungated(-1, bar)
-    confirmed = _entry_filter(0.5)
-    assert not confirmed(1, bar) and not confirmed(-1, bar)
-    # the quantile gate still applies with z_gate=None
-    assert not ungated(1, {**bar, "gate_allow": 0.0})
-    # half-life is the gate's business now; no fixed bound blocks an entry
-    assert ungated(1, {"half_life": 500.0, "ou_z": 0.0})
+
+    assert entry(1, bar) and entry(-1, bar)
+    assert not entry(1, {**bar, "gate_allow": 0.0})
+    assert entry(1, {**bar, "gate_allow": 1.0})
+    # an OU-z that contradicts the trade no longer blocks it on its own
+    assert entry(1, {"half_life": 500.0, "ou_z": 3.0})
 
 
 def test_gate_conditions_are_buildable():
@@ -121,7 +122,6 @@ def test_sweep_grids_build_one_grid_per_saved_winner(monkeypatch, tmp_path):
     assert res["gate"] == [None] and "ou_lb" not in res
     for grid in grids:
         assert grid["stop_loss_bps"] == STRATEGY.sweep_stop_loss_bps
-        assert grid["z_gate"] == [None]
 
 
 def test_sweep_mode_saves_results_and_trade_log(monkeypatch, tmp_path):
@@ -456,15 +456,3 @@ def test_sweep_gate_specs_serialize_and_block_entries():
     sharpes = gated["sharpe"].to_list()
     assert sharpes[0] == pytest.approx(sharpes[1], nan_ok=True)
 
-
-def test_sweep_z_gate_none_lets_gates_filter_alone():
-    data = view.model_frame(synthetic_data())
-    grid = {"z_gate": [None, 0.5], "gate": [None, ("r2", "high_75")]}
-    out = sweep_strategy("book.curve.tens_10s30s", data, grid, n_jobs=1)
-
-    assert "error" not in out.columns
-    assert len(out) == 4
-    no_z = out.filter(pl.col("z_gate").is_null() & pl.col("gate").is_null())
-    with_z = out.filter((pl.col("z_gate") == 0.5) & pl.col("gate").is_null())
-    # dropping the OU-z confirmation can only open up entries
-    assert no_z["n_trades"][0] >= with_z["n_trades"][0] > 0

@@ -110,7 +110,6 @@ DEFAULT_PARAMS = {
     "entry_signal": "residual",  # "residual" (bps) | "ou_z" (z)
     "entry_threshold": 20.0,  # positive signal -> short target
     # entry filters: what must ALSO be true at the bar to take the trade
-    "z_gate": 0.5,  # residual entries only: OU z must confirm; None = off
     "gate": None,  # quantile regime gate (condition, bucket) — see lab.parse_gate
     "gate_window": None,  # gate percentile lookback; None = expanding (all history)
     # exit: one primary style from the --exit menu + hard stop on top
@@ -127,11 +126,12 @@ def _finite(value) -> bool:
         return False
 
 
-def _entry_filter(z_gate: float | None):
-    """Quantile gate plus optional OU-z confirmation.
+def _gate_filter():
+    """Entry hook that enforces the quantile gate, and nothing else.
 
-    z_gate=None drops the OU-z confirmation entirely so the quantile gate
-    (params["gate"] -> gate_allow) carries the entry filtering on its own.
+    Conditioning an entry is the gate's job in its entirety: there is no
+    separate filter layer, so params["gate"] -> gate_allow is the only thing
+    that can block a threshold crossing.
     """
 
     def fn(direction: int, bar: dict) -> bool:
@@ -139,20 +139,7 @@ def _entry_filter(z_gate: float | None):
         gate = bar.get("gate_allow")
         if gate is not None and gate != 1.0:
             return False
-
-        if z_gate is None:
-            return direction in (1, -1)
-
-        ou_z = bar.get("ou_z")
-        if not _finite(ou_z):
-            return False
-        # direction +1 is long target: residual should be cheap/negative.
-        # direction -1 is short target: residual should be rich/positive.
-        if direction == 1:
-            return float(ou_z) <= -z_gate
-        if direction == -1:
-            return float(ou_z) >= z_gate
-        return False
+        return direction in (1, -1)
 
     return fn
 
@@ -202,10 +189,7 @@ def _daily_pnl_from_trades(
 
 
 def _winner_params(row: dict) -> dict:
-    """Engine params for one (setup, exit) winner row from exits_file.
-    z_gate is off — the discovery scans never used it, and re-filtering the
-    discovered event here starves the exact engine of the very trades steps
-    1-2 counted."""
+    """Engine params for one (setup, exit) winner row from exits_file."""
     p = {
         "entry_signal": row["entry_signal"],
         "beta_lb": int(row["beta_lb"]),
@@ -222,7 +206,6 @@ def _winner_params(row: dict) -> dict:
             if row.get("gate_window") is None
             else int(row["gate_window"])
         ),
-        "z_gate": None,
     }
     if row["ou_lb"] is not None:
         p["ou_lb"] = int(row["ou_lb"])
@@ -485,9 +468,6 @@ class Strategy:
                 f"unknown exit_style={style!r}; "
                 "expected 'band', 'revert_frac', or 'half_life_frac'"
             )
-        # the OU-z confirmation only makes sense when the entry signal is the
-        # raw residual; an ou_z entry already IS the z-score
-        z_gate = p["z_gate"] if p["entry_signal"] == "residual" else None
         return SignalPipeline(
             name=self.name,
             trade_def=TradeDef.outright(self.name, self.target),
@@ -500,7 +480,7 @@ class Strategy:
                 stop_loss_bps=p["stop_loss_bps"],
                 time_stop_bars=None,
                 exit_fn=exit_fn,
-                entry_filter_fn=_entry_filter(z_gate),
+                entry_filter_fn=_gate_filter(),
             ),
         )
 
@@ -745,21 +725,17 @@ class Strategy:
         if sig_val is None or not _finite(sig_val):
             print("\nlatest signal: warmup - no signal yet")
         else:
-            z_gate = p["z_gate"] if p["entry_signal"] == "residual" else None
-            z_ok_short = z_gate is None or (_finite(ou_z) and ou_z >= z_gate)
-            z_ok_long = z_gate is None or (_finite(ou_z) and ou_z <= -z_gate)
-            if gate_ok and sig_val >= p["entry_threshold"] and z_ok_short:
+            if gate_ok and sig_val >= p["entry_threshold"]:
                 action = f"SHORT {self.target} (rich vs {self.feature})"
-            elif gate_ok and sig_val <= -p["entry_threshold"] and z_ok_long:
+            elif gate_ok and sig_val <= -p["entry_threshold"]:
                 action = f"LONG {self.target} (cheap vs {self.feature})"
             else:
                 action = "FLAT"
-            z_rule = "" if z_gate is None else f", abs(ou_z)>={z_gate}"
             print(
                 f"\nlatest signal: ts={data['ts'][-1]}  resid={resid:+.1f}bps  "
                 f"ou_z={ou_z:+.2f}  half_life={half_life:.1f}d  "
                 f"beta={last['beta']:+.3f}  r2={last['r2']:.2f}  action={action}  "
-                f"(abs({p['entry_signal']})>={p['entry_threshold']}{units}{z_rule}, "
+                f"(abs({p['entry_signal']})>={p['entry_threshold']}{units}, "
                 f"exit={p['exit_style']}@{p['exit_param']})"
             )
 

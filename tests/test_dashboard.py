@@ -51,7 +51,6 @@ def test_dashboard_has_live_overview_and_selectable_deep_dive(monkeypatch, tmp_p
                 "exit_style": "revert_frac",
                 "exit_param": 1.0,
                 "gate": None,
-                "z_gate": None,
                 "stop_loss_bps": 25.0,
                 "sharpe": 0.71,
                 "n_trades": 58,
@@ -238,7 +237,7 @@ def test_registry_list_states_the_whole_frozen_configuration():
         "entry_signal": "ou_z", "beta_lb": 80, "ou_lb": 400,
         "entry_threshold": 1.7, "exit_style": "revert_frac", "exit_param": 1.0,
         "gate": "('r2', 'tails_25_75')", "gate_window": 1260,
-        "z_gate": None, "stop_loss_bps": 25.0,
+        "stop_loss_bps": 25.0,
         "sharpe": 0.70089, "n_trades": 17.0, "hit_rate": 0.882353,
         "max_drawdown_bps": -22.63,
     }])
@@ -251,7 +250,6 @@ def test_registry_list_states_the_whole_frozen_configuration():
     assert "revert_frac=1" in out
     assert "25bps" in out
     assert "r2 · tails_25_75 · roll 1260d" in out      # gate basis, not just bucket
-    assert "z_gate=off" in out                          # states what is NOT applied
     assert "sharpe 0.70" in out and "17 trades" in out
     assert "sweep rank 0" in out
 
@@ -282,12 +280,10 @@ def test_params_from_row_preserves_explicitly_disabled_filters():
             "entry_signal": "residual",
             "beta_lb": 50.0,
             "ou_lb": 252.0,
-            "z_gate": None,
             "gate": None,
         }
     )
 
-    assert params["z_gate"] is None
     assert params["gate"] is None
     assert params["beta_lb"] == 50
     assert params["ou_lb"] == 252

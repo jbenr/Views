@@ -29,7 +29,6 @@ from .params import (
     PARAM_COLS,
     entry_label,
     exit_label,
-    filter_label,
     gate_label,
     params_from_row,
     signal_label,
@@ -276,7 +275,6 @@ def describe(frame: pl.DataFrame) -> str:
             ("exit", exit_label(params)),
             ("stop", _metric(params.get("stop_loss_bps"), "g", "bps")),
             ("gate", gate_label(params)),
-            ("filters", filter_label(params)),
             (
                 "backtest",
                 f"sharpe {_metric(row.get('sharpe'), '.2f')}"
