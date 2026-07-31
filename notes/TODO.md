@@ -2,6 +2,8 @@
 
 North star: a live, timestamped, auditable macro trading platform with a real track record.
 
+Focused research, promotion, and strategy checklists: [`RESEARCH_ROADMAP.md`](RESEARCH_ROADMAP.md).
+
 ---
 
 ## Data Foundation
