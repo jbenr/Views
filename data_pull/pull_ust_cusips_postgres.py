@@ -6,7 +6,7 @@
 
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -31,6 +31,7 @@ FISCAL_URL = (
 DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets")
 TABLE = os.getenv("AUCTIONS_TABLE", "sec.auctioned_securities")  # schema.table
 PAGE_SIZE = 10_000  # Fiscal Data API max page size is typically 10k
+INCREMENTAL_LOOKBACK_DAYS = 7
 
 # Split schema + table safely, and build a properly-quoted qualified name.
 if "." not in TABLE:
@@ -114,7 +115,7 @@ def _insert_dataframe(conn, df: pd.DataFrame) -> int:
     """
     Insert rows from df into the target table.
     - Only inserts columns that exist in DB (ignores extras).
-    - Uses ON CONFLICT (cusip, auction_date) DO NOTHING when possible.
+    - Uses ON CONFLICT (cusip, auction_date) DO UPDATE when possible.
     Returns rows inserted (best-effort; rowcount can be driver-dependent).
     """
     if df.empty:
@@ -131,7 +132,11 @@ def _insert_dataframe(conn, df: pd.DataFrame) -> int:
 
     conflict = ""
     if {"cusip", "auction_date"}.issubset(cols):
-        conflict = ' ON CONFLICT ("cusip","auction_date") DO NOTHING'
+        update_cols = [c for c in cols if c not in {"cusip", "auction_date"}]
+        assignments = ", ".join(
+            f'"{c}" = EXCLUDED."{c}"' for c in update_cols
+        )
+        conflict = f' ON CONFLICT ("cusip","auction_date") DO UPDATE SET {assignments}'
 
     sql = f"INSERT INTO {qname()} ({col_list}) VALUES {placeholders}{conflict};"
 
@@ -144,10 +149,10 @@ def _insert_dataframe(conn, df: pd.DataFrame) -> int:
     return inserted
 
 
-def _get_max_auction_date(conn) -> Optional[datetime]:
-    """Max auction_date in table; None if table empty or missing column."""
+def _get_max_record_date(conn) -> Optional[datetime]:
+    """Max publication date in table; None if table empty or missing column."""
     with conn.cursor() as cur:
-        cur.execute(f'SELECT max("auction_date") FROM {qname()};')
+        cur.execute(f'SELECT max("record_date") FROM {qname()};')
         row = cur.fetchone()
     return row[0] if row and row[0] is not None else None
 
@@ -215,11 +220,14 @@ def fetch_all_auctions(extra_params: Optional[Dict[str, Any]] = None) -> pd.Data
 
 
 def _dedupe(df: pd.DataFrame) -> pd.DataFrame:
-    """Best-effort dedupe: prefer latest row per (cusip, auction_date) or cusip."""
+    """Prefer the latest published row per (cusip, auction_date) or cusip."""
     if df.empty:
         return df
     if {"cusip", "auction_date"}.issubset(df.columns):
-        return df.sort_values(["cusip", "auction_date"]).drop_duplicates(["cusip", "auction_date"], keep="last")
+        sort_cols = ["cusip", "auction_date"]
+        if "record_date" in df.columns:
+            sort_cols.append("record_date")
+        return df.sort_values(sort_cols).drop_duplicates(["cusip", "auction_date"], keep="last")
     if "cusip" in df.columns:
         return df.sort_values("cusip").drop_duplicates(["cusip"], keep="last")
     return df
@@ -259,13 +267,13 @@ def full_refresh() -> None:
 def incremental_update() -> None:
     """
     Incremental:
-    - get max(auction_date) from DB
-    - fetch API rows with auction_date > max
-    - insert (ON CONFLICT DO NOTHING)
+    - get max(record_date) from DB
+    - refetch an inclusive publication-date overlap
+    - upsert new or revised auction rows
     """
     with get_conn() as conn:
         try:
-            max_dt = _get_max_auction_date(conn)
+            max_dt = _get_max_record_date(conn)
         except Exception:
             # First run / table not created yet → bootstrap with full refresh.
             max_dt = None
@@ -275,12 +283,13 @@ def incremental_update() -> None:
             full_refresh()
             return
 
-        cutoff = max_dt.date().isoformat()
-        print(f"📡 Fetching auctions with auction_date > {cutoff} …")
-        df = fetch_all_auctions(extra_params={"filter": f"auction_date:gt:{cutoff}"})
+        latest = max_dt.date()
+        cutoff = (latest - timedelta(days=INCREMENTAL_LOOKBACK_DAYS)).isoformat()
+        print(f"📡 Fetching auctions with record_date >= {cutoff} …")
+        df = fetch_all_auctions(extra_params={"filter": f"record_date:gte:{cutoff}"})
 
         if df.empty:
-            print(f"✅ No new auctions returned by API. Up to date as of auction_date {cutoff}.")
+            print(f"✅ No auctions returned by API. Up to date as of record_date {latest}.")
             return
 
         api_rows = len(df)
@@ -294,7 +303,7 @@ def incremental_update() -> None:
         "✅ Incremental update complete.\n"
         f"   API rows returned: {api_rows}\n"
         f"   After dedupe: {deduped_rows}\n"
-        f"   New rows inserted into {SCHEMA}.{TABLE_NAME}: {inserted}"
+        f"   Rows upserted into {SCHEMA}.{TABLE_NAME}: {inserted}"
     )
 
 
