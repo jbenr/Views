@@ -39,10 +39,21 @@ from utils import tickers as tkr
 DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets")
 TODAY  = dt.date.today()
 
+FUT_GENERIC_RANKS = {
+    "TU": range(1, 3),
+    "FV": range(1, 3),
+    "TY": range(1, 3),
+    "UXY": range(1, 3),
+    "US": range(1, 3),
+    "WN": range(1, 3),
+    "FF": range(1, 9),
+    "SER": range(1, 9),
+    "SFR": range(1, 9),
+}
 FUT_TICKERS = [
-    f"{a}{b} Comdty"
-    for a in ['TU', 'FV', 'TY', 'UXY', 'US', 'WN']
-    for b in [1, 2]
+    f"{root}{rank} Comdty"
+    for root, ranks in FUT_GENERIC_RANKS.items()
+    for rank in ranks
 ]
 
 INDEX_TICKERS = (
@@ -97,6 +108,7 @@ def pull_fut(bbg: Bbg) -> pd.DataFrame:
         .rename_axis('generic_ticker')
         .reset_index()
     )
+    df['generic_ticker'] = df['generic_ticker'].str.replace(' Comdty', '', regex=False)
     df['ts']      = TODAY
     df['source']  = 'BGN'
     df['is_live'] = True

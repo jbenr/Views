@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Pull daily Treasury futures history from Bloomberg into TimescaleDB.
+Pull daily rates futures history from Bloomberg into TimescaleDB.
 
 - Pulls from a configurable list of tickers (generic or specific contracts)
 - Uses Bloomberg BDH via Bbg helper
 - Stores into md.fut_eod (Timescale hypertable), keyed by (contract, ts)
 - Also populates sec.fut_contracts with contract metadata
-- Incremental: each run only fetches dates after max(ts) already stored
+- Incremental: each generic resumes from its own max(ts), with a short overlap
 
 Usage:
-    python pull_fut_eod.py              # incremental update
-    python pull_fut_eod.py full         # full historical refresh from 2000
+    python pull_fut_eod.py                         # incremental update
+    python pull_fut_eod.py --backfill 2020-01-01  # non-destructive backfill
+    python pull_fut_eod.py full                    # full historical refresh from 2000
 """
 
 from __future__ import annotations
@@ -18,7 +19,8 @@ from __future__ import annotations
 import os
 import sys
 import datetime as dt
-from typing import List, Optional
+from collections import defaultdict
+from typing import List
 
 import pandas as pd
 import psycopg
@@ -52,10 +54,26 @@ BBG_CONTRACT_FIELDS = [
 
 BATCH_SIZE = 5
 HISTORICAL_START = dt.date(2000, 1, 1)
+INCREMENTAL_OVERLAP_DAYS = 7
 
-# Treasury futures tickers to pull
-# Add/remove as needed — these are front-month generics
-TICKERS = [f"{a}{b} Comdty" for a in ['TU', 'FV', 'TY', 'UXY', 'US', 'WN'] for b in [1, 2]]
+# Bloomberg generics discover the active contracts; stored rows retain the
+# specific contract returned by FUT_CUR_GEN_TICKER.
+GENERIC_RANKS = {
+    "TU": range(1, 3),
+    "FV": range(1, 3),
+    "TY": range(1, 3),
+    "UXY": range(1, 3),
+    "US": range(1, 3),
+    "WN": range(1, 3),
+    "FF": range(1, 9),
+    "SER": range(1, 9),
+    "SFR": range(1, 9),
+}
+TICKERS = [
+    f"{root}{rank} Comdty"
+    for root, ranks in GENERIC_RANKS.items()
+    for rank in ranks
+]
 
 
 # ---------------------------------------------------------------------------
@@ -122,19 +140,49 @@ def ensure_tables(conn) -> None:
     conn.commit()
 
 
-def get_max_date(conn) -> Optional[dt.date]:
-    """Return the max ts currently in fut_eod, or None if empty."""
+def normalize_generic_ticker(ticker: str) -> str:
+    """Return the stored generic name (for example, ``SFR1``)."""
+    return ticker.replace(" Comdty", "").strip()
+
+
+def get_grouped_pulls(
+    conn,
+    tickers: list[str],
+    force_start: dt.date | None = None,
+) -> dict[dt.date, list[str]]:
+    """Group generics by pull start, using a separate watermark per series."""
+    if force_start is not None:
+        return {force_start: list(tickers)}
+
     with conn.cursor() as cur:
-        cur.execute("SELECT max(ts)::date FROM md.fut_eod;")
-        row = cur.fetchone()
-    
-    if row is None or row[0] is None:
-        return None
-    
-    result = row[0]
-    if isinstance(result, dt.datetime):
-        return result.date()
-    return result
+        cur.execute(
+            """
+            SELECT generic_ticker, MAX(ts)::date
+            FROM md.fut_eod
+            GROUP BY generic_ticker
+            """
+        )
+        rows = cur.fetchall()
+
+    db_maxes: dict[str, dt.date] = {}
+    for ticker, max_ts in rows:
+        if max_ts is None:
+            continue
+        key = normalize_generic_ticker(ticker)
+        value = max_ts.date() if isinstance(max_ts, dt.datetime) else max_ts
+        if key not in db_maxes or value > db_maxes[key]:
+            db_maxes[key] = value
+
+    today = dt.date.today()
+    overlap = dt.timedelta(days=INCREMENTAL_OVERLAP_DAYS)
+    groups: dict[dt.date, list[str]] = defaultdict(list)
+    for ticker in tickers:
+        last_ts = db_maxes.get(normalize_generic_ticker(ticker))
+        start = HISTORICAL_START if last_ts is None else max(HISTORICAL_START, last_ts - overlap)
+        if start <= today:
+            groups[start].append(ticker)
+
+    return dict(groups)
 
 
 def parse_contract_ticker(ticker: str) -> tuple[str, str]:
@@ -147,8 +195,8 @@ def parse_contract_ticker(ticker: str) -> tuple[str, str]:
         'UXYH6 Comdty' -> ('UXY', 'UXYH6')
         'WN1 Comdty' -> ('WN', 'WN1')
     """
-    # Known Treasury futures roots
-    KNOWN_ROOTS = ["UXY", "WN", "TU", "FV", "TY", "US", "UB", "Z3N"]
+    # Known rates futures roots
+    KNOWN_ROOTS = ["SFR", "SER", "UXY", "WN", "TU", "FV", "TY", "US", "UB", "Z3N", "FF"]
     
     clean = ticker.replace(" Comdty", "").strip()
     
@@ -399,13 +447,15 @@ def populate_contracts_from_eod(conn, bbg: Bbg) -> int:
     Populate sec.fut_contracts from distinct contracts found in md.fut_eod.
     Fetches metadata from Bloomberg for each actual contract.
     """
-    # Get distinct contracts from EOD data
+    # Fetch metadata only for contracts not yet present in the security master.
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT DISTINCT contract 
-            FROM md.fut_eod 
-            WHERE contract IS NOT NULL
-            ORDER BY contract;
+            SELECT DISTINCT e.contract
+            FROM md.fut_eod e
+            LEFT JOIN sec.fut_contracts c ON c.contract = e.contract
+            WHERE e.contract IS NOT NULL
+              AND c.contract IS NULL
+            ORDER BY e.contract;
         """)
         contracts = [row[0] for row in cur.fetchall()]
     
@@ -525,42 +575,35 @@ def full_refresh() -> None:
             print(f"✅ Full refresh complete. Upserted {n_contracts} contract records into sec.fut_contracts")
 
 
-def incremental_update() -> None:
-    """Incremental update: fetch only dates after max(ts) in DB."""
+def incremental_update(force_start: dt.date | None = None) -> None:
+    """Update each generic from its own watermark, or force a backfill date."""
     with get_conn() as conn:
         ensure_tables(conn)
-        
-        max_dt = get_max_date(conn)
-        
-        if max_dt is None:
-            print("No existing data found. Running full refresh instead.")
-            conn.close()
-            full_refresh()
-            return
-        
-        start = max_dt
+
+        groups = get_grouped_pulls(conn, TICKERS, force_start)
         end = dt.date.today()
 
-        if start > end:
-            print(
-                f"✅ No new dates to pull.\n"
-                f"   Database is up to date as of {max_dt}."
-            )
+        if not groups:
+            print("✅ No dates to pull.")
             return
-        
-        print(f"📡 Fetching futures data from {start} to {end}...")
-        print(f"Tickers: {TICKERS}")
-        
+
+        n_tickers = sum(len(group) for group in groups.values())
+        print(f"📡 Pulling {n_tickers} futures generics across {len(groups)} date group(s)...")
+
         bbg = Bbg()
-        
-        # Pull EOD data first
-        inserted = fetch_eod_for_tickers(bbg, conn, TICKERS, start, end)
-        
-        if inserted == 0:
+
+        total_inserted = 0
+        for start, group_tickers in sorted(groups.items()):
+            print(f"  {len(group_tickers)} tickers from {start} to {end}...")
+            total_inserted += fetch_eod_for_tickers(
+                bbg, conn, group_tickers, start, end
+            )
+
+        if total_inserted == 0:
             print("✅ Bloomberg returned no new EOD data. You're up to date.")
         else:
-            print(f"✅ Upserted {inserted} rows into md.fut_eod")
-            
+            print(f"✅ Upserted {total_inserted} rows into md.fut_eod")
+
             # Update contract metadata for any new contracts
             n_contracts = populate_contracts_from_eod(conn, bbg)
             print(f"✅ Incremental update complete. Upserted {n_contracts} contract records into sec.fut_contracts")
@@ -571,6 +614,14 @@ def incremental_update() -> None:
 # ---------------------------------------------------------------------------
 
 def main():
+    force_start = None
+    if "--backfill" in sys.argv:
+        idx = sys.argv.index("--backfill")
+        try:
+            force_start = dt.datetime.strptime(sys.argv[idx + 1], "%Y-%m-%d").date()
+        except (IndexError, ValueError):
+            raise SystemExit("--backfill requires a date in YYYY-MM-DD format")
+
     mode = "incremental"
     if len(sys.argv) > 1 and sys.argv[1].lower() in {"full", "all", "refresh"}:
         mode = "full"
@@ -580,7 +631,7 @@ def main():
     if mode == "full":
         full_refresh()
     else:
-        incremental_update()
+        incremental_update(force_start)
 
 if __name__ == "__main__":
     main()

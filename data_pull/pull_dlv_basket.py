@@ -16,6 +16,7 @@ from data_pull.berg import Bbg
 
 DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets")
 BATCH_SIZE = 50
+DELIVERABLE_ROOTS = ["TU", "FV", "TY", "UXY", "US", "WN", "UB", "Z3N"]
 
 
 def ensure_dlv_basket_column(conn):
@@ -42,17 +43,19 @@ def get_contracts(conn, only_missing: bool = True):
     with conn.cursor() as cur:
         if only_missing:
             cur.execute("""
-                SELECT contract 
-                FROM sec.fut_contracts 
+                SELECT contract
+                FROM sec.fut_contracts
                 WHERE dlv_basket IS NULL
+                  AND generic_ticker = ANY(%s)
                 ORDER BY contract_month DESC
-            """)
+            """, (DELIVERABLE_ROOTS,))
         else:
             cur.execute("""
-                SELECT contract 
-                FROM sec.fut_contracts 
+                SELECT contract
+                FROM sec.fut_contracts
+                WHERE generic_ticker = ANY(%s)
                 ORDER BY contract_month DESC
-            """)
+            """, (DELIVERABLE_ROOTS,))
         return [row[0] for row in cur.fetchall()]
 
 
