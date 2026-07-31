@@ -8,6 +8,16 @@ The goal is to build a real research-and-trading evidence stack: every signal is
 
 ---
 
+**Direction update (2026-07-31):** this document is the original vision/pitch —
+still accurate on strategy taxonomy and intent, but the repo's actual
+architecture, signal schema, and ledger mechanism have since diverged in
+places. Where they do, an "As-built note" is inlined below pointing to the
+real implementation; the root [`README.md`](../README.md) and
+[`dashboard/README.md`](../dashboard/README.md) are authoritative over this
+file for anything code-related.
+
+---
+
 ## 1. The Goal
 
 The goal of this project is to prove that I can build and manage a real macro trading process.
@@ -672,6 +682,16 @@ No log, no claim.
 
 ## 7.2 Signal Record
 
+**As-built note (2026-07-31):** the schema below was the original target. What's
+actually implemented is a flatter, mechanical row in `store/signal_ledger.parquet`
+— `run_ts, data_asof_ts, level, signal, resid, ou_z, beta, r2, half_life,
+gate_value, gate_percentile, gate_allow, fired` (see
+[`dashboard/README.md`](../dashboard/README.md)). The narrative/portfolio fields
+below (`conviction`, `rationale`, `trade_expression`, `stop`/`take_profit`,
+`risk_unit`) were never built — the real ledger stays quant-mechanical rather
+than a discretionary trade record. Treat the JSON below as the original vision,
+not the current schema.
+
 Every signal should produce a structured JSON record.
 
 Minimum fields:
@@ -709,6 +729,12 @@ That is what makes it auditable.
 ---
 
 ## 7.3 Timestamping
+
+**As-built note:** none of the git-commit / OpenTimestamps mechanism below was
+built. The actual immutability guarantee comes from `store/signal_ledger.parquet`
+being append-only with atomic writes (temp file + `os.replace`) — see
+[`dashboard/README.md`](../dashboard/README.md). "Once logged, permanent" still
+holds; the mechanism is just a different one than originally scoped.
 
 The system should prove that each signal existed before the outcome.
 
@@ -936,6 +962,15 @@ Monthly writeups:
 
 # 10. Repo Structure
 
+**As-built note:** this was the original proposed layout, written before the
+research side of the project existed. The actual repo structure is documented
+in the root [`README.md`](../README.md)'s repo map (`stats/`, `utils/`,
+`backtest/`, `book/`, `execution/`, `dashboard/`, `data_pull/`, `dig/`,
+`tests/`) and differs substantially from what's below — e.g. strategies live
+in `book/<family>/`, not `src/strategies/`; there's no `signals/`, `proofs/`,
+or `portfolios/` directory. Treat this section as historical intent, not
+current structure.
+
 ```text
 macro-signal-ledger/
   README.md
@@ -1071,7 +1106,7 @@ Create a public-facing dashboard that shows live performance and the full signal
 
 Deliverables:
 
-- Streamlit dashboard
+- ~~Streamlit dashboard~~ Dash dashboard (built, see [`dashboard/README.md`](../dashboard/README.md))
 - signal ledger page
 - NAV page
 - strategy performance page

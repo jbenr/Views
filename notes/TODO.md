@@ -4,6 +4,8 @@ North star: a live, timestamped, auditable macro trading platform with a real tr
 
 Focused research, promotion, and strategy checklists: [`RESEARCH_ROADMAP.md`](RESEARCH_ROADMAP.md).
 
+**Direction update (2026-07-31):** the actual repo (see root [`README.md`](../README.md)) is now the authoritative source for architecture and schema, not this file or `PLAN.md`. Several items below were built, just differently than originally scoped here — those are struck through with a pointer to what exists instead. Checked items are confirmed done. Everything else is untouched because it wasn't verified either way, not because it's still accurate as written.
+
 ---
 
 ## Data Foundation
@@ -31,8 +33,8 @@ Focused research, promotion, and strategy checklists: [`RESEARCH_ROADMAP.md`](RE
 - [ ] Add any missing macro series needed for research anchors
 
 **Data access layer**
-- [ ] Write a single `load_research_data(start, end)` function that returns a clean wide DataFrame of all research-ready series with consistent date alignment
-- [ ] Confirm `query_db` in `utils/helpers.py` is the standard entry point - no raw psycopg calls in research files
+- ~~Write a single `load_research_data(start, end)` function that returns a clean wide DataFrame of all research-ready series with consistent date alignment~~ (built differently: `utils/market_data.py`'s `load_wide(TICKERS, start, ...)` takes a per-strategy ticker dict rather than one blanket all-series loader)
+- [x] Confirm `query_db` in `utils/helpers.py` is the standard entry point - no raw psycopg calls in research files
 - [ ] Build a lightweight data health check - confirm no stale series, no gaps in last 30 days
 
 ---
@@ -46,7 +48,7 @@ The model quality determines the signal quality. Work through these in order.
 - [ ] Document the winner and why (this is the baseline everything else gets compared to)
 
 **Pairs / spread trading**
-- [ ] `book/duration/spread_rv.py` - trade 10Y vs 5y5y fwd inflation as a two-leg spread (in progress)
+- [x] `book/duration/spread_rv.py` - trade 10Y vs 5y5y fwd inflation as a two-leg spread (in progress)
 - [ ] Extend to other pairs: 10Y vs BE10, 10Y vs 5y5y SOFR fwd, 5y vs 5y BE, 10Y vs 30Y
 - [ ] Verify: P&L of the pairs trade = fading the spread residual (hedge ratio from rolling beta)
 - [ ] Compare pairs: IC, hit rate, Sharpe at 20d - which pairing has the most consistent edge?
@@ -54,7 +56,7 @@ The model quality determines the signal quality. Work through these in order.
 **Multi-factor regression**
 - [ ] Build multi-factor OLS model for 10Y - 2 to 4 anchors chosen by forward IC not in-sample R-squared
 - [ ] Test whether multi-factor residual has better OOS IC than the best single-factor
-- [ ] Check beta stability - unstable betas mean the model is overfit
+- [x] Check beta stability - unstable betas mean the model is overfit (`beta_cv` in `stats/`, per README's model-stability gates)
 
 **PCA decomposition**
 - [ ] Apply PCA to the full rates curve - confirm PC1/PC2/PC3 = level/slope/curvature
@@ -81,12 +83,12 @@ The model quality determines the signal quality. Work through these in order.
 - [ ] Identify which anchors have the strongest and most stable edge
 
 **Regime conditioning**
-- [ ] Add `hurst_exponent` and `roll_hurst` to `stats/ou.py`
-- [ ] Add `resid_hurst_60d` and anchor trend features to `signal_context.py`
-- [ ] Add residual range breakout features to `signal_context.py`
-- [ ] Run OOS edge test across all features, all anchors
-- [ ] Identify the 2-3 filters with the most consistent OOS Sharpe lift
-- [ ] Define regime gate: conditions under which the signal fires vs stands down
+- [x] Add `hurst_exponent` and `roll_hurst` to `stats/ou.py`
+- ~~Add `resid_hurst_60d` and anchor trend features to `signal_context.py`~~ (built differently: `signal_context.py` has `beta_trend`, `r2_trend`, `zscore_mom_*`, `vol_ratio` instead of an explicit rolling-Hurst feature)
+- [x] Add residual range breakout features to `signal_context.py` (`resid_pct_hi_Nd`, `resid_dist_hi_Nd`, `resid_dist_lo_Nd`)
+- [x] Run OOS edge test across all features, all anchors (`oos_edge_test` / `oos_edge_summary` / `oos_edge_summary_fast` in `signal_context.py`)
+- [x] Identify the 2-3 filters with the most consistent OOS Sharpe lift (`filtered_sharpe_summary` picks the best filter per anchor by `sharpe_filtered`)
+- [x] Define regime gate: conditions under which the signal fires vs stands down (`backtest.lab.gate_scan` + `entry_filter_fn`, per README's parameter-lab section)
 
 **Signal definition**
 - [ ] Write the final signal function `signal_fn` returning standard schema (signal, size, confidence, vol, time_stop)
@@ -146,19 +148,25 @@ The model quality determines the signal quality. Work through these in order.
 
 ## Signal Ledger Infrastructure
 
-- [ ] Define signal JSON schema (all required fields - see section 7.2 in PLAN.md)
-- [ ] Write `write_signal.py` - saves signal JSON to `signals/YYYY/YYYY-MM-DD.json`
-- [ ] Write `validate_signal.py` - rejects malformed or incomplete signals
-- [ ] Write `hash_signal.py` - SHA256 of each signal file
-- [ ] Wire git auto-commit: daily signal file committed with timestamp
-- [ ] Test: generate a fake signal, log it, confirm it cannot be silently edited
+Superseded as a whole: the ledger was built as an append-only parquet
+(`store/signal_ledger.parquet`), not JSON files + git commits. See
+[`dashboard/README.md`](../dashboard/README.md) for the actual schema and
+the atomic-write (`os.replace`) mechanism that gives it the "can't be
+silently edited" property a different way.
+
+- ~~Define signal JSON schema (all required fields - see section 7.2 in PLAN.md)~~
+- ~~Write `write_signal.py` - saves signal JSON to `signals/YYYY/YYYY-MM-DD.json`~~
+- ~~Write `validate_signal.py` - rejects malformed or incomplete signals~~
+- ~~Write `hash_signal.py` - SHA256 of each signal file~~
+- ~~Wire git auto-commit: daily signal file committed with timestamp~~
+- ~~Test: generate a fake signal, log it, confirm it cannot be silently edited~~ (append-only parquet + atomic write is the actual mechanism)
 
 ---
 
 ## Model Versioning
 
 - [ ] Add model version + git commit hash to every signal record
-- [ ] Add data as-of timestamp to every signal record
+- [x] Add data as-of timestamp to every signal record (`data_asof_ts` in `signal_ledger.parquet`)
 - [ ] Write version bump protocol: any model change increments version
 
 ---
@@ -187,8 +195,8 @@ The model quality determines the signal quality. Work through these in order.
 
 ## Dashboard
 
-- [ ] Basic Dash app skeleton with routing
-- [ ] Signal ledger page - every signal ever logged, searchable and filterable
+- [x] Basic Dash app skeleton with routing (`dashboard/app.py`)
+- ~~Signal ledger page - every signal ever logged, searchable and filterable~~ (built differently: **Live Overview** groups by traded target instead of a flat ledger browse; **Signal Deep Dive** is the per-signal detail view — see `dashboard/README.md`)
 - [ ] NAV page - total return, Sharpe, max drawdown, monthly returns table
 - [ ] Forecast accuracy page - IC and direction accuracy by strategy and horizon
 - [ ] Strategy performance page - breakdown by family
