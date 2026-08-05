@@ -158,23 +158,38 @@ def load_wide(
 
 def last_updated(
     tickers: Union[Mapping[str, str], Iterable[str]],
+    wake: bool = True,
 ) -> dict | None:
     """Freshness of md.index_eod itself for a set of tickers.
 
-    Returns the newest bar date and the newest row write time (created_at),
-    or None if the tickers have no rows. This is the database's own clock --
-    how current the source is, independent of any cached copy of it.
+    Returns the newest bar date and the newest row write time, or None if the
+    tickers have no rows. This is the database's own clock -- how current the
+    source is, independent of any cached copy of it.
+
+    Write time is updated_at, not created_at: the live BDP pulls upsert
+    today's row all day, so created_at stays pinned to the first insert and
+    would report a bar as hours old seconds after it was rewritten.
+
+    Rows written before updated_at existed have it NULL and fall back to
+    created_at, which is only a lower bound: such a row may have been upserted
+    any number of times since, leaving no trace. Once a pull has run they
+    carry a real updated_at and the answer is exact.
+
+    wake=False fails fast rather than waking a sleeping WSL/postgres, for
+    callers that treat freshness as optional decoration.
     """
     ticker_list = (
         list(tickers.values()) if isinstance(tickers, Mapping) else list(tickers)
     )
     out = query_db(
         """
-        SELECT MAX(ts) AS last_ts, MAX(created_at) AS last_written
+        SELECT MAX(ts) AS last_ts,
+               MAX(COALESCE(updated_at, created_at)) AS last_written
         FROM md.index_eod
         WHERE ticker = ANY(%s)
         """,
         params=[ticker_list],
+        wake=wake,
     )
     if out.empty or pd.isna(out.loc[0, "last_ts"]):
         return None

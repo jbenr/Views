@@ -73,6 +73,20 @@ def cached_data(signal_id: str) -> pl.DataFrame | None:
     return pl.read_parquet(cache_path)
 
 
+def cache_written_at(signal_id: str) -> dt.datetime | None:
+    """When this signal's data cache was last pulled, or None if never.
+
+    The parquet's mtime is the pull time -- pull_data() is the only writer --
+    so this needs no bookkeeping of its own. Callers compare it against the
+    database's own write clock to tell whether a re-pull is owed.
+    """
+    _, strategy = _resolve(signal_id)
+    cache_path = _data_cache_path(strategy.name)
+    if not cache_path.exists():
+        return None
+    return dt.datetime.fromtimestamp(cache_path.stat().st_mtime, dt.timezone.utc)
+
+
 FRESHNESS_TTL_SECONDS = 60.0
 _freshness_cache: dict[tuple[str, ...], tuple[float, dict | None]] = {}
 
@@ -87,7 +101,10 @@ def db_freshness(signal_id: str) -> dict | None:
 
     Returns None when the database is unreachable: the dashboard renders off
     cached parquet by design and must keep working when the DB is down, so a
-    freshness readout is never allowed to break a card.
+    freshness readout is never allowed to break a card -- or to delay one.
+    Hence wake=False: waking a slept WSL and waiting out a WAL replay takes
+    far longer than a page render may block, and the answer is only a
+    decoration on data already in hand.
     """
     _, strategy = _resolve(signal_id)
     key = tuple(sorted(strategy.tickers.values()))
@@ -96,7 +113,7 @@ def db_freshness(signal_id: str) -> dict | None:
     if cached is not None and now - cached[0] < FRESHNESS_TTL_SECONDS:
         return cached[1]
     try:
-        fresh = last_updated(strategy.tickers)
+        fresh = last_updated(strategy.tickers, wake=False)
     except Exception:
         fresh = None
     _freshness_cache[key] = (now, fresh)

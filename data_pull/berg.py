@@ -11,6 +11,7 @@ Requires: blpapi, pandas
 from __future__ import annotations
 
 import datetime as dt
+import socket
 import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union, Callable
@@ -50,9 +51,43 @@ class Bbg:
         opts.setServerPort(self.cfg.port)
         sess = blpapi.Session(opts)
         if not sess.start():
-            raise RuntimeError("Cannot start Bloomberg session (is Terminal open?)")
+            raise RuntimeError(self._session_error())
         self._session = sess
         return sess
+
+    def _session_error(self) -> str:
+        """Explain a failed session start in terms the caller can act on.
+
+        blpapi only reports a boolean, and its own log lines say nothing about
+        the cause, so probe the port directly: a refused connection means the
+        Desktop API is not being served at all (Terminal closed), whereas an
+        open port means it is being served but declined us (logged out, or no
+        Desktop API entitlement). Those need different fixes.
+        """
+        host, port = self.cfg.host, self.cfg.port
+        try:
+            with socket.create_connection((host, port), timeout=2.0):
+                pass
+        except OSError as exc:
+            return (
+                f"Bloomberg API is not reachable at {host}:{port} -- nothing is "
+                f"listening there ({exc}).\n"
+                "The Desktop API is served by the Bloomberg Terminal running on this "
+                "machine, so:\n"
+                "  1. Start the Bloomberg Terminal and log in -- the API is not served "
+                "while logged out.\n"
+                "  2. Check that bbcomm.exe is running; that is the process listening "
+                f"on {port}.\n"
+                "  3. Re-run once the Terminal is up.\n"
+                "For a Terminal on another host or a B-PIPE, pass "
+                "Bbg(BbgConfig(host=..., port=...))."
+            )
+        return (
+            f"Bloomberg refused the API session on {host}:{port}. The port is open, so "
+            "something is serving it -- the Terminal is most likely running but not "
+            "logged in, or this machine has no active Desktop API entitlement. Log in "
+            "to the Terminal and retry."
+        )
 
     @property
     def session(self) -> blpapi.Session:

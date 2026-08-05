@@ -61,7 +61,10 @@ def test_dashboard_has_live_overview_and_selectable_deep_dive(monkeypatch, tmp_p
     ).write_parquet(tmp_path / "live_signals.parquet")
 
     app_module = _load_app_module(monkeypatch, tmp_path)
-    ids = set(_component_ids(app_module.app.layout))
+    # the layout is a callable so each page load re-renders against the
+    # current data cache; Dash invokes it per request, so the test does too
+    layout = app_module.app.layout
+    ids = set(_component_ids(layout() if callable(layout) else layout))
 
     assert {
         "dashboard-tabs",

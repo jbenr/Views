@@ -89,6 +89,7 @@ def ensure_tables(conn) -> None:
                 yld_ytm_mid double precision,
                 source      text NOT NULL DEFAULT 'BGN',
                 created_at  timestamptz NOT NULL DEFAULT now(),
+                updated_at  timestamptz NOT NULL DEFAULT now(),
                 PRIMARY KEY (cusip, ts)
             );
         """)

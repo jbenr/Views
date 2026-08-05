@@ -181,6 +181,26 @@ def pull_strips(bbg: Bbg, conn) -> pd.DataFrame:
 # Write
 # ─────────────────────────────────────────────────────────────────────────────
 
+_UPDATED_AT_TABLES = ("md.fut_eod", "md.index_eod", "md.ust_eod", "md.strips_eod")
+
+
+def ensure_updated_at(conn) -> None:
+    """Make sure every target table has the updated_at column before writing.
+
+    These pulls upsert existing rows all day, so created_at (correctly) stays
+    at the first insert and nothing records the last write -- updated_at is
+    that missing half. Run here, not only in the standalone migration, so a
+    pull can never hit a table that predates the column. ADD COLUMN IF NOT
+    EXISTS is a catalog no-op once it is there, matching how this codebase
+    already re-runs CREATE TABLE IF NOT EXISTS on every pull.
+    """
+    with conn.cursor() as cur:
+        for table in _UPDATED_AT_TABLES:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS updated_at timestamptz")
+            cur.execute(f"ALTER TABLE {table} ALTER COLUMN updated_at SET DEFAULT now()")
+    conn.commit()
+
+
 def write_fut(conn, df: pd.DataFrame) -> int:
     rows = [
         (row.ts, row.generic_ticker, row.contract, _n(row.px_last), _n(row.volume), row.source, row.is_live)
@@ -195,7 +215,8 @@ def write_fut(conn, df: pd.DataFrame) -> int:
                 px_last        = EXCLUDED.px_last,
                 volume         = EXCLUDED.volume,
                 source         = EXCLUDED.source,
-                is_live        = EXCLUDED.is_live
+                is_live        = EXCLUDED.is_live,
+                updated_at     = now()
         """, rows)
     conn.commit()
     return len(rows)
@@ -213,7 +234,8 @@ def write_index(conn, df: pd.DataFrame) -> int:
             ON CONFLICT (ticker, ts) DO UPDATE SET
                 px_last = EXCLUDED.px_last,
                 source  = EXCLUDED.source,
-                is_live = EXCLUDED.is_live
+                is_live = EXCLUDED.is_live,
+                updated_at = now()
         """, rows)
     conn.commit()
     return len(rows)
@@ -232,7 +254,8 @@ def write_ust(conn, df: pd.DataFrame) -> int:
                 px_last     = EXCLUDED.px_last,
                 yld_ytm_mid = EXCLUDED.yld_ytm_mid,
                 source      = EXCLUDED.source,
-                is_live     = EXCLUDED.is_live
+                is_live     = EXCLUDED.is_live,
+                updated_at  = now()
         """, rows)
     conn.commit()
     return len(rows)
@@ -253,7 +276,8 @@ def write_strips(conn, df: pd.DataFrame) -> int:
                 px_last     = EXCLUDED.px_last,
                 yld_ytm_mid = EXCLUDED.yld_ytm_mid,
                 source      = EXCLUDED.source,
-                is_live     = EXCLUDED.is_live
+                is_live     = EXCLUDED.is_live,
+                updated_at  = now()
         """, rows)
     conn.commit()
     return len(rows)
@@ -281,6 +305,7 @@ def main():
             strips_df = pull_strips(bbg, conn)
 
         if args.write:
+            ensure_updated_at(conn)
             total  = write_fut(conn, fut_df)
             total += write_index(conn, index_df)
             if args.level >= 2:

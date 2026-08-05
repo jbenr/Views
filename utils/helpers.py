@@ -1,6 +1,7 @@
 """Polars / pandas input conversion helpers."""
 
 from __future__ import annotations
+import atexit
 import contextlib
 import os
 import re
@@ -42,6 +43,58 @@ def _ensure_wsl_keepalive() -> None:
         return
 
 
+_wsl_hold: subprocess.Popen | None = None
+
+
+def hold_wsl() -> bool:
+    """Pin the WSL VM up for the lifetime of this process. Returns True if held.
+
+    WSL2 recycles its VM about a minute after the last wsl.exe process
+    detaches, and `vmIdleTimeout` does not prevent it. When that happens
+    postgres is killed without a clean shutdown, so the next connection finds
+    it replaying WAL and reporting "the database system is starting up".
+
+    _ensure_wsl_keepalive() cannot prevent this: it backgrounds a sleep
+    *inside* the VM and lets wsl.exe exit, and it is the attached Windows-side
+    process that counts. Holding one open is the only thing that works, which
+    is why long-running callers (a dashboard, a data pull) need this and
+    one-shot queries do not.
+
+    Idempotent, best-effort, and released automatically at interpreter exit.
+    """
+    global _wsl_hold
+    if os.name != "nt" or os.getenv("VIEWS_SKIP_WSL_KEEPALIVE") == "1":
+        return False
+    if _wsl_hold is not None and _wsl_hold.poll() is None:
+        return True
+    distro = os.getenv("VIEWS_WSL_DISTRO", os.getenv("REF_WSL_DISTRO", "Ubuntu"))
+    try:
+        _ensure_wsl_keepalive()  # also starts postgres if the VM was down
+        _wsl_hold = subprocess.Popen(
+            ["wsl", "-d", distro, "-u", "root", "--", "sleep", "infinity"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        _wsl_hold = None
+        return False
+    atexit.register(release_wsl)
+    return True
+
+
+def release_wsl() -> None:
+    """Drop the WSL hold taken by hold_wsl(). Safe to call more than once."""
+    global _wsl_hold
+    if _wsl_hold is None:
+        return
+    proc, _wsl_hold = _wsl_hold, None
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        proc.kill()
+
+
 def _validate_conn(conn: psycopg.Connection) -> psycopg.Connection:
     """Return conn only after a trivial query succeeds."""
     try:
@@ -54,13 +107,24 @@ def _validate_conn(conn: psycopg.Connection) -> psycopg.Connection:
     return conn
 
 
-def _connect(dsn: str | None = None) -> psycopg.Connection:
-    """Open a DB connection. On Windows, wakes WSL+postgres automatically if the first attempt fails."""
+def _connect(dsn: str | None = None, wake: bool = True) -> psycopg.Connection:
+    """Open a DB connection. On Windows, wakes WSL+postgres automatically if the first attempt fails.
+
+    wake=False makes one short-timeout attempt and raises on failure: no WSL
+    wake, no retry ladder, no progress output. For callers that must not block
+    on a sleeping database because they already have something to fall back
+    on -- a UI render drawing from a local cache, say. The wake path can take
+    half a minute when postgres is replaying WAL, which is far too long to
+    hold a page render.
+    """
     dsn = dsn or DB_DSN
 
     probe = re.sub(r"connect_timeout=\d+", "connect_timeout=3", dsn)
     if "connect_timeout" not in probe:
         probe += ("&" if "?" in probe else "?") + "connect_timeout=3"
+
+    if not wake:
+        return _validate_conn(psycopg.connect(probe))
 
     if os.name != "nt":
         return _validate_conn(psycopg.connect(dsn))
@@ -171,8 +235,24 @@ def fix_outliers(
     return pl.when(mask).then(None).otherwise(expr).interpolate()
 
 
-def query_db(sql: str, params: list | tuple | None = None, dsn: str | None = None) -> pd.DataFrame:
-    """Run a SQL query and return a DataFrame. Opens and closes the connection for you."""
+def query_db(
+    sql: str,
+    params: list | tuple | None = None,
+    dsn: str | None = None,
+    wake: bool = True,
+) -> pd.DataFrame:
+    """Run a SQL query and return a DataFrame. Opens and closes the connection for you.
+
+    wake=False fails fast instead of waking a sleeping WSL/postgres -- see
+    _connect. It also skips the retry, since retrying is the thing being
+    opted out of.
+    """
+    if not wake:
+        with _connect(dsn, wake=False) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return pd.DataFrame(cur.fetchall(), columns=[d.name for d in cur.description])
+
     last_err: Exception | None = None
     for attempt in range(2):
         try:

@@ -137,6 +137,7 @@ def run(script: str, log_file, extra: list[str] | None = None) -> tuple[bool, st
                 suppress = True
                 if stripped and not stripped.startswith("File ") and not line.startswith(" "):
                     in_traceback = False  # exception type line — traceback done
+                    suppress = False      # ...and it is the one line worth showing
             elif stripped.startswith("Connecting to Postgres:"):
                 suppress = True
 

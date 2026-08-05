@@ -69,6 +69,7 @@ def ensure_ust_eod_table(conn) -> None:
                 ask_yield   double precision,
                 source      text    NOT NULL DEFAULT 'BGN',
                 created_at  timestamptz NOT NULL DEFAULT now(),
+                updated_at  timestamptz NOT NULL DEFAULT now(),
                 PRIMARY KEY (cusip, ts)
             );
             """

@@ -74,6 +74,7 @@ def ensure_table(conn) -> None:
                 volume    double precision,
                 source    text NOT NULL DEFAULT 'BGN',
                 created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now(),
                 PRIMARY KEY (ticker, ts)
             );
         """)

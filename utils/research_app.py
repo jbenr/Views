@@ -158,7 +158,12 @@ def make_app(
     sliders   : list of slider() Divs, or a list of such lists to lay out
                 as separate rows (e.g. group entry params on one row and
                 exit params on another)
-    body      : html.Div containing charts, stats, etc.
+    body      : html.Div containing charts, stats, etc., OR a zero-argument
+                callable returning one. Dash re-invokes a callable layout on
+                every page load and serves a Div layout as-is, so pass a
+                callable whenever the body renders live state -- otherwise it
+                freezes at whatever it read when the app was constructed and
+                every later browser refresh re-serves that same snapshot.
     debug     : True shows callback errors in browser (recommended during dev)
     """
     _assets = Path(__file__).parent / "assets"
@@ -185,34 +190,39 @@ def make_app(
         for row in slider_rows
     ]
 
-    app.layout = html.Div(
-        style={"background": BG, "minHeight": "100vh", "paddingBottom": 64,
-               "fontFamily": "Arial, Helvetica, sans-serif", "color": TEXT},
-        children=[
-            # header bar
-            html.Div(style={
-                "background": PANEL, "borderBottom": f"2px solid {BORDER}",
-                "padding": "10px 24px", "display": "flex",
-                "alignItems": "center", "gap": 14,
-            }, children=[
-                html.Span(title, style={"fontSize": 18, "fontWeight": "bold",
-                                         "color": ORANGE, "letterSpacing": 3}),
-                *([html.Span(subtitle, style={"fontSize": 12, "color": DIM})]
-                  if subtitle else []),
-                *([html.Span(data_info,
-                             style={"marginLeft": "auto", "fontSize": 11,
-                                    "color": DIM, "fontStyle": "italic"})]
-                  if data_info else []),
-            ]),
-            # slider rows
-            html.Div(
-                style={"borderBottom": f"1px solid {BORDER}", "paddingTop": 4},
-                children=slider_row_divs,
-            ),
-            # body
-            body,
-        ],
-    )
+    def _layout():
+        return html.Div(
+            style={"background": BG, "minHeight": "100vh", "paddingBottom": 64,
+                   "fontFamily": "Arial, Helvetica, sans-serif", "color": TEXT},
+            children=[
+                # header bar
+                html.Div(style={
+                    "background": PANEL, "borderBottom": f"2px solid {BORDER}",
+                    "padding": "10px 24px", "display": "flex",
+                    "alignItems": "center", "gap": 14,
+                }, children=[
+                    html.Span(title, style={"fontSize": 18, "fontWeight": "bold",
+                                             "color": ORANGE, "letterSpacing": 3}),
+                    *([html.Span(subtitle, style={"fontSize": 12, "color": DIM})]
+                      if subtitle else []),
+                    *([html.Span(data_info,
+                                 style={"marginLeft": "auto", "fontSize": 11,
+                                        "color": DIM, "fontStyle": "italic"})]
+                      if data_info else []),
+                ]),
+                # slider rows
+                html.Div(
+                    style={"borderBottom": f"1px solid {BORDER}", "paddingTop": 4},
+                    children=slider_row_divs,
+                ),
+                # body
+                body() if callable(body) else body,
+            ],
+        )
+
+    # a callable body means the caller wants a fresh render per page load, so
+    # hand Dash the function; a plain Div is served as the fixed tree it is.
+    app.layout = _layout if callable(body) else _layout()
 
     # stash debug flag so run() callers can pick it up
     app._ra_debug = debug

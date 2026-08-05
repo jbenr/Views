@@ -95,6 +95,32 @@ Viz's own live-server registry, since refresh here is button-driven, not a
 background loop) -- same colors, endpoint flags, and residual fill as every
 other chart in the codebase.
 
+## Reading "Data As-Of"
+
+```
+2026-08-04 · db 9:12:06am EDT
+└─ bar        └─ when the DB was last written for these tickers
+```
+
+The two halves fail in different ways and have different fixes:
+
+| Symptom | Meaning | Fix |
+|---|---|---|
+| cell is **orange** | this cache is behind the DB | click **Ref** |
+| **db time is old** | the DB itself is behind the market | run `python data_pull.ref --live2` |
+
+**Ref re-reads Postgres; it never touches Bloomberg.** So the page can never
+be fresher than the last `--live2`, and clicking Ref against a cold database
+correctly changes nothing — that is the case the db write time exists to make
+visible, because otherwise a stale pipeline and a broken app look identical.
+
+There is no scheduled pull, so the database only advances when you run one.
+
+One caveat on rows written before the `updated_at` column existed: they have
+it NULL, so the readout falls back to `created_at` — the row's *first* insert
+— and understates how recently the row was actually written. Once a pull has
+run and stamped `updated_at`, the time is exact.
+
 ## Scope / limitations
 
 `fired` is a **snapshot** check -- does the latest reading cross

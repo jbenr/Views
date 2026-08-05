@@ -33,6 +33,7 @@ import pandas as pd
 import polars as pl
 from dash import Input, Output, State, ctx, dash_table, dcc, html
 
+import utils.helpers
 from dashboard import runner
 from dashboard.charts import (
     DEFAULT_WINDOW,
@@ -303,16 +304,30 @@ def _db_asof(signal_id: str, data_asof) -> tuple[str, str, bool]:
     """The bar this card is drawn on, and when that data landed in the DB.
 
     Returns (bar, written, stale) as separate parts so a one-line table cell
-    and a stacked stat block can each lay them out their own way. Stale means
-    md.index_eod carries a newer bar than the cached copy this card is drawn
-    from -- the case where Ref is overdue.
+    and a stacked stat block can each lay them out their own way.
+
+    The two halves answer different questions, and conflating them is what
+    makes a cold pipeline look like a broken app:
+
+      bar / stale  is this CACHE behind the DB?   -> fix by clicking Ref
+      written      is the DB itself behind now?   -> fix by running --live2
+
+    Ref re-reads Postgres and never touches Bloomberg, so it can only ever
+    make the page as current as the last pull. The write age is therefore the
+    number that says whether clicking Ref can help at all. Stale (the orange
+    flag) stays reserved for the case where it can: a newer bar, or the same
+    bar rewritten since this cache was pulled -- the intraday case, since the
+    live upserts move today's row without the date ever changing.
     """
     fresh = runner.db_freshness(signal_id)
     if fresh is None:
         return str(data_asof), "db unreachable", False
     db_bar = pd.Timestamp(fresh["last_ts"]).date()
     stale = db_bar > pd.Timestamp(data_asof).date()
-    written = _clock(fresh["last_written"], same_day_as=data_asof)
+    pulled_at = runner.cache_written_at(signal_id)
+    if not stale and pulled_at is not None:
+        stale = pd.Timestamp(fresh["last_written"]) > pd.Timestamp(pulled_at)
+    written = f"db {_clock(fresh['last_written'], same_day_as=data_asof)}"
     return str(data_asof), written, stale
 
 
@@ -836,119 +851,127 @@ def build_app() -> dash.Dash:
         "borderTop": f"3px solid {ORANGE}",
     }
 
-    overview_tab = html.Div(
-        style={"padding": "18px 24px"},
-        children=[
-            html.Div(
-                style={
-                    "display": "flex",
-                    "alignItems": "center",
-                    "gap": 12,
-                    "marginBottom": 14,
-                },
-                children=[
-                    html.Div(
-                        "LIVE TRADING OVERVIEW",
-                        style={"fontSize": 14, "fontWeight": "bold"},
-                    ),
-                    html.Button(
-                        "Ref",
-                        id="refresh-overview",
-                        n_clicks=0,
-                        className="ref-btn",
-                        style=_btn_style(primary=True),
-                    ),
-                ],
-            ),
-            dcc.Loading(
-                html.Div(id="overview-content", children=_overview_content(rows)),
-                type="dot",
-                color=ORANGE,
-            ),
-        ],
-    )
-
-    deep_dive_tab = html.Div(
-        style={"padding": "18px 24px"},
-        children=(
-            [
+    def _overview_tab():
+        return html.Div(
+            style={"padding": "18px 24px"},
+            children=[
                 html.Div(
                     style={
                         "display": "flex",
                         "alignItems": "center",
-                        "gap": 14,
+                        "gap": 12,
                         "marginBottom": 14,
                     },
                     children=[
                         html.Div(
-                            "SIGNAL DEEP DIVE",
+                            "LIVE TRADING OVERVIEW",
                             style={"fontSize": 14, "fontWeight": "bold"},
                         ),
-                        dcc.Dropdown(
-                            id="deep-dive-signal",
-                            options=[
-                                {
-                                    "label": _display_name(row),
-                                    "value": _row_id(row),
-                                }
-                                for row in rows
-                            ],
-                            value=selected_signal,
-                            clearable=False,
-                            style={"width": 360, "marginLeft": "auto", "fontSize": 12},
+                        html.Button(
+                            "Ref",
+                            id="refresh-overview",
+                            n_clicks=0,
+                            className="ref-btn",
+                            style=_btn_style(primary=True),
                         ),
                     ],
                 ),
-                *[
+                dcc.Loading(
+                    html.Div(id="overview-content", children=_overview_content(rows)),
+                    type="dot",
+                    color=ORANGE,
+                ),
+            ],
+        )
+
+    def _deep_dive_tab():
+        return html.Div(
+            style={"padding": "18px 24px"},
+            children=(
+                [
                     html.Div(
-                        id=f"deep-card-{_slug(_row_id(row))}",
                         style={
-                            "display": "block"
-                            if _row_id(row) == selected_signal
-                            else "none"
+                            "display": "flex",
+                            "alignItems": "center",
+                            "gap": 14,
+                            "marginBottom": 14,
                         },
-                        children=_card(row),
+                        children=[
+                            html.Div(
+                                "SIGNAL DEEP DIVE",
+                                style={"fontSize": 14, "fontWeight": "bold"},
+                            ),
+                            dcc.Dropdown(
+                                id="deep-dive-signal",
+                                options=[
+                                    {
+                                        "label": _display_name(row),
+                                        "value": _row_id(row),
+                                    }
+                                    for row in rows
+                                ],
+                                value=selected_signal,
+                                clearable=False,
+                                style={"width": 360, "marginLeft": "auto", "fontSize": 12},
+                            ),
+                        ],
+                    ),
+                    *[
+                        html.Div(
+                            id=f"deep-card-{_slug(_row_id(row))}",
+                            style={
+                                "display": "block"
+                                if _row_id(row) == selected_signal
+                                else "none"
+                            },
+                            children=_card(row),
+                        )
+                        for row in rows
+                    ],
+                ]
+                if rows
+                else [
+                    html.Div(
+                        "No signals promoted yet -- "
+                        "python -m dashboard.registry --promote <module>",
+                        style={"color": DIM, "padding": "24px 0"},
                     )
-                    for row in rows
-                ],
-            ]
-            if rows
-            else [
-                html.Div(
-                    "No signals promoted yet -- "
-                    "python -m dashboard.registry --promote <module>",
-                    style={"color": DIM, "padding": "24px 0"},
+                ]
+            ),
+        )
+
+    def _body():
+        """Rebuilt on every page load, so both tabs render the currently
+        cached data rather than whatever was on disk when the process
+        started. Component ids are identical every call -- `rows` is fixed at
+        build time, which is what keeps the callbacks registered below valid.
+        Promoting a new signal still needs a restart."""
+        return html.Div(
+            children=[
+                dcc.Tabs(
+                    id="dashboard-tabs",
+                    value="live-overview",
+                    children=[
+                        dcc.Tab(
+                            label="Signal",
+                            value="live-overview",
+                            style=tab_style,
+                            selected_style=selected_tab_style,
+                            children=_overview_tab(),
+                        ),
+                        dcc.Tab(
+                            label="Dig",
+                            value="signal-deep-dive",
+                            style=tab_style,
+                            selected_style=selected_tab_style,
+                            children=_deep_dive_tab(),
+                        ),
+                    ],
                 )
             ]
-        ),
-    )
+        )
 
-    body = html.Div(
-        children=[
-            dcc.Tabs(
-                id="dashboard-tabs",
-                value="live-overview",
-                children=[
-                    dcc.Tab(
-                        label="Signal",
-                        value="live-overview",
-                        style=tab_style,
-                        selected_style=selected_tab_style,
-                        children=overview_tab,
-                    ),
-                    dcc.Tab(
-                        label="Dig",
-                        value="signal-deep-dive",
-                        style=tab_style,
-                        selected_style=selected_tab_style,
-                        children=deep_dive_tab,
-                    ),
-                ],
-            )
-        ]
-    )
-
-    app = make_app(title="LIVE", sliders=[], body=body)
+    app = make_app(title="LIVE", sliders=[], body=_body)
 
     window_keys = list(WINDOW_PRESETS)
 
@@ -1068,5 +1091,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8052)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Flask reloader + in-browser tracebacks. Off by default: the "
+             "reloader runs this module in two processes, so every DB probe "
+             "and every render happens twice.",
+    )
     args = parser.parse_args()
+    # This server outlives the WSL VM's idle timeout, and postgres dies with
+    # the VM. Hold it up for as long as the dashboard runs; released at exit.
+    utils.helpers.hold_wsl()
+    app._ra_debug = args.debug
     run(app, port=args.port, host=args.host)
