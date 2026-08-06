@@ -971,7 +971,7 @@ def build_app() -> dash.Dash:
             ]
         )
 
-    app = make_app(title="LIVE", sliders=[], body=_body)
+    app = make_app(title="Model", sliders=[], body=_body)
 
     window_keys = list(WINDOW_PRESETS)
 
