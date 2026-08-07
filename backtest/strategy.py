@@ -51,6 +51,14 @@ hand-copying between runs:
 Every grid below is a constructor field; override per strategy as needed.
 Derived features (PC1 scores, synthetic forwards, ...) plug in via
 feature_fn, which runs on the loaded panel before the model frame is cut.
+
+Exogenous inputs (market vol, auction demand, issuance) plug in via
+gate_columns: panel columns offered to the gate search alongside the
+regression's own conditions. They do not enter the model -- it stays one
+(feature -> target) pair -- and they are carried at whatever history they
+have, so an input starting years after the model gates itself shut early
+rather than trimming the sample. Add the ticker (or a feature_fn column),
+name it in gate_columns, and --predict searches it like any other gate.
 """
 
 from __future__ import annotations
@@ -82,6 +90,7 @@ from .engine import (
     trade_log,
 )
 from .lab import (
+    CONDITION_NAMES,
     ParamGrid,
     fast_scan,
     gate_allow_mask,
@@ -236,6 +245,13 @@ class Strategy:
     synthetic_fn: Optional[Callable[[], pl.DataFrame]] = None
     feature_fn: Optional[Callable[[pl.DataFrame], pl.DataFrame]] = None
 
+    # exogenous gate candidates: panel columns (from tickers or feature_fn)
+    # offered to the gate search alongside the regression's own conditions.
+    # They do not enter the regression -- the model stays (feature -> target)
+    # -- and they are carried at whatever history they have rather than
+    # trimming the model sample to their start date.
+    gate_columns: list[str] = field(default_factory=list)
+
     # step 1 --predict: the setup search space. Wide on purpose.
     predict_entry_signals: list = field(
         default_factory=lambda: ["residual", "ou"]
@@ -293,6 +309,20 @@ class Strategy:
     validation_slices: int = 8  # CSCV partitions for finalist PBO
 
     def __post_init__(self):
+        # A gate column that collides with a built-in condition name would
+        # silently win or lose depending on lookup order; refuse at build time.
+        shadowed = sorted(set(self.gate_columns) & set(CONDITION_NAMES))
+        if shadowed:
+            raise ValueError(
+                f"{self.name}: gate_columns {shadowed} shadow built-in gate "
+                f"conditions; rename the panel column"
+            )
+        if self.target in self.gate_columns or self.feature in self.gate_columns:
+            raise ValueError(
+                f"{self.name}: gate_columns may not contain the model's own "
+                f"target/feature ({self.target!r}, {self.feature!r})"
+            )
+
         # Keep generated funnel artifacts grouped by strategy instead of
         # allowing them to accumulate beside the strategy modules.
         self.data_dir = self.path.parent / "data" / self.name
@@ -329,8 +359,22 @@ class Strategy:
         return data.with_columns(pl.col(self.model_columns).round(2))
 
     def model_frame(self, data: pl.DataFrame) -> pl.DataFrame:
-        """Common-sample frame used by this model: ts, target, feature."""
-        return align_columns(data, self.model_columns)
+        """Common-sample frame used by this model: ts, target, feature, plus
+        any gate_columns carried along at their own history."""
+        return align_columns(
+            data, self.model_columns, optional=self.gate_columns
+        )
+
+    def _exogenous_conditions(self, data: pl.DataFrame) -> dict[str, pl.Series]:
+        """Gate candidates drawn from the panel rather than the regression.
+
+        Tolerates a frame that predates a gate_columns change -- a cached
+        parquet or a synthetic_fn that never had the column -- so adding a
+        candidate cannot break a signal that does not use it yet. A gate that
+        actually names a missing column still fails loudly in
+        _gate_condition().
+        """
+        return {c: data[c] for c in self.gate_columns if c in data.columns}
 
     def _data(self, use_db: bool) -> pl.DataFrame:
         if use_db:
@@ -356,9 +400,12 @@ class Strategy:
             p["exit_style"], p["exit_param"] = "revert_frac", raw["exit_reversion_frac"]
         return p
 
-    def _gate_condition(self, frame: pl.DataFrame, p: dict) -> pl.Series:
+    def _gate_condition(
+        self, frame: pl.DataFrame, p: dict, data: pl.DataFrame | None = None
+    ) -> pl.Series:
         """Condition series for the gate param — the same menu as the
-        fast/predict scan conditions, built from this signal frame."""
+        fast/predict scan conditions, built from this signal frame, plus any
+        exogenous gate_columns read straight off the model frame."""
         name, _, _ = parse_gate(p["gate"])
         builders = {
             "r2": lambda: frame["r2"],
@@ -373,11 +420,19 @@ class Strategy:
             "resid_vol20": lambda: frame["resid"].diff().rolling_std(20),
             "resid_mom10": lambda: frame["resid"].diff(10),
         }
-        if name not in builders:
-            raise ValueError(
-                f"unknown gate condition {name!r}; known: {sorted(builders)}"
-            )
-        return builders[name]()
+        if name in builders:
+            return builders[name]()
+        if name in self.gate_columns:
+            if data is None or name not in data.columns:
+                raise ValueError(
+                    f"gate condition {name!r} is an exogenous gate column but "
+                    f"is not present in the data frame; re-pull the panel"
+                )
+            return data[name]
+        raise ValueError(
+            f"unknown gate condition {name!r}; "
+            f"known: {sorted(set(builders) | set(self.gate_columns))}"
+        )
 
     def compute(self, data: pl.DataFrame, params: dict | None = None) -> pl.DataFrame:
         """Signal frame: beta-weighted target-vs-feature residual and its OU
@@ -429,7 +484,7 @@ class Strategy:
                 (ou["half_life"] * p["exit_param"]).alias("time_stop")
             )
         if p.get("gate") is not None:
-            condition = self._gate_condition(frame, p)
+            condition = self._gate_condition(frame, p, data)
             gate_window = p.get("gate_window")
             percentile = gate_percentile_rank(
                 condition, min_history=self.gate_min_history, window=gate_window
@@ -608,6 +663,7 @@ class Strategy:
                     return_conditions=True,
                     signal_kind=signal_kind,
                     lookback_name="ou_lb",
+                    extra_conditions=self._exogenous_conditions(data),
                 )
                 column = 0
             else:
@@ -766,6 +822,7 @@ class Strategy:
                 return_conditions=True,
                 signal_kind="residual",
                 lookback_name="ou_lb",
+                extra_conditions=self._exogenous_conditions(data),
             )
             scans.append(
                 {
@@ -787,6 +844,7 @@ class Strategy:
                 return_conditions=True,
                 signal_kind="ou_zscore",
                 lookback_name="ou_lb",
+                extra_conditions=self._exogenous_conditions(data),
             )
             scans.append(
                 {
@@ -928,6 +986,7 @@ class Strategy:
                 return_conditions=True,
                 signal_kind=signal_kind,
                 lookback_name="ou_lb",
+                extra_conditions=self._exogenous_conditions(data),
             )
 
             gate_spec = setup.get("gate")

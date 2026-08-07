@@ -5,7 +5,7 @@ import numpy as np
 import polars as pl
 import pandas as pd
 from typing import Union
-from utils.helpers import to_pl_series
+from utils.helpers import to_pl_df, to_pl_series
 
 
 def roll_lr(
@@ -121,6 +121,172 @@ def roll_lr_diff(
         reg["r2"],
     )
     return out
+
+
+def _roll_sum(a: np.ndarray, lookback: int, min_periods: int) -> np.ndarray:
+    """Trailing-window sum of each column of `a`, aligned to the window's last
+    row, NaN where the window holds fewer than `min_periods` finite values.
+
+    Uses a cumulative-sum difference rather than a per-bar reduction, so the
+    cost is one pass regardless of lookback. Non-finite entries are skipped
+    rather than propagated: a plain cumsum turns a single NaN into NaN for
+    every later row, which silently voids a whole series when the input is a
+    warmup-padded column like the residual. Counting finite entries separately
+    reproduces polars' rolling_sum(min_samples=...) semantics, so this matches
+    roll_lr column for column.
+    """
+    n_rows, n_cols = a.shape
+    finite = np.isfinite(a)
+    cum_sum = np.cumsum(np.where(finite, a, 0.0), axis=0)
+    cum_count = np.cumsum(finite, axis=0)
+
+    zero = np.zeros((1, n_cols))
+    padded_sum = np.concatenate([zero, cum_sum], axis=0)
+    padded_count = np.concatenate([zero, cum_count], axis=0)
+
+    end = np.arange(n_rows) + 1
+    start = np.maximum(end - lookback, 0)
+    window_sum = padded_sum[end] - padded_sum[start]
+    window_count = padded_count[end] - padded_count[start]
+    return np.where(window_count >= min_periods, window_sum, np.nan)
+
+
+def roll_mlr(
+    X: Union[pl.DataFrame, pd.DataFrame],
+    y: Union[pl.Series, pd.Series],
+    lookback: int = 100,
+    min_periods: int = None,
+    max_cond: float = 1e10,
+) -> pl.DataFrame:
+    """y = alpha + B.X for K regressors, rolled over trailing `lookback` rows.
+
+    The multivariate counterpart to roll_lr. Rolling cross-product sums build
+    one (K+1, K+1) normal-equation system per bar, solved as a single batched
+    linear solve -- no Python loop over bars.
+
+    Returns a polars DataFrame with columns:
+        y, alpha, beta_<name> (one per regressor), yhat, resid, r2, cond
+
+    `cond` is the 2-norm condition number of that bar's normal-equation
+    matrix, and it is not decoration. Rates regressors are near-collinear
+    (10y vs 30y runs above 0.95), which makes X'X ill-conditioned and sends
+    individual betas swinging to large offsetting values even while the fit
+    looks fine. Bars where cond exceeds `max_cond` are returned as null rather
+    than as a confidently-wrong number; a persistently high cond means the
+    regressors are not separately identified over that window, and the honest
+    fixes are to drop a regressor or orthogonalize (see stats.pca.fit_pca),
+    not to raise the ceiling.
+    """
+    X = to_pl_df(X)
+    y = to_pl_series(y)
+    names = list(X.columns)
+    if not names:
+        raise ValueError("roll_mlr needs at least one regressor column")
+
+    if min_periods is None:
+        min_periods = lookback
+    if min_periods <= len(names):
+        raise ValueError(
+            f"min_periods={min_periods} cannot fit {len(names)} regressors plus "
+            "an intercept; the system is underdetermined"
+        )
+
+    df = X.with_columns(y.alias("__y")).drop_nulls()
+    y_arr = df["__y"].to_numpy().astype(float)
+    x_arr = df.select(names).to_numpy().astype(float)
+    n_rows, k = x_arr.shape
+    n_params = k + 1
+
+    # design matrix with intercept; the ones column makes the (0,0) moment the
+    # observation count and the first row/column the plain sums, so the
+    # intercept falls out of the same system as the slopes
+    design = np.column_stack([np.ones(n_rows), x_arr])
+    gram = _roll_sum(
+        (design[:, :, None] * design[:, None, :]).reshape(n_rows, -1),
+        lookback, min_periods,
+    ).reshape(n_rows, n_params, n_params)
+    moment = _roll_sum(design * y_arr[:, None], lookback, min_periods)
+
+    coef = np.full((n_rows, n_params), np.nan)
+    cond = np.full(n_rows, np.nan)
+    ready = np.isfinite(gram).all(axis=(1, 2)) & np.isfinite(moment).all(axis=1)
+    if ready.any():
+        cond[ready] = np.linalg.cond(gram[ready])
+        solvable = ready & np.isfinite(cond) & (cond <= max_cond)
+        if solvable.any():
+            # (S, P, 1) rather than (S, P): a 2-D b reads as one matrix, not a
+            # stack of right-hand sides
+            rhs = moment[solvable][:, :, None]
+            try:
+                coef[solvable] = np.linalg.solve(gram[solvable], rhs).squeeze(-1)
+            except np.linalg.LinAlgError:
+                # only reachable once max_cond is raised past the point where
+                # the system is numerically rank-deficient; the least-norm
+                # solution is the defensible answer there, not a crash
+                coef[solvable] = (
+                    np.linalg.pinv(gram[solvable]) @ rhs
+                ).squeeze(-1)
+
+    yhat = (design * coef).sum(axis=1)
+    resid = y_arr - yhat
+
+    # r2 mirrors roll_lr: each bar's residual uses that bar's coefficients,
+    # summed over the window against the window's total variation in y
+    sums = _roll_sum(
+        np.column_stack([resid ** 2, y_arr, y_arr ** 2, np.ones(n_rows)]),
+        lookback, min_periods,
+    )
+    ss_res, sum_y, sum_yy, n_obs = sums[:, 0], sums[:, 1], sums[:, 2], sums[:, 3]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ss_tot = sum_yy - sum_y ** 2 / n_obs
+        r2 = np.where(ss_tot > 0, 1.0 - ss_res / ss_tot, np.nan)
+
+    out = pl.DataFrame({
+        "y": y_arr,
+        "alpha": coef[:, 0],
+        **{f"beta_{name}": coef[:, i + 1] for i, name in enumerate(names)},
+        "yhat": yhat,
+        "resid": resid,
+        "r2": r2,
+        "cond": cond,
+    })
+    # warmup and unidentified bars arrive as NaN from numpy; the rest of the
+    # codebase tests missingness with null (drop_nulls, is_not_null), and
+    # roll_lr already emits nulls, so normalize before handing the frame back
+    return out.with_columns(pl.exclude("y").fill_nan(None))
+
+
+def roll_mlr_diff(
+    X: Union[pl.DataFrame, pd.DataFrame],
+    y: Union[pl.Series, pd.Series],
+    lookback: int = 100,
+    min_periods: int = None,
+    max_cond: float = 1e10,
+) -> pl.DataFrame:
+    """Changes-based rolling multiple regression: dy = alpha + B.dX.
+
+    The multivariate counterpart to roll_lr_diff, and the one to use for
+    hedge ratios: betas fitted on daily changes are the weights that actually
+    neutralize the regressors, whereas levels betas absorb any shared trend.
+
+    Returns the roll_mlr columns plus `resid_cum`, the residual accumulated
+    back into level space for z-scoring. Output is one row shorter than the
+    input, the first differencing row having no predecessor.
+    """
+    X = to_pl_df(X)
+    y = to_pl_series(y)
+    names = list(X.columns)
+
+    levels = X.with_columns(y.alias("__y")).drop_nulls()
+    changes = levels.select(
+        [pl.col(c).diff().alias(c) for c in names] + [pl.col("__y").diff().alias("__y")]
+    ).slice(1)
+
+    out = roll_mlr(
+        changes.select(names), changes["__y"],
+        lookback=lookback, min_periods=min_periods, max_cond=max_cond,
+    )
+    return out.with_columns(out["resid"].cum_sum().alias("resid_cum"))
 
 
 def roll_beta(x, y, lookback=100):

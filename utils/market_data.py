@@ -35,10 +35,18 @@ def align_columns(
     data: pl.DataFrame,
     columns: Iterable[str],
     date_col: str = "ts",
+    optional: Iterable[str] = (),
 ) -> pl.DataFrame:
-    """Return date + required columns on the common non-null sample."""
+    """Return date + required columns on the common non-null sample.
+
+    ``optional`` columns are carried through but kept out of the non-null
+    subset: an exogenous series that starts years after the model columns
+    must not truncate the sample it is only decorating. They still have to
+    exist — a misspelled name is an error, not a silent drop.
+    """
     col_list = list(columns)
-    cols = _require_columns(data, [date_col, *col_list])
+    opt_list = [c for c in optional if c not in col_list]
+    cols = _require_columns(data, [date_col, *col_list, *opt_list])
     return data.select(cols).drop_nulls(subset=col_list)
 
 

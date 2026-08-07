@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from importlib.util import module_from_spec, spec_from_file_location
 from itertools import product
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Callable, Mapping, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -1267,6 +1267,7 @@ def signal_matrix(
     return_conditions: bool = False,
     signal_kind: str = "ou_zscore",
     lookback_name: str = "z_lb",
+    extra_conditions: Optional[Mapping[str, Union[pl.Series, np.ndarray]]] = None,
 ):
     """Build the (T, K) OU z-score matrix for the standard model family:
     changes-based rolling OLS of y on x, residual rolled into level space,
@@ -1279,6 +1280,14 @@ def signal_matrix(
     volatility/momentum. Volatility is rolling 20-bar standard deviation of
     daily changes; momentum is 10-bar change. Feed z + conditions to
     fast_scan()/predict_scan() to evaluate gated grids.
+
+    ``extra_conditions`` adds exogenous gate candidates: series that come from
+    the data panel rather than from this regression (market vol, auction
+    demand, issuance). Being exogenous they do not vary with beta_lb, so each
+    is broadcast across all K columns rather than recomputed per combo. They
+    may carry leading nulls -- a non-finite bar never opens a gate, so a
+    series with shorter history than the model keeps its gates shut until it
+    starts instead of truncating the sample.
 
     Returns (z, combos) or (z, combos, conditions).
     """
@@ -1294,6 +1303,24 @@ def signal_matrix(
     cols, combos = [], []
     cond_cols: dict[str, list[np.ndarray]] = {name: [] for name in CONDITION_NAMES}
     null1 = pl.Series([None], dtype=pl.Float64)
+
+    exogenous: dict[str, np.ndarray] = {}
+    for name, values in (extra_conditions or {}).items():
+        if name in CONDITION_NAMES:
+            raise ValueError(
+                f"extra condition {name!r} shadows a built-in condition; "
+                f"built-ins: {sorted(CONDITION_NAMES)}"
+            )
+        arr = np.asarray(
+            values.to_numpy() if isinstance(values, pl.Series) else values,
+            dtype=float,
+        )
+        if arr.ndim != 1 or len(arr) != t_len:
+            raise ValueError(
+                f"extra condition {name!r} has shape {arr.shape}; "
+                f"expected a 1-D series of length {t_len}"
+            )
+        exogenous[name] = arr
 
     for beta_lb in beta_lbs:
         reg = roll_lr_diff(x, y, lookback=beta_lb)
@@ -1335,6 +1362,10 @@ def signal_matrix(
     if not return_conditions:
         return z_mat, combos
     conditions = {name: np.column_stack(v) for name, v in cond_cols.items()}
+    # Exogenous conditions are identical down every column, so broadcast a
+    # read-only view rather than materializing another (T, K) copy each.
+    for name, arr in exogenous.items():
+        conditions[name] = np.broadcast_to(arr[:, None], z_mat.shape)
     return z_mat, combos, conditions
 
 
