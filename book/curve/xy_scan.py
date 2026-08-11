@@ -2,8 +2,9 @@
 
 Question: which (x feature, y curve) pairs show ANY corroborated forward
 predictability? Predict-only: for every pair, the same residual / OU-z
-signal grid and gate overlay as tens_10s30s --predict, scored on raw IC and
-selected by neighborhood IC. No trading mechanics.
+signal grid and gate overlay as tens_10s30s --predict, scored on raw IC,
+selected by neighborhood IC, and screened for independent forecast windows
+the same way Strategy.predict screens them. No trading mechanics.
 
 X candidates include the 2Y and 10Y levels, real 10Y, breakevens, both 5y5y
 flavors (nominal 2*10y-5y and inflation 2*be10-be5), and point-in-time PC1
@@ -30,7 +31,14 @@ import numpy as np
 import polars as pl
 
 import utils
-from backtest import gate_variant_count, neighbor_ic_stats, predict_scan, signal_matrix
+from backtest import (
+    event_overlap_diagnostics,
+    gate_allow_mask,
+    gate_variant_count,
+    neighbor_ic_stats,
+    predict_scan,
+    signal_matrix,
+)
 from stats import roll_pc1_score
 from utils.market_data import align_columns, load_wide
 from utils.rates import linear_5y5y_forward
@@ -82,6 +90,19 @@ XY_MIN_OBS = 30  # ignore cells with fewer threshold-crossing events
 XY_MIN_ROWS = 750  # skip pairs with less aligned history (~3y)
 XY_TOP_N_PER_PAIR = 3  # setups kept per (x, y) pair
 XY_MIN_NEIGHBORS = 3  # corroborating grid neighbors a setup needs
+# Non-overlapping forecast windows a setup needs, matching Strategy's
+# predict_min_independent_events. n_obs counts threshold crossings, which at
+# h100 can be 30+ events sharing almost the same 100-day forward window -- an
+# IC computed over those is mostly the autocorrelation of overlapping labels,
+# and it ranks the longest horizon top of the board every time. Screening on
+# independent episodes is what makes this explorer agree with the per-strategy
+# funnel that setups graduate into; without it the scan promotes cells that
+# --predict then rejects.
+XY_MIN_INDEPENDENT_EVENTS = 8
+# candidates shortlisted per pair BEFORE the independence screen, so the
+# XY_TOP_N_PER_PAIR survivors come from a real pool rather than whatever three
+# cells happened to top the raw board (mirrors Strategy's predict_top_n * 10)
+XY_CANDIDATE_LIMIT = 30
 XY_KEEP_PER_PAIR = 200  # top valid rows kept per pair for the cross-pair board
 # (each pair produces ~7M result rows; they are reduced per pair - filtered,
 # selected, top slice kept - so 48 pairs never accumulate ~40GB in RAM)
@@ -163,11 +184,17 @@ def add_features(data: pl.DataFrame) -> pl.DataFrame:
 
 def _pair_scan(
     frame: pl.DataFrame, x: str, y: str, device: str
-) -> list[pl.DataFrame]:
+) -> tuple[list[pl.DataFrame], list[dict]]:
     """tens_10s30s-style predict scan (residual + ou_z, gates overlaid) for
-    one aligned (x, y) frame, tagged with pair identity."""
+    one aligned (x, y) frame, tagged with pair identity.
+
+    Returns the result blocks and the underlying signal matrices, so the
+    independence screen can re-derive each shortlisted setup's entry events
+    without rebuilding the scan.
+    """
     level = frame[y].to_numpy()
     blocks = []
+    scans = []
     for entry_signal, ou_lbs, thresholds, kind, units in [
         ("residual", [0], XY_RESID_THRESHOLDS_BPS, "residual", "bps"),
         ("ou_z", XY_OU_LBS, XY_OU_Z_THRESHOLDS, "ou_zscore", "z"),
@@ -202,7 +229,108 @@ def _pair_scan(
         if entry_signal == "residual":
             block = block.with_columns(pl.lit(None, dtype=pl.Int64).alias("ou_lb"))
         blocks.append(block)
-    return blocks
+        scans.append({
+            "entry_signal": entry_signal,
+            "matrix": matrix,
+            "combos": combos,
+            "conditions": conditions,
+        })
+    return blocks, scans
+
+
+def _overlap_diagnostics(setups: pl.DataFrame, scans: list[dict]) -> pl.DataFrame:
+    """Count each setup's non-overlapping forecast windows.
+
+    Replays the entry rule the scan scored -- first bar of each threshold
+    excursion, gate applied, forward window in sample -- against the cached
+    signal matrix, then measures how many of those events carry independent
+    labels. Same construction as Strategy._add_overlap_diagnostics, so a
+    setup's count here is the count it will get on graduation.
+    """
+    lookup = {}
+    for scan in scans:
+        for column, combo in enumerate(scan["combos"]):
+            key = (
+                scan["entry_signal"],
+                int(combo["beta_lb"]),
+                int(combo.get("ou_lb", 0)),
+            )
+            lookup[key] = (scan, column)
+
+    rows = []
+    for setup in setups.iter_rows(named=True):
+        entry_signal = setup["entry_signal"]
+        ou_lb = 0 if entry_signal == "residual" else int(setup["ou_lb"])
+        scan, column = lookup[(entry_signal, int(setup["beta_lb"]), ou_lb)]
+        signal = scan["matrix"][:, column]
+
+        previous = np.concatenate([[np.nan], signal[:-1]])
+        entry = float(setup["entry_threshold"])
+        crossed = (
+            ((signal >= entry) & ~(previous >= entry))
+            | ((signal <= -entry) & ~(previous <= -entry))
+        )
+        gate = setup["gate"]
+        if gate in (None, "(none)"):
+            gate_ok = np.ones(len(signal), dtype=bool)
+        else:
+            # the scan took predict_scan's gate defaults (252-bar warmup,
+            # expanding percentile), so the replay must too
+            gate_ok = gate_allow_mask(
+                scan["conditions"][gate][:, column], (gate, setup["gate_bucket"])
+            )
+        horizon = int(setup["predict_horizon"])
+        valid_forward = np.arange(len(signal)) < len(signal) - horizon
+        indices = np.flatnonzero(crossed & gate_ok & valid_forward)
+        rows.append(event_overlap_diagnostics(indices, horizon))
+
+    return setups.with_columns(
+        pl.Series("n_non_overlapping", [r["n_non_overlapping"] for r in rows],
+                  dtype=pl.Int64),
+        pl.Series("overlap_fraction", [r["overlap_fraction"] for r in rows],
+                  dtype=pl.Float64),
+    )
+
+
+def _fmt_secs(seconds: float) -> str:
+    """Compact duration: 45s, 3m10s, 1h04m."""
+    seconds = int(max(seconds, 0))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def _device_label(device: str) -> str:
+    """Which array backend the scan will actually use, not which was asked for.
+
+    device='auto' silently falls back to numpy when CUDA is unusable, and the
+    difference is minutes per pair -- worth stating outright rather than
+    leaving the reader to infer it from a cupy import warning.
+    """
+    from backtest.lab import _get_xp  # authoritative: also test-compiles a kernel
+
+    resolved = "gpu" if _get_xp(device).__name__ == "cupy" else "cpu"
+    return resolved if resolved == device else f"{resolved}  (requested {device})"
+
+
+def _pair_line(
+    i: int, n: int, y: str, x: str, rows: int, best_ic: float | None,
+    n_kept: int, n_candidates: int, pair_secs: float, total_secs: float,
+) -> str:
+    """One finished pair as a permanent line: what it found, and when the run ends.
+
+    Printed per pair rather than overwritten in place, so the scan leaves a
+    readable history -- which pairs produced setups is the actual output of
+    this stage, and waiting for the final table to learn it wastes the run.
+    """
+    ic = f"{best_ic:+.3f}" if best_ic is not None and np.isfinite(best_ic) else "  --  "
+    eta = _fmt_secs((total_secs / i) * (n - i)) if i < n else "done"
+    return (
+        f"  [{i:>2}/{n}] {y:>6}~{x:<9} rows {rows:>5}  ic {ic}  "
+        f"kept {n_kept}/{n_candidates:<2}  {pair_secs:5.1f}s  eta {eta:>6}"
+    )
 
 
 def _setup_name(row: dict) -> str:
@@ -217,8 +345,8 @@ def _setup_name(row: dict) -> str:
     return name
 
 
-def _select_setups(valid: pl.DataFrame) -> pl.DataFrame:
-    """Top XY_TOP_N_PER_PAIR setups per (x, y) pair by neighborhood IC.
+def _select_setups(valid: pl.DataFrame, limit: int) -> pl.DataFrame:
+    """Top `limit` setups per (x, y) pair by neighborhood IC.
 
     Called per pair (memory discipline), but keyed on x/y regardless so
     neighborhoods can never cross pairs. Same discipline as tens_10s30s:
@@ -243,7 +371,7 @@ def _select_setups(valid: pl.DataFrame) -> pl.DataFrame:
             maintain_order=True,
         )
         .group_by("x", "y", maintain_order=True)
-        .head(XY_TOP_N_PER_PAIR)
+        .head(limit)
         .sort("nbr_ic", descending=True)
         .rename({"horizon": "predict_horizon"})
         .select(
@@ -267,40 +395,67 @@ def main(use_db: bool = True, device: str = "auto") -> dict:
     ]
     n_variants = 1 + 11 * gate_variant_count(XY_GATE_BUCKETS)
     print(
-        f"xy scan: {len(XS)} x-features vs {len(YS)} curves = {len(pairs)} pairs  "
-        f"horizons={XY_HORIZONS}  gate variants~{n_variants}  (device={device})"
+        f"xy scan  {len(XS)} x-features x {len(YS)} curves = {len(pairs)} pairs  "
+        f"horizons={XY_HORIZONS}  gate variants~{n_variants}\n"
+        f"data     {len(data)} rows  {data['ts'][0]} -> {data['ts'][-1]}  "
+        f"{len(TICKERS)} tickers  ({'db' if use_db else 'synthetic'})\n"
+        f"device   {_device_label(device)}\n"
     )
 
     t0 = time.time()
     top_blocks: list[pl.DataFrame] = []
     setup_blocks: list[pl.DataFrame] = []
     skipped = []
+    n_rejected = 0
     for i, (y, x) in enumerate(pairs, 1):
         frame = align_columns(data, [y, x])
         if len(frame) < XY_MIN_ROWS:
             skipped.append((y, x, len(frame)))
             continue
         bt = time.time()
+        # transient: a pair takes tens of seconds, so say what is running
+        print(f"\r  [{i:>2}/{len(pairs)}] {y:>6}~{x:<9} scanning...",
+              end="", flush=True)
         # reduce per pair: filter, select setups, keep a top slice - the raw
         # ~7M-row pair frame is dropped before the next pair starts
+        blocks, scans = _pair_scan(frame, x, y, device)
         pair_valid = (
-            pl.concat(_pair_scan(frame, x, y, device), how="diagonal_relaxed")
+            pl.concat(blocks, how="diagonal_relaxed")
             .filter((pl.col("n_obs") >= XY_MIN_OBS) & pl.col("ic").is_finite())
             .sort("ic", descending=True, nulls_last=True)
         )
         top_blocks.append(pair_valid.head(XY_KEEP_PER_PAIR))
-        pair_setups = _select_setups(pair_valid)
-        if not pair_setups.is_empty():
-            setup_blocks.append(pair_setups)
-        print(
-            f"\r  [{i}/{len(pairs)}] y={y} x={x} rows={len(frame)} "
-            f"({time.time() - bt:.1f}s, total {time.time() - t0:.0f}s)   ",
-            end="",
-            flush=True,
-        )
-    print(f"\n  scan done in {time.time() - t0:.1f}s")
+        candidates = _select_setups(pair_valid, limit=XY_CANDIDATE_LIMIT)
+        n_kept = 0
+        if not candidates.is_empty():
+            candidates = _overlap_diagnostics(candidates, scans)
+            n_rejected += int(
+                (candidates["n_non_overlapping"] < XY_MIN_INDEPENDENT_EVENTS).sum()
+            )
+            pair_setups = candidates.filter(
+                pl.col("n_non_overlapping") >= XY_MIN_INDEPENDENT_EVENTS
+            ).head(XY_TOP_N_PER_PAIR)
+            n_kept = len(pair_setups)
+            if not pair_setups.is_empty():
+                setup_blocks.append(pair_setups)
+        # \r + pad: overwrite the transient line, then keep this one
+        print("\r" + _pair_line(
+            i, len(pairs), y, x, len(frame),
+            pair_valid["ic"].max() if not pair_valid.is_empty() else None,
+            n_kept, len(candidates), time.time() - bt, time.time() - t0,
+        ).ljust(88))
+    print(
+        f"\n  scanned {len(pairs) - len(skipped)}/{len(pairs)} pairs in "
+        f"{_fmt_secs(time.time() - t0)}  |  {len(setup_blocks)} pairs produced "
+        f"setups, {sum(len(b) for b in setup_blocks)} setups total"
+    )
     if skipped:
         print(f"  skipped {len(skipped)} pairs with < {XY_MIN_ROWS} aligned rows")
+    if n_rejected:
+        print(
+            f"  rejected {n_rejected} shortlisted cells with < "
+            f"{XY_MIN_INDEPENDENT_EVENTS} independent forecast windows"
+        )
 
     results = pl.concat(top_blocks, how="diagonal_relaxed").sort(
         "ic", descending=True, nulls_last=True
@@ -325,7 +480,8 @@ def main(use_db: bool = True, device: str = "auto") -> dict:
     setups.write_parquet(XY_SETUPS_FILE)
     print(
         f"\ntop {XY_TOP_N_PER_PAIR} setups per pair by neighborhood IC "
-        f"(>= {XY_MIN_NEIGHBORS} neighbors), saved -> {XY_SETUPS_FILE}:"
+        f"(>= {XY_MIN_NEIGHBORS} neighbors, >= {XY_MIN_INDEPENDENT_EVENTS} "
+        f"independent forecast windows), saved -> {XY_SETUPS_FILE}:"
     )
     utils.pdf(setups.head(25))
 
