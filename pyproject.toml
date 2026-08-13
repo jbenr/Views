@@ -26,6 +26,7 @@ packages = [
     "stats",
     "backtest",
     "book",
+    "book.basis",
     "book.curve",
     "book.cross_market_rv",
     "book.duration",

@@ -5,10 +5,12 @@ Everything needed to turn `md.fut_eod` + `sec.fut_contracts.dlv_basket` +
 access and rate construction, so it lives in utils/ alongside market_data;
 `book/basis/cash_futures.py` is the strategy that trades the output.
 
-    from utils.basis import net_basis, basis_panel
+    from utils.basis import net_basis, basis_panel, futures_roll, futures_roll_panel
 
     nb = net_basis(["TY", "US"], start="2015-01-01")
     panel = basis_panel(nb)
+    roll = futures_roll(["TY", "US"], start="2015-01-01")
+    roll_panel = futures_roll_panel(roll)
 
 The measure. For each date pick the front contract (rolling to the deferred
 one once the front is within `min_days` of delivery), price every bond in its
@@ -442,6 +444,118 @@ def basis_panel(nb: pl.DataFrame) -> pl.DataFrame:
             "ts",
             pl.col("net_basis_bps").alias(f"{root}_nb_bps"),
             pl.col("net_basis_32").alias(f"{root}_nb32"),
+            pl.col("level").alias(f"{root}_level"),
+        )
+        frames.append(part)
+
+    panel = frames[0]
+    for part in frames[1:]:
+        panel = panel.join(part, on="ts", how="full", coalesce=True)
+    return panel.sort("ts")
+
+
+# -- futures calendar roll ---------------------------------------------------
+
+def futures_roll(
+    roots: list[str] | None = None,
+    start: str = "2010-01-01",
+    min_days: int = 5,
+) -> pl.DataFrame:
+    """Daily front-minus-deferred futures roll per contract root.
+
+    Returns one row per (ts, root), using Bloomberg generic rank 1 and rank 2
+    futures. `roll` is front_px - deferred_px in futures price points. Positive
+    means the front contract is rich to the deferred contract; buying the roll
+    is long front / short deferred.
+
+    `min_days` filters out the final days before the front contract delivery
+    assumption. The roll is still a generic spread, so use futures_roll_panel()
+    for a back-adjusted tradable level that does not book generic-roll gaps.
+    """
+    roots = list(roots or DELIVERABLE_ROOTS)
+    futures = load_futures(roots, start)
+
+    observed_last = {
+        row["contract"]: row["last_ts"]
+        for row in futures.group_by("contract")
+        .agg(pl.col("ts").max().alias("last_ts"))
+        .iter_rows(named=True)
+    }
+    delivery = delivery_dates(roots, observed_last)
+    futures = futures.with_columns(
+        pl.col("contract").replace_strict(delivery, default=None).alias("delivery")
+    ).drop_nulls(["delivery", "fut_px"])
+
+    front = futures.filter(pl.col("rank") == 1).select(
+        "ts",
+        "root",
+        pl.col("contract").alias("front_contract"),
+        pl.col("delivery").alias("front_delivery"),
+        pl.col("fut_px").alias("front_px"),
+    )
+    deferred = futures.filter(pl.col("rank") == 2).select(
+        "ts",
+        "root",
+        pl.col("contract").alias("deferred_contract"),
+        pl.col("delivery").alias("deferred_delivery"),
+        pl.col("fut_px").alias("deferred_px"),
+    )
+
+    return (
+        front.join(deferred, on=["ts", "root"], how="inner")
+        .with_columns(
+            (pl.col("front_delivery") - pl.col("ts")).dt.total_days().alias("n_days"),
+            (pl.col("deferred_delivery") - pl.col("ts")).dt.total_days().alias("deferred_n_days"),
+            (pl.col("front_px") - pl.col("deferred_px")).alias("roll"),
+        )
+        .filter(pl.col("n_days") >= min_days)
+        .sort(["root", "ts"])
+    )
+
+
+def futures_roll_panel(roll: pl.DataFrame) -> pl.DataFrame:
+    """Pivot futures_roll() output wide with a stitched tradable level.
+
+    Per root:
+      {root}_roll   front-minus-deferred generic roll, in futures price points
+      {root}_level  back-adjusted roll level, resetting roll gaps to zero PnL
+
+    Generic futures rolls change contract identity. The level accumulates
+    same-pair roll changes only, so a position marked through the generic roll
+    date does not book the mechanical jump from one contract pair to the next.
+    """
+    if roll.is_empty():
+        return pl.DataFrame(schema={"ts": pl.Date})
+
+    required = {"ts", "root", "front_contract", "deferred_contract", "roll"}
+    missing = required.difference(roll.columns)
+    if missing:
+        raise ValueError(f"futures roll frame missing columns: {sorted(missing)}")
+
+    stitched = (
+        roll.sort(["root", "ts"])
+        .with_columns(
+            pl.concat_str(
+                [pl.col("front_contract"), pl.col("deferred_contract")],
+                separator="/",
+            ).alias("_pair")
+        )
+        .with_columns(
+            pl.when(pl.col("_pair") == pl.col("_pair").shift(1).over("root"))
+            .then(pl.col("roll").diff().over("root"))
+            .otherwise(0.0)
+            .alias("d_roll")
+        )
+        .with_columns(
+            pl.col("d_roll").fill_null(0.0).cum_sum().over("root").alias("level")
+        )
+    )
+
+    frames = []
+    for root in stitched["root"].unique(maintain_order=True):
+        part = stitched.filter(pl.col("root") == root).select(
+            "ts",
+            pl.col("roll").alias(f"{root}_roll"),
             pl.col("level").alias(f"{root}_level"),
         )
         frames.append(part)
