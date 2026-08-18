@@ -159,6 +159,12 @@ def _connect(dsn: str | None = None, wake: bool = True) -> psycopg.Connection:
 
     _log(f"probe: {probe_err}")
 
+    # Pin the WSL VM up for the whole wait, not just the wake call. Otherwise
+    # a slow WAL replay in phase 2 can outlast WSL's idle-recycle window (no
+    # wsl.exe stays attached once _ensure_wsl_keepalive's script returns),
+    # killing postgres mid-replay and restarting the "starting up" loop.
+    hold_wsl()
+
     # ── phase 1: wake WSL and start postgres ─────────────────────────────────
     if not starting_up:
         _log("step 1 — waking WSL...")
