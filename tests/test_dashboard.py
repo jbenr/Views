@@ -249,14 +249,14 @@ def test_registry_list_states_the_whole_frozen_configuration():
 
     assert "CURVE" in out                              # grouped by family
     assert "10s30s" in out                             # target leads the row
-    assert "10y_10s30s · OU400 · 1.7z" in out          # same name as the app
     assert "ou_z b80/ou400" in out                     # both lookbacks
     assert "1.7z" in out                               # entry threshold + units
     assert "revert 100%" in out                        # exit rule and its size
     assert "25bps" in out
     assert "r2 tails_25_75 /1260d" in out              # gate basis, not just bucket
     assert "0.70" in out and "17" in out               # frozen backtest metrics
-    assert "sweep rank 0" in out
+    assert "book.curve.tens_10s30s" in out             # full id, pasteable into --remove
+    assert "Jul 29" in out                             # when it went live
 
 
 def test_registry_list_groups_by_family_and_keeps_gates_off_visible():

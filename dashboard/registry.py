@@ -35,7 +35,6 @@ from .params import (
     gate_short,
     model_label,
     params_from_row,
-    signal_label,
 )
 
 
@@ -256,11 +255,6 @@ def _metric(value, fmt: str, suffix: str = "") -> str:
         return "—"
     value = float(value)
     return "—" if value != value else format(value, fmt) + suffix
-
-
-def _format_promoted_at(value: str) -> str:
-    ts = dt.datetime.fromisoformat(value).astimezone(ZoneInfo("America/New_York"))
-    return ts.strftime("%b %d, %Y %I:%M:%S %p %Z")
 
 
 def _input_label(row: dict) -> str:
