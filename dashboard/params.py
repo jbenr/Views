@@ -113,3 +113,46 @@ def gate_label(params: dict) -> str:
     basis = "expanding" if window is None else f"roll {int(window)}d"
     return f"{condition} · {bucket} · {basis}"
 
+
+# ── compact labels ───────────────────────────────────────────────────────────
+# Same facts as the labels above, sized for a table cell rather than a line of
+# its own. The verbose forms stay because a single promoted signal is a record
+# that should read as prose; these exist so several can be compared at a glance.
+
+def model_label(params: dict) -> str:
+    """Signal kind and the lookbacks that define it."""
+    out = f"{params['entry_signal']} b{int(params['beta_lb'])}"
+    if params.get("ou_lb") is not None:
+        out += f"/ou{int(params['ou_lb'])}"
+    return out
+
+
+def entry_short(params: dict) -> str:
+    """Entry threshold with its units, without restating the signal name."""
+    units = "bps" if params["entry_signal"] == "residual" else "z"
+    return f"{float(params['entry_threshold']):g}{units}"
+
+
+def exit_short(params: dict) -> str:
+    """Exit rule in one cell. Style names collapse to a verb plus its size."""
+    style, param = params["exit_style"], float(params["exit_param"])
+    if style == "revert_frac":
+        return f"revert {param:.0%}"
+    if style == "half_life_frac":
+        return f"hl x{param:g}"
+    if style == "band":
+        units = "bps" if params["entry_signal"] == "residual" else "z"
+        return f"band {param:g}{units}"
+    return f"{style} {param:g}"
+
+
+def gate_short(params: dict) -> str:
+    """Gate as condition/bucket/basis, abbreviated but never dropped -- a gate
+    is the difference between two otherwise identical configs."""
+    gate = params.get("gate")
+    if gate is None:
+        return "none"
+    window = params.get("gate_window")
+    basis = "exp" if window is None else f"{int(window)}d"
+    return f"{gate[0]} {gate[1]} /{basis}"
+

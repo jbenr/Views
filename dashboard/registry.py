@@ -20,17 +20,20 @@ import argparse
 import datetime as dt
 import importlib
 import os
+import textwrap
 import uuid
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import polars as pl
+from tabulate import tabulate
 
 from .params import (
     PARAM_COLS,
-    entry_label,
-    exit_label,
-    gate_label,
+    entry_short,
+    exit_short,
+    gate_short,
+    model_label,
     params_from_row,
     signal_label,
 )
@@ -260,44 +263,94 @@ def _format_promoted_at(value: str) -> str:
     return ts.strftime("%b %d, %Y %I:%M:%S %p %Z")
 
 
-def describe(frame: pl.DataFrame) -> str:
-    """Every frozen attribute of each promoted signal, one block per signal.
+def _input_label(row: dict) -> str:
+    """The distinguishing part of a signal inside its target group: the input
+    feature, plus the variant name when one module is promoted more than once.
+    The target itself is the group header, so repeating it in every row costs
+    width and says nothing."""
+    variant = row.get("variant")
+    return f"{row['feature']} ({variant})" if variant else row["feature"]
 
-    A wide table cannot carry fourteen parameters without truncating them, and
-    this is the record of what is live -- it has to state the whole
-    configuration, including the filters that are switched off.
+
+def _config_row(row: dict) -> dict:
+    """What the signal does, plus the two facts you act on: the id to pass to
+    --remove, and when it went live."""
+    params = params_from_row(row)
+    promoted = dt.datetime.fromisoformat(row["promoted_at"]).astimezone(
+        ZoneInfo("America/New_York")
+    )
+    return {
+        "target": row["target"],
+        "input": _input_label(row),
+        "model": model_label(params),
+        "entry": entry_short(params),
+        "exit": exit_short(params),
+        "stop": _metric(params.get("stop_loss_bps"), "g", "bps"),
+        "gate": gate_short(params),
+        "sharpe": _metric(row.get("sharpe"), ".2f"),
+        "trades": _metric(row.get("n_trades"), ".0f"),
+        "hit": _metric((row.get("hit_rate") or 0) * 100, ".1f", "%"),
+        "max dd": _metric(row.get("max_drawdown_bps"), "+.1f"),
+        "live since": promoted.strftime("%b %d"),
+        # full id, not a shortened one: this is what --remove takes, so it has
+        # to be pasteable straight out of the table
+        "signal_id": row["signal_id"],
+    }
+
+
+def describe(frame: pl.DataFrame) -> str:
+    """Promoted signals as one table per strategy family, plus provenance.
+
+    Grouped by family because that is what makes two rows comparable: a curve
+    signal and a vol signal share no metric worth reading side by side, while
+    everything inside a family does. Target leads each row and orders the
+    table, so signals on the same traded series sit together -- they are one
+    risk position expressed several ways, and that has to be visible.
+
+    Every field the per-signal blocks carried is here except the derived name
+    and the sweep rank it came from; both stay in live_signals.parquet, and a
+    rationale is printed underneath when one was recorded.
     """
-    lines = [f"{len(frame)} live signal{'s' if len(frame) != 1 else ''}"]
-    for row in frame.sort("target", "family", "signal_id").iter_rows(named=True):
-        params = params_from_row(row)
-        model = f"{params['entry_signal']}  ·  beta_lb={params['beta_lb']}"
-        if params.get("ou_lb") is not None:
-            model += f"  ·  ou_lb={params['ou_lb']}"
-        fields = [
-            ("name", signal_label(row)),
-            ("family", row["family"]),
-            ("model", model),
-            ("entry", entry_label(params)),
-            ("exit", exit_label(params)),
-            ("stop", _metric(params.get("stop_loss_bps"), "g", "bps")),
-            ("gate", gate_label(params)),
-            (
-                "backtest",
-                f"sharpe {_metric(row.get('sharpe'), '.2f')}"
-                f"  ·  {_metric(row.get('n_trades'), '.0f')} trades"
-                f"  ·  hit {_metric((row.get('hit_rate') or 0) * 100, '.1f', '%')}"
-                f"  ·  max dd {_metric(row.get('max_drawdown_bps'), '+.1f', 'bps')}",
-            ),
-            (
-                "promoted",
-                f"{_format_promoted_at(row['promoted_at'])}"
-                f"  ·  {row.get('selection_source') or 'sweep rank ' + str(row.get('rank'))}",
-            ),
-        ]
-        if row.get("rationale"):
-            fields.append(("rationale", row["rationale"]))
-        lines.append(f"\n  {row['signal_id']}")
-        lines += [f"    {label:<10} {value}" for label, value in fields]
+    rows = list(frame.sort("family", "target", "signal_id").iter_rows(named=True))
+    families = sorted({r["family"] for r in rows})
+    targets = sorted({r["target"] for r in rows})
+    plural = "s" if len(rows) != 1 else ""
+    lines = [
+        f"{len(rows)} live signal{plural} · {len(targets)} "
+        f"target{'s' if len(targets) != 1 else ''} · "
+        f"{len(families)} famil{'ies' if len(families) != 1 else 'y'}"
+    ]
+
+    for family in families:
+        group = [r for r in rows if r["family"] == family]
+        group_targets = sorted({r["target"] for r in group})
+        table = [_config_row(r) for r in group]
+        # target ascending, then best first within a target
+        table.sort(key=lambda t: (
+            t["target"],
+            -(float(t["sharpe"]) if t["sharpe"] != "—" else -9e9),
+        ))
+        lines.append(
+            f"\n{family.upper()} · {len(group)} signal"
+            f"{'s' if len(group) != 1 else ''} · "
+            f"{len(group_targets)} target{'s' if len(group_targets) != 1 else ''}"
+        )
+        lines.append(
+            textwrap.indent(
+                # disable_numparse: these cells are already formatted to a
+                # fixed precision, and tabulate would re-parse and re-render
+                # them (0.70 -> 0.7), breaking the column's decimal alignment
+                tabulate(table, headers="keys", tablefmt="simple",
+                         disable_numparse=True,
+                         colalign=("left",) * 7 + ("right",) * 4 + ("left",) * 2),
+                "  ",
+            )
+        )
+
+    rationales = [r for r in rows if r.get("rationale")]
+    if rationales:
+        lines.append("")
+        lines += [f"  {r['signal_id']}: {r['rationale']}" for r in rationales]
     return "\n".join(lines)
 
 

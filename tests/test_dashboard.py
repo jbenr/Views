@@ -247,14 +247,54 @@ def test_registry_list_states_the_whole_frozen_configuration():
 
     out = describe(frame)
 
+    assert "CURVE" in out                              # grouped by family
+    assert "10s30s" in out                             # target leads the row
     assert "10y_10s30s · OU400 · 1.7z" in out          # same name as the app
-    assert "beta_lb=80" in out and "ou_lb=400" in out
-    assert "|ou_z| >= 1.7z" in out
-    assert "revert_frac=1" in out
+    assert "ou_z b80/ou400" in out                     # both lookbacks
+    assert "1.7z" in out                               # entry threshold + units
+    assert "revert 100%" in out                        # exit rule and its size
     assert "25bps" in out
-    assert "r2 · tails_25_75 · roll 1260d" in out      # gate basis, not just bucket
-    assert "sharpe 0.70" in out and "17 trades" in out
+    assert "r2 tails_25_75 /1260d" in out              # gate basis, not just bucket
+    assert "0.70" in out and "17" in out               # frozen backtest metrics
     assert "sweep rank 0" in out
+
+
+def test_registry_list_groups_by_family_and_keeps_gates_off_visible():
+    """Rows are only comparable within a family, so that is the grouping;
+    target leads and orders each row. A signal with no gate still says so."""
+    from dashboard.registry import describe
+
+    def row(signal_id, target, feature, gate, window, family="curve"):
+        return {
+            "signal_id": signal_id, "module": signal_id,
+            "name": signal_id, "family": family,
+            "target": target, "feature": feature,
+            "variant": None, "variant_label": None, "rationale": None,
+            "rank": 0, "selection_source": None,
+            "promoted_at": "2026-07-29T04:33:59+00:00",
+            "entry_signal": "ou_z", "beta_lb": 80, "ou_lb": 400,
+            "entry_threshold": 1.7, "exit_style": "band", "exit_param": 1.5,
+            "gate": gate, "gate_window": window, "stop_loss_bps": 25.0,
+            "sharpe": 0.70, "n_trades": 17.0, "hit_rate": 0.88,
+            "max_drawdown_bps": -22.6,
+        }
+
+    out = describe(pl.DataFrame([
+        row("a", "10s30s", "10y", "('r2', 'tails_25_75')", 1260),
+        row("b", "10s30s", "2y", None, None),
+        row("c", "2s10s", "real10y", "('r2', 'tails_25_75')", None),
+        row("d", "1m10y", "move", None, None, family="rate_vol"),
+    ]))
+
+    assert "4 live signals · 3 targets · 2 families" in out
+    assert "CURVE · 3 signals · 2 targets" in out
+    assert "RATE_VOL · 1 signal · 1 target" in out
+    assert "none" in out        # a disabled gate is stated, not blank
+    assert "/exp" in out        # expanding percentile basis, distinct from a roll
+
+    # inside a family, rows are ordered by target
+    curve = out.split("CURVE")[1].split("RATE_VOL")[0]
+    assert curve.index("10s30s") < curve.index("2s10s")
 
 
 def test_registry_can_promote_curated_module_defaults(monkeypatch, tmp_path):

@@ -1318,6 +1318,34 @@ class Strategy:
             })
         return pl.DataFrame(rows).sort("sharpe_ex_best", descending=True)
 
+    def _promote_block(self, robustness: pl.DataFrame, top: int = 5) -> str:
+        """Ready-to-paste promote commands, in promotion-ranking order.
+
+        The board names setups by their parameter shorthand, but promotion
+        addresses them by their row in sweep_results -- so reading a winner off
+        the table and promoting it meant translating between two identifiers by
+        hand, with no feedback if you got it wrong. These are the exact
+        commands, already translated.
+
+        Deliberately ordered by sharpe_ex_best rather than raw sharpe: the bare
+        `--promote <module>` defaults to rank 0, which is the top of the RAW
+        board, and that is usually not what this ranking recommends.
+        """
+        lines = [
+            "\nto promote (rank = row in sweep_results, which is what "
+            "--promote reads):"
+        ]
+        for row in robustness.head(top).iter_rows(named=True):
+            if row["rank"] is None:
+                lines.append(f"  # {row['setup']}: no matching sweep row, cannot promote")
+                continue
+            lines.append(
+                f"  python -m dashboard.registry --promote {self.module} "
+                f"--rank {row['rank']}"
+                f"    # {row['setup']}  ·  sharpe_ex_best {row['sharpe_ex_best']}"
+            )
+        return "\n".join(lines)
+
     def _selection_validation(self, results: pl.DataFrame) -> pl.DataFrame:
         """DSR/PBO diagnostics for the exact finalist selection stage.
 
@@ -1456,6 +1484,24 @@ class Strategy:
         board = results.sort("sharpe", descending=True, nulls_last=True)
         utils.pdf(board.select([c for c in show if c in board.columns]).head(10))
 
+        # Position of each config in `results`, which is what `registry
+        # --promote --rank N` indexes into. The robustness board below is
+        # ordered by sharpe_ex_best, NOT by the raw sharpe `results` is sorted
+        # on, so its top row is generally not rank 0 -- without this mapping
+        # the obvious `--promote <module>` promotes a different setup than the
+        # one the promotion ranking recommends.
+        rank_keys = [
+            c for c in ("entry_signal", "beta_lb", "ou_lb", "entry_threshold",
+                        "exit_style", "exit_param", "gate", "gate_window",
+                        "stop_loss_bps")
+            if c in results.columns
+        ]
+        rank_of = {
+            tuple(r[c] for c in rank_keys): i
+            for i, r in enumerate(results.iter_rows(named=True))
+        }
+        setup_rank: dict[str, int] = {}
+
         # trade log: one more engine run per winner at its best stop, so the
         # comparison app can chart every entry/exit
         trade_frames = []
@@ -1466,6 +1512,9 @@ class Strategy:
             if ok.is_empty():
                 continue
             best = ok.sort("sharpe", descending=True, nulls_last=True).row(0, named=True)
+            rank = rank_of.get(tuple(best.get(c) for c in rank_keys))
+            if rank is not None:
+                setup_rank[row["setup"]] = rank
             p = {**_winner_params(row), "stop_loss_bps": float(best["stop_loss_bps"])}
             result = (
                 Engine(BacktestConfig(transaction_cost_bps=self.transaction_cost_bps))
@@ -1489,11 +1538,17 @@ class Strategy:
             self._robustness(trades, data) if not trades.is_empty() else pl.DataFrame()
         )
         if not robustness.is_empty():
+            robustness = robustness.with_columns(
+                pl.col("setup")
+                .replace_strict(setup_rank, default=None, return_dtype=pl.Int64)
+                .alias("rank")
+            ).select("setup", "rank", pl.exclude("setup", "rank"))
             print(
                 "\nrobustness - the promotion ranking (by sharpe EX best trade; "
                 "gross re-marked pnl):"
             )
             utils.pdf(robustness)
+            print(self._promote_block(robustness))
 
         if not validation.is_empty():
             print(
