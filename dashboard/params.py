@@ -78,6 +78,14 @@ def signal_label(row: dict) -> str:
     return f"{base} · {row.get('variant_label') or auto_label(row)}"
 
 
+def input_label(row: dict) -> str:
+    """The input feature, disambiguated by variant when one module is promoted
+    more than once. Used wherever the traded target is already established by
+    a group header or a neighbouring column, so repeating it would be noise."""
+    variant = row.get("variant")
+    return f"{row['feature']} ({variant})" if variant else row["feature"]
+
+
 def entry_label(params: dict) -> str:
     """The trigger, in the units the signal is measured in."""
     units = "bps" if params["entry_signal"] == "residual" else "z"

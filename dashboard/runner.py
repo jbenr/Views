@@ -131,7 +131,7 @@ def compute_signal(signal_id: str) -> dict:
     data = cached_data(signal_id)
     if data is None:
         raise RuntimeError(
-            f"{signal_id}: no cached data -- click 'Re-pull data' first"
+            f"{signal_id}: no market data cached yet -- click Ref to pull it"
         )
     params = params_from_row(row)
 

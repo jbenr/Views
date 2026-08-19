@@ -45,7 +45,8 @@ from dashboard.charts import (
 )
 from dashboard.ledger import SignalLedger
 from dashboard.params import (
-    exit_label, gate_label as _gate_rule, signal_label as _display_name,
+    auto_label, exit_label, gate_label as _gate_rule, input_label,
+    signal_label as _display_name,
 )
 from dashboard.registry import LiveRegistry
 from utils.research_app import (
@@ -764,6 +765,36 @@ def _btn_style(primary: bool = False) -> dict:
     }
 
 
+def _dropdown_options(rows: list[dict]) -> list[dict]:
+    """Deep-dive picker, grouped by family then ordered by target and input.
+
+    dcc.Dropdown has no optgroups, so the family header is a disabled option --
+    it renders as a heading and cannot be chosen. Labels lead with the target
+    rather than the feature so the list reads in the order it is sorted; the
+    same signal still carries its full name on the card itself.
+    """
+    options: list[dict] = []
+    for family in sorted({r["family"] for r in rows}):
+        group = sorted(
+            (r for r in rows if r["family"] == family),
+            key=lambda r: (r["target"], input_label(r)),
+        )
+        options.append({
+            "label": f"── {family.upper()} ──",
+            "value": f"__family__{family}",
+            "disabled": True,
+        })
+        options += [
+            {
+                "label": f"{r['target']} · {input_label(r)} · "
+                         f"{r.get('variant_label') or auto_label(r)}",
+                "value": _row_id(r),
+            }
+            for r in group
+        ]
+    return options
+
+
 def _card(row: dict) -> html.Div:
     module = row["module"]
     signal_id = _row_id(row)
@@ -903,13 +934,7 @@ def build_app() -> dash.Dash:
                             ),
                             dcc.Dropdown(
                                 id="deep-dive-signal",
-                                options=[
-                                    {
-                                        "label": _display_name(row),
-                                        "value": _row_id(row),
-                                    }
-                                    for row in rows
-                                ],
+                                options=_dropdown_options(rows),
                                 value=selected_signal,
                                 clearable=False,
                                 style={"width": 360, "marginLeft": "auto", "fontSize": 12},

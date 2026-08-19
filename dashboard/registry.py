@@ -33,6 +33,7 @@ from .params import (
     entry_short,
     exit_short,
     gate_short,
+    input_label,
     model_label,
     params_from_row,
 )
@@ -257,15 +258,6 @@ def _metric(value, fmt: str, suffix: str = "") -> str:
     return "—" if value != value else format(value, fmt) + suffix
 
 
-def _input_label(row: dict) -> str:
-    """The distinguishing part of a signal inside its target group: the input
-    feature, plus the variant name when one module is promoted more than once.
-    The target itself is the group header, so repeating it in every row costs
-    width and says nothing."""
-    variant = row.get("variant")
-    return f"{row['feature']} ({variant})" if variant else row["feature"]
-
-
 def _config_row(row: dict) -> dict:
     """What the signal does, plus the two facts you act on: the id to pass to
     --remove, and when it went live."""
@@ -275,7 +267,7 @@ def _config_row(row: dict) -> dict:
     )
     return {
         "target": row["target"],
-        "input": _input_label(row),
+        "input": input_label(row),
         "model": model_label(params),
         "entry": entry_short(params),
         "exit": exit_short(params),
