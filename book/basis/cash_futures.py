@@ -119,7 +119,7 @@ def make_pipeline(root: str, params: dict | None = None) -> SignalPipeline:
 
 
 def coverage(nb: pl.DataFrame) -> pl.DataFrame:
-    """Per-root sample, CTD turnover and net basis distribution."""
+    """Per-root sample and CTD turnover."""
     return nb.group_by("root").agg(
         pl.len().alias("n_days"),
         pl.col("ts").min().alias("first"),
@@ -127,8 +127,6 @@ def coverage(nb: pl.DataFrame) -> pl.DataFrame:
         pl.col("contract").n_unique().alias("n_contracts"),
         pl.col("ctd").n_unique().alias("n_ctd"),
         pl.col("gross_basis_32").median().round(2).alias("med_gross_32"),
-        pl.col("net_basis_32").median().round(2).alias("med_net_32"),
-        pl.col("net_basis_32").std().round(2).alias("sd_net_32"),
         (pl.col("implied_repo") - pl.col("financing")).median().round(3).alias("med_irr_less_fin"),
     ).sort("root")
 
@@ -204,7 +202,7 @@ def main(roots: list[str] | None = None, params: dict | None = None) -> dict:
 
     # sample, CTD turnover and where the basis has actually sat
     cover = coverage(nb)
-    print("\ncoverage / basis distribution (32nds; irr_less_fin in %):")
+    print("\ncoverage (32nds; irr_less_fin in %):")
     utils.pdf(cover)
 
     # the prior the whole strategy rests on: does net basis revert?
@@ -255,7 +253,7 @@ def diagnose(roots: list[str] | None = None) -> dict:
     nb, panel = load_data(roots)
 
     print(f"roots={roots}  rows={len(nb)}")
-    print("\ncoverage / basis distribution:")
+    print("\ncoverage:")
     utils.pdf(coverage(nb))
 
     print("\nmedian net basis (32nds) by root and year:")
