@@ -101,7 +101,7 @@ General-purpose helpers:
 ### `utils/rates.py`
 Rate construction helpers:
 - `synthetic_real_rate(nominal, inflation)` — nominal minus inflation swap.
-- `linear_5y5y_forward(r5, r10)` — trader shortcut: `2*10y - 5y`.
+- `linear_forward(r1, t1, r2, t2)` — linear forward between two tenors; `linear_forward(r5, 5, r10, 10)` is the 5y5y shortcut `2*10y - 5y`.
 - `with_synthetic_real_rates(df)` — adds real rate columns to a DataFrame in one call.
 
 ### `utils/viz.py`

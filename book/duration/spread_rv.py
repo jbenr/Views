@@ -23,7 +23,7 @@ import pandas as pd
 from stats import half_life, horizon_backtest, roll_lr
 from utils.helpers import timed
 from utils.market_data import load_wide
-from utils.rates import linear_5y5y_forward
+from utils.rates import linear_forward
 from utils.viz import Viz
 
 warnings.filterwarnings("ignore")
@@ -64,9 +64,9 @@ def load_data(start: str = START) -> pd.DataFrame:
     df.index = pd.to_datetime(df.index)
 
     if "zc5" in df.columns and "zc10" in df.columns:
-        df["5y5y_ifs"] = linear_5y5y_forward(df["zc5"], df["zc10"])
+        df["5y5y_ifs"] = linear_forward(df["zc5"], 5, df["zc10"], 10)
     if "sofr5" in df.columns and "sofr10" in df.columns:
-        df["5y5y_sfr"] = linear_5y5y_forward(df["sofr5"], df["sofr10"])
+        df["5y5y_sfr"] = linear_forward(df["sofr5"], 5, df["sofr10"], 10)
 
     return df.dropna(how="all")
 

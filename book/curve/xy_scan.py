@@ -6,10 +6,16 @@ signal grid and gate overlay as tens_10s30s --predict, scored on raw IC,
 selected by neighborhood IC, and screened for independent forecast windows
 the same way Strategy.predict screens them. No trading mechanics.
 
-X candidates include the 2Y and 10Y levels, real 10Y, breakevens, both 5y5y
-flavors (nominal 2*10y-5y and inflation 2*be10-be5), and point-in-time PC1
-of the yield panel at several PCA lookbacks (PC1_LBS) - rolling, sign-fixed,
-no lookahead.
+X candidates include the 2Y and 10Y levels, real 10Y, breakevens, several
+forwards (nominal 5y5y, inflation 5y5y, SOFR 1y1y / 5y5y / 20y10y and a
+synthetic real 5y5y), and point-in-time PC1 of the yield panel at several
+PCA lookbacks (PC1_LBS) - rolling, sign-fixed, no lookahead.
+
+A forward spanning two tenors is a linear combination of them, so a forward
+that straddles the curve being modelled contains that curve outright: nominal
+5y5y carries 1.5x the 5s10s spread. leak_matrix() prints every such
+construction overlap before the scan runs, so a headline IC that is really a
+target explaining itself is visible rather than inferred.
 
 Winners graduate: clone book/curve/tens_10s30s.py for the promising pair
 and run the full --predict/--exit/--sweep funnel there. The top setups per
@@ -41,7 +47,7 @@ from backtest import (
 )
 from stats import roll_pc1_score
 from utils.market_data import align_columns, load_wide
-from utils.rates import linear_5y5y_forward
+from utils.rates import linear_forward, synthetic_5y5y_real
 
 # -- config -----------------------------------------------------------------
 
@@ -59,6 +65,19 @@ TICKERS = {
     "be5": "USGGBE05 Index",
     "be10": "USGGBE10 Index",
     "real10y": "USGGT10Y Index",
+    # forward inputs are built from SOFR OIS and inflation swaps rather than
+    # the Treasury panel: a forward spanning two Treasury tenors is a linear
+    # combination of them, so it carries any curve between them straight into
+    # the explanatory variable (see X_PANEL_WEIGHTS / leak_matrix below)
+    "ois1": "USOSFR1 Curncy",
+    "ois2": "USOSFR2 Curncy",
+    "ois3": "USOSFR3 Curncy",
+    "ois5": "USOSFR5 Curncy",
+    "ois10": "USOSFR10 Curncy",
+    "ois20": "USOSFR20 Curncy",
+    "ois30": "USOSFR30 Curncy",
+    "zc5": "USSWIT5 Curncy",
+    "zc10": "USSWIT10 Curncy",
     # y candidates: curve generics, already quoted in bps
     "2s5s": "USYC2Y5Y Index",
     "2s10s": "USYC2Y10 Index",
@@ -67,15 +86,48 @@ TICKERS = {
     "5s30s": "USYC5Y30 Index",
     "10s30s": "USYC1030 Index",
 }
-BPS_COLS = ["2y", "5y", "10y", "30y", "be5", "be10", "real10y"]
+BPS_COLS = [
+    "2y",
+    "5y",
+    "10y",
+    "30y",
+    "be5",
+    "be10",
+    "real10y",
+    "ois1",
+    "ois2",
+    "ois3",
+    "ois5",
+    "ois10",
+    "ois20",
+    "ois30",
+    "zc5",
+    "zc10",
+]
 
 PC1_COLS = ["2y", "5y", "10y", "30y"]
 PC1_LBS = [126, 252, 504]  # each lookback is its own x candidate (pc1_126, ...)
 
 YS = ["2s5s", "2s10s", "2s30s", "5s10s", "5s30s", "10s30s"]
-XS = ["2y", "10y", "real10y", "be10", "5y5y", "5y5y_infl"] + [
-    f"pc1_{lb}" for lb in PC1_LBS
-]
+XS = [
+    "2y",
+    "10y",
+    "real10y",
+    "be10",
+    "5y5y",
+    "5y5y_infl",
+    # forwards: 1y1y is the policy path, 20y10y the long-end term premium --
+    # both sit outside every YS target's legs. 5y5y_sfr and 5y5y_real span
+    # 5y-10y but on a different instrument, so they carry no arithmetic leak
+    # (they are still ~0.95 correlated with the nominal curve; a residual
+    # against 5y5y_sfr is part swap-spread trade).
+    "1y1y",
+    "3y2y",
+    "2y3y",
+    "20y10y",
+    "5y5y_sfr",
+    "5y5y_real",
+] + [f"pc1_{lb}" for lb in PC1_LBS]
 
 # the tens_10s30s predict grid at half resolution (step 20 not 10) so the
 # full pair sweep stays in GPU-minutes; neighborhood steps follow these lists
@@ -111,7 +163,60 @@ XY_DATA_DIR = Path(__file__).with_name("data")
 XY_SETUPS_FILE = XY_DATA_DIR / f"{SCAN_NAME}_setups.parquet"
 
 
+# Weights each x places on the NOMINAL TREASURY legs that YS targets are built
+# from. Anything drawn from another instrument (TIPS, breakevens, SOFR OIS,
+# inflation swaps) contributes nothing here: it may be highly correlated with
+# the curve, but it is not arithmetically made of it. pc1_* is absent because
+# its weights are fitted per bar rather than fixed -- measure those with
+# stats.pc1_self_weight instead.
+X_PANEL_WEIGHTS = {
+    "2y": {"2y": 1.0},
+    "10y": {"10y": 1.0},
+    "5y5y": {"5y": -1.0, "10y": 2.0},
+}
+
+# y -> (short leg, long leg)
+Y_LEGS = {
+    "2s5s": ("2y", "5y"),
+    "2s10s": ("2y", "10y"),
+    "2s30s": ("2y", "30y"),
+    "5s10s": ("5y", "10y"),
+    "5s30s": ("5y", "30y"),
+    "10s30s": ("10y", "30y"),
+}
+
+
 # -- helpers ----------------------------------------------------------------
+
+
+def leak_coefficient(x: str, y: str) -> float | None:
+    """How much of curve `y` the feature `x` contains, by construction.
+
+    Writing the target's legs as their mean m and spread s = long - short, a
+    feature with weights w carries s with coefficient (w_long - w_short)/2 --
+    the same quantity stats.pc1_self_weight measures for a fitted PC1. It is
+    exact here because these weights are fixed.
+
+    Non-zero does not mean invalid: hedging a curve on its own short leg is a
+    deliberate design (tens_10s30s) and lands at 0.5. It means the regression
+    is partly explaining the target with itself, so the residual shrinks and
+    reverts more readily than the market did. Magnitude is what matters --
+    5y5y against 5s10s is 1.5, an order above any leg hedge.
+
+    None for features whose weights are fitted rather than declared.
+    """
+    if x.startswith("pc1_"):
+        return None
+    weights = X_PANEL_WEIGHTS.get(x, {})
+    short, long = Y_LEGS[y]
+    return (weights.get(long, 0.0) - weights.get(short, 0.0)) / 2.0
+
+
+def leak_matrix() -> pl.DataFrame:
+    """Every (x, y) construction leak, as an x-by-y table."""
+    return pl.DataFrame(
+        [{"x": x, **{y: leak_coefficient(x, y) for y in YS}} for x in XS]
+    )
 
 
 def load_data(start: str = START) -> pl.DataFrame:
@@ -157,21 +262,54 @@ def synthetic_data(n: int = 1500, seed: int = 7) -> pl.DataFrame:
     )
     ts = ts.filter(ts.dt.weekday() <= 5)[:n]
 
-    return pl.DataFrame({
-        "ts": ts,
-        **yields,
-        **be,
-        "real10y": yields["10y"] - be["be10"],
-        **curves,
-    })
+    # Swap-market stand-ins: same level factor, own idiosyncratic noise, so
+    # they correlate with the Treasury panel without being made of it. Tenors
+    # are read off TICKERS rather than listed again here -- a hardcoded list
+    # silently drops any swap ticker added later, and --synthetic then fails
+    # on a missing column well away from the edit that caused it.
+    def _anchor(tenor: int) -> str:
+        return f"{min(yields, key=lambda k: abs(int(k[:-1]) - tenor))}"
+
+    ois = {
+        k: yields[_anchor(int(k[3:]))] + walk(0.0, 0.3)
+        for k in TICKERS if k.startswith("ois")
+    }
+    zc = {
+        k: 200.0 + 2.0 * int(k[2:]) + walk(0.0, 0.6)
+        for k in TICKERS if k.startswith("zc")
+    }
+
+    return pl.DataFrame(
+        {
+            "ts": ts,
+            **yields,
+            **be,
+            **ois,
+            **zc,
+            "real10y": yields["10y"] - be["be10"],
+            **curves,
+        }
+    )
 
 
 def add_features(data: pl.DataFrame) -> pl.DataFrame:
     """Derived x candidates: both 5y5y flavors and rolling sign-fixed PC1
     scores at each PC1_LBS lookback."""
     out = data.with_columns(
-        linear_5y5y_forward(pl.col("5y"), pl.col("10y")).alias("5y5y"),
-        linear_5y5y_forward(pl.col("be5"), pl.col("be10")).alias("5y5y_infl"),
+        # <a>y<b>y = the b-year rate starting a years forward, so the legs are
+        # a and a+b -- not a and b. linear_forward is symmetric in its
+        # (rate, tenor) pairs, so passing the same two tenors in either order
+        # yields the same series: 2y3y and 3y2y must differ in their LEGS.
+        linear_forward(pl.col("ois1"), 1, pl.col("ois2"), 2).alias("1y1y"),
+        linear_forward(pl.col("ois2"), 2, pl.col("ois5"), 5).alias("2y3y"),
+        linear_forward(pl.col("ois3"), 3, pl.col("ois5"), 5).alias("3y2y"),
+        linear_forward(pl.col("5y"), 5, pl.col("10y"), 10).alias("5y5y"),
+        linear_forward(pl.col("be5"), 5, pl.col("be10"), 10).alias("5y5y_infl"),
+        linear_forward(pl.col("ois20"), 20, pl.col("ois30"), 30).alias("20y10y"),
+        linear_forward(pl.col("ois5"), 5, pl.col("ois10"), 10).alias("5y5y_sfr"),
+        synthetic_5y5y_real(
+            pl.col("ois5"), pl.col("ois10"), pl.col("zc5"), pl.col("zc10")
+        ).alias("5y5y_real"),
     )
     panel = align_columns(out, PC1_COLS)
     scores = panel.select("ts")
@@ -229,12 +367,14 @@ def _pair_scan(
         if entry_signal == "residual":
             block = block.with_columns(pl.lit(None, dtype=pl.Int64).alias("ou_lb"))
         blocks.append(block)
-        scans.append({
-            "entry_signal": entry_signal,
-            "matrix": matrix,
-            "combos": combos,
-            "conditions": conditions,
-        })
+        scans.append(
+            {
+                "entry_signal": entry_signal,
+                "matrix": matrix,
+                "combos": combos,
+                "conditions": conditions,
+            }
+        )
     return blocks, scans
 
 
@@ -266,9 +406,8 @@ def _overlap_diagnostics(setups: pl.DataFrame, scans: list[dict]) -> pl.DataFram
 
         previous = np.concatenate([[np.nan], signal[:-1]])
         entry = float(setup["entry_threshold"])
-        crossed = (
-            ((signal >= entry) & ~(previous >= entry))
-            | ((signal <= -entry) & ~(previous <= -entry))
+        crossed = ((signal >= entry) & ~(previous >= entry)) | (
+            (signal <= -entry) & ~(previous <= -entry)
         )
         gate = setup["gate"]
         if gate in (None, "(none)"):
@@ -285,10 +424,12 @@ def _overlap_diagnostics(setups: pl.DataFrame, scans: list[dict]) -> pl.DataFram
         rows.append(event_overlap_diagnostics(indices, horizon))
 
     return setups.with_columns(
-        pl.Series("n_non_overlapping", [r["n_non_overlapping"] for r in rows],
-                  dtype=pl.Int64),
-        pl.Series("overlap_fraction", [r["overlap_fraction"] for r in rows],
-                  dtype=pl.Float64),
+        pl.Series(
+            "n_non_overlapping", [r["n_non_overlapping"] for r in rows], dtype=pl.Int64
+        ),
+        pl.Series(
+            "overlap_fraction", [r["overlap_fraction"] for r in rows], dtype=pl.Float64
+        ),
     )
 
 
@@ -316,8 +457,16 @@ def _device_label(device: str) -> str:
 
 
 def _pair_line(
-    i: int, n: int, y: str, x: str, rows: int, best_ic: float | None,
-    n_kept: int, n_candidates: int, pair_secs: float, total_secs: float,
+    i: int,
+    n: int,
+    y: str,
+    x: str,
+    rows: int,
+    best_ic: float | None,
+    n_kept: int,
+    n_candidates: int,
+    pair_secs: float,
+    total_secs: float,
 ) -> str:
     """One finished pair as a permanent line: what it found, and when the run ends.
 
@@ -365,8 +514,15 @@ def _select_setups(valid: pl.DataFrame, limit: int) -> pl.DataFrame:
         .filter(pl.col("n_nbr") >= XY_MIN_NEIGHBORS)
         .sort("nbr_ic", descending=True)
         .unique(
-            subset=["x", "y", "entry_signal", "beta_lb", "ou_lb", "gate",
-                    "gate_bucket"],
+            subset=[
+                "x",
+                "y",
+                "entry_signal",
+                "beta_lb",
+                "ou_lb",
+                "gate",
+                "gate_bucket",
+            ],
             keep="first",
             maintain_order=True,
         )
@@ -375,9 +531,21 @@ def _select_setups(valid: pl.DataFrame, limit: int) -> pl.DataFrame:
         .sort("nbr_ic", descending=True)
         .rename({"horizon": "predict_horizon"})
         .select(
-            "x", "y", "entry_signal", "beta_lb", "ou_lb", "entry_threshold",
-            "predict_horizon", "gate", "gate_bucket",
-            "ic", "nbr_ic", "n_nbr", "hit_rate", "fire_rate", "n_obs",
+            "x",
+            "y",
+            "entry_signal",
+            "beta_lb",
+            "ou_lb",
+            "entry_threshold",
+            "predict_horizon",
+            "gate",
+            "gate_bucket",
+            "ic",
+            "nbr_ic",
+            "n_nbr",
+            "hit_rate",
+            "fire_rate",
+            "n_obs",
         )
     )
     names = [_setup_name(r) for r in best.iter_rows(named=True)]
@@ -390,9 +558,7 @@ def _select_setups(valid: pl.DataFrame, limit: int) -> pl.DataFrame:
 def main(use_db: bool = True, device: str = "auto") -> dict:
     data = add_features(load_data() if use_db else synthetic_data())
 
-    pairs = [
-        (y, x) for y in YS for x in XS if y != x
-    ]
+    pairs = [(y, x) for y in YS for x in XS if y != x]
     n_variants = 1 + 11 * gate_variant_count(XY_GATE_BUCKETS)
     print(
         f"xy scan  {len(XS)} x-features x {len(YS)} curves = {len(pairs)} pairs  "
@@ -401,6 +567,11 @@ def main(use_db: bool = True, device: str = "auto") -> dict:
         f"{len(TICKERS)} tickers  ({'db' if use_db else 'synthetic'})\n"
         f"device   {_device_label(device)}\n"
     )
+
+    print("construction leak - how much of y each x contains by arithmetic")
+    print("(0 = none; 0.5 = hedging on the curve's own leg; null = fitted PC1)")
+    utils.pdf(leak_matrix())
+    print()
 
     t0 = time.time()
     top_blocks: list[pl.DataFrame] = []
@@ -414,8 +585,9 @@ def main(use_db: bool = True, device: str = "auto") -> dict:
             continue
         bt = time.time()
         # transient: a pair takes tens of seconds, so say what is running
-        print(f"\r  [{i:>2}/{len(pairs)}] {y:>6}~{x:<9} scanning...",
-              end="", flush=True)
+        print(
+            f"\r  [{i:>2}/{len(pairs)}] {y:>6}~{x:<9} scanning...", end="", flush=True
+        )
         # reduce per pair: filter, select setups, keep a top slice - the raw
         # ~7M-row pair frame is dropped before the next pair starts
         blocks, scans = _pair_scan(frame, x, y, device)
@@ -439,11 +611,21 @@ def main(use_db: bool = True, device: str = "auto") -> dict:
             if not pair_setups.is_empty():
                 setup_blocks.append(pair_setups)
         # \r + pad: overwrite the transient line, then keep this one
-        print("\r" + _pair_line(
-            i, len(pairs), y, x, len(frame),
-            pair_valid["ic"].max() if not pair_valid.is_empty() else None,
-            n_kept, len(candidates), time.time() - bt, time.time() - t0,
-        ).ljust(88))
+        print(
+            "\r"
+            + _pair_line(
+                i,
+                len(pairs),
+                y,
+                x,
+                len(frame),
+                pair_valid["ic"].max() if not pair_valid.is_empty() else None,
+                n_kept,
+                len(candidates),
+                time.time() - bt,
+                time.time() - t0,
+            ).ljust(88)
+        )
     print(
         f"\n  scanned {len(pairs) - len(skipped)}/{len(pairs)} pairs in "
         f"{_fmt_secs(time.time() - t0)}  |  {len(setup_blocks)} pairs produced "
@@ -462,8 +644,18 @@ def main(use_db: bool = True, device: str = "auto") -> dict:
     )
 
     show = [
-        "x", "y", "entry_signal", "beta_lb", "ou_lb", "entry_threshold",
-        "horizon", "gate", "gate_bucket", "ic", "hit_rate", "fire_rate",
+        "x",
+        "y",
+        "entry_signal",
+        "beta_lb",
+        "ou_lb",
+        "entry_threshold",
+        "horizon",
+        "gate",
+        "gate_bucket",
+        "ic",
+        "hit_rate",
+        "fire_rate",
         "n_obs",
     ]
     print(f"\ntop 20 cells by raw IC, any pair (n_obs >= {XY_MIN_OBS}):")
@@ -486,8 +678,10 @@ def main(use_db: bool = True, device: str = "auto") -> dict:
     utils.pdf(setups.head(25))
 
     if not setups.is_empty():
-        print("\nwhich x predicts which y (best nbr_ic per pair; blank = "
-              "nothing corroborated):")
+        print(
+            "\nwhich x predicts which y (best nbr_ic per pair; blank = "
+            "nothing corroborated):"
+        )
         grid = (
             setups.group_by("y", "x")
             .agg(pl.col("nbr_ic").max().round(3))
@@ -505,8 +699,7 @@ if __name__ == "__main__":
     unknown = args - known
     if unknown:
         sys.exit(
-            f"unknown argument(s): {sorted(unknown)}\n"
-            "flags: --synthetic --cpu --gpu"
+            f"unknown argument(s): {sorted(unknown)}\nflags: --synthetic --cpu --gpu"
         )
     use_db = "--synthetic" not in args
     device = "cpu" if "--cpu" in args else ("gpu" if "--gpu" in args else "auto")

@@ -39,7 +39,7 @@ from book.duration.signal_context import (
 )
 from utils.helpers import timed
 from utils.market_data import load_wide
-from utils.rates import linear_5y5y_forward
+from utils.rates import linear_forward
 from utils.viz import Viz
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -102,9 +102,9 @@ def load_basket(tickers: dict[str, str] = TICKERS, start: str = START, cache: bo
         wide["mtg_basis"] = wide["mtg_cc"] - wide["10y"]
     # derived: 5y5y forwards via linear approx (2×10y − 5y)
     if "zc5" in wide.columns and "zc10" in wide.columns:
-        wide["5y5y_ifs"] = linear_5y5y_forward(wide["zc5"], wide["zc10"])
+        wide["5y5y_ifs"] = linear_forward(wide["zc5"], 5, wide["zc10"], 10)
     if "sofr5" in wide.columns and "sofr10" in wide.columns:
-        wide["5y5y_sfr"] = linear_5y5y_forward(wide["sofr5"], wide["sofr10"])
+        wide["5y5y_sfr"] = linear_forward(wide["sofr5"], 5, wide["sofr10"], 10)
     wide = wide.dropna(how="all")
     if cache:
         wide.to_parquet(_BASKET_CACHE)
