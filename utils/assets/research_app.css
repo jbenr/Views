@@ -16,7 +16,147 @@
     transition-duration: 45ms;
 }
 
+/* Tables from utils.viz.table_div share this class. Colour the cells rather
+   than the row so the highlight is visible with collapsed table borders. */
+.viz-table tbody tr:hover > td {
+    background: #f3f3f3;
+}
+
 @media (prefers-reduced-motion: reduce) {
     .ref-btn { transition: none; }
     .ref-btn:active { transform: none; }
+}
+
+
+/* Shimmer loader: a faint mark at top-centre that catches a burgundy/gold
+   sweep, then rests.
+
+   The gradient and animation live on __mark; the sweep is revealed either by
+   clipping the gradient to a glyph (--text) or by masking it with a logo's
+   alpha channel (--logo). Animating background-position rather than opacity
+   is what makes the highlight travel ACROSS the shape instead of the whole
+   thing pulsing.
+
+   The keyframes hold the end position from 45% to 100%. That pause is what
+   reads as "shimmers every couple of seconds" rather than a spinner grinding
+   continuously. */
+
+.shimmer-loader {
+    position: fixed;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1200;
+    pointer-events: none;
+    text-align: center;
+}
+
+.shimmer-loader__mark {
+    background-image: linear-gradient(
+        100deg,
+        rgba(119, 49, 65, 0.16) 0%,
+        rgba(119, 49, 65, 0.16) 40%,
+        rgba(255, 182, 18, 0.80) 47%,
+        #773141 53%,
+        rgba(119, 49, 65, 0.16) 60%,
+        rgba(119, 49, 65, 0.16) 100%
+    );
+    background-size: 300% 100%;
+    background-repeat: no-repeat;
+    animation: shimmer-sweep 2.6s ease-in-out infinite;
+}
+
+.shimmer-loader__mark--text {
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 30px;
+    font-weight: bold;
+    line-height: 1;
+    letter-spacing: 3px;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+}
+
+/* mask-image uses the PNG's alpha, so the gradient shows through the logo's
+   silhouette. The source must have real transparency -- a JPEG's baked-in
+   checkerboard would mask as solid. */
+.shimmer-loader__mark--logo {
+    width: 76px;
+    height: 76px;
+    -webkit-mask-size: contain;
+    mask-size: contain;
+    -webkit-mask-repeat: no-repeat;
+    mask-repeat: no-repeat;
+    -webkit-mask-position: center;
+    mask-position: center;
+}
+
+.shimmer-loader__caption {
+    display: block;
+    margin-top: 2px;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 9px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: rgba(119, 49, 65, 0.42);
+}
+
+/* Stays inside 0%-100%. Outside that range part of the element sits beyond
+   the gradient's edge, and with background-repeat:no-repeat that region gets
+   no paint at all -- which reads as the mark being half covered rather than
+   the sweep finishing. At 100% the visible third is 67-100% of the gradient,
+   at 0% it is 0-33%; the bright band sits at ~50% so it is off-screen at both
+   ends and travels fully across in between. */
+@keyframes shimmer-sweep {
+    0%   { background-position: 100% 0; }
+    55%  { background-position: 0% 0; }
+    100% { background-position: 0% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .shimmer-loader__mark {
+        animation: none;
+        background-image: linear-gradient(
+            100deg, rgba(119, 49, 65, 0.45), rgba(119, 49, 65, 0.45)
+        );
+    }
+}
+
+
+/* Dash paints <div class="_dash-loading">Loading...</div> into the entry point
+   until React mounts. Hide its text and stand the same mark in its place, so
+   the boot sequence shows one indicator rather than a word and then a logo. */
+._dash-loading {
+    font-size: 0;
+    color: transparent;
+    text-align: center;
+    padding-top: 12px;
+}
+
+._dash-loading::after {
+    content: "";
+    display: inline-block;
+    width: 76px;
+    height: 76px;
+    background-image: linear-gradient(
+        100deg,
+        rgba(119, 49, 65, 0.16) 0%,
+        rgba(119, 49, 65, 0.16) 40%,
+        rgba(255, 182, 18, 0.80) 47%,
+        #773141 53%,
+        rgba(119, 49, 65, 0.16) 60%,
+        rgba(119, 49, 65, 0.16) 100%
+    );
+    background-size: 300% 100%;
+    background-repeat: no-repeat;
+    -webkit-mask-image: url("guy.png");
+    mask-image: url("guy.png");
+    -webkit-mask-size: contain;
+    mask-size: contain;
+    -webkit-mask-repeat: no-repeat;
+    mask-repeat: no-repeat;
+    -webkit-mask-position: center;
+    mask-position: center;
+    animation: shimmer-sweep 2.6s ease-in-out infinite;
 }

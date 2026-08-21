@@ -1412,6 +1412,147 @@ def _open_browser(url):
             continue
 
 
+def column_widths(
+    records,
+    columns,
+    headers=None,
+    float_fmt=",.3f",
+    pad=3,
+    min_ch=6,
+):
+    """Uniform per-column widths, sized to the widest cell across ALL records.
+
+    Each HTML table sizes its columns from its own contents, so sections
+    stacked down a page each pick their own widths and nothing lines up.
+    Measuring once over every row that will be rendered -- across every
+    section -- and handing the result to each table is what puts them on a
+    shared grid.
+
+    Widths are in `ch`, so they track the rendered font rather than a guessed
+    pixel count. Returns {column: "<n>ch"}.
+    """
+    labels = {**{c: c for c in columns}, **(headers or {})}
+
+    def _width(v):
+        if isinstance(v, (float, np.floating)):
+            return len(format(v, float_fmt))
+        if isinstance(v, pd.Timestamp):
+            return 10
+        return len(str(v))
+
+    out = {}
+    for col in columns:
+        widest = max(
+            [len(str(labels[col]))]
+            + [_width(r[col]) for r in records if col in r and r[col] is not None]
+        )
+        out[col] = f"{max(widest + pad, min_ch)}ch"
+    return out
+
+
+def table_div(
+    df,
+    title=None,
+    max_rows=20,
+    max_height=None,
+    cell_style=None,
+    float_fmt=",.3f",
+    columns=None,
+    headers=None,
+    col_widths=None,
+    table_style=None,
+):
+    """Render a DataFrame as a plain HTML table -- the house table style.
+
+    Shared by PlotlyViz.table, the research app's section blocks, and the live
+    dashboard, so a table reads the same everywhere it appears.
+
+    cell_style(column, value, row) -> dict | None adds per-cell style on top of
+    the base. It exists because a static table has no equivalent of Dash's
+    style_data_conditional, and a trading surface needs long/short and
+    profit/loss to be visible at a glance rather than read off.
+
+    columns picks and orders what is rendered; headers renames those columns
+    for display only. cell_style still receives the FULL row and the original
+    column name, so styling can key off a value the table does not show -- a
+    staleness flag, say -- without that flag becoming a column.
+
+    col_widths {column: css width} pins the layout. An HTML table sizes its
+    own columns from its own contents, so two tables stacked on a page do not
+    line up. Pass widths measured across every table (see column_widths) to
+    put them all on one grid.
+
+    table_style adds CSS to the table element itself (rather than its scrolling
+    wrapper), useful when a table needs a distinct surface within a panel.
+    """
+    from dash import html as dhtml
+
+    def _fmt(v):
+        if isinstance(v, (float, np.floating)):
+            return format(v, float_fmt)
+        if isinstance(v, pd.Timestamp):
+            return v.strftime("%Y-%m-%d")
+        return str(v)
+
+    show = df.head(max_rows).copy()
+    render_cols = list(columns) if columns is not None else list(show.columns)
+    labels = {**{c: c for c in render_cols}, **(headers or {})}
+    th_style = {
+        "padding": "5px 10px", "textAlign": "right",
+        "borderBottom": "2px solid #bbb", "fontWeight": "bold",
+        "fontSize": "12px", "color": "#333", "whiteSpace": "nowrap",
+        "position": "sticky", "top": 0, "background": "#FAFAFA", "zIndex": 1,
+    }
+    td_style = {
+        "padding": "4px 10px", "textAlign": "right",
+        "borderBottom": "1px solid #e8e8e8", "fontSize": "12px",
+        "whiteSpace": "nowrap",
+    }
+    def _with_width(base, col):
+        width = (col_widths or {}).get(col)
+        return {**base, "width": width} if width else base
+
+    header = dhtml.Tr([
+        dhtml.Th(str(labels[col]), style=_with_width(th_style, col))
+        for col in render_cols
+    ])
+    rows = []
+    for record in show.to_dict("records"):
+        cells = []
+        for col in render_cols:
+            style = _with_width(td_style, col)
+            if cell_style is not None:
+                extra = cell_style(col, record[col], record)
+                if extra:
+                    style = {**style, **extra}
+            cells.append(dhtml.Td(_fmt(record[col]), style=style))
+        rows.append(dhtml.Tr(cells))
+
+    children = []
+    if title:
+        children.append(dhtml.P(
+            title.upper(),
+            style={"fontWeight": "bold", "fontSize": "11px",
+                   "color": "#333", "marginBottom": "6px",
+                   "letterSpacing": "0.04em"},
+        ))
+    base_table_style = {"borderCollapse": "collapse", "minWidth": "100%",
+                        "width": "max-content"}
+    if col_widths:
+        # fixed layout is what makes the declared widths binding rather than
+        # advisory; without it the browser still resizes to fit content
+        base_table_style["tableLayout"] = "fixed"
+    children.append(dhtml.Table(
+        [dhtml.Thead(header), dhtml.Tbody(rows)],
+        className="viz-table",
+        style={**base_table_style, **(table_style or {})},
+    ))
+    style = {"overflowX": "auto", "marginBottom": "16px"}
+    if max_height:
+        style.update({"maxHeight": max_height, "overflowY": "auto"})
+    return dhtml.Div(children, style=style)
+
+
 def _build_dash_app():
     import dash
     from dash import Dash, dcc, html, Output, Input, State, MATCH, ALL, ctx
@@ -1422,6 +1563,7 @@ def _build_dash_app():
     _assets_dir.mkdir(exist_ok=True)
     (_assets_dir / "viz.css").write_text(
         "[role='option'][aria-selected='true'] { font-weight: bold !important; }\n"
+        ".viz-table tbody tr:hover > td { background: #f3f3f3; }\n"
         ".viz-ref-btn:active { transform: translateY(2px);"
         " box-shadow: inset 0 2px 4px rgba(0,0,0,0.22);"
         " background: #DFAE00 !important; }\n"
@@ -1509,47 +1651,8 @@ def _build_dash_app():
         ]
 
     def _table_div_static(title, df, max_rows=20, max_height=None):
-        """Render a DataFrame as an HTML table (matches PlotlyViz.table styling)."""
-        def _fmt(v):
-            if isinstance(v, (float, np.floating)):
-                return f"{v:,.3f}"
-            if isinstance(v, pd.Timestamp):
-                return v.strftime("%Y-%m-%d")
-            return str(v)
-
-        show = df.head(max_rows).copy()
-        th_style = {
-            "padding": "5px 10px", "textAlign": "right",
-            "borderBottom": "2px solid #bbb", "fontWeight": "bold",
-            "fontSize": "12px", "color": "#333", "whiteSpace": "nowrap",
-            "position": "sticky", "top": 0, "background": "#FAFAFA", "zIndex": 1,
-        }
-        td_style = {
-            "padding": "4px 10px", "textAlign": "right",
-            "borderBottom": "1px solid #e8e8e8", "fontSize": "12px",
-            "whiteSpace": "nowrap",
-        }
-        header = html.Tr([html.Th(str(col), style=th_style) for col in show.columns])
-        rows = [
-            html.Tr([html.Td(_fmt(v), style=td_style) for v in row])
-            for row in show.to_numpy()
-        ]
-        children = []
-        if title:
-            children.append(html.P(
-                title.upper(),
-                style={"fontWeight": "bold", "fontSize": "11px",
-                       "color": "#333", "marginBottom": "6px",
-                       "letterSpacing": "0.04em"},
-            ))
-        children.append(html.Table(
-            [html.Thead(header), html.Tbody(rows)],
-            style={"borderCollapse": "collapse", "minWidth": "100%", "width": "max-content"},
-        ))
-        style = {"overflowX": "auto", "marginBottom": "16px"}
-        if max_height:
-            style.update({"maxHeight": max_height, "overflowY": "auto"})
-        return html.Div(children, style=style)
+        """Arg-order shim onto the module-level table_div()."""
+        return table_div(df, title, max_rows, max_height)
 
     def _section_blocks_to_children(blocks):
         """Convert _ScopedViz blocks into dash children. Chart blocks are
@@ -2088,47 +2191,7 @@ class PlotlyViz(Viz):
 
     def table(self, df: pd.DataFrame, title: Optional[str] = None, max_rows: int = 20, max_height: Optional[str] = None):
         """Render a pandas DataFrame as a plain HTML table in the browser app."""
-        from dash import html as dhtml
-
-        def _fmt(v):
-            if isinstance(v, (float, np.floating)):
-                return f"{v:,.3f}"
-            if isinstance(v, pd.Timestamp):
-                return v.strftime("%Y-%m-%d")
-            return str(v)
-
-        show = df.head(max_rows).copy()
-        _th_style = {
-            "padding": "5px 10px", "textAlign": "right",
-            "borderBottom": "2px solid #bbb", "fontWeight": "bold",
-            "fontSize": "12px", "color": "#333", "whiteSpace": "nowrap",
-            "position": "sticky", "top": 0, "background": "#FAFAFA", "zIndex": 1,
-        }
-        _td_style = {
-            "padding": "4px 10px", "textAlign": "right",
-            "borderBottom": "1px solid #e8e8e8", "fontSize": "12px",
-            "whiteSpace": "nowrap",
-        }
-        header = dhtml.Tr([dhtml.Th(str(col), style=_th_style) for col in show.columns])
-        rows = [
-            dhtml.Tr([dhtml.Td(_fmt(v), style=_td_style) for v in row])
-            for row in show.to_numpy()
-        ]
-        children = []
-        if title:
-            children.append(dhtml.P(
-                title.upper(),
-                style={"fontWeight": "bold", "fontSize": "11px",
-                       "color": "#333", "marginBottom": "6px", "letterSpacing": "0.04em"},
-            ))
-        children.append(dhtml.Table(
-            [dhtml.Thead(header), dhtml.Tbody(rows)],
-            style={"borderCollapse": "collapse", "minWidth": "100%", "width": "max-content"},
-        ))
-        block_style = {"overflowX": "auto"}
-        if max_height:
-            block_style.update({"maxHeight": max_height, "overflowY": "auto"})
-        block = dhtml.Div(children, style=block_style)
+        block = table_div(df, title, max_rows, max_height)
         dummy = pd.DataFrame(index=pd.DatetimeIndex([pd.Timestamp.today().normalize()]))
         _REGISTRY.add(
             title=title,

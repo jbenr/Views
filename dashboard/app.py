@@ -31,7 +31,7 @@ import re
 import dash
 import pandas as pd
 import polars as pl
-from dash import Input, Output, State, ctx, dash_table, dcc, html
+from dash import Input, Output, State, ctx, dcc, html
 
 import utils.helpers
 from dashboard import runner
@@ -49,8 +49,10 @@ from dashboard.params import (
     signal_label as _display_name,
 )
 from dashboard.registry import LiveRegistry
+from utils.viz import column_widths, table_div
 from utils.research_app import (
-    BORDER, C0, C1, DIM, ORANGE, PANEL, TEXT, make_app, run, stat_block,
+    BORDER, C0, C1, DIM, ORANGE, PANEL, TEXT, make_app, run, shimmer_loader,
+    stat_block,
 )
 
 REGISTRY = LiveRegistry()
@@ -158,11 +160,14 @@ def _live_pnl_bps(trades, open_entry: dict | None) -> float:
     return total
 
 
-def _trade_page_rows(trades, page: int) -> list[dict]:
-    """5-row page slice, formatted for dash_table.DataTable's `data` prop."""
-    sliced = trades.slice(page, TRADES_PER_PAGE)
+def _format_trade_rows(trades) -> list[dict]:
+    """Dashboard-safe, display-ready rows for the full closed-trade log.
+
+    Keeping these compact rows in a dcc.Store lets the pager swap a slice
+    without re-running the backtest that produced the log.
+    """
     rows = []
-    for row in sliced.to_dicts():
+    for row in trades.to_dicts():
         out = {}
         for col in TRADE_TABLE_COLS:
             val = row.get(col)
@@ -460,78 +465,68 @@ def _overview_snapshot(row: dict) -> dict:
     }
 
 
-def _overview_table(target: str, rows: list[dict]) -> html.Div:
-    snapshots = [_overview_snapshot(row) for row in rows]
+def _trade_cell_style(column: str, value, row: dict) -> dict | None:
+    """Direction and P&L sign, coloured -- the trade table's two read-at-a-glance
+    columns. Mirrors the style_data_conditional rules this replaced."""
+    if column == "direction":
+        return {"color": C1 if value == "long" else C0, "fontWeight": "bold"}
+    if column == "pnl_bps" and isinstance(value, (int, float)):
+        if value > 0:
+            return {"color": C1, "fontWeight": "bold"}
+        if value < 0:
+            return {"color": C0, "fontWeight": "bold"}
+    return None
+
+
+def _overview_cell_style(column: str, value, row: dict) -> dict | None:
+    """Semantic colour for one overview cell.
+
+    Replaces the DataTable's style_data_conditional rules one for one. A static
+    table has no filter_query equivalent, and on a trading surface direction,
+    gate state and P&L sign have to read at a glance rather than be parsed.
+    """
+    if column == "position":
+        for token, colour in (("LONG", C1), ("SHORT", C0), ("GATED", ORANGE)):
+            if token in str(value):
+                return {"color": colour, "fontWeight": "bold"}
+    elif column == "gate_status":
+        if "CLOSED" in str(value):
+            return {"color": C0}
+        if "OPEN" in str(value):
+            return {"color": C1}
+    elif column == "live_pnl_bps" and isinstance(value, (int, float)):
+        if value > 0:
+            return {"color": C1, "fontWeight": "bold"}
+        if value < 0:
+            return {"color": C0, "fontWeight": "bold"}
+    elif column == "data_asof" and row.get("data_stale"):
+        # the db holds a newer bar, or has rewritten this one, since the pull
+        return {"color": ORANGE, "fontWeight": "bold"}
+    return None
+
+
+OVERVIEW_KEYS = [key for key, _label in OVERVIEW_COLUMNS]
+OVERVIEW_FLOAT_FMT = ",.4g"  # ",.3f" would print sharpe 0.7 as 0.700
+
+
+def _overview_table(
+    target: str, rows: list[dict], snapshots: list[dict], widths: dict
+) -> html.Div:
+    """One target's section. Snapshots and widths are passed in rather than
+    derived here: the widths have to be measured across every section for the
+    columns to line up, and a snapshot costs a full Engine.run()."""
     return html.Div(
         style={"marginBottom": 22},
         children=[
             _target_header(target, rows),
-            dash_table.DataTable(
-                columns=[{"name": label, "id": key} for key, label in OVERVIEW_COLUMNS],
-                data=snapshots,
-                sort_action="native",
-                style_table={"overflowX": "auto"},
-                style_cell={
-                    "backgroundColor": "#FFFFFF",
-                    "color": TEXT,
-                    "border": f"1px solid {BORDER}",
-                    "fontSize": 11,
-                    "padding": "7px 9px",
-                    "textAlign": "center",
-                    "whiteSpace": "nowrap",
-                },
-                style_header={
-                    "backgroundColor": "#EDEDED",
-                    "fontWeight": "bold",
-                    "border": f"1px solid {BORDER}",
-                },
-                style_data_conditional=[
-                    # long green / short red, whether held or merely signalled
-                    *[
-                        {
-                            "if": {
-                                "filter_query": f'{{position}} contains "{side}"',
-                                "column_id": "position",
-                            },
-                            "color": colour,
-                            "fontWeight": "bold",
-                        }
-                        for side, colour in (("LONG", C1), ("SHORT", C0))
-                    ],
-                    {
-                        # a signal blocked by its own gate is the case to notice
-                        "if": {
-                            "filter_query": '{position} contains "GATED"',
-                            "column_id": "position",
-                        },
-                        "color": ORANGE,
-                        "fontWeight": "bold",
-                    },
-                    {
-                        "if": {"filter_query": '{gate_status} contains "CLOSED"', "column_id": "gate_status"},
-                        "color": C0,
-                    },
-                    {
-                        "if": {"filter_query": '{gate_status} contains "OPEN"', "column_id": "gate_status"},
-                        "color": C1,
-                    },
-                    {
-                        "if": {"filter_query": "{live_pnl_bps} > 0", "column_id": "live_pnl_bps"},
-                        "color": C1,
-                        "fontWeight": "bold",
-                    },
-                    {
-                        "if": {"filter_query": "{live_pnl_bps} < 0", "column_id": "live_pnl_bps"},
-                        "color": C0,
-                        "fontWeight": "bold",
-                    },
-                    {
-                        # the db holds a newer bar than this cached row
-                        "if": {"filter_query": "{data_stale} = 1", "column_id": "data_asof"},
-                        "color": ORANGE,
-                        "fontWeight": "bold",
-                    },
-                ],
+            table_div(
+                pd.DataFrame(snapshots),
+                columns=OVERVIEW_KEYS,
+                headers=dict(OVERVIEW_COLUMNS),
+                max_rows=len(snapshots),
+                cell_style=_overview_cell_style,
+                float_fmt=OVERVIEW_FLOAT_FMT,
+                col_widths=widths,
             ),
         ],
     )
@@ -553,73 +548,68 @@ def _overview_content(rows: list[dict]) -> list:
             )
         ]
     targets = sorted({row["target"] for row in rows})
-    return [
-        _overview_table(
-            target,
-            sorted(
-                [row for row in rows if row["target"] == target],
-                key=_display_name,
-            ),
+    by_target = {
+        target: sorted(
+            [row for row in rows if row["target"] == target], key=_display_name
         )
+        for target in targets
+    }
+    # snapshot everything first: the column widths have to be measured over
+    # every section at once, or each table sizes itself and the page reads as
+    # a stack of unrelated grids
+    snapshots = {
+        target: [_overview_snapshot(row) for row in group]
+        for target, group in by_target.items()
+    }
+    widths = column_widths(
+        [snap for group in snapshots.values() for snap in group],
+        columns=OVERVIEW_KEYS,
+        headers=dict(OVERVIEW_COLUMNS),
+        float_fmt=OVERVIEW_FLOAT_FMT,
+    )
+    return [
+        _overview_table(target, by_target[target], snapshots[target], widths)
         for target in targets
     ]
 
 
-def _trade_table_block(trades, page: int, open_entry: dict | None, slug: str) -> html.Div:
-    n = 0 if trades is None or trades.is_empty() else len(trades)
-    if n == 0 and open_entry is None:
+def _trade_table_block(
+    closed_rows: list[dict], page: int, open_row: dict | None, slug: str
+) -> html.Div:
+    """One visible trade page from already-formatted trade rows."""
+    n = len(closed_rows)
+    if n == 0 and open_row is None:
         return html.Div("no closed trades yet", style={"color": DIM, "padding": "8px 0"})
 
-    rows = ([_open_trade_row(open_entry)] if open_entry is not None and page == 0 else [])
-    rows += _trade_page_rows(trades, page) if n else []
+    rows = ([open_row] if open_row is not None and page == 0 else [])
+    rows += closed_rows[page:page + TRADES_PER_PAGE]
     lo, hi = (page + 1, min(page + TRADES_PER_PAGE, n)) if n else (0, 0)
 
     return html.Div(
         style={"marginTop": 14},
         children=[
-            dash_table.DataTable(
-                columns=[{"name": TRADE_TABLE_HEADERS[c], "id": c} for c in TRADE_TABLE_COLS],
-                data=rows,
-                style_table={"overflowX": "auto"},
-                style_cell={
-                    "backgroundColor": PANEL, "color": TEXT,
-                    "border": f"1px solid {BORDER}", "fontSize": 11,
-                    "padding": "4px 8px", "textAlign": "center",
-                },
-                style_header={
-                    "backgroundColor": "#EDEDED", "fontWeight": "bold",
-                    "border": f"1px solid {BORDER}",
-                },
-                style_data_conditional=[
-                    {
-                        "if": {
-                            "filter_query": '{direction} = "long"',
-                            "column_id": "direction",
-                        },
-                        "color": C1,
-                        "fontWeight": "bold",
-                    },
-                    {
-                        "if": {
-                            "filter_query": '{direction} = "short"',
-                            "column_id": "direction",
-                        },
-                        "color": C0,
-                        "fontWeight": "bold",
-                    },
-                    {"if": {"filter_query": "{pnl_bps} > 0", "column_id": "pnl_bps"},
-                     "color": C1, "fontWeight": "bold"},
-                    {"if": {"filter_query": "{pnl_bps} < 0", "column_id": "pnl_bps"},
-                     "color": C0, "fontWeight": "bold"},
-                ],
+            table_div(
+                pd.DataFrame(rows),
+                columns=TRADE_TABLE_COLS,
+                headers=TRADE_TABLE_HEADERS,
+                max_rows=len(rows),
+                cell_style=_trade_cell_style,
+                float_fmt=",.4g",
+                table_style={"background": "#FFFFFF"},
             ),
             html.Div(
                 style={"display": "flex", "gap": 8, "alignItems": "center", "marginTop": 8},
                 children=[
+                    html.Button("<<", id=f"trades-first-{slug}", n_clicks=0,
+                                title="First trade page",
+                                style={**_btn_style(), "padding": "3px 6px"}),
                     html.Button("< prev", id=f"trades-prev-{slug}", n_clicks=0,
                                 style=_btn_style()),
                     html.Button("next >", id=f"trades-next-{slug}", n_clicks=0,
                                 style=_btn_style()),
+                    html.Button(">>", id=f"trades-last-{slug}", n_clicks=0,
+                                title="Last trade page",
+                                style={**_btn_style(), "padding": "3px 6px"}),
                     html.Button("Snap chart to view", id=f"snap-{slug}", n_clicks=0,
                                 style=_btn_style()),
                     html.Span(
@@ -646,6 +636,7 @@ def _card_sections(
         return (
             html.Div(),
             html.Div(f"{signal_id}: no longer promoted", style={"color": DIM}),
+            None,
         )
 
     ledger_row = LEDGER.latest(signal_id)
@@ -660,6 +651,10 @@ def _card_sections(
             error = str(exc)
 
     live_pnl = _live_pnl_bps(trades, open_entry) if state and not error else None
+    trade_data = {
+        "closed": _format_trade_rows(trades) if trades is not None else [],
+        "open": _open_trade_row(open_entry) if open_entry is not None else None,
+    }
     asof_bar, asof_written, asof_stale = (
         _db_asof(signal_id, state["data_asof"]) if state else ("—", "", False)
     )
@@ -741,7 +736,15 @@ def _card_sections(
                     for png in chart_pngs
                 ],
             ),
-            _trade_table_block(trades, page, open_entry, _slug(signal_id)),
+            html.Div(
+                _trade_table_block(
+                    trade_data["closed"],
+                    page,
+                    trade_data["open"],
+                    _slug(signal_id),
+                ),
+                id=f"trade-table-{_slug(signal_id)}",
+            ),
         ]
 
     summary = html.Div([
@@ -752,7 +755,7 @@ def _card_sections(
                                          "borderTop": f"1px solid {BORDER}",
                                          "marginTop": 4, "paddingTop": 8}),
     ])
-    return summary, html.Div(body)
+    return summary, html.Div(body), trade_data
 
 
 def _btn_style(primary: bool = False) -> dict:
@@ -799,7 +802,7 @@ def _card(row: dict) -> html.Div:
     module = row["module"]
     signal_id = _row_id(row)
     slug = _slug(signal_id)
-    summary, analysis = _card_sections(signal_id)
+    summary, analysis, trade_data = _card_sections(signal_id)
     return html.Div(
         style={"border": f"1px solid {BORDER}", "background": PANEL,
                "padding": "14px 18px", "marginBottom": 18},
@@ -826,6 +829,7 @@ def _card(row: dict) -> html.Div:
                     dcc.Store(id=f"window-{slug}", data=DEFAULT_WINDOW),
                     dcc.Store(id=f"snap-range-{slug}", data=None),
                     dcc.Store(id=f"trades-page-{slug}", data=0),
+                    dcc.Store(id=f"trades-data-{slug}", data=trade_data),
                 ],
             ),
             html.Div(id=f"card-summary-{slug}", children=summary),
@@ -909,8 +913,10 @@ def build_app() -> dash.Dash:
                 ),
                 dcc.Loading(
                     html.Div(id="overview-content", children=_overview_content(rows)),
-                    type="dot",
-                    color=ORANGE,
+                    custom_spinner=shimmer_loader(image="guy.png", caption="loading"),
+                    # keep the stale table visible and dimmed underneath rather
+                    # than blanking it: a Ref is a refresh, not a page change
+                    overlay_style={"visibility": "visible", "opacity": 0.35},
                 ),
             ],
         )
@@ -965,38 +971,60 @@ def build_app() -> dash.Dash:
             ),
         )
 
-    def _body():
-        """Rebuilt on every page load, so both tabs render the currently
-        cached data rather than whatever was on disk when the process
-        started. Component ids are identical every call -- `rows` is fixed at
-        build time, which is what keeps the callbacks registered below valid.
-        Promoting a new signal still needs a restart."""
-        return html.Div(
+    def _tabs():
+        """The real page. Costs one Engine.run() per promoted signal, so it is
+        built in a callback rather than in the layout -- see _body."""
+        return dcc.Tabs(
+            id="dashboard-tabs",
+            value="live-overview",
             children=[
-                dcc.Tabs(
-                    id="dashboard-tabs",
+                dcc.Tab(
+                    label="Signal",
                     value="live-overview",
-                    children=[
-                        dcc.Tab(
-                            label="Signal",
-                            value="live-overview",
-                            style=tab_style,
-                            selected_style=selected_tab_style,
-                            children=_overview_tab(),
-                        ),
-                        dcc.Tab(
-                            label="Dig",
-                            value="signal-deep-dive",
-                            style=tab_style,
-                            selected_style=selected_tab_style,
-                            children=_deep_dive_tab(),
-                        ),
-                    ],
-                )
-            ]
+                    style=tab_style,
+                    selected_style=selected_tab_style,
+                    children=_overview_tab(),
+                ),
+                dcc.Tab(
+                    label="Dig",
+                    value="signal-deep-dive",
+                    style=tab_style,
+                    selected_style=selected_tab_style,
+                    children=_deep_dive_tab(),
+                ),
+            ],
         )
 
+    def _body():
+        """A shell that renders instantly; _tabs() fills it from a callback.
+
+        Building the tabs here instead would block the HTTP response for the
+        couple of seconds they take, and the browser paints nothing at all
+        until the response arrives -- so there is no window in which a loading
+        indicator could be shown. Returning a shell first means the page is on
+        screen immediately and the wait happens with the spinner visible.
+
+        Content is still rebuilt per page load (the boot callback runs each
+        time), and the component ids inside are identical every call, which is
+        what keeps the per-card callbacks below valid. Those callbacks
+        reference ids that do not exist until this fills, which is legal only
+        because make_app sets suppress_callback_exceptions.
+        """
+        return html.Div([
+            dcc.Interval(id="page-boot", interval=60, max_intervals=1),
+            dcc.Loading(
+                html.Div(id="page-body"),
+                custom_spinner=shimmer_loader(image="guy.png", caption="loading"),
+                overlay_style={"visibility": "visible"},
+            ),
+        ])
+
     app = make_app(title="Model", sliders=[], body=_body)
+
+    app.callback(
+        Output("page-body", "children"),
+        Input("page-boot", "n_intervals"),
+    )(lambda _n: _tabs())
 
     window_keys = list(WINDOW_PRESETS)
 
@@ -1040,7 +1068,7 @@ def build_app() -> dash.Dash:
             slug=slug,
             window_prefix=window_prefix,
         ):
-            *_window_clicks, _prev, _next, _snap, window, snap_range, page = rest
+            *_window_clicks, _snap, window, snap_range, page = rest
             trigger = ctx.triggered_id or ""
             no_btn_styles = [dash.no_update] * len(window_keys)
             try:
@@ -1057,15 +1085,7 @@ def build_app() -> dash.Dash:
                 trades, open_entry = runner.trade_history(signal_id, state)
             except RuntimeError as exc:
                 err = html.Div(str(exc), style={"color": ORANGE, "padding": "12px 0"})
-                return (html.Div(), err, 0, window, snap_range, *no_btn_styles)
-
-            n = 0 if trades is None or trades.is_empty() else len(trades)
-            last_page = max(0, (n - 1) // TRADES_PER_PAGE * TRADES_PER_PAGE) if n else 0
-            if trigger == f"trades-prev-{slug}":
-                page = max(0, page - TRADES_PER_PAGE)
-            elif trigger == f"trades-next-{slug}":
-                page = min(page + TRADES_PER_PAGE, last_page)
-            page = min(page, last_page)
+                return (html.Div(), err, None, 0, window, snap_range, *no_btn_styles)
 
             if trigger == f"snap-{slug}":
                 rng = _visible_trade_range(trades, open_entry, page, state["data_asof"])
@@ -1076,7 +1096,7 @@ def build_app() -> dash.Dash:
             if snap_range:
                 date_range = (pd.Timestamp(snap_range[0]), pd.Timestamp(snap_range[1]))
 
-            summary, analysis = _card_sections(
+            summary, analysis, trade_data = _card_sections(
                 signal_id,
                 state=state,
                 trades=trades,
@@ -1086,25 +1106,63 @@ def build_app() -> dash.Dash:
                 date_range=date_range,
             )
             btn_styles = [_btn_style(primary=(k == window)) for k in window_keys]
-            return summary, analysis, page, window, snap_range, *btn_styles
+            return summary, analysis, trade_data, page, window, snap_range, *btn_styles
 
         app.callback(
             Output(f"card-summary-{slug}", "children"),
             Output(f"card-analysis-{slug}", "children"),
+            Output(f"trades-data-{slug}", "data"),
             Output(f"trades-page-{slug}", "data"),
             Output(f"window-{slug}", "data"),
             Output(f"snap-range-{slug}", "data"),
             *[Output(f"window-{slug}-{k}", "style") for k in window_keys],
             Input(f"ref-{slug}", "n_clicks"),
             *[Input(f"window-{slug}-{k}", "n_clicks") for k in window_keys],
-            Input(f"trades-prev-{slug}", "n_clicks"),
-            Input(f"trades-next-{slug}", "n_clicks"),
             Input(f"snap-{slug}", "n_clicks"),
             State(f"window-{slug}", "data"),
             State(f"snap-range-{slug}", "data"),
             State(f"trades-page-{slug}", "data"),
             prevent_initial_call=True,
         )(_update)
+
+        def _page_trades(
+            _first,
+            _prev,
+            _next,
+            _last,
+            trade_data,
+            page,
+            slug=slug,
+        ):
+            """Swap rows only -- chart and backtest work stays off this path."""
+            trade_data = trade_data or {"closed": [], "open": None}
+            closed_rows = trade_data.get("closed", [])
+            open_entry = trade_data.get("open")
+            n = len(closed_rows)
+            last_page = max(0, (n - 1) // TRADES_PER_PAGE * TRADES_PER_PAGE) if n else 0
+            page = page or 0
+            if ctx.triggered_id == f"trades-first-{slug}":
+                page = 0
+            elif ctx.triggered_id == f"trades-prev-{slug}":
+                page = max(0, page - TRADES_PER_PAGE)
+            elif ctx.triggered_id == f"trades-next-{slug}":
+                page = min(page + TRADES_PER_PAGE, last_page)
+            elif ctx.triggered_id == f"trades-last-{slug}":
+                page = last_page
+            page = min(page, last_page)
+            return _trade_table_block(closed_rows, page, open_entry, slug), page
+
+        app.callback(
+            Output(f"trade-table-{slug}", "children"),
+            Output(f"trades-page-{slug}", "data", allow_duplicate=True),
+            Input(f"trades-first-{slug}", "n_clicks"),
+            Input(f"trades-prev-{slug}", "n_clicks"),
+            Input(f"trades-next-{slug}", "n_clicks"),
+            Input(f"trades-last-{slug}", "n_clicks"),
+            State(f"trades-data-{slug}", "data"),
+            State(f"trades-page-{slug}", "data"),
+            prevent_initial_call=True,
+        )(_page_trades)
 
     return app
 

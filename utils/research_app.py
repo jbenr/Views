@@ -140,6 +140,40 @@ def graph(id_: str) -> dcc.Graph:
 
 # ── app factory ───────────────────────────────────────────────────────────────
 
+def shimmer_loader(
+    mark: str = "W",
+    caption: str | None = None,
+    image: str | None = None,
+) -> html.Div:
+    """Top-centre loading indicator: a faint mark that catches a burgundy/gold
+    sweep every couple of seconds, then rests.
+
+    Pass to dcc.Loading(custom_spinner=...). The animation runs in CSS rather
+    than via callbacks -- a spinner the server had to animate would freeze
+    exactly when the server is busy, which is the only time it is visible.
+
+    image is a filename in this package's assets/ directory; the gradient is
+    masked by its alpha channel, so the sweep travels through the artwork's
+    silhouette. It must carry real transparency -- a JPEG exported with a
+    checkerboard "transparent" background masks as a solid square. Without an
+    image, `mark` is rendered as a glyph and the gradient clipped to it.
+    """
+    if image:
+        url = f"/assets/{image}"
+        glyph = html.Div(
+            className="shimmer-loader__mark shimmer-loader__mark--logo",
+            style={"maskImage": f"url('{url}')", "WebkitMaskImage": f"url('{url}')"},
+        )
+    else:
+        glyph = html.Div(
+            mark, className="shimmer-loader__mark shimmer-loader__mark--text"
+        )
+    children = [glyph]
+    if caption:
+        children.append(html.Span(caption, className="shimmer-loader__caption"))
+    return html.Div(children, className="shimmer-loader")
+
+
 def make_app(
     title: str,
     sliders: list,

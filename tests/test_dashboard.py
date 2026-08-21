@@ -61,18 +61,39 @@ def test_dashboard_has_live_overview_and_selectable_deep_dive(monkeypatch, tmp_p
     ).write_parquet(tmp_path / "live_signals.parquet")
 
     app_module = _load_app_module(monkeypatch, tmp_path)
-    # the layout is a callable so each page load re-renders against the
-    # current data cache; Dash invokes it per request, so the test does too
-    layout = app_module.app.layout
-    ids = set(_component_ids(layout() if callable(layout) else layout))
 
-    assert {
+    # The layout is deliberately only a shell: building the tabs costs an
+    # Engine.run() per signal, and doing that before the response is sent
+    # leaves the browser blank with no window to show a loading state in.
+    layout = app_module.app.layout
+    shell = set(_component_ids(layout() if callable(layout) else layout))
+    assert {"page-boot", "page-body"} <= shell
+    assert "dashboard-tabs" not in shell
+
+    # ...so the page proper arrives via the boot callback, the way a browser
+    # gets it. Exercise that rather than the builder, so the wiring is covered.
+    response = app_module.app.server.test_client().post(
+        "/_dash-update-component",
+        json={
+            "output": "page-body.children",
+            "outputs": {"id": "page-body", "property": "children"},
+            "inputs": [
+                {"id": "page-boot", "property": "n_intervals", "value": 1}
+            ],
+            "changedPropIds": ["page-boot.n_intervals"],
+        },
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 200
+    page = response.data.decode()
+    for component_id in (
         "dashboard-tabs",
         "overview-content",
         "refresh-overview",
         "deep-dive-signal",
         "deep-card-book-curve-twos-10s30s",
-    } <= ids
+    ):
+        assert component_id in page
 
 
 def test_overview_snapshot_uses_exact_open_position(monkeypatch, tmp_path):
