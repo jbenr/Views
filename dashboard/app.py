@@ -573,8 +573,16 @@ def _overview_content(rows: list[dict]) -> list:
     ]
 
 
+def _trade_page_label(n: int, page: int) -> str:
+    """The trade-count caption shown beside the persistent pager controls."""
+    if not n:
+        return "no closed trades yet"
+    lo, hi = page + 1, min(page + TRADES_PER_PAGE, n)
+    return f"showing {lo}-{hi} of {n} closed trades"
+
+
 def _trade_table_block(
-    closed_rows: list[dict], page: int, open_row: dict | None, slug: str
+    closed_rows: list[dict], page: int, open_row: dict | None
 ) -> html.Div:
     """One visible trade page from already-formatted trade rows."""
     n = len(closed_rows)
@@ -583,20 +591,37 @@ def _trade_table_block(
 
     rows = ([open_row] if open_row is not None and page == 0 else [])
     rows += closed_rows[page:page + TRADES_PER_PAGE]
-    lo, hi = (page + 1, min(page + TRADES_PER_PAGE, n)) if n else (0, 0)
+    return table_div(
+        pd.DataFrame(rows),
+        columns=TRADE_TABLE_COLS,
+        headers=TRADE_TABLE_HEADERS,
+        max_rows=len(rows),
+        cell_style=_trade_cell_style,
+        float_fmt=",.4g",
+        table_style={"background": "#FFFFFF"},
+    )
 
+
+def _trade_table_section(
+    closed_rows: list[dict], page: int, open_row: dict | None, slug: str
+) -> html.Div:
+    """A fixed control row around the table area that the pager replaces.
+
+    Keeping all buttons outside ``trade-table-*`` matters: replacing a Dash
+    callback input can trigger dependent callbacks as it is reinserted. The
+    pager therefore only replaces rows and its caption, never chart controls.
+    """
+    table = html.Div(
+        _trade_table_block(closed_rows, page, open_row),
+        id=f"trade-table-{slug}",
+    )
+    n = len(closed_rows)
+    if n == 0 and open_row is None:
+        return html.Div(table, style={"marginTop": 14})
     return html.Div(
         style={"marginTop": 14},
         children=[
-            table_div(
-                pd.DataFrame(rows),
-                columns=TRADE_TABLE_COLS,
-                headers=TRADE_TABLE_HEADERS,
-                max_rows=len(rows),
-                cell_style=_trade_cell_style,
-                float_fmt=",.4g",
-                table_style={"background": "#FFFFFF"},
-            ),
+            table,
             html.Div(
                 style={"display": "flex", "gap": 8, "alignItems": "center", "marginTop": 8},
                 children=[
@@ -613,7 +638,8 @@ def _trade_table_block(
                     html.Button("Snap chart to view", id=f"snap-{slug}", n_clicks=0,
                                 style=_btn_style()),
                     html.Span(
-                        f"showing {lo}-{hi} of {n} closed trades" if n else "no closed trades yet",
+                        _trade_page_label(n, page),
+                        id=f"trades-status-{slug}",
                         style={"fontSize": 11, "color": DIM},
                     ),
                 ],
@@ -736,14 +762,8 @@ def _card_sections(
                     for png in chart_pngs
                 ],
             ),
-            html.Div(
-                _trade_table_block(
-                    trade_data["closed"],
-                    page,
-                    trade_data["open"],
-                    _slug(signal_id),
-                ),
-                id=f"trade-table-{_slug(signal_id)}",
+            _trade_table_section(
+                trade_data["closed"], page, trade_data["open"], _slug(signal_id),
             ),
         ]
 
@@ -1150,10 +1170,15 @@ def build_app() -> dash.Dash:
             elif ctx.triggered_id == f"trades-last-{slug}":
                 page = last_page
             page = min(page, last_page)
-            return _trade_table_block(closed_rows, page, open_entry, slug), page
+            return (
+                _trade_table_block(closed_rows, page, open_entry),
+                _trade_page_label(n, page),
+                page,
+            )
 
         app.callback(
             Output(f"trade-table-{slug}", "children"),
+            Output(f"trades-status-{slug}", "children"),
             Output(f"trades-page-{slug}", "data", allow_duplicate=True),
             Input(f"trades-first-{slug}", "n_clicks"),
             Input(f"trades-prev-{slug}", "n_clicks"),
