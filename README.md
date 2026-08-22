@@ -21,6 +21,7 @@ The core research loop:
 | Directory | Status | What it is |
 |---|---|---|
 | `stats/` | production | Quant primitives: rolling OLS (`ols.py`), OU/half-life/Hurst (`ou.py`), PCA (`pca.py`), residual diagnostics (`diagnostics.py`) |
+| `research/` | production | Reusable alpha-discovery methods: conditional dislocations, pair/PC relative value, and multi-factor fair value. These research studies generate evidence and candidates; they do not replace the exact backtest. |
 | `utils/` | production | DB access (`helpers.py`), market-data loaders (`market_data.py`), rate construction (`rates.py`), ticker universes (`tickers.py`), formatting, `Viz` plotting (`viz.py`), Dash helpers (`research_app.py`), DB browser (`peep.py`) |
 | `backtest/` | production | The single shared backtest/signal engine: `Engine`, `SignalPipeline`, `TradeDef`, sizing, metrics, parameter scans, selection diagnostics, cross-sectional `SpreadBook` |
 | `book/` | production | Strategy families: `duration/`, `curve/`, `inflation/`, `rate_vol/`, `cross_market_rv/`, `event_driven/`. Each has a `strategy.py` (or `pipeline.py`) with the standard strategy layout; research scripts live alongside. (Named `strategy.py`, not `signal.py` — that shadows the stdlib `signal` module) |
@@ -96,6 +97,33 @@ from stats import (
 ```bash
 python -m book.rate_vol.template
 ```
+
+## Research methods
+
+Use the research modules to investigate an alpha hypothesis before turning it
+into a strategy/backtest candidate. They accept column names from any wide
+panel, so a method is not tied to curves, duration, inflation, or basis:
+
+```python
+from research import DislocationStudy, PairRVStudy, FairValueStudy
+
+# 1. Conditional overreaction: unusual 10s30s move given 10Y and MOVE.
+shock = DislocationStudy("10s30s", ("10y", "move"))
+shock_evidence = shock.research(data)
+
+# 2. Literal relative-value package: one leg versus another.
+rv = PairRVStudy("30y", "10y", weighting="beta")
+rv_evidence = rv.research(data)
+
+# 3. Declared economic fair value; `.search()` explores a controlled
+# factor-family library with at most one selected input from each family.
+fair = FairValueStudy("10s30s", ("term_premium", "move", "supply"))
+fair_evidence = fair.research(data)
+```
+
+Each study returns its signal frame plus the diagnostics appropriate to its
+research type. A promising result is still only a candidate: freeze its rules,
+then take that candidate to the exact backtest and walk-forward process.
 
 Every curve strategy module is configuration on the shared template
 (`backtest/strategy.py`), which provides the signal construction, all four

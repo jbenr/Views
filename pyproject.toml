@@ -24,6 +24,7 @@ build-backend = "setuptools.build_meta"
 packages = [
     "utils",
     "stats",
+    "research",
     "backtest",
     "book",
     "book.basis",
