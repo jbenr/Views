@@ -1,4 +1,18 @@
-"""Research multi-factor fair value and error-correction relationships."""
+"""Research multi-factor fair value and error-correction relationships.
+
+Fair value is a slower, economics-led process.  It can begin with a factor
+set declared by the researcher, then compare it to a controlled search across
+factor families.  The research must distinguish a high in-sample fit from a
+tradable relationship by checking residual stationarity, error-correction
+speed, coefficient stability, and structural breaks.
+
+Multiple regression is intentional here.  The study records the condition
+number of the rolling design matrix so highly collinear factor sets are visible
+instead of producing deceptively precise, offsetting betas.  The next
+extension is a static-fit diagnostic alongside the current rolling stability
+view; static economic models should be the default starting point, with
+rolling models used to test whether that relationship remains alive.
+"""
 
 from __future__ import annotations
 

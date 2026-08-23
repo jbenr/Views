@@ -39,7 +39,7 @@ def fade_scorecard(
     horizons: Iterable[int],
     min_obs: int = 30,
 ) -> pl.DataFrame:
-    """Forward diagnostics for fading a signed dislocation.
+    """Forward diagnostics for fading a signed research signal.
 
     A positive signal is faded (short the level); a negative signal is bought.
     The table is a research diagnostic, not a trade simulation.

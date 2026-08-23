@@ -27,9 +27,11 @@ def _panel(n: int = 900, seed: int = 12) -> pl.DataFrame:
 def test_dislocation_accepts_zero_one_and_many_features():
     data = _panel()
     for features in [(), ("factor_a",), ("factor_a", "factor_b")]:
-        state = DislocationStudy("target", features, beta_lookback=60, z_lookback=30).research(data)
+        state = DislocationStudy(
+            "target", features, beta_lookback=60, normalization_lookback=30
+        ).research(data)
         assert {"signals", "horizons", "events"} == set(state)
-        assert "signal" in state["signals"].columns
+        assert {"signal", "dislocation", "dislocation_score"} <= set(state["signals"].columns)
         assert len(state["horizons"]) == 4
 
 
@@ -64,7 +66,9 @@ def test_research_signals_are_prefix_invariant():
     data = _panel()
     cutoff = 700
     studies = [
-        DislocationStudy("target", ("factor_a", "factor_b"), beta_lookback=60, z_lookback=30),
+        DislocationStudy(
+            "target", ("factor_a", "factor_b"), beta_lookback=60, normalization_lookback=30
+        ),
         PairRVStudy("target", "other", beta_lookback=60, z_lookback=30),
         FairValueStudy("target", ("factor_a", "factor_b"), lookback=80),
     ]

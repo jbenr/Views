@@ -1,4 +1,19 @@
-"""Research weighted pair and principal-component relative-value packages."""
+"""Research weighted pair and principal-component relative-value packages.
+
+Relative value begins with an actual package, not merely a predictive target.
+The research is designed to establish:
+
+* which hedge is defensible: fixed/DV01, rolling beta, or a PC factor;
+* whether its residual is stationary, with sensible half-life and Hurst;
+* whether the hedge ratio is stable enough to trade;
+* whether hidden duration or other factor exposure remains after hedging;
+* whether convergence holds across different rates regimes; and
+* whether the real package has acceptable carry and roll.
+
+This is a stronger, medium-horizon claim than a short-horizon dislocation.
+PCA research has its own class because a fitted curve factor requires separate
+leakage and factor-exposure scrutiny from a literal pair trade.
+"""
 
 from __future__ import annotations
 

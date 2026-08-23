@@ -6,7 +6,7 @@ then evaluates a frozen candidate trade.
 
 The three first-class research paths are:
 
-* :class:`DislocationStudy` -- short-horizon overreaction and surprises.
+* :class:`DislocationStudy` -- short-horizon conditional dislocations.
 * :class:`PairRVStudy` / :class:`PCRelativeValueStudy` -- weighted
   relative-value packages.
 * :class:`FairValueStudy` -- declared or searched multi-factor fair value.

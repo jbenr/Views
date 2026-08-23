@@ -107,7 +107,7 @@ panel, so a method is not tied to curves, duration, inflation, or basis:
 ```python
 from research import DislocationStudy, PairRVStudy, FairValueStudy
 
-# 1. Conditional overreaction: unusual 10s30s move given 10Y and MOVE.
+# 1. Conditional dislocation: unusual 10s30s move given 10Y and MOVE.
 shock = DislocationStudy("10s30s", ("10y", "move"))
 shock_evidence = shock.research(data)
 

@@ -1,9 +1,26 @@
-"""Research short-horizon alpha from market dislocations and overreactions.
+"""Research short-horizon alpha from market dislocations.
 
 ``DislocationStudy`` works with any target ``y`` and zero, one, or many
 conditioning inputs ``x``.  It models *changes*, so its signal is today's
-unusual move rather than a presumed long-run fair-value gap.  That makes this
-the home for z-score, shock, and conditional-reversal research.
+dislocation rather than a presumed long-run fair-value gap.  This is the home
+for technically rigorous dislocation research, not a claim that the series is
+an OU process.
+
+What this method is designed to learn:
+
+* whether a target moved too far -- or not far enough -- given related moves;
+* which forecast horizon contains the subsequent correction, if any;
+* whether large dislocations differ from small ones;
+* whether steepening and flattening (or positive/negative states generally)
+  behave differently;
+* which event, volatility, liquidity, and calendar environments support or
+  negate the relationship; and
+* whether conditional dislocation improves on a simple extreme-level baseline.
+
+The base model is deliberately simple: a changes regression yields a raw
+dislocation in native units.  The optional standardized score only makes
+dislocations comparable across volatility regimes; it is not an OU residual
+and is not assumed to mean-revert by construction.
 """
 
 from __future__ import annotations
@@ -20,7 +37,7 @@ from .common import aligned_panel, fade_scorecard, threshold_scorecard
 
 @dataclass(frozen=True)
 class DislocationStudy:
-    """A reusable conditional-overreaction study.
+    """A reusable conditional-dislocation study.
 
     ``features=()`` studies unusual moves in ``target`` itself.  With one or
     more features, it studies the part of the target move unexplained by
@@ -31,29 +48,29 @@ class DislocationStudy:
     target: str
     features: tuple[str, ...] = ()
     beta_lookback: int = 126
-    z_lookback: int = 63
+    normalization_lookback: int = 63
     ts_col: str = "ts"
 
     def __post_init__(self) -> None:
         if self.beta_lookback < 2:
             raise ValueError("beta_lookback must be >= 2")
-        if self.z_lookback < 2:
-            raise ValueError("z_lookback must be >= 2")
+        if self.normalization_lookback < 2:
+            raise ValueError("normalization_lookback must be >= 2")
         if self.target in self.features:
             raise ValueError("target may not also be a dislocation feature")
 
     def compute(self, data: pl.DataFrame) -> pl.DataFrame:
-        """Return target moves, conditional surprise, and standardized signal."""
+        """Return target moves and raw/standardized conditional dislocation."""
         frame = aligned_panel(data, [self.target, *self.features], self.ts_col)
         target = frame[self.target].cast(pl.Float64)
         if not self.features:
-            surprise = target.diff().alias("surprise")
+            dislocation = target.diff().alias("dislocation")
             extras: dict[str, pl.Series] = {}
         elif len(self.features) == 1:
             feature = frame[self.features[0]].cast(pl.Float64)
             reg = roll_lr_diff(feature, target, lookback=self.beta_lookback)
-            surprise = pl.concat(
-                [pl.Series("surprise", [None], dtype=pl.Float64), reg["resid"]]
+            dislocation = pl.concat(
+                [pl.Series("dislocation", [None], dtype=pl.Float64), reg["resid"]]
             )
             extras = {
                 "predicted_move": pl.concat(
@@ -68,8 +85,8 @@ class DislocationStudy:
             reg = roll_mlr_diff(
                 frame.select(self.features), target, lookback=self.beta_lookback
             )
-            surprise = pl.concat(
-                [pl.Series("surprise", [None], dtype=pl.Float64), reg["resid"]]
+            dislocation = pl.concat(
+                [pl.Series("dislocation", [None], dtype=pl.Float64), reg["resid"]]
             )
             extras = {
                 "predicted_move": pl.concat(
@@ -88,12 +105,19 @@ class DislocationStudy:
                     ]
                 )
 
-        z = ((surprise - surprise.rolling_mean(self.z_lookback)) /
-             surprise.rolling_std(self.z_lookback)).alias("signal")
+        scale = dislocation.rolling_std(self.normalization_lookback).alias(
+            "dislocation_scale"
+        )
+        score = (dislocation / scale).alias("dislocation_score")
         return frame.with_columns(
             target.diff().alias("target_move"),
-            surprise,
-            z,
+            dislocation,
+            scale,
+            score,
+            # The raw dislocation is the default research signal.  A caller
+            # may explicitly request dislocation_score when comparing states
+            # across volatility regimes.
+            dislocation.alias("signal"),
             *[series.alias(name) for name, series in extras.items()],
         )
 
@@ -101,14 +125,23 @@ class DislocationStudy:
         self,
         data: pl.DataFrame,
         horizons: Iterable[int] = (1, 5, 10, 20),
-        thresholds: Iterable[float] = (1.0, 1.5, 2.0, 2.5),
+        thresholds: Iterable[float] = (5.0, 10.0, 15.0, 20.0),
+        metric: str = "dislocation",
     ) -> dict[str, pl.DataFrame]:
-        """Produce continuous and threshold-event evidence for this idea."""
+        """Produce continuous and threshold-event evidence for this idea.
+
+        ``metric='dislocation'`` uses native units (bps for a rates curve).
+        ``metric='dislocation_score'`` is an optional volatility-normalized
+        alternative; it changes scale, not the underlying regression.
+        """
         signal_frame = self.compute(data)
+        if metric not in {"dislocation", "dislocation_score"}:
+            raise ValueError("metric must be 'dislocation' or 'dislocation_score'")
+        signal = signal_frame[metric]
         return {
             "signals": signal_frame,
-            "horizons": fade_scorecard(signal_frame["signal"], signal_frame[self.target], horizons),
+            "horizons": fade_scorecard(signal, signal_frame[self.target], horizons),
             "events": threshold_scorecard(
-                signal_frame["signal"], signal_frame[self.target], thresholds, horizons
+                signal, signal_frame[self.target], thresholds, horizons
             ),
         }
