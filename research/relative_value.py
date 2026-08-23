@@ -20,13 +20,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import polars as pl
 
-from stats import half_life, hurst_exponent, roll_lr_diff, roll_pc1_score
+from stats import half_life, hurst_exponent, ou_zscore, roll_lr_diff, roll_pc1_score
 
 from .common import aligned_panel, fade_scorecard
-
-
-def _zscore(series: pl.Series, lookback: int) -> pl.Series:
-    return ((series - series.rolling_mean(lookback)) / series.rolling_std(lookback)).alias("signal")
 
 
 def _residual_diagnostics(residual: pl.Series) -> pl.DataFrame:
@@ -75,7 +71,7 @@ class PairRVStudy:
             reg = roll_lr_diff(right, left, lookback=self.beta_lookback)
             beta = pl.concat([pl.Series("hedge_weight", [None], dtype=pl.Float64), reg["beta"]])
         value = (left - beta * right).alias("rv_value")
-        return frame.with_columns(beta, value, _zscore(value, self.z_lookback))
+        return frame.with_columns(beta, value, ou_zscore(value, lookback=self.z_lookback).alias("signal"))
 
     def research(self, data: pl.DataFrame) -> dict[str, pl.DataFrame]:
         signals = self.compute(data)
@@ -111,7 +107,9 @@ class PCRelativeValueStudy:
         pad = len(frame) - len(reg)
         beta = pl.concat([pl.Series("pc1_beta", [None] * pad, dtype=pl.Float64), reg["beta"]])
         residual = pl.concat([pl.Series("rv_value", [None] * pad, dtype=pl.Float64), reg["resid"]])
-        return frame.with_columns(pc1, beta, residual, _zscore(residual, self.z_lookback))
+        return frame.with_columns(
+            pc1, beta, residual, ou_zscore(residual, lookback=self.z_lookback).alias("signal")
+        )
 
     def research(self, data: pl.DataFrame) -> dict[str, pl.DataFrame]:
         signals = self.compute(data)

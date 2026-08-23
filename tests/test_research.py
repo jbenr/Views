@@ -31,7 +31,10 @@ def test_dislocation_accepts_zero_one_and_many_features():
             "target", features, beta_lookback=60, normalization_lookback=30
         ).research(data)
         assert {"signals", "horizons", "events"} == set(state)
-        assert {"signal", "dislocation", "dislocation_score"} <= set(state["signals"].columns)
+        assert {
+            "signal", "dislocation", "dislocation_score", "dislocation_ou_z",
+            "dislocation_half_life", "dislocation_expected_delta_1d",
+        } <= set(state["signals"].columns)
         assert len(state["horizons"]) == 4
 
 

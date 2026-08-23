@@ -3,8 +3,9 @@
 ``DislocationStudy`` works with any target ``y`` and zero, one, or many
 conditioning inputs ``x``.  It models *changes*, so its signal is today's
 dislocation rather than a presumed long-run fair-value gap.  This is the home
-for technically rigorous dislocation research, not a claim that the series is
-an OU process.
+for technically rigorous dislocation research.  An OU process is an optional
+second-layer diagnostic: it can describe expected correction, half-life, and
+time at risk only after the raw dislocation proves worth studying.
 
 What this method is designed to learn:
 
@@ -19,8 +20,9 @@ What this method is designed to learn:
 
 The base model is deliberately simple: a changes regression yields a raw
 dislocation in native units.  The optional standardized score only makes
-dislocations comparable across volatility regimes; it is not an OU residual
-and is not assumed to mean-revert by construction.
+dislocations comparable across volatility regimes.  The optional OU state
+does not create the signal; it tests whether the observed dislocation has a
+stable convergence process worth trading.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ from typing import Iterable
 
 import polars as pl
 
-from stats import roll_lr_diff, roll_mlr_diff
+from stats import roll_lr_diff, roll_mlr_diff, roll_ou_features
 
 from .common import aligned_panel, fade_scorecard, threshold_scorecard
 
@@ -49,6 +51,7 @@ class DislocationStudy:
     features: tuple[str, ...] = ()
     beta_lookback: int = 126
     normalization_lookback: int = 63
+    ou_lookback: int | None = 126
     ts_col: str = "ts"
 
     def __post_init__(self) -> None:
@@ -56,6 +59,8 @@ class DislocationStudy:
             raise ValueError("beta_lookback must be >= 2")
         if self.normalization_lookback < 2:
             raise ValueError("normalization_lookback must be >= 2")
+        if self.ou_lookback is not None and self.ou_lookback < 2:
+            raise ValueError("ou_lookback must be >= 2 or None")
         if self.target in self.features:
             raise ValueError("target may not also be a dislocation feature")
 
@@ -109,6 +114,16 @@ class DislocationStudy:
             "dislocation_scale"
         )
         score = (dislocation / scale).alias("dislocation_score")
+        ou_extras: dict[str, pl.Series] = {}
+        if self.ou_lookback is not None:
+            ou = roll_ou_features(dislocation, lookback=self.ou_lookback)
+            ou_extras = {
+                f"dislocation_{name}": ou[name]
+                for name in (
+                    "ou_z", "ou_mean", "ou_sigma", "ou_rho", "ou_theta",
+                    "expected_delta_1d", "half_life",
+                )
+            }
         return frame.with_columns(
             target.diff().alias("target_move"),
             dislocation,
@@ -119,6 +134,7 @@ class DislocationStudy:
             # across volatility regimes.
             dislocation.alias("signal"),
             *[series.alias(name) for name, series in extras.items()],
+            *[series.alias(name) for name, series in ou_extras.items()],
         )
 
     def research(
@@ -133,10 +149,16 @@ class DislocationStudy:
         ``metric='dislocation'`` uses native units (bps for a rates curve).
         ``metric='dislocation_score'`` is an optional volatility-normalized
         alternative; it changes scale, not the underlying regression.
+        ``metric='dislocation_ou_z'`` asks the same question through the OU
+        state and is available when ``ou_lookback`` is not ``None``.
         """
         signal_frame = self.compute(data)
-        if metric not in {"dislocation", "dislocation_score"}:
-            raise ValueError("metric must be 'dislocation' or 'dislocation_score'")
+        if metric not in {"dislocation", "dislocation_score", "dislocation_ou_z"}:
+            raise ValueError(
+                "metric must be 'dislocation', 'dislocation_score', or 'dislocation_ou_z'"
+            )
+        if metric not in signal_frame.columns:
+            raise ValueError(f"metric {metric!r} needs ou_lookback to be set")
         signal = signal_frame[metric]
         return {
             "signals": signal_frame,

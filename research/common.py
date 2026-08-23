@@ -12,6 +12,8 @@ from typing import Iterable
 import numpy as np
 import polars as pl
 
+from utils.market_data import align_columns
+
 
 def aligned_panel(
     data: pl.DataFrame,
@@ -20,10 +22,7 @@ def aligned_panel(
 ) -> pl.DataFrame:
     """Return a date-sorted common sample for named input columns."""
     names = list(dict.fromkeys(required))
-    missing = [name for name in [ts_col, *names] if name not in data.columns]
-    if missing:
-        raise ValueError(f"research inputs missing columns: {missing}")
-    return data.select([ts_col, *names]).drop_nulls(subset=names).sort(ts_col)
+    return align_columns(data, names, date_col=ts_col).sort(ts_col)
 
 
 def forward_change(series: pl.Series, horizon: int) -> pl.Series:
