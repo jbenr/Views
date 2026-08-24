@@ -40,3 +40,6 @@ packages = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.black]
+line-length = 120
