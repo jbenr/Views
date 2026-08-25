@@ -165,10 +165,13 @@ def roll_mlr(
     linear solve -- no Python loop over bars.
 
     Returns a polars DataFrame with columns:
-        y, alpha, beta_<name> (one per regressor), yhat, resid, r2, cond
+        y, alpha, beta_<name> (one per regressor), yhat, resid, r2, cond,
+        factor_cond
 
-    `cond` is the 2-norm condition number of that bar's normal-equation
-    matrix, and it is not decoration. Rates regressors are near-collinear
+    `cond` is the 2-norm condition number of that bar's raw normal-equation
+    matrix, chiefly a numerical-solver diagnostic.  `factor_cond` is the
+    scale-free 2-norm condition number of the factor correlation matrix and
+    is the diagnostic to use for multicollinearity.  Rates regressors are near-collinear
     (10y vs 30y runs above 0.95), which makes X'X ill-conditioned and sends
     individual betas swinging to large offsetting values even while the fit
     looks fine. Bars where cond exceeds `max_cond` are returned as null rather
@@ -209,9 +212,29 @@ def roll_mlr(
 
     coef = np.full((n_rows, n_params), np.nan)
     cond = np.full(n_rows, np.nan)
+    factor_cond = np.full(n_rows, np.nan)
     ready = np.isfinite(gram).all(axis=(1, 2)) & np.isfinite(moment).all(axis=1)
     if ready.any():
         cond[ready] = np.linalg.cond(gram[ready])
+        # The raw normal equations are necessarily unit-sensitive: an index
+        # point and a bps rate may differ by orders of magnitude.  Convert
+        # each trailing factor covariance matrix to correlations before taking
+        # its condition number, so this answers the research question (are
+        # factors separately identified?) rather than a units question.
+        n_ready = gram[ready, 0, 0]
+        sums_x = gram[ready, 0, 1:]
+        cross_x = gram[ready, 1:, 1:]
+        cov_x = cross_x / n_ready[:, None, None] - (
+            sums_x / n_ready[:, None]
+        )[:, :, None] * (sums_x / n_ready[:, None])[:, None, :]
+        std_x = np.sqrt(np.clip(np.diagonal(cov_x, axis1=1, axis2=2), 0.0, None))
+        valid_scale = np.all(std_x > np.finfo(float).eps, axis=1)
+        if valid_scale.any():
+            corr_x = cov_x[valid_scale] / (
+                std_x[valid_scale, :, None] * std_x[valid_scale, None, :]
+            )
+            ready_idx = np.flatnonzero(ready)
+            factor_cond[ready_idx[valid_scale]] = np.linalg.cond(corr_x)
         solvable = ready & np.isfinite(cond) & (cond <= max_cond)
         if solvable.any():
             # (S, P, 1) rather than (S, P): a 2-D b reads as one matrix, not a
@@ -249,6 +272,7 @@ def roll_mlr(
         "resid": resid,
         "r2": r2,
         "cond": cond,
+        "factor_cond": factor_cond,
     })
     # warmup and unidentified bars arrive as NaN from numpy; the rest of the
     # codebase tests missingness with null (drop_nulls, is_not_null), and

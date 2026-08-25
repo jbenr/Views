@@ -109,6 +109,20 @@ def test_collinear_regressors_are_nulled_not_fitted():
     assert len(fitted) == 0
 
 
+def test_factor_condition_number_is_unit_invariant():
+    """Collinearity is about factor overlap, not whether a column uses bps."""
+    X, y = _panel(n=300, k=2)
+    scaled = X.with_columns((pl.col("x0") * 1_000_000).alias("x0"))
+    base = roll_mlr(X, y, lookback=60)
+    changed_units = roll_mlr(scaled, y, lookback=60)
+    assert changed_units["cond"].drop_nulls()[-1] > base["cond"].drop_nulls()[-1] * 1e8
+    np.testing.assert_allclose(
+        base["factor_cond"].drop_nulls().to_numpy(),
+        changed_units["factor_cond"].drop_nulls().to_numpy(),
+        rtol=1e-10,
+    )
+
+
 def test_raising_max_cond_returns_fits_but_only_their_sum_is_identified():
     """With two near-identical regressors the individual loadings are
     arbitrary -- only their combined effect is pinned down. Raising max_cond

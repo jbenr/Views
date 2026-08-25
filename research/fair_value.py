@@ -6,9 +6,10 @@ factor families.  The research must distinguish a high in-sample fit from a
 tradable relationship by checking residual stationarity, error-correction
 speed, coefficient stability, and structural breaks.
 
-Multiple regression is intentional here.  The study records the condition
-number of the rolling design matrix so highly collinear factor sets are visible
-instead of producing deceptively precise, offsetting betas.  The next
+Multiple regression is intentional here.  The study records a scale-free
+condition number of the rolling factor-correlation matrix so highly collinear
+factor sets are visible instead of producing deceptively precise, offsetting
+betas.  The next
 extension is a static-fit diagnostic alongside the current rolling stability
 view; static economic models should be the default starting point, with
 rolling models used to test whether that relationship remains alive.
@@ -50,7 +51,8 @@ class FairValueStudy:
             reg["yhat"].alias("fair_value"),
             reg["resid"].alias("residual"),
             reg["r2"].alias("r2"),
-            reg["cond"].alias("condition_number"),
+            reg["factor_cond"].alias("factor_condition_number"),
+            reg["cond"].alias("raw_normal_eq_condition_number"),
             *[reg[f"beta_{factor}"].alias(f"beta_{factor}") for factor in self.factors],
         )
 
