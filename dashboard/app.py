@@ -1036,6 +1036,7 @@ def build_app() -> dash.Dash:
                 html.Div(id="page-body"),
                 custom_spinner=shimmer_loader(image="guy.png", caption="loading"),
                 overlay_style={"visibility": "visible"},
+                parent_className="dashboard-page-loader",
             ),
         ])
 
