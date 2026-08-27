@@ -10,7 +10,10 @@ import polars as pl
 from matplotlib.collections import LineCollection
 
 from dashboard import charts
-from dashboard.charts import _window_pnl_frame, gate_chart, pnl_chart
+from dashboard.charts import (
+    _window_pnl_frame, gate_chart, input_chart, pnl_chart,
+    return_distribution_chart,
+)
 from dashboard.params import params_from_row
 from dashboard.registry import LiveRegistry
 
@@ -531,3 +534,25 @@ def test_pnl_chart_renders_exact_cumulative_curve():
     assert visible["cumulative_pnl"].iloc[-1] == (
         equity["cumulative_pnl"][-1] - equity["cumulative_pnl"][-30]
     )
+
+
+def test_return_distribution_chart_renders_closed_trade_returns():
+    trades = pl.DataFrame({"pnl_bps": [-8.0, -1.0, 0.5, 3.0, 7.5]})
+
+    encoded = return_distribution_chart(trades)
+    empty_encoded = return_distribution_chart(pl.DataFrame({"pnl_bps": []}))
+
+    assert base64.b64decode(encoded).startswith(b"\x89PNG\r\n\x1a\n")
+    assert base64.b64decode(empty_encoded).startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_input_chart_renders_the_strategy_feature_series():
+    dates = pl.date_range(
+        pd.Timestamp("2026-01-01"), pd.Timestamp("2026-02-15"),
+        interval="1d", eager=True,
+    )
+    data = pl.DataFrame({"ts": dates, "input_x": range(len(dates))})
+
+    encoded = input_chart(data, "input_x", window_bars=21)
+
+    assert base64.b64decode(encoded).startswith(b"\x89PNG\r\n\x1a\n")

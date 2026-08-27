@@ -51,17 +51,19 @@
     text-align: center;
 }
 
-/* The dashboard's initial loader sits inside the page-body wrapper. Keep the
-   mark in that local coordinate system, below the tab strip, rather than
-   floating over the persistent Model header. */
+/* Dashboard loaders share one deliberate, viewport-relative anchor: directly
+   below the tab strip. The page boot and overview refresh can briefly overlap,
+   so giving them the same coordinates prevents duplicate marks on the page.
+   This is fixed to the viewport, not a scrolling panel. */
 .dashboard-page-loader {
     position: relative;
     min-height: 140px;
 }
 
-.dashboard-page-loader .shimmer-loader {
-    position: absolute;
-    top: 50px;
+.dashboard-page-loader .shimmer-loader,
+.dashboard-overview-loader .shimmer-loader {
+    position: fixed;
+    top: 130px;
     left: 50%;
     transform: translateX(-50%);
 }

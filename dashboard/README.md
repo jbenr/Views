@@ -79,14 +79,14 @@ The **Signal Deep Dive** tab has a signal selector and renders the complete
 research card for just that strategy:
 
 Name / pair / module, a stat row (data as-of, last analysis run, current
-reading, gate state, and an explanatory param summary), then two charts side
-by side: the tradable level and the entry signal (residual or OU z-score)
-with `±entry_threshold` bands and the current reading flagged. Gated signals
-also show a compact causal-percentile chart identifying the gate rule and
-whether it is currently open or closed. The fourth chart is the exact
-engine's cumulative daily marked-to-market PnL, including open-position
-movements rather than only realized trade exits, rebased to zero at the
-left edge of the selected chart window. The chart-window controls sit
+reading, gate state, and an explanatory param summary), then paired charts of
+the traded target and its X/input series. They are followed by the entry
+signal (residual or OU z-score) with `±entry_threshold` bands and the current
+reading flagged, plus a compact causal-percentile gate chart where applicable.
+The bottom row contains cumulative marked-to-market PnL for the selected
+window and the strategy-wide distribution of realized closed-trade returns;
+the latter colours gains and losses separately and marks zero plus the average
+return. The chart-window controls sit
 immediately above the chart grid. "Snap chart to view" includes five
 business days before the earliest visible entry. Trade-table directions
 are green for long and red for short. Charts are rendered through `utils.viz.Viz`

@@ -39,8 +39,10 @@ from dashboard.charts import (
     DEFAULT_WINDOW,
     WINDOW_PRESETS,
     gate_chart,
+    input_chart,
     level_chart,
     pnl_chart,
+    return_distribution_chart,
     signal_chart,
 )
 from dashboard.ledger import SignalLedger
@@ -626,16 +628,21 @@ def _trade_table_section(
                 style={"display": "flex", "gap": 8, "alignItems": "center", "marginTop": 8},
                 children=[
                     html.Button("<<", id=f"trades-first-{slug}", n_clicks=0,
+                                className="ref-btn",
                                 title="First trade page",
                                 style={**_btn_style(), "padding": "3px 6px"}),
                     html.Button("< prev", id=f"trades-prev-{slug}", n_clicks=0,
+                                className="ref-btn",
                                 style=_btn_style()),
                     html.Button("next >", id=f"trades-next-{slug}", n_clicks=0,
+                                className="ref-btn",
                                 style=_btn_style()),
                     html.Button(">>", id=f"trades-last-{slug}", n_clicks=0,
+                                className="ref-btn",
                                 title="Last trade page",
                                 style={**_btn_style(), "padding": "3px 6px"}),
                     html.Button("Snap chart to view", id=f"snap-{slug}", n_clicks=0,
+                                className="ref-btn",
                                 style=_btn_style()),
                     html.Span(
                         _trade_page_label(n, page),
@@ -721,12 +728,16 @@ def _card_sections(
     ]
 
     if error:
-        body = [html.Div(error, style={"color": ORANGE, "padding": "12px 0"})]
+        chart_body = html.Div(error, style={"color": ORANGE, "padding": "12px 0"})
     else:
         window_bars = WINDOW_PRESETS.get(window, WINDOW_PRESETS[DEFAULT_WINDOW])
         level_png = level_chart(
             state["data"], state["strategy"].target,
             trades=trades, open_entry=open_entry,
+            window_bars=window_bars, date_range=date_range,
+        )
+        input_png = input_chart(
+            state["data"], state["strategy"].feature,
             window_bars=window_bars, date_range=date_range,
         )
         sig_png = signal_chart(
@@ -747,25 +758,21 @@ def _card_sections(
             window_bars=window_bars,
             date_range=date_range,
         )
-        chart_pngs = [level_png, sig_png]
+        returns_png = return_distribution_chart(trades)
+        chart_pngs = [level_png, input_png, sig_png]
         if gate_png is not None:
             chart_pngs.append(gate_png)
-        chart_pngs.append(pnl_png)
-        body = [
-            html.Div(
-                style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": 10},
-                children=[
-                    html.Img(
-                        src=f"data:image/png;base64,{png}",
-                        style={"width": "100%", "border": f"1px solid {BORDER}"},
-                    )
-                    for png in chart_pngs
-                ],
-            ),
-            _trade_table_section(
-                trade_data["closed"], page, trade_data["open"], _slug(signal_id),
-            ),
-        ]
+        chart_pngs += [pnl_png, returns_png]
+        chart_body = html.Div(
+            style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": 10},
+            children=[
+                html.Img(
+                    src=f"data:image/png;base64,{png}",
+                    style={"width": "100%", "border": f"1px solid {BORDER}"},
+                )
+                for png in chart_pngs
+            ],
+        )
 
     summary = html.Div([
         html.Div(stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
@@ -775,7 +782,7 @@ def _card_sections(
                                          "borderTop": f"1px solid {BORDER}",
                                          "marginTop": 4, "paddingTop": 8}),
     ])
-    return summary, html.Div(body), trade_data
+    return summary, chart_body, trade_data
 
 
 def _btn_style(primary: bool = False) -> dict:
@@ -822,7 +829,7 @@ def _card(row: dict) -> html.Div:
     module = row["module"]
     signal_id = _row_id(row)
     slug = _slug(signal_id)
-    summary, analysis, trade_data = _card_sections(signal_id)
+    summary, chart_body, trade_data = _card_sections(signal_id)
     return html.Div(
         style={"border": f"1px solid {BORDER}", "background": PANEL,
                "padding": "14px 18px", "marginBottom": 18},
@@ -876,9 +883,29 @@ def _card(row: dict) -> html.Div:
                                     style=_btn_style(primary=(key == DEFAULT_WINDOW)))
                         for key in WINDOW_PRESETS
                     ],
+                    html.Button(
+                        "Copy",
+                        id=f"copy-charts-{slug}",
+                        n_clicks=0,
+                        className="ref-btn copy-charts-btn",
+                        title="Copy all visible charts as one image",
+                        style={**_btn_style(), "marginLeft": "auto"},
+                    ),
+                    html.Span(
+                        id=f"copy-status-{slug}",
+                        style={"fontSize": 11, "color": DIM, "minWidth": 42},
+                    ),
                 ],
             ),
-            html.Div(id=f"card-analysis-{slug}", children=analysis),
+            html.Div(
+                id=f"card-analysis-{slug}",
+                children=[
+                    html.Div(id=f"card-charts-{slug}", children=chart_body),
+                    _trade_table_section(
+                        trade_data["closed"], 0, trade_data["open"], slug,
+                    ) if trade_data is not None else html.Div(),
+                ],
+            ),
         ],
     )
 
@@ -937,6 +964,7 @@ def build_app() -> dash.Dash:
                     # keep the stale table visible and dimmed underneath rather
                     # than blanking it: a Ref is a refresh, not a page change
                     overlay_style={"visibility": "visible", "opacity": 0.35},
+                    parent_className="dashboard-overview-loader",
                 ),
             ],
         )
@@ -1106,7 +1134,11 @@ def build_app() -> dash.Dash:
                 trades, open_entry = runner.trade_history(signal_id, state)
             except RuntimeError as exc:
                 err = html.Div(str(exc), style={"color": ORANGE, "padding": "12px 0"})
-                return (html.Div(), err, None, 0, window, snap_range, *no_btn_styles)
+                return (
+                    html.Div(), err, None,
+                    dash.no_update, dash.no_update, 0,
+                    window, snap_range, *no_btn_styles,
+                )
 
             if trigger == f"snap-{slug}":
                 rng = _visible_trade_range(trades, open_entry, page, state["data_asof"])
@@ -1117,7 +1149,7 @@ def build_app() -> dash.Dash:
             if snap_range:
                 date_range = (pd.Timestamp(snap_range[0]), pd.Timestamp(snap_range[1]))
 
-            summary, analysis, trade_data = _card_sections(
+            summary, chart_body, trade_data = _card_sections(
                 signal_id,
                 state=state,
                 trades=trades,
@@ -1127,12 +1159,27 @@ def build_app() -> dash.Dash:
                 date_range=date_range,
             )
             btn_styles = [_btn_style(primary=(k == window)) for k in window_keys]
-            return summary, analysis, trade_data, page, window, snap_range, *btn_styles
+            if trigger == f"snap-{slug}":
+                # Snap changes the chart range only. Leaving the trade DOM and
+                # page store untouched keeps the viewer on the same rows.
+                return (
+                    summary, chart_body,
+                    dash.no_update, dash.no_update, dash.no_update, dash.no_update,
+                    window, snap_range, *btn_styles,
+                )
+            return (
+                summary, chart_body, trade_data,
+                _trade_table_block(trade_data["closed"], page, trade_data["open"]),
+                _trade_page_label(len(trade_data["closed"]), page), page,
+                window, snap_range, *btn_styles,
+            )
 
         app.callback(
             Output(f"card-summary-{slug}", "children"),
-            Output(f"card-analysis-{slug}", "children"),
+            Output(f"card-charts-{slug}", "children"),
             Output(f"trades-data-{slug}", "data"),
+            Output(f"trade-table-{slug}", "children", allow_duplicate=True),
+            Output(f"trades-status-{slug}", "children", allow_duplicate=True),
             Output(f"trades-page-{slug}", "data"),
             Output(f"window-{slug}", "data"),
             Output(f"snap-range-{slug}", "data"),
