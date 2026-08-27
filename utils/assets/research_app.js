@@ -6,24 +6,44 @@
   const statusPrefix = "copy-status-";
   const chartPrefix = "card-charts-";
 
-  function imageReady(image) {
-    if (image.complete && image.naturalWidth) return Promise.resolve();
-    return new Promise((resolve, reject) => {
-      image.addEventListener("load", resolve, { once: true });
-      image.addEventListener("error", reject, { once: true });
-    });
+  function pngBlobNow(canvas) {
+    // toBlob() is async. Some browsers revoke the trusted-click permission
+    // before its callback runs, then reject navigator.clipboard.write().
+    // Data URLs are synchronous, so this keeps the clipboard call inside the
+    // original button event.
+    const encoded = canvas.toDataURL("image/png").split(",", 2)[1];
+    const binary = atob(encoded);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return new Blob([bytes], { type: "image/png" });
   }
 
-  function pngBlob(canvas) {
-    return new Promise((resolve, reject) => {
-      canvas.toBlob((blob) => {
-        if (blob) resolve(blob);
-        else reject(new Error("The chart image could not be encoded."));
-      }, "image/png");
-    });
+  function legacyCopyImage(canvas) {
+    // Firefox and a few embedded browsers still lack ClipboardItem for image
+    // data. Their legacy copy implementation can copy an image selected from
+    // an editable DOM fragment, provided it runs in the original click event.
+    const holder = document.createElement("div");
+    holder.contentEditable = "true";
+    holder.style.cssText = "position:fixed;left:-10000px;top:0;width:1px;height:1px;overflow:hidden;";
+    const image = document.createElement("img");
+    image.src = canvas.toDataURL("image/png");
+    holder.appendChild(image);
+    document.body.appendChild(holder);
+
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(holder);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const copied = document.execCommand("copy");
+    selection.removeAllRanges();
+    holder.remove();
+    return copied;
   }
 
-  document.addEventListener("click", async (event) => {
+  document.addEventListener("click", (event) => {
     const button = event.target.closest(".copy-charts-btn");
     if (!button || !button.id.startsWith(buttonPrefix)) return;
 
@@ -36,10 +56,14 @@
       return;
     }
 
+    if (!images.every((image) => image.complete && image.naturalWidth)) {
+      if (status) status.textContent = "Charts still loading";
+      return;
+    }
+
     button.disabled = true;
     if (status) status.textContent = "Copying…";
     try {
-      await Promise.all(images.map(imageReady));
       const padding = 20;
       const columns = 2;
       const cellWidth = Math.max(...images.map((image) => image.naturalWidth));
@@ -67,15 +91,33 @@
         y += rowHeights[rowIndex] + padding;
       });
 
-      const blob = await pngBlob(canvas);
-      await navigator.clipboard.write([
-        new ClipboardItem({ "image/png": blob }),
-      ]);
-      if (status) status.textContent = "Copied";
+      const blob = pngBlobNow(canvas);
+      // Do not await before this line: Chromium/Firefox require a direct
+      // user gesture for an image clipboard write.
+      if (navigator.clipboard && window.ClipboardItem) {
+        navigator.clipboard.write([
+          new ClipboardItem({ "image/png": blob }),
+        ]).then(() => {
+          if (status) status.textContent = "Copied";
+        }).catch((error) => {
+          console.error("Could not copy dashboard charts", error);
+          if (status) {
+            status.textContent = error.name === "NotAllowedError"
+              ? "Allow clipboard"
+              : "Copy failed";
+          }
+        }).finally(() => {
+          button.disabled = false;
+        });
+      } else {
+        if (status) status.textContent = legacyCopyImage(canvas)
+          ? "Copied"
+          : "Copy unsupported";
+        button.disabled = false;
+      }
     } catch (error) {
       console.error("Could not copy dashboard charts", error);
       if (status) status.textContent = "Copy failed";
-    } finally {
       button.disabled = false;
     }
   });
