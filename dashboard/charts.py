@@ -349,10 +349,13 @@ def return_distribution_chart(trades: pl.DataFrame | None) -> str:
     fig.subplots_adjust(left=0.06, right=0.94, top=0.84, bottom=0.20)
 
     if values.size:
-        # Square-root scaling is stable for the modest trade counts typical of
-        # these strategies, without the jumpy bin changes of a fully automatic
-        # rule as one trade is added or removed.
-        bins = max(8, min(20, int(np.ceil(np.sqrt(values.size) * 2))))
+        # Fixed one-basis-point buckets make the distribution directly
+        # comparable across refreshes and strategies.
+        lower = float(np.floor(values.min()))
+        upper = float(np.ceil(values.max()))
+        if upper <= lower:
+            upper = lower + 1.0
+        bins = np.arange(lower, upper + 1.0, 1.0)
         _counts, edges, patches = ax.hist(
             values,
             bins=bins,
