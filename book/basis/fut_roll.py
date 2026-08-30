@@ -14,7 +14,6 @@ position held through a generic roll does not book the mechanical roll gap.
 
     python -m book.basis.fut_roll
     python -m book.basis.fut_roll --roots TY,US
-    python -m book.basis.fut_roll --synthetic
     python -m book.basis.fut_roll --diagnose
 
 main() returns a dict of state for interactive chaining: state = main().
@@ -23,9 +22,7 @@ main() returns a dict of state for interactive chaining: state = main().
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 
-import numpy as np
 import polars as pl
 
 import utils
@@ -66,74 +63,10 @@ TRANSACTION_COST_PX = 0.015625
 def load_data(
     roots: list[str],
     start: str = START,
-    *,
-    use_db: bool = True,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Futures-roll long frame and its wide trading panel."""
-    if use_db:
-        roll = futures_roll(
-            roots,
-            start=start,
-            min_days=MIN_DAYS_TO_FRONT_DELIVERY,
-        )
-    else:
-        roll = synthetic_roll(roots)
+    roll = futures_roll(roots, start=start, min_days=MIN_DAYS_TO_FRONT_DELIVERY)
     return roll, futures_roll_panel(roll)
-
-
-def synthetic_roll(
-    roots: list[str] | None = None,
-    n: int = 1500,
-    seed: int = 51,
-) -> pl.DataFrame:
-    """Synthetic front/deferred futures roll with mean-reverting dislocations."""
-    roots = list(roots or DELIVERABLE_ROOTS)
-    rng = np.random.default_rng(seed)
-    start_date = dt.date.fromisoformat(START)
-    dates = pl.date_range(
-        start_date,
-        start_date + dt.timedelta(days=n - 1),
-        interval="1d",
-        eager=True,
-    ).to_list()
-
-    rows = []
-    cycle = 63
-    quarter_codes = ("H", "M", "U", "Z")
-    for root_i, root in enumerate(roots):
-        front_px = 108.0 + root_i * 1.5 + np.cumsum(rng.normal(0.0, 0.08, n))
-        resid = np.zeros(n)
-        for i in range(1, n):
-            resid[i] = 0.93 * resid[i - 1] + rng.normal(0.0, 0.08)
-        seasonal = 0.12 * np.sin(np.arange(n) / cycle * 2.0 * np.pi)
-        roll = -0.25 - 0.03 * root_i + seasonal + resid
-
-        for i, ts in enumerate(dates):
-            pair = i // cycle
-            front_code = quarter_codes[pair % 4]
-            deferred_code = quarter_codes[(pair + 1) % 4]
-            year_digit = (start_date.year + pair // 4) % 10
-            front_contract = f"{root}{front_code}{year_digit}"
-            deferred_contract = f"{root}{deferred_code}{year_digit}"
-            front_delivery = start_date + dt.timedelta(days=(pair + 1) * cycle)
-            deferred_delivery = start_date + dt.timedelta(days=(pair + 2) * cycle)
-            rows.append(
-                {
-                    "ts": ts,
-                    "root": root,
-                    "front_contract": front_contract,
-                    "deferred_contract": deferred_contract,
-                    "front_delivery": front_delivery,
-                    "deferred_delivery": deferred_delivery,
-                    "n_days": (front_delivery - ts).days,
-                    "deferred_n_days": (deferred_delivery - ts).days,
-                    "front_px": float(front_px[i]),
-                    "deferred_px": float(front_px[i] - roll[i]),
-                    "roll": float(roll[i]),
-                }
-            )
-
-    return pl.DataFrame(rows).sort(["root", "ts"])
 
 
 def compute(panel: pl.DataFrame, root: str, params: dict | None = None) -> pl.DataFrame:
@@ -228,15 +161,12 @@ def latest(roll: pl.DataFrame, panel: pl.DataFrame, params: dict) -> pl.DataFram
 def main(
     roots: list[str] | None = None,
     params: dict | None = None,
-    *,
-    use_db: bool = True,
 ) -> dict:
     p = {**DEFAULT_PARAMS, **(params or {})}
     roots = list(roots or DELIVERABLE_ROOTS)
 
-    roll, panel = load_data(roots, use_db=use_db)
-    source = "db" if use_db else "synthetic"
-    print(f"roots={roots}  rows={len(roll)}  panel={panel.shape}  source={source}  params={p}")
+    roll, panel = load_data(roots)
+    print(f"roots={roots}  rows={len(roll)}  panel={panel.shape}  params={p}")
 
     cover = coverage(roll)
     print("\ncoverage / roll distribution (front - deferred, price points):")
@@ -287,10 +217,10 @@ def main(
     }
 
 
-def diagnose(roots: list[str] | None = None, *, use_db: bool = True) -> dict:
+def diagnose(roots: list[str] | None = None) -> dict:
     """Futures-roll construction only; no trading."""
     roots = list(roots or DELIVERABLE_ROOTS)
-    roll, panel = load_data(roots, use_db=use_db)
+    roll, panel = load_data(roots)
     print(f"roots={roots}  rows={len(roll)}  panel={panel.shape}")
     print("\ncoverage / roll distribution:")
     utils.pdf(coverage(roll))
@@ -311,7 +241,6 @@ if __name__ == "__main__":
         "--roots",
         help=f"comma-separated contract roots (default: {','.join(DELIVERABLE_ROOTS)})",
     )
-    parser.add_argument("--synthetic", action="store_true", help="use synthetic data")
     parser.add_argument(
         "--diagnose",
         action="store_true",
@@ -319,6 +248,5 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     selected = args.roots.split(",") if args.roots else None
-    kwargs = {"use_db": not args.synthetic}
 
-    state = diagnose(selected, **kwargs) if args.diagnose else main(selected, **kwargs)
+    state = diagnose(selected) if args.diagnose else main(selected)

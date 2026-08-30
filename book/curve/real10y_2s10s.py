@@ -12,7 +12,6 @@ All machinery lives in backtest.strategy.Strategy — this module is the
 configuration. Same funnel as every curve strategy:
 
     python -m book.curve.real10y_2s10s              # single run, live DB
-    python -m book.curve.real10y_2s10s --synthetic  # single run, no DB
     python -m book.curve.real10y_2s10s --predict    # setup search
     python -m book.curve.real10y_2s10s --exit       # exits per saved setup
     python -m book.curve.real10y_2s10s --sweep      # exact engine + trade logs
@@ -23,7 +22,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from backtest.strategy import Strategy, synthetic_pair
+from backtest.strategy import Strategy
 
 STRATEGY_FAMILY = "curve"
 SIGNAL_NAME = "real10y_2s10s"
@@ -38,13 +37,6 @@ FEATURE = "real10y"
 FEATURES = [FEATURE]
 
 
-def synthetic_data(n: int = 1500, seed: int = 11):
-    """Synthetic substitute: 2s10s explained by real 10Y plus OU residual."""
-    return synthetic_pair(
-        TARGET, FEATURE, n=n, seed=seed, feature_level=150.0, target_base=80.0
-    )
-
-
 STRATEGY = Strategy(
     name=SIGNAL_NAME,
     module="book.curve.real10y_2s10s",  # sweep workers import this
@@ -54,7 +46,6 @@ STRATEGY = Strategy(
     target=TARGET,
     feature=FEATURE,
     family=STRATEGY_FAMILY,
-    synthetic_fn=synthetic_data,
 )
 
 # lab worker contract + interactive / app API

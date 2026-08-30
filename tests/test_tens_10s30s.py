@@ -7,19 +7,19 @@ import pytest
 
 from backtest import sweep_strategy
 from backtest.strategy import _gate_filter, _normalize_predict_signals
+from tests import synthetic as syn
 
 view = importlib.import_module("book.curve.tens_10s30s")
 STRATEGY = view.STRATEGY
 compute = view.compute
 main = view.main
 pipeline = view.pipeline
-synthetic_data = view.synthetic_data
 TARGET = view.TARGET
 FEATURES = view.FEATURES
 
 
-def test_synthetic_data_shape():
-    data = synthetic_data(n=900)
+def test_synthetic_panel_shape():
+    data = syn.pair_panel(view, n=900)
     assert data.columns == ["ts", "10y", "10s30s"]
     assert len(data) == 900
     assert data["10y"].equals(data["10y"].round(2))
@@ -27,15 +27,16 @@ def test_synthetic_data_shape():
 
 
 def test_compute_schema_matches_input_length():
-    data = synthetic_data(n=900)
+    data = syn.pair_panel(view, n=900)
     sig = compute(data)
     assert "signal" in sig.columns
     assert {"resid", "beta", "r2"} <= set(sig.columns)
     assert len(sig) == len(data)
 
 
-def test_end_to_end_synthetic():
-    state = main(use_db=False)
+def test_end_to_end_synthetic(monkeypatch):
+    syn.use(monkeypatch, STRATEGY, syn.pair_panel(view))
+    state = main()
     assert set(state) == {"raw_data", "coverage", "data", "signals", "diag", "result"}
     assert isinstance(state["diag"], pl.DataFrame)
     assert len(state["result"].closed_trades) > 0
@@ -59,7 +60,7 @@ def test_pipeline_wiring():
 
 
 def test_compute_gate_param_adds_allow_column():
-    data = synthetic_data(n=900)
+    data = syn.pair_panel(view, n=900)
     gated = compute(data, params={"gate": ("r2", "high_75")})
     assert {"gate_value", "gate_percentile", "gate_allow"} <= set(gated.columns)
     assert gated["gate_allow"].dtype == pl.Boolean
@@ -84,7 +85,7 @@ def test_gate_filter_blocks_only_on_the_quantile_gate():
 
 
 def test_gate_conditions_are_buildable():
-    frame = compute(synthetic_data(n=900))
+    frame = compute(syn.pair_panel(view, n=900))
     p = STRATEGY._params({})
     names = [
         "r2", "beta_cv", "beta", "beta_vol20", "beta_mom10",
@@ -145,7 +146,8 @@ def test_sweep_mode_saves_results_and_trade_log(monkeypatch, tmp_path):
     monkeypatch.setattr(STRATEGY, "validation_file", tmp_path / "validation.parquet")
     monkeypatch.setattr(STRATEGY, "sweep_stop_loss_bps", [25.0])
 
-    state = view.sweep(use_db=False, n_jobs=1)
+    syn.use(monkeypatch, STRATEGY, syn.pair_panel(view))
+    state = view.sweep(n_jobs=1)
 
     assert (tmp_path / "sweep.parquet").exists()
     trades = pl.read_parquet(tmp_path / "trades.parquet")
@@ -188,7 +190,8 @@ def test_cook_runs_the_whole_funnel(monkeypatch, tmp_path):
     monkeypatch.setattr(STRATEGY, "predict_min_neighbors", 0)
     monkeypatch.setattr(STRATEGY, "sweep_stop_loss_bps", [25.0])
 
-    state = STRATEGY.cook(use_db=False, device="cpu", n_jobs=1)
+    syn.use(monkeypatch, STRATEGY, syn.pair_panel(view))
+    state = STRATEGY.cook(device="cpu", n_jobs=1)
 
     assert set(state) == {"predict", "exit", "sweep"}
     # every handoff artifact was written by its step
@@ -201,7 +204,7 @@ def test_cook_runs_the_whole_funnel(monkeypatch, tmp_path):
 
 
 def test_robustness_flags_one_trade_wonders():
-    data = view.model_frame(synthetic_data(n=3000))
+    data = view.model_frame(syn.pair_panel(view, n=3000))
     dates = data["ts"].to_list()
 
     def trade(setup, i0, i1, pnl):
@@ -324,7 +327,7 @@ def test_load_setups_and_exits_require_prior_modes(tmp_path):
 
 
 def test_compute_ou_z_entry_signal():
-    data = synthetic_data(n=900)
+    data = syn.pair_panel(view, n=900)
     resid_frame = compute(data)
     z_frame = compute(data, params={"entry_signal": "ou_z"})
     assert resid_frame["signal"].equals(resid_frame["resid"])
@@ -344,7 +347,7 @@ def test_predict_signal_names_normalize_ou_and_reject_unknown():
 
 
 def test_sweep_engine_runs_every_signal_and_exit_style():
-    data = view.model_frame(synthetic_data())
+    data = view.model_frame(syn.pair_panel(view))
     cases = [
         ("residual", 20.0, "band", 5.0),
         ("residual", 20.0, "revert_frac", 0.5),
@@ -394,7 +397,8 @@ def test_exit_mode_reports_exit_stats(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(STRATEGY, "exit_revert_fracs", [0.5])
     monkeypatch.setattr(STRATEGY, "exit_half_life_fracs", [1.0])
 
-    state = view.exit_scan(use_db=False, device="cpu")
+    syn.use(monkeypatch, STRATEGY, syn.pair_panel(view))
+    state = view.exit_scan(device="cpu")
     results = state["results"]
     assert {
         "sharpe", "hit_rate", "total_pnl_bps", "pnl_per_trade_bps",
@@ -434,7 +438,7 @@ def test_exit_mode_reports_exit_stats(monkeypatch, tmp_path, capsys):
 
 
 def test_sweep_gate_specs_serialize_and_block_entries():
-    data = view.model_frame(synthetic_data())
+    data = view.model_frame(syn.pair_panel(view))
     grid = {
         "gate": [
             None,

@@ -19,7 +19,6 @@ versus the 2Y relationship -> short 10s30s. A negative residual means it is
 flat/cheap -> long 10s30s.
 
     python -m book.curve.twos_10s30s              # live DB research candidate
-    python -m book.curve.twos_10s30s --synthetic  # synthetic smoke run
     python -m book.curve.twos_10s30s --predict    # causal setup search
     python -m book.curve.twos_10s30s --exit       # exit search
     python -m book.curve.twos_10s30s --sweep      # exact engine + validation
@@ -30,7 +29,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from backtest.strategy import DEFAULT_PARAMS, Strategy, synthetic_pair
+from backtest.strategy import DEFAULT_PARAMS, Strategy
 
 STRATEGY_FAMILY = "curve"
 SIGNAL_NAME = "twos_10s30s"
@@ -104,18 +103,6 @@ DASHBOARD_VARIANTS = {
 }
 
 
-def synthetic_data(n: int = 1500, seed: int = 31):
-    """Synthetic substitute: 10s30s explained by 2Y plus an OU residual."""
-    return synthetic_pair(
-        TARGET,
-        FEATURE,
-        n=n,
-        seed=seed,
-        feature_level=250.0,
-        target_base=50.0,
-    )
-
-
 STRATEGY = Strategy(
     name=SIGNAL_NAME,
     module="book.curve.twos_10s30s",
@@ -125,7 +112,6 @@ STRATEGY = Strategy(
     target=TARGET,
     feature=FEATURE,
     family=STRATEGY_FAMILY,
-    synthetic_fn=synthetic_data,
     default_params={**DEFAULT_PARAMS, **RESEARCH_PARAMS},
 )
 

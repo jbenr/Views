@@ -5,8 +5,7 @@ This is a worked, runnable example of the repo's strategy lifecycle:
     tickers -> load data -> build features -> signal frame
             -> SignalPipeline -> backtest -> sweep/gates -> (ledger / execution)
 
-It runs on SYNTHETIC data by default so a new contributor can execute it
-without DB access:
+It runs against the live DB:
 
     python -m book.rate_vol.template            # single backtest
     python -m book.rate_vol.template --sweep    # parameter grid through the lab
@@ -26,11 +25,9 @@ the structure. The real (stub) rate-vol strategy lives in strategy.py.
 
 from __future__ import annotations
 
-import datetime as dt
 import sys
 from functools import partial
 
-import numpy as np
 import polars as pl
 
 from backtest import (
@@ -68,31 +65,6 @@ def load_data(start: str = START) -> pl.DataFrame:
     from utils.market_data import load_wide
 
     return load_wide(TICKERS, start=start)
-
-
-def synthetic_data(n: int = 1500, seed: int = 7) -> pl.DataFrame:
-    """2b. Synthetic substitute: an anchor random walk plus a target that is
-    beta-linked to it with a mean-reverting (OU) residual — the structure the
-    signal is designed to exploit, so the template demonstrably trades.
-    """
-    rng = np.random.default_rng(seed)
-
-    anchor = 100.0 + np.cumsum(rng.normal(0.0, 1.0, n))
-
-    resid = np.zeros(n)                    # OU residual: half-life ~ ln2/theta ≈ 14d
-    theta, sigma = 0.05, 1.0
-    for i in range(1, n):
-        resid[i] = resid[i - 1] * (1 - theta) + rng.normal(0.0, sigma)
-
-    target = 20.0 + 0.8 * anchor + resid
-
-    start_date = dt.date.fromisoformat(START)
-    ts = pl.date_range(
-        start_date, start_date + dt.timedelta(days=2 * n), interval="1d", eager=True
-    )
-    ts = ts.filter(ts.dt.weekday() <= 5)[:n]
-
-    return pl.DataFrame({"ts": ts, "target": target, "anchor": anchor})
 
 
 # 3. Features + 4. signal frame. compute() takes the wide data frame (and the
@@ -157,13 +129,11 @@ SWEEP_GRID = {
 pipeline = make_pipeline()   # default-parameter pipeline (engine/tests import this)
 
 
-def main(use_db: bool = False, params: dict | None = None) -> dict:
+def main(params: dict | None = None) -> dict:
     p = {**DEFAULT_PARAMS, **(params or {})}
 
-    # load data — synthetic by default so this runs anywhere
-    data = load_data() if use_db else synthetic_data()
-    print(f"rows={len(data)}  cols={data.columns}  "
-          f"(source={'db' if use_db else 'synthetic'})  params={p}")
+    data = load_data()
+    print(f"rows={len(data)}  cols={data.columns}  params={p}")
 
     # residual diagnostics before backtesting: does fading it even work?
     sig_frame = compute(data, params=p)
@@ -191,11 +161,11 @@ def main(use_db: bool = False, params: dict | None = None) -> dict:
     return {"data": data, "signals": sig_frame, "diag": diag, "result": result}
 
 
-def sweep(use_db: bool = False, n_jobs: int | None = None) -> dict:
+def sweep(n_jobs: int | None = None) -> dict:
     """8. Parameter search through the lab: exact engine per combo, parallel
     across CPU cores, logged to the MetricStore for cross-strategy comparison.
     """
-    data = load_data() if use_db else synthetic_data()
+    data = load_data()
     print(f"sweep: {SIGNAL_NAME}  grid={SWEEP_GRID}  rows={len(data)}")
 
     results = sweep_strategy(
@@ -203,9 +173,7 @@ def sweep(use_db: bool = False, n_jobs: int | None = None) -> dict:
         transaction_cost_bps=TRANSACTION_COST_BPS, n_jobs=n_jobs,
     )
     store = MetricStore()
-    store.log(SIGNAL_NAME, results, meta={
-        "engine": "exact", "source": "db" if use_db else "synthetic",
-    })
+    store.log(SIGNAL_NAME, results, meta={"engine": "exact", "source": "db"})
 
     print("\nleaderboard (top 10 by sharpe):")
     show = ["beta_lb", "z_lb", "entry_z", "sharpe", "total_pnl_bps", "hit_rate", "n_trades"]
@@ -214,8 +182,7 @@ def sweep(use_db: bool = False, n_jobs: int | None = None) -> dict:
 
 
 if __name__ == "__main__":
-    use_db = "--db" in sys.argv
     if "--sweep" in sys.argv:
-        state = sweep(use_db=use_db)
+        state = sweep()
     else:
-        state = main(use_db=use_db)
+        state = main()

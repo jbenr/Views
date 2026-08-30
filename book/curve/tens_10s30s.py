@@ -20,7 +20,6 @@ configuration. Tune by overriding Strategy fields below (grids, params,
 costs); see the Strategy docstring for the funnel and every knob.
 
     python -m book.curve.tens_10s30s              # single run, live DB
-    python -m book.curve.tens_10s30s --synthetic  # single run, no DB
     python -m book.curve.tens_10s30s --predict    # setup search -> setups parquet
     python -m book.curve.tens_10s30s --exit       # exits per setup -> exits parquet
     python -m book.curve.tens_10s30s --sweep      # exact engine + trade logs
@@ -36,7 +35,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from backtest.strategy import Strategy, synthetic_pair
+from backtest.strategy import Strategy
 
 STRATEGY_FAMILY = "curve"
 SIGNAL_NAME = "tens_10s30s"
@@ -51,11 +50,6 @@ FEATURE = "10y"
 FEATURES = [FEATURE]
 
 
-def synthetic_data(n: int = 1500, seed: int = 21):
-    """Synthetic substitute: 10s30s target explained by 10Y plus OU residual."""
-    return synthetic_pair(TARGET, FEATURE, n=n, seed=seed)
-
-
 STRATEGY = Strategy(
     name=SIGNAL_NAME,
     module="book.curve.tens_10s30s",  # sweep workers import this
@@ -65,7 +59,6 @@ STRATEGY = Strategy(
     target=TARGET,
     feature=FEATURE,
     family=STRATEGY_FAMILY,
-    synthetic_fn=synthetic_data,
 )
 
 # lab worker contract + interactive / app API

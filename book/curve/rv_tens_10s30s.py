@@ -11,7 +11,6 @@ remaining direction exposure, convergence across rates regimes, and carry/
 roll for the final executable legs.
 
     python -m book.curve.rv_tens_10s30s
-    python -m book.curve.rv_tens_10s30s --synthetic
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ import utils
 from research import PairRVStudy
 from stats import beta_cv
 
-from .tens_10s30s_research_data import coverage, load_data, synthetic_data
+from .tens_10s30s_research_data import coverage, load_data
 
 NAME = "rv_tens_10s30s"
 LEFT = "10s30s"
@@ -69,8 +68,8 @@ def run(data: pl.DataFrame) -> dict:
     }
 
 
-def main(use_db: bool = True) -> dict:
-    data = load_data() if use_db else synthetic_data()
+def main() -> dict:
+    data = load_data()
     state = run(data)
     print(f"{NAME}  rows={len(data)}  {data['ts'][0]} -> {data['ts'][-1]}")
     print("\ncoverage:")
@@ -88,7 +87,6 @@ def main(use_db: bool = True) -> dict:
 
 if __name__ == "__main__":
     args = set(sys.argv[1:])
-    unknown = args - {"--synthetic"}
-    if unknown:
-        sys.exit(f"unknown argument(s): {sorted(unknown)}\nflags: --synthetic")
-    main(use_db="--synthetic" not in args)
+    if args:
+        sys.exit(f"unknown argument(s): {sorted(args)}")
+    main()

@@ -1,8 +1,0 @@
-  LIVE  →  http://127.0.0.1:8099  (debug=True)
-Dash is running on http://127.0.0.1:8099/
-
- * Serving Flask app 'utils.research_app'
- * Debug mode: on
-  LIVE  →  http://127.0.0.1:8099  (debug=True)
-  LIVE  →  http://127.0.0.1:8099  (debug=True)
-  LIVE  →  http://127.0.0.1:8099  (debug=True)

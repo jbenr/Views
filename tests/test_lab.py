@@ -25,7 +25,7 @@ from backtest.lab import (
     signal_matrix,
     sweep_strategy,
 )
-from book.rate_vol.template import synthetic_data
+from tests.synthetic import template_panel
 
 
 # ── ParamGrid ────────────────────────────────────────────────────────────────
@@ -229,7 +229,7 @@ def test_predict_lift_matches_null_param_keys():
 
 
 def test_signal_matrix_shape_and_combos():
-    data = synthetic_data(n=800)
+    data = template_panel(n=800)
     z, combos = signal_matrix(data["anchor"], data["target"], [42, 63], [42, 63])
     assert z.shape == (800, 4)
     assert combos[0] == {"beta_lb": 42, "z_lb": 42}
@@ -244,7 +244,7 @@ def test_signal_matrix_shape_and_combos():
 
 
 def test_signal_matrix_returns_conditions():
-    data = synthetic_data(n=800)
+    data = template_panel(n=800)
     z, combos, conditions = signal_matrix(
         data["anchor"], data["target"], [42, 63], [42, 63], return_conditions=True
     )
@@ -384,7 +384,7 @@ def test_strategy_import_falls_back_to_source_file(monkeypatch):
 
 
 def test_sweep_strategy_serial():
-    data = synthetic_data(n=800)
+    data = template_panel(n=800)
     grid = {"beta_lb": [42, 63], "entry_z": [1.5, 2.0]}
     out = sweep_strategy("book.rate_vol.template", data, grid, n_jobs=1)
     assert len(out) == 4
@@ -395,7 +395,7 @@ def test_sweep_strategy_serial():
 
 
 def test_sweep_strategy_surfaces_errors():
-    data = synthetic_data(n=800)
+    data = template_panel(n=800)
     out = sweep_strategy(
         "book.rate_vol.template", data, {"beta_lb": [-5]}, n_jobs=1, sort_by="sharpe"
     )

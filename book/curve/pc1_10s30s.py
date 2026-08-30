@@ -13,7 +13,6 @@ All machinery lives in backtest.strategy.Strategy — this module is the
 configuration plus the PC1 feature hook. Same funnel as every curve strategy:
 
     python -m book.curve.pc1_10s30s              # single run, live DB
-    python -m book.curve.pc1_10s30s --synthetic  # single run, no DB
     python -m book.curve.pc1_10s30s --predict    # setup search
     python -m book.curve.pc1_10s30s --exit       # exits per saved setup
     python -m book.curve.pc1_10s30s --sweep      # exact engine + trade logs
@@ -22,10 +21,8 @@ configuration plus the PC1 feature hook. Same funnel as every curve strategy:
 
 from __future__ import annotations
 
-import datetime as dt
 from pathlib import Path
 
-import numpy as np
 import polars as pl
 
 from backtest.strategy import Strategy
@@ -61,35 +58,6 @@ def add_pc1(data: pl.DataFrame) -> pl.DataFrame:
     return data.join(scores, on="ts", how="left")
 
 
-def synthetic_data(n: int = 1500, seed: int = 13):
-    """Synthetic substitute: correlated yield panel with a common level
-    factor; 10s30s explained by that factor plus an OU residual."""
-    rng = np.random.default_rng(seed)
-
-    level = np.cumsum(rng.normal(0.0, 2.0, n))
-    yields = {
-        "2y": 150.0 + level + np.cumsum(rng.normal(0.0, 0.5, n)),
-        "5y": 250.0 + level + np.cumsum(rng.normal(0.0, 0.5, n)),
-        "10y": 350.0 + level + np.cumsum(rng.normal(0.0, 0.5, n)),
-        "30y": 400.0 + level + np.cumsum(rng.normal(0.0, 0.5, n)),
-    }
-
-    resid = np.zeros(n)  # OU: half-life around 14d
-    theta, sigma = 0.05, 2.0
-    for i in range(1, n):
-        resid[i] = resid[i - 1] * (1 - theta) + rng.normal(0.0, sigma)
-
-    slope = 50.0 + 0.25 * level + resid
-
-    start_date = dt.date.fromisoformat("2010-01-01")
-    ts = pl.date_range(
-        start_date, start_date + dt.timedelta(days=2 * n), interval="1d", eager=True
-    )
-    ts = ts.filter(ts.dt.weekday() <= 5)[:n]
-
-    return pl.DataFrame({"ts": ts, **yields, "10s30s": slope})
-
-
 STRATEGY = Strategy(
     name=SIGNAL_NAME,
     module="book.curve.pc1_10s30s",  # sweep workers import this
@@ -99,7 +67,6 @@ STRATEGY = Strategy(
     target=TARGET,
     feature=FEATURE,
     family=STRATEGY_FAMILY,
-    synthetic_fn=synthetic_data,
     feature_fn=add_pc1,
 )
 

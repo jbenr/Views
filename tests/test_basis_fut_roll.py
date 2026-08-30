@@ -5,6 +5,7 @@ import importlib
 
 import polars as pl
 
+from tests.synthetic import roll_panel
 from utils.basis import futures_roll_panel
 
 view = importlib.import_module("book.basis.fut_roll")
@@ -29,7 +30,8 @@ def test_futures_roll_panel_stitches_contract_pair_gaps():
 
 
 def test_synthetic_roll_and_compute_schema():
-    roll, panel = view.load_data(["TY", "US"], use_db=False)
+    roll = roll_panel(["TY", "US"])
+    panel = futures_roll_panel(roll)
     sig = view.compute(panel, "TY", params={"ou_lb": 60})
 
     assert {"ts", "TY_roll", "TY_level", "US_roll", "US_level"} <= set(panel.columns)
@@ -46,10 +48,13 @@ def test_pipeline_wiring():
     assert pipeline.trade_def.legs == {"TY_level": 1.0}
 
 
-def test_end_to_end_synthetic():
+def test_end_to_end_synthetic(monkeypatch):
+    roll = roll_panel(["TY", "US"])
+    monkeypatch.setattr(
+        view, "load_data", lambda *a, **k: (roll, futures_roll_panel(roll))
+    )
     state = view.main(
         roots=["TY", "US"],
-        use_db=False,
         params={"ou_lb": 60, "entry_z": 1.0, "exit_z": 0.2},
     )
 

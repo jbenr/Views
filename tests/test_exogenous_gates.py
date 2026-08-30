@@ -11,7 +11,8 @@ import polars as pl
 import pytest
 
 from backtest.lab import CONDITION_NAMES, signal_matrix
-from backtest.strategy import Strategy, synthetic_pair
+from backtest.strategy import Strategy
+from tests.synthetic import synthetic_pair
 from utils.market_data import align_columns
 
 TARGET, FEATURE, EXO = "10s30s", "10y", "vol"
@@ -159,12 +160,11 @@ def test_exogenous_conditions_tolerate_a_frame_missing_the_column(tmp_path):
     assert strategy._exogenous_conditions(stale) == {}
 
 
-def test_predict_scan_searches_exogenous_gates(tmp_path):
+def test_predict_scan_searches_exogenous_gates(tmp_path, monkeypatch):
     """End to end: the exogenous column competes as a gate in --predict."""
     panel = _panel(n=1200)
     strategy = _strategy(
         tmp_path,
-        synthetic_fn=lambda: panel,
         predict_entry_signals=["ou"],
         predict_beta_lbs=[40, 60],
         predict_ou_lbs=[120, 180],
@@ -173,6 +173,7 @@ def test_predict_scan_searches_exogenous_gates(tmp_path):
         gate_windows=[252, None],
         gate_min_history=126,
     )
-    state = strategy.predict(use_db=False, device="cpu")
+    monkeypatch.setattr(strategy, "load_data", lambda *a, **k: panel)
+    state = strategy.predict(device="cpu")
     gates = set(state["results"]["gate"].unique().to_list())
     assert EXO in gates, f"exogenous gate absent from scan; saw {sorted(gates)}"

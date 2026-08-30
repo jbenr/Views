@@ -8,6 +8,7 @@ import polars as pl
 import pytest
 
 from backtest.engine import BacktestConfig, Engine
+from tests import synthetic as syn
 
 MODULES = [
     "book.curve.real10y_2s10s",
@@ -34,9 +35,10 @@ def test_twos_10s30s_defaults_to_live_ungated_research_candidate():
 
 
 @pytest.mark.parametrize("module_name", MODULES)
-def test_end_to_end_synthetic(module_name):
+def test_end_to_end_synthetic(module_name, monkeypatch):
     mod = importlib.import_module(module_name)
-    state = mod.main(use_db=False)
+    syn.use(monkeypatch, mod.STRATEGY, syn.panel_for(mod))
+    state = mod.main()
     assert set(state) == {"raw_data", "coverage", "data", "signals", "diag", "result"}
     assert len(state["result"].closed_trades) > 0
     # residual is OU by construction -> fading it must show positive IC
@@ -64,7 +66,7 @@ def test_xy_scan_uses_shared_curve_data_directory():
 
 def test_pc1_feature_hook_adds_point_in_time_score():
     mod = importlib.import_module("book.curve.pc1_10s30s")
-    data = mod.add_pc1(mod.synthetic_data(n=900))
+    data = mod.add_pc1(syn.pc1_panel(n=900))
     assert mod.FEATURE in data.columns
     # warmup nulls, then populated
     assert data[mod.FEATURE][: mod.PC1_LB - 1].is_null().all()
@@ -80,7 +82,7 @@ def test_live_signal_is_prefix_invariant(module_name, gate):
     """Appending future observations cannot alter any earlier signal state."""
     mod = importlib.import_module(module_name)
     strategy = mod.STRATEGY
-    raw = mod.synthetic_data(n=1600)
+    raw = syn.panel_for(mod, n=1600)
     cutoff = 1200
 
     def prepare(frame):
@@ -120,7 +122,7 @@ def test_live_backtest_history_is_prefix_invariant(module_name):
     """Future rows cannot rewrite earlier positions, PnL, or closed trades."""
     mod = importlib.import_module(module_name)
     strategy = mod.STRATEGY
-    raw = mod.synthetic_data(n=1600)
+    raw = syn.panel_for(mod, n=1600)
     cutoff = 1200
 
     def prepare(frame):

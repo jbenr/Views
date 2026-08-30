@@ -31,7 +31,7 @@ The core research loop:
 | `tests/` | production | Synthetic-data tests — no DB or Bloomberg required |
 | `notes/` | docs | `PLAN.md` (the north star), `TODO.md`, `notes.md` (factor decomposition) |
 
-Root-level `main.py`, `_db_inspect.py`, `_gap_check.py` are scratch scripts.
+Root-level `main.py` and `_db_inspect.py` are scratch scripts.
 
 ## Setup
 
@@ -92,7 +92,7 @@ from stats import (
 
 ## Building a new strategy
 
-**Start from the template: [`book/rate_vol/template.py`](book/rate_vol/template.py).** It is a complete, runnable walkthrough on synthetic data:
+**Start from the template: [`book/rate_vol/template.py`](book/rate_vol/template.py).** It is a complete, runnable walkthrough of the lifecycle:
 
 ```bash
 python -m book.rate_vol.template
@@ -130,7 +130,7 @@ Every curve strategy module is configuration on the shared template
 research modes, the CLI, and the artifact files:
 
 ```python
-from backtest.strategy import Strategy, synthetic_pair
+from backtest.strategy import Strategy
 
 STRATEGY = Strategy(
     name="real10y_2s10s",
@@ -139,7 +139,6 @@ STRATEGY = Strategy(
     tickers={"real10y": "USGGT10Y Index", "2s10s": "USYC2Y10 Index"},
     bps_cols=["real10y"],
     target="2s10s", feature="real10y",
-    synthetic_fn=...,                      # no-DB substitute for tests/dev
     feature_fn=...,                        # optional derived features (e.g. PC1)
 )
 compute, make_pipeline, pipeline = STRATEGY.compute, STRATEGY.make_pipeline, STRATEGY.pipeline
@@ -153,16 +152,15 @@ constructor field — override per strategy as needed. Strategies with a custom
 `compute` (non-residual-fade families) can still build a raw `SignalPipeline`
 against the engine directly.
 
-**Every strategy module must also be scriptable**, with a `main(use_db: bool = True) -> dict` that prints the four standard blocks and returns its state for interactive chaining:
+**Every strategy module must also be scriptable**, with a `main() -> dict` that prints the four standard blocks and returns its state for interactive chaining:
 
-1. data line — rows, date span, columns, source (`db` / `synthetic`)
+1. data line — rows, date span, columns
 2. residual horizon backtest table (IC / hit / Sharpe at 5/20/60d)
 3. engine `BACKTEST SUMMARY`
 4. latest signal line — ts, z, resid, beta, r2, action
 
 ```bash
 python -m book.curve.tens_10s30s              # live DB data
-python -m book.curve.tens_10s30s --synthetic  # no DB needed
 ```
 
 `book/curve/tens_10s30s.py` (the direction→curve research thread: 10Y vs 10s30s) is the live example of this pattern; `book/curve/real10y_2s10s.py` and `book/curve/pc1_10s30s.py` are graduates of the cross-pair explorer (`book/curve/xy_scan.py`, funnel step 0).
@@ -225,7 +223,10 @@ The last hop is stubbed in `execution/`: a `TargetPosition` → `OrderPreview` t
 ## Tests
 
 ```bash
-pytest            # synthetic data only — no DB, no Bloomberg
+pytest            # no DB, no Bloomberg
 ```
+
+Tests run offline: `tests/synthetic.py` builds the panels and injects them by
+replacing a strategy's `load_data`. Production code has no synthetic path.
 
 Covers the stats primitives, the market-data transformation, the backtest engine, the strategy template end-to-end, and the execution safety gates.

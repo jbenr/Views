@@ -9,7 +9,6 @@ This is research only.  It does not choose a winner or replace the incumbent
 ``tens_10s30s`` strategy/backtest.
 
     python -m book.curve.dislocation_tens_10s30s
-    python -m book.curve.dislocation_tens_10s30s --synthetic
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ import polars as pl
 import utils
 from research import DislocationStudy
 
-from .tens_10s30s_research_data import coverage, load_data, synthetic_data
+from .tens_10s30s_research_data import coverage, load_data
 
 NAME = "dislocation_tens_10s30s"
 TARGET = "10s30s"
@@ -51,9 +50,9 @@ def run(data: pl.DataFrame, metric: str = "dislocation") -> dict:
     return {"coverage": coverage(data, [TARGET, *FEATURES]), **state}
 
 
-def main(use_db: bool = True, metric: str = "dislocation") -> dict:
+def main(metric: str = "dislocation") -> dict:
     """Print the research evidence and latest dislocation state."""
-    data = load_data() if use_db else synthetic_data()
+    data = load_data()
     state = run(data, metric=metric)
     print(f"{NAME}  metric={metric}  rows={len(data)}  {data['ts'][0]} -> {data['ts'][-1]}")
     print("\ncoverage:")
@@ -74,8 +73,8 @@ def main(use_db: bool = True, metric: str = "dislocation") -> dict:
 
 if __name__ == "__main__":
     args = set(sys.argv[1:])
-    known = {"--synthetic", "--ou"}
+    known = {"--ou"}
     unknown = args - known
     if unknown:
-        sys.exit(f"unknown argument(s): {sorted(unknown)}\nflags: --synthetic --ou")
-    main(use_db="--synthetic" not in args, metric="dislocation_ou_z" if "--ou" in args else "dislocation")
+        sys.exit(f"unknown argument(s): {sorted(unknown)}\nflags: --ou")
+    main(metric="dislocation_ou_z" if "--ou" in args else "dislocation")

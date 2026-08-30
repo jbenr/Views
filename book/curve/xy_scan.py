@@ -22,13 +22,11 @@ and run the full --predict/--exit/--sweep funnel there. The top setups per
 pair are saved to XY_SETUPS_FILE for reference.
 
     python -m book.curve.xy_scan              # live DB (GPU-friendly)
-    python -m book.curve.xy_scan --synthetic  # no DB
     --cpu / --gpu force the scan device (default: auto).
 """
 
 from __future__ import annotations
 
-import datetime as dt
 import sys
 import time
 from pathlib import Path
@@ -222,74 +220,6 @@ def leak_matrix() -> pl.DataFrame:
 def load_data(start: str = START) -> pl.DataFrame:
     """Load the full ticker panel from md.index_eod."""
     return load_wide(TICKERS, start=start, bps_cols=BPS_COLS)
-
-
-def synthetic_data(n: int = 1500, seed: int = 7) -> pl.DataFrame:
-    """Synthetic panel: correlated yield levels, curves as spreads plus OU
-    residuals, breakevens as their own walk."""
-    rng = np.random.default_rng(seed)
-
-    def walk(start_level, vol):
-        return start_level + np.cumsum(rng.normal(0.0, vol, n))
-
-    level = np.cumsum(rng.normal(0.0, 2.0, n))  # common level factor
-    yields = {
-        "2y": 150.0 + level + walk(0.0, 1.0),
-        "5y": 250.0 + level + walk(0.0, 0.8),
-        "10y": 350.0 + level + walk(0.0, 0.6),
-        "30y": 400.0 + level + walk(0.0, 0.6),
-    }
-    be = {"be5": 200.0 + walk(0.0, 1.0), "be10": 220.0 + walk(0.0, 0.8)}
-
-    def ou(sigma=2.0, theta=0.05):
-        r = np.zeros(n)
-        for i in range(1, n):
-            r[i] = r[i - 1] * (1 - theta) + rng.normal(0.0, sigma)
-        return r
-
-    curves = {
-        "2s5s": yields["5y"] - yields["2y"] + ou(),
-        "2s10s": yields["10y"] - yields["2y"] + ou(),
-        "2s30s": yields["30y"] - yields["2y"] + ou(),
-        "5s10s": yields["10y"] - yields["5y"] + ou(),
-        "5s30s": yields["30y"] - yields["5y"] + ou(),
-        "10s30s": yields["30y"] - yields["10y"] + ou(),
-    }
-
-    start_date = dt.date.fromisoformat(START)
-    ts = pl.date_range(
-        start_date, start_date + dt.timedelta(days=2 * n), interval="1d", eager=True
-    )
-    ts = ts.filter(ts.dt.weekday() <= 5)[:n]
-
-    # Swap-market stand-ins: same level factor, own idiosyncratic noise, so
-    # they correlate with the Treasury panel without being made of it. Tenors
-    # are read off TICKERS rather than listed again here -- a hardcoded list
-    # silently drops any swap ticker added later, and --synthetic then fails
-    # on a missing column well away from the edit that caused it.
-    def _anchor(tenor: int) -> str:
-        return f"{min(yields, key=lambda k: abs(int(k[:-1]) - tenor))}"
-
-    ois = {
-        k: yields[_anchor(int(k[3:]))] + walk(0.0, 0.3)
-        for k in TICKERS if k.startswith("ois")
-    }
-    zc = {
-        k: 200.0 + 2.0 * int(k[2:]) + walk(0.0, 0.6)
-        for k in TICKERS if k.startswith("zc")
-    }
-
-    return pl.DataFrame(
-        {
-            "ts": ts,
-            **yields,
-            **be,
-            **ois,
-            **zc,
-            "real10y": yields["10y"] - be["be10"],
-            **curves,
-        }
-    )
 
 
 def add_features(data: pl.DataFrame) -> pl.DataFrame:
@@ -555,8 +485,8 @@ def _select_setups(valid: pl.DataFrame, limit: int) -> pl.DataFrame:
 # -- mode -------------------------------------------------------------------
 
 
-def main(use_db: bool = True, device: str = "auto") -> dict:
-    data = add_features(load_data() if use_db else synthetic_data())
+def main(device: str = "auto") -> dict:
+    data = add_features(load_data())
 
     pairs = [(y, x) for y in YS for x in XS if y != x]
     n_variants = 1 + 11 * gate_variant_count(XY_GATE_BUCKETS)
@@ -564,7 +494,7 @@ def main(use_db: bool = True, device: str = "auto") -> dict:
         f"xy scan  {len(XS)} x-features x {len(YS)} curves = {len(pairs)} pairs  "
         f"horizons={XY_HORIZONS}  gate variants~{n_variants}\n"
         f"data     {len(data)} rows  {data['ts'][0]} -> {data['ts'][-1]}  "
-        f"{len(TICKERS)} tickers  ({'db' if use_db else 'synthetic'})\n"
+        f"{len(TICKERS)} tickers\n"
         f"device   {_device_label(device)}\n"
     )
 
@@ -695,12 +625,11 @@ def main(use_db: bool = True, device: str = "auto") -> dict:
 
 if __name__ == "__main__":
     args = set(sys.argv[1:])
-    known = {"--synthetic", "--cpu", "--gpu"}
+    known = {"--cpu", "--gpu"}
     unknown = args - known
     if unknown:
         sys.exit(
-            f"unknown argument(s): {sorted(unknown)}\nflags: --synthetic --cpu --gpu"
+            f"unknown argument(s): {sorted(unknown)}\nflags: --cpu --gpu"
         )
-    use_db = "--synthetic" not in args
     device = "cpu" if "--cpu" in args else ("gpu" if "--gpu" in args else "auto")
-    state = main(use_db=use_db, device=device)
+    state = main(device=device)

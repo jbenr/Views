@@ -16,6 +16,7 @@ from dashboard.charts import (
 )
 from dashboard.params import params_from_row
 from dashboard.registry import LiveRegistry
+from tests import synthetic as syn
 
 
 def _load_app_module(monkeypatch, tmp_path):
@@ -323,7 +324,7 @@ def test_registry_list_groups_by_family_and_keeps_gates_off_visible():
 
 def test_registry_can_promote_curated_module_defaults(monkeypatch, tmp_path):
     mod = importlib.import_module("book.curve.twos_10s30s")
-    monkeypatch.setattr(mod.STRATEGY, "load_data", lambda: mod.synthetic_data(n=1500))
+    syn.use(monkeypatch, mod.STRATEGY, syn.panel_for(mod, n=1500))
     monkeypatch.setattr(
         "dashboard.registry.load_strategy",
         lambda _module: mod.STRATEGY,
@@ -376,7 +377,7 @@ def test_params_from_row_drops_null_required_values_from_union_schema():
 
 def test_registry_keeps_named_variants_beside_base(monkeypatch, tmp_path):
     mod = importlib.import_module("book.curve.twos_10s30s")
-    monkeypatch.setattr(mod.STRATEGY, "load_data", lambda: mod.synthetic_data(n=1500))
+    syn.use(monkeypatch, mod.STRATEGY, syn.panel_for(mod, n=1500))
     monkeypatch.setattr(
         "dashboard.registry.load_strategy",
         lambda _module: mod.STRATEGY,

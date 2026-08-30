@@ -63,7 +63,6 @@ name it in gate_columns, and --predict searches it like any other gate.
 
 from __future__ import annotations
 
-import datetime as dt
 import math
 import sys
 import time
@@ -242,7 +241,6 @@ class Strategy:
     transaction_cost_bps: float = 0.1
 
     # data hooks
-    synthetic_fn: Optional[Callable[[], pl.DataFrame]] = None
     feature_fn: Optional[Callable[[pl.DataFrame], pl.DataFrame]] = None
 
     # exogenous gate candidates: panel columns (from tickers or feature_fn)
@@ -369,22 +367,11 @@ class Strategy:
         """Gate candidates drawn from the panel rather than the regression.
 
         Tolerates a frame that predates a gate_columns change -- a cached
-        parquet or a synthetic_fn that never had the column -- so adding a
-        candidate cannot break a signal that does not use it yet. A gate that
-        actually names a missing column still fails loudly in
-        _gate_condition().
+        parquet that never had the column -- so adding a candidate cannot
+        break a signal that does not use it yet. A gate that actually names a
+        missing column still fails loudly in _gate_condition().
         """
         return {c: data[c] for c in self.gate_columns if c in data.columns}
-
-    def _data(self, use_db: bool) -> pl.DataFrame:
-        if use_db:
-            return self.load_data()
-        if self.synthetic_fn is None:
-            raise ValueError(f"{self.name}: no synthetic_fn configured")
-        data = self.synthetic_fn()
-        if self.feature_fn is not None:
-            data = self.feature_fn(data)
-        return data.with_columns(pl.col(self.model_columns).round(2))
 
     # -- signal construction ------------------------------------------------
 
@@ -742,12 +729,12 @@ class Strategy:
 
     # -- modes --------------------------------------------------------------
 
-    def main(self, use_db: bool = True, params: dict | None = None) -> dict:
+    def main(self, params: dict | None = None) -> dict:
         """Single run: coverage, horizon diagnostics, exact backtest, and the
         latest live signal line."""
         p = self._params(params)
 
-        raw_data = self._data(use_db)
+        raw_data = self.load_data()
         coverage = coverage_report(raw_data, self.model_columns)
         data = self.model_frame(raw_data)
 
@@ -759,7 +746,7 @@ class Strategy:
         print(
             f"raw_rows={len(raw_data)}  model_rows={len(data)}  "
             f"{data['ts'].min()} -> {data['ts'].max()}  "
-            f"cols={data.columns}  (source={'db' if use_db else 'synthetic'})  params={p}"
+            f"cols={data.columns}  params={p}"
         )
 
         sig_frame = self.compute(data, params=p)
@@ -804,10 +791,10 @@ class Strategy:
             "result": result,
         }
 
-    def predict(self, use_db: bool = True, device: str = "auto") -> dict:
+    def predict(self, device: str = "auto") -> dict:
         """GPU-friendly forward-horizon predictability scan with gate buckets."""
         entry_signals = _normalize_predict_signals(self.predict_entry_signals)
-        raw_data = self._data(use_db)
+        raw_data = self.load_data()
         data = self.model_frame(raw_data)
         level = self.pipeline.trade_def.composite_series(data).to_numpy()
 
@@ -951,7 +938,7 @@ class Strategy:
 
         return {"data": data, "results": results, "setups": setups}
 
-    def exit_scan(self, use_db: bool = True, device: str = "auto") -> dict:
+    def exit_scan(self, device: str = "auto") -> dict:
         """Vectorized exit scan: every (setup, entry, exit style, exit param)
         as an approximate trade backtest — which exits pay, how long they
         hold, at what hit rate. Setups come from setups_file (saved by
@@ -959,7 +946,7 @@ class Strategy:
         --sweep. Bands run on device; the stateful styles (revert_frac,
         half_life_frac) are CPU."""
         setups = self.load_setups()
-        raw_data = self._data(use_db)
+        raw_data = self.load_data()
         data = self.model_frame(raw_data)
         level = self.pipeline.trade_def.composite_series(data).to_numpy()
 
@@ -1407,7 +1394,7 @@ class Strategy:
             })
         return pl.DataFrame([row])
 
-    def sweep(self, use_db: bool = True, n_jobs: int | None = None) -> dict:
+    def sweep(self, n_jobs: int | None = None) -> dict:
         """Exact-engine sweep: one full backtest (stops, costs, trade
         mechanics) per saved (setup, exit) winner x hard stop, parallel
         across CPU cores, with live progress. Also re-runs each winner at
@@ -1415,15 +1402,13 @@ class Strategy:
         the robustness board — the promotion ranking."""
         winners = self.load_exits()  # fail fast if --exit hasn't been run
         grids = self._sweep_grids(winners)
-        raw_data = self._data(use_db)
+        raw_data = self.load_data()
         data = self.model_frame(raw_data)
-        source = "db" if use_db else "synthetic"
 
         total = sum(len(ParamGrid(g)) for g in grids)
         print(
             f"sweep: {self.name}  winners={len(grids)} (from {self.exits_file.name})  "
-            f"stops={self.sweep_stop_loss_bps}  combos={total:,}  rows={len(data)}  "
-            f"(source={source})"
+            f"stops={self.sweep_stop_loss_bps}  combos={total:,}  rows={len(data)}"
         )
 
         t0 = time.time()
@@ -1579,7 +1564,6 @@ class Strategy:
 
     def cook(
         self,
-        use_db: bool = True,
         device: str = "auto",
         n_jobs: int | None = None,
     ) -> dict:
@@ -1589,11 +1573,11 @@ class Strategy:
         separately; the returned dict carries all three states."""
         line = "=" * 72
         print(f"{line}\ncooking {self.name}  [1/3] --predict\n{line}")
-        predict_state = self.predict(use_db=use_db, device=device)
+        predict_state = self.predict(device=device)
         print(f"\n{line}\ncooking {self.name}  [2/3] --exit\n{line}")
-        exit_state = self.exit_scan(use_db=use_db, device=device)
+        exit_state = self.exit_scan(device=device)
         print(f"\n{line}\ncooking {self.name}  [3/3] --sweep\n{line}")
-        sweep_state = self.sweep(use_db=use_db, n_jobs=n_jobs)
+        sweep_state = self.sweep(n_jobs=n_jobs)
         print(f"\n{line}\n{self.name} cooked.\n{line}")
         return {"predict": predict_state, "exit": exit_state, "sweep": sweep_state}
 
@@ -1601,11 +1585,10 @@ class Strategy:
 
     def cli(self, argv: list[str] | None = None) -> dict:
         """Standard strategy-module CLI: modes --predict | --exit | --sweep |
-        --cook (all three) (default: single run), flags --synthetic --cpu
-        --gpu."""
+        --cook (all three) (default: single run), flags --cpu --gpu."""
         args = set(sys.argv[1:] if argv is None else argv)
         known = {
-            "--synthetic", "--cpu", "--gpu",
+            "--cpu", "--gpu",
             "--sweep", "--predict", "--exit", "--exits", "--fast", "--cook",
         }
         unknown = args - known
@@ -1613,51 +1596,16 @@ class Strategy:
             sys.exit(
                 f"unknown argument(s): {sorted(unknown)}\n"
                 "modes: --predict | --exit | --sweep | --cook (all three) "
-                "(default: single run)  flags: --synthetic --cpu --gpu"
+                "(default: single run)  flags: --cpu --gpu"
             )
-        use_db = "--synthetic" not in args
         device = "cpu" if "--cpu" in args else ("gpu" if "--gpu" in args else "auto")
         if "--cook" in args:
-            return self.cook(use_db=use_db, device=device)
+            return self.cook(device=device)
         if "--sweep" in args:
-            return self.sweep(use_db=use_db)
+            return self.sweep()
         if "--predict" in args:
-            return self.predict(use_db=use_db, device=device)
+            return self.predict(device=device)
         if args & {"--exit", "--exits", "--fast"}:  # --exits/--fast: aliases
-            return self.exit_scan(use_db=use_db, device=device)
-        return self.main(use_db=use_db)
+            return self.exit_scan(device=device)
+        return self.main()
 
-
-def synthetic_pair(
-    target: str,
-    feature: str,
-    n: int = 1500,
-    seed: int = 21,
-    start: str = "2010-01-01",
-    feature_level: float = 350.0,
-    target_base: float = 50.0,
-    beta: float = 0.25,
-) -> pl.DataFrame:
-    """Standard synthetic (feature, target) pair: target explained by the
-    feature plus an OU residual (half-life ~14d). The default synthetic_fn
-    for any single-pair Strategy."""
-    rng = np.random.default_rng(seed)
-
-    x = feature_level + np.cumsum(rng.normal(0.0, 2.0, n))
-
-    resid = np.zeros(n)
-    theta, sigma = 0.05, 2.0
-    for i in range(1, n):
-        resid[i] = resid[i - 1] * (1 - theta) + rng.normal(0.0, sigma)
-
-    y = target_base + beta * (x - feature_level) + resid
-
-    start_date = dt.date.fromisoformat(start)
-    ts = pl.date_range(
-        start_date, start_date + dt.timedelta(days=2 * n), interval="1d", eager=True
-    )
-    ts = ts.filter(ts.dt.weekday() <= 5)[:n]
-
-    return pl.DataFrame({"ts": ts, feature: x, target: y}).with_columns(
-        pl.col([feature, target]).round(2)
-    )

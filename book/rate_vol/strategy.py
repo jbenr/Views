@@ -5,7 +5,7 @@ Blocked on swaption vol surface coverage in the DB (md.swaption_vol) — see
 notes/TODO.md ("Research - Rates Vol Signal").
 
 For the worked end-to-end pattern a new strategy should follow, see
-book/rate_vol/template.py — it runs on synthetic data.
+book/rate_vol/template.py.
 
 Note: strategy modules are named strategy.py (not signal.py) because a file
 named signal.py shadows the stdlib 'signal' module for any script run from

@@ -5,16 +5,18 @@ import importlib
 import polars as pl
 import pytest
 
+from tests.synthetic import xy_panel
+
 xy = importlib.import_module("book.curve.xy_scan")
 
 
 def test_synthetic_panel_has_all_columns():
-    data = xy.synthetic_data(n=600)
+    data = xy_panel(xy.TICKERS, n=600)
     assert set(xy.TICKERS) <= set(data.columns)
 
 
 def test_add_features_builds_derived_xs():
-    data = xy.add_features(xy.synthetic_data(n=900))
+    data = xy.add_features(xy_panel(xy.TICKERS, n=900))
     assert "2y" in xy.XS
     for col in ["5y5y", "5y5y_infl", *[f"pc1_{lb}" for lb in xy.PC1_LBS]]:
         assert col in data.columns, col
@@ -34,8 +36,9 @@ def test_xy_scan_end_to_end_synthetic(monkeypatch, tmp_path):
     monkeypatch.setattr(xy, "XY_OU_LBS", [120, 180])
     monkeypatch.setattr(xy, "XY_HORIZONS", [20, 40])
     monkeypatch.setattr(xy, "XY_MIN_ROWS", 400)
+    monkeypatch.setattr(xy, "load_data", lambda *a, **k: xy_panel(xy.TICKERS))
 
-    state = xy.main(use_db=False, device="cpu")
+    state = xy.main(device="cpu")
 
     results = state["results"]
     assert set(results["x"]) == {"10y", "pc1_126"}

@@ -10,7 +10,6 @@ explore economically related alternatives, not permission to brute-force all
 available columns until one backtest looks attractive.
 
     python -m book.curve.fair_value_tens_10s30s
-    python -m book.curve.fair_value_tens_10s30s --synthetic
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ import polars as pl
 import utils
 from research import FairValueStudy
 
-from .tens_10s30s_research_data import coverage, load_data, synthetic_data
+from .tens_10s30s_research_data import coverage, load_data
 
 NAME = "fair_value_tens_10s30s"
 TARGET = "10s30s"
@@ -54,8 +53,8 @@ def run(data: pl.DataFrame) -> dict:
     }
 
 
-def main(use_db: bool = True) -> dict:
-    data = load_data() if use_db else synthetic_data()
+def main() -> dict:
+    data = load_data()
     state = run(data)
     print(f"{NAME}  rows={len(data)}  {data['ts'][0]} -> {data['ts'][-1]}")
     print("\ncoverage of the declared model:")
@@ -80,7 +79,6 @@ def main(use_db: bool = True) -> dict:
 
 if __name__ == "__main__":
     args = set(sys.argv[1:])
-    unknown = args - {"--synthetic"}
-    if unknown:
-        sys.exit(f"unknown argument(s): {sorted(unknown)}\nflags: --synthetic")
-    main(use_db="--synthetic" not in args)
+    if args:
+        sys.exit(f"unknown argument(s): {sorted(args)}")
+    main()

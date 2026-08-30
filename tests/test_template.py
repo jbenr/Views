@@ -2,25 +2,27 @@
 
 import polars as pl
 
-from book.rate_vol.template import compute, main, pipeline, synthetic_data
+from book.rate_vol.template import compute, main, pipeline
+from tests.synthetic import template_panel
 
 
-def test_synthetic_data_shape():
-    data = synthetic_data(n=800)
+def test_template_panel_shape():
+    data = template_panel(n=800)
     assert data.columns == ["ts", "target", "anchor"]
     assert len(data) == 800
 
 
 def test_compute_schema_matches_input_length():
-    data = synthetic_data(n=800)
+    data = template_panel(n=800)
     sig = compute(data)
     assert "signal" in sig.columns
     assert {"resid", "beta", "r2"} <= set(sig.columns)
     assert len(sig) == len(data)
 
 
-def test_template_end_to_end():
-    state = main(use_db=False)
+def test_template_end_to_end(monkeypatch):
+    monkeypatch.setattr("book.rate_vol.template.load_data", lambda *a, **k: template_panel())
+    state = main()
     result = state["result"]
     assert len(result.closed_trades) > 0
     assert isinstance(state["diag"], pl.DataFrame)

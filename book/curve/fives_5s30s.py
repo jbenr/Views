@@ -21,7 +21,6 @@ All machinery lives in backtest.strategy.Strategy - this module is the
 configuration. Tune by overriding Strategy fields below.
 
     python -m book.curve.fives_5s30s              # single run, live DB
-    python -m book.curve.fives_5s30s --synthetic  # single run, no DB
     python -m book.curve.fives_5s30s --predict    # setup search -> setups parquet
     python -m book.curve.fives_5s30s --exit       # exits per setup -> exits parquet
     python -m book.curve.fives_5s30s --sweep      # exact engine + trade logs
@@ -34,7 +33,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from backtest.strategy import Strategy, synthetic_pair
+from backtest.strategy import Strategy
 
 STRATEGY_FAMILY = "curve"
 SIGNAL_NAME = "fives_5s30s"
@@ -49,11 +48,6 @@ FEATURE = "5y"
 FEATURES = [FEATURE]
 
 
-def synthetic_data(n: int = 1500, seed: int = 37):
-    """Synthetic substitute: 5s30s explained by 5Y plus an OU residual."""
-    return synthetic_pair(TARGET, FEATURE, n=n, seed=seed)
-
-
 STRATEGY = Strategy(
     name=SIGNAL_NAME,
     module="book.curve.fives_5s30s",  # sweep workers import this
@@ -63,7 +57,6 @@ STRATEGY = Strategy(
     target=TARGET,
     feature=FEATURE,
     family=STRATEGY_FAMILY,
-    synthetic_fn=synthetic_data,
 )
 
 # lab worker contract + interactive / app API
