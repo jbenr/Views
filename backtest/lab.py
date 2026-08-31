@@ -240,7 +240,20 @@ def _get_xp(device: str = "cpu"):
         raise ValueError(f"unknown device={device!r}; expected 'cpu', 'gpu', or 'auto'")
     if device in {"gpu", "auto"}:
         try:
-            import cupy
+            # The cupy-cuda12x wheels ship their own CUDA libraries under
+            # nvidia/*, so a missing CUDA toolkit is the normal case rather
+            # than a problem; cupy still warns "CUDA path could not be
+            # detected" at import. Suppressed because the kernel probe below
+            # is what actually decides whether the GPU path is usable -- and
+            # because spawn-based sweep workers each re-import, so the warning
+            # would otherwise repeat once per worker.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="CUDA path could not be detected",
+                    category=UserWarning,
+                )
+                import cupy
         except ImportError:
             if device == "auto":
                 return np

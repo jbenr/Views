@@ -75,7 +75,7 @@ import numpy as np
 import polars as pl
 
 import utils
-from stats import beta_cv, horizon_backtest, roll_lr_diff, roll_ou_features
+from stats import beta_cv, horizon_backtest, roll_lr, roll_lr_diff, roll_ou_features
 from utils.market_data import align_columns, coverage_report, load_wide
 
 from .engine import (
@@ -125,6 +125,19 @@ DEFAULT_PARAMS = {
     "exit_param": 0.5,  # meaning follows the style (band level / frac / x half-life)
     "stop_loss_bps": 25.0,  # hard stop on adverse move
 }
+
+
+def _pad_to(series: pl.Series, n: int) -> pl.Series:
+    """Left-pad a regression output with nulls back to `n` rows.
+
+    Rolling fits drop rows internally (nulls, and the first differencing row
+    for a changes fit), and how many depends on what the fit is run on -- so
+    pad by the measured gap rather than by an assumed single row.
+    """
+    gap = n - len(series)
+    if gap <= 0:
+        return series
+    return pl.concat([pl.Series([None] * gap, dtype=pl.Float64), series])
 
 
 def _finite(value) -> bool:
@@ -231,6 +244,19 @@ class Strategy:
     tickers: dict[str, str]
     target: str
     feature: str
+    # what the fair-value OLS is fitted on:
+    #   "changes"  d(target) ~ d(feature), residual re-accumulated over the
+    #              beta window. Beta is the hedge ratio and stays stable, but
+    #              the level has to be rebuilt from daily misses.
+    #   "levels"   target ~ feature, so yhat IS the fair level. Beta absorbs
+    #              any shared trend, so check it is not drifting or flipping
+    #              sign before trusting the residual (stats.diagnostics.beta_cv,
+    #              and see dig/levels_vs_changes.py).
+    # This is a declared modelling decision, not a swept parameter: the two
+    # put the residual on different scales, so a shared bps entry threshold
+    # does not mean the same thing under both. Run the funnel once per
+    # fit_on value and compare, rather than letting one grid pick.
+    fit_on: str = "changes"
     bps_cols: list[str] = field(default_factory=list)
     start: str = "2010-01-01"
     family: str = "curve"
@@ -307,6 +333,12 @@ class Strategy:
     validation_slices: int = 8  # CSCV partitions for finalist PBO
 
     def __post_init__(self):
+        if self.fit_on not in {"changes", "levels"}:
+            raise ValueError(
+                f"{self.name}: unknown fit_on={self.fit_on!r}; "
+                "expected 'changes' or 'levels'"
+            )
+
         # A gate column that collides with a built-in condition name would
         # silently win or lose depending on lookup order; refuse at build time.
         shadowed = sorted(set(self.gate_columns) & set(CONDITION_NAMES))
@@ -422,9 +454,10 @@ class Strategy:
         )
 
     def compute(self, data: pl.DataFrame, params: dict | None = None) -> pl.DataFrame:
-        """Signal frame: beta-weighted target-vs-feature residual and its OU
-        state. The tradable "signal" column follows params["entry_signal"]:
-        the raw residual in bps, or its OU z-score."""
+        """Signal frame: target-vs-feature residual and its OU state, fitted
+        on whichever series this strategy declares (see `fit_on`). The
+        tradable "signal" column follows params["entry_signal"]: the raw
+        residual in bps, or its OU z-score."""
         p = self._params(params)
         if p["entry_signal"] not in {"residual", "ou_z"}:
             raise ValueError(
@@ -434,18 +467,26 @@ class Strategy:
 
         y = data[self.target]
         x = data[self.feature]
-        reg = roll_lr_diff(x, y, lookback=p["beta_lb"])
+        if self.fit_on == "changes":
+            # beta is the hedge ratio on daily changes, so the model only
+            # states a daily move; re-accumulate the daily misses over the same
+            # window to get a level. Windowed rather than running: a full
+            # cumsum never resets, so its level depends on when the sample
+            # started (see dig/levels_vs_changes.py).
+            reg = roll_lr_diff(x, y, lookback=p["beta_lb"])
+            resid = reg["resid"].rolling_sum(p["beta_lb"], min_samples=p["beta_lb"])
+        else:
+            # the levels fit states the fair level directly, so its residual is
+            # already in target units and needs no re-accumulation
+            reg = roll_lr(x, y, lookback=p["beta_lb"])
+            resid = reg["resid"]
 
-        # roll_lr_diff drops one row (first diff) - pad back to len(data)
-        null1 = pl.Series([None], dtype=pl.Float64)
-        resid_roll = pl.concat(
-            [
-                null1,
-                reg["resid"].rolling_sum(p["beta_lb"], min_samples=p["beta_lb"]),
-            ]
-        )
-        beta = pl.concat([null1, reg["beta"]])
-        r2 = pl.concat([null1, reg["r2"]])
+        # both fits drop rows internally, and how many depends on what they
+        # were fitted on (changes also loses the first diff), so pad back to
+        # len(data)
+        resid_roll = _pad_to(resid, len(data))
+        beta = _pad_to(reg["beta"], len(data))
+        r2 = _pad_to(reg["r2"], len(data))
 
         ou = roll_ou_features(resid_roll, lookback=p["ou_lb"])
         signal = resid_roll if p["entry_signal"] == "residual" else ou["ou_z"]

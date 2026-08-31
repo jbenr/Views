@@ -59,6 +59,12 @@ STRATEGY = Strategy(
     target=TARGET,
     feature=FEATURE,
     family=STRATEGY_FAMILY,
+    fit_on="levels",
+    # only setups that actually trade: floor on n_trades for the --exit
+    # leaderboards and the winners handed to --sweep. Note the funnel falls
+    # back to the unfiltered board if NOTHING clears this, so keep it under
+    # the observed max (~42 trades on this pair) or the filter silently no-ops.
+    exit_min_trades=100,
 )
 
 # lab worker contract + interactive / app API
