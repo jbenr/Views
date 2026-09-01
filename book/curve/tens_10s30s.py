@@ -64,7 +64,7 @@ STRATEGY = Strategy(
     # leaderboards and the winners handed to --sweep. Note the funnel falls
     # back to the unfiltered board if NOTHING clears this, so keep it under
     # the observed max (~42 trades on this pair) or the filter silently no-ops.
-    exit_min_trades=100,
+    exit_min_trades=60,
 )
 
 # lab worker contract + interactive / app API
