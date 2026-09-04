@@ -4,6 +4,7 @@ import numpy as np
 import polars as pl
 
 from research import DislocationStudy, FairValueStudy, PCRelativeValueStudy, PairRVStudy
+from research.dislocation import dislocation_scan
 
 
 def _panel(n: int = 900, seed: int = 12) -> pl.DataFrame:
@@ -86,3 +87,26 @@ def test_research_signals_are_prefix_invariant():
                 np.testing.assert_allclose(
                     full[column].to_numpy(), prefix[column].to_numpy(), equal_nan=True
                 )
+
+
+def test_dislocation_scan_keeps_changes_and_levels_models_distinct():
+    """A levels residual is a level gap; it must not inherit a fake window."""
+    _, results = dislocation_scan(
+        _panel(),
+        target="target",
+        feature="factor_a",
+        beta_lookbacks=[60],
+        residual_lookbacks=[10, 20],
+        normalization_lookbacks=[30],
+        thresholds=[1.0],
+        horizons=[5],
+        gate_names=[],
+        fit_on=["changes", "levels"],
+        device="cpu",
+    )
+
+    changes = results.filter(pl.col("fit_on") == "changes")
+    levels = results.filter(pl.col("fit_on") == "levels")
+    assert set(changes["residual_lb"].to_list()) == {10, 20}
+    assert levels["residual_lb"].null_count() == len(levels)
+    assert set(results["gate"].to_list()) == {"(none)"}

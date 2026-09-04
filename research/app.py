@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 import traceback
 
 import polars as pl
@@ -31,6 +32,7 @@ from research.panel import (
     diagnostics,
     resolve_target,
 )
+from backtest.lab import scan_backend
 from research.dislocation import dislocation_scan
 from utils.market_data import last_updated, swaption_last_updated
 from utils.research_app import (
@@ -49,12 +51,32 @@ DISLOCATION_NORM_LBS = [63, 126]
 DISLOCATION_THRESHOLDS = [1.0, 1.5, 2.0, 2.5]
 DISLOCATION_HORIZONS = [5, 10, 20, 40]
 DISLOCATION_GATES = {
-    "feature_level": "Feature level",
-    "feature_move20": "Feature 20d move",
-    "target_vol20": "Target 20d volatility",
-    "beta": "Regression beta",
-    "r2": "Regression R²",
-    "resid_vol20": "Dislocation 20d volatility",
+    "feature_level": "Feature · level",
+    "feature_move20": "Feature · 20d change",
+    "feature_vol20": "Feature · 20d volatility",
+    "target_level": "Target · level",
+    "target_move20": "Target · 20d change",
+    "target_vol20": "Target · 20d volatility",
+    "r2": "Model · R²",
+    "beta": "Model · beta",
+    "beta_cv": "Model · beta stability",
+    "model_quality": "Model · quality",
+    "beta_vol20": "Model · beta 20d volatility",
+    "beta_mom10": "Model · beta 10d change",
+    "r2_vol20": "Model · R² 20d volatility",
+    "r2_mom10": "Model · R² 10d change",
+    "resid_vol20": "Residual · 20d volatility",
+    "resid_vol60": "Residual · 60d volatility",
+    "resid_mom10": "Residual · 10d change",
+}
+DEFAULT_DISLOCATION_GATES = [
+    "feature_level", "feature_move20", "target_vol20",
+    "r2", "beta", "beta_cv", "model_quality", "beta_vol20",
+    "beta_mom10", "r2_vol20", "r2_mom10", "resid_vol20", "resid_mom10",
+]
+DISLOCATION_FIT_BASES = {
+    "changes": "Changes · accumulated residual",
+    "levels": "Levels · regression residual",
 }
 
 FEATURE_GROUPS = {
@@ -182,6 +204,14 @@ def dislocation_tab() -> html.Div:
             for name in FEATURE_LABELS
         ], style={"fontSize": 12},
     ))]
+    controls += [field("regression basis", dcc.Checklist(
+        id="dis-fit-on", value=["changes", "levels"],
+        options=[{"label": label, "value": value}
+                 for value, label in DISLOCATION_FIT_BASES.items()],
+        labelStyle={"display": "block", "fontSize": 12, "marginBottom": 6,
+                    "color": TEXT},
+        inputStyle={"marginRight": 5},
+    ))]
     controls += [field(label, dcc.Dropdown(
         id=id_, value=items, multi=True, clearable=False,
         options=[{"label": str(item), "value": item} for item in items],
@@ -189,12 +219,22 @@ def dislocation_tab() -> html.Div:
     )) for label, id_, items in values]
     controls += [
         field("gate conditions", dcc.Dropdown(
-            id="dis-gates", value=list(DISLOCATION_GATES), multi=True,
-            clearable=False,
+            id="dis-gates", value=DEFAULT_DISLOCATION_GATES, multi=True,
+            clearable=True,
             options=[{"label": label, "value": name}
                      for name, label in DISLOCATION_GATES.items()],
             style={"fontSize": 12},
         )),
+        html.Div(style={"display": "flex", "gap": 7, "marginTop": -7,
+                        "marginBottom": 12}, children=[
+            html.Button("All", id="dis-gates-all", n_clicks=0,
+                        className="ref-btn", style=btn_style()),
+            html.Button("None", id="dis-gates-none", n_clicks=0,
+                        className="ref-btn", style=btn_style()),
+            html.Span("None = ungated only", style={
+                "fontSize": 10, "color": DIM, "alignSelf": "center",
+            }),
+        ]),
         field("gate percentile lookbacks", dcc.Dropdown(
             id="dis-gate-windows", value=[126, 252, 504], multi=True,
             clearable=False,
@@ -202,10 +242,12 @@ def dislocation_tab() -> html.Div:
                      for value in [63, 126, 252, 504]],
             style={"fontSize": 12},
         )),
-        note("Ungated is always included. Gates use only percentile history available "
-             "at that bar; a gate must agree across windows before promotion.", "dim"),
+        note("Changes uses a windowed accumulated residual. Levels uses the raw "
+             "level-regression residual, so residual window is shown as —. Ungated is "
+             "always included. Each checked gate adds causal bucket variants.", "dim"),
         html.Button("Run discovery", id="dis-run", n_clicks=0,
                     className="ref-btn", style={**btn_style(primary=True), "width": "100%"}),
+        html.Div(id="dis-run-info"),
     ]
     return html.Div(style={"padding": "18px 24px"}, children=[
         heading("dislocation discovery"),
@@ -452,26 +494,29 @@ def panel_view(
     ])
 
 
-def dislocation_view(results: pl.DataFrame, feature: str) -> html.Div:
+def dislocation_view(
+    results: pl.DataFrame, feature: str, run_info: dict
+) -> html.Div:
     """Compact discovery board. It deliberately does not call a cell a winner."""
     valid = results.filter(pl.col("n_obs") >= 30)
     gated = valid.filter(pl.col("gate") != "(none)")
     agreement = (
         gated.filter(pl.col("ic") > 0)
-        .group_by("beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate", "gate_bucket")
-        .agg(pl.col("gate_window").n_unique().alias("gate_windows_positive"))
+        .group_by("fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate", "gate_bucket")
+        .agg(pl.col("gate_window").n_unique().alias("positive_windows_30plus"))
     )
     board = (
         valid.join(
             agreement,
-            on=["beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate", "gate_bucket"],
+            on=["fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate", "gate_bucket"],
             how="left",
         )
         .with_columns(
             pl.when(pl.col("gate") == "(none)").then(None)
-            .otherwise(pl.col("gate_windows_positive").fill_null(0))
-            .alias("gate_windows_positive")
+            .otherwise(pl.col("positive_windows_30plus").fill_null(0))
+            .alias("positive_windows_30plus")
         )
+        .with_columns(pl.col("residual_lb").cast(pl.Utf8).fill_null("—"))
         .sort("ic", descending=True)
     )
     stats = [
@@ -479,19 +524,22 @@ def dislocation_view(results: pl.DataFrame, feature: str) -> html.Div:
         stat_block("cells tested", f"{len(results):,}"),
         stat_block("cells with ≥30 events", f"{len(valid):,}"),
         stat_block("gated cells", f"{len(gated):,}"),
+        stat_block("backend", run_info["backend"]),
+        stat_block("elapsed", f"{run_info['elapsed_s']:.2f}s"),
+        stat_block("rate", f"{run_info['cells_per_second']:,.0f} cells/s"),
     ]
     cols = [
-        "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate",
-        "gate_bucket", "gate_window", "gate_windows_positive", "ic", "hit_rate",
+        "fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate",
+        "gate_bucket", "gate_window", "positive_windows_30plus", "ic", "hit_rate",
         "n_obs", "events_per_year",
     ]
     return html.Div([
         html.Div(stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
                                "marginBottom": 14, "paddingBottom": 12,
                                "borderBottom": f"1px solid {BORDER}"}),
-        note("Discovery only. A gated row needs positive evidence across more than one "
-             "gate-percentile window before it can proceed; exits, costs, time in market, "
-             "and trade robustness are deliberately not scored here."),
+        note("Discovery only. 'Positive windows' means positive IC with ≥30 events; "
+             "it is agreement, not proof. Exits, costs, time in market, and trade "
+             "robustness are deliberately not scored here."),
         table_div(
             board.select([col for col in cols if col in board.columns]).head(40).to_pandas(),
             title="IC discovery board", max_rows=40, float_fmt=",.3f",
@@ -538,6 +586,15 @@ def tabs() -> dcc.Tabs:
 
 def register_callbacks(app) -> None:
     @app.callback(
+        Output("dis-gates", "value"),
+        Input("dis-gates-all", "n_clicks"),
+        Input("dis-gates-none", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _set_dislocation_gates(_all, _none):
+        return list(DISLOCATION_GATES) if ctx.triggered_id == "dis-gates-all" else []
+
+    @app.callback(
         Output("ping-out", "children"),
         Input("ping", "n_clicks"),
         prevent_initial_call=True,
@@ -556,26 +613,32 @@ def register_callbacks(app) -> None:
 
     @app.callback(
         Output("dis-out", "children"),
+        Output("dis-run-info", "children"),
         Input("dis-run", "n_clicks"),
         State("research-level-data", "data"),
         State("dis-feature", "value"),
+        State("dis-fit-on", "value"),
         State("dis-beta-lbs", "value"), State("dis-residual-lbs", "value"),
         State("dis-norm-lbs", "value"), State("dis-thresholds", "value"),
         State("dis-horizons", "value"), State("dis-gates", "value"),
         State("dis-gate-windows", "value"),
         prevent_initial_call=True,
+        running=[
+            (Output("dis-run", "children"), "Running discovery…", "Run discovery"),
+            (Output("dis-run", "disabled"), True, False),
+        ],
     )
     def _run_dislocation(
-        _n, stored, feature, beta_lbs, residual_lbs, norm_lbs, thresholds,
+        _n, stored, feature, fit_on, beta_lbs, residual_lbs, norm_lbs, thresholds,
         horizons, gates, gate_windows,
     ):
         if not stored:
-            return note("Load a target and this feature on Setup first.", "warn")
+            return note("Load a target and this feature on Setup first.", "warn"), ""
         if feature not in stored.get("features", []):
             return note(
                 f"{FEATURE_LABELS.get(feature, feature)} is not in the loaded panel. "
                 "Add it on Setup, then Load.", "warn"
-            )
+            ), ""
         try:
             target = stored["target"]
             rows = stored["rows"]
@@ -584,8 +647,11 @@ def register_callbacks(app) -> None:
                 target: pl.Series([row[target] for row in rows], dtype=pl.Float64),
                 feature: pl.Series([row[feature] for row in rows], dtype=pl.Float64),
             }).with_columns(pl.col("ts").str.to_date())
+            backend = scan_backend("auto")
+            started = time.perf_counter()
             _, results = dislocation_scan(
                 frame, target=target, feature=feature,
+                fit_on=fit_on or ["changes"], device="auto",
                 beta_lookbacks=beta_lbs or DISLOCATION_BETA_LBS,
                 residual_lookbacks=residual_lbs or DISLOCATION_RESIDUAL_LBS,
                 normalization_lookbacks=norm_lbs or DISLOCATION_NORM_LBS,
@@ -594,13 +660,23 @@ def register_callbacks(app) -> None:
                 gate_names=gates or [],
                 gate_windows=gate_windows or [126, 252, 504],
             )
+            elapsed_s = time.perf_counter() - started
         except Exception as exc:
             return html.Div([
                 note(f"{type(exc).__name__}: {exc}", "bad"),
                 html.Pre(traceback.format_exc(), style={"fontSize": 10, "color": DIM,
                                                         "whiteSpace": "pre-wrap"}),
-            ])
-        return dislocation_view(results, feature)
+            ]), ""
+        info = {
+            "backend": backend,
+            "elapsed_s": elapsed_s,
+            "cells_per_second": len(results) / max(elapsed_s, 1e-9),
+        }
+        status = note(
+            f"Completed · {backend} · {len(results):,} cells in {elapsed_s:.2f}s",
+            "good",
+        )
+        return dislocation_view(results, feature, info), status
 
     @app.callback(
         Output("panel-out", "children"),

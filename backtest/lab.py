@@ -291,6 +291,12 @@ def _get_xp(device: str = "cpu"):
     return np
 
 
+def scan_backend(device: str = "auto") -> str:
+    """Name the array backend that a vectorized discovery scan will use."""
+    xp = _get_xp(device)
+    return "GPU · CuPy / CUDA" if xp.__name__ == "cupy" else "CPU · NumPy"
+
+
 def _to_numpy(arr) -> np.ndarray:
     return arr.get() if hasattr(arr, "get") else np.asarray(arr)
 

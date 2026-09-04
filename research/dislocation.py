@@ -34,7 +34,8 @@ import numpy as np
 import polars as pl
 
 from backtest.lab import predict_scan
-from stats import roll_lr_diff, roll_mlr_diff, roll_ou_features
+from stats.diagnostics import beta_cv, quality_weight
+from stats import roll_lr, roll_lr_diff, roll_mlr_diff, roll_ou_features
 
 from .common import aligned_panel, fade_scorecard, threshold_scorecard
 
@@ -195,14 +196,15 @@ def dislocation_scan(
     gate_windows: Iterable[int] = (126, 252, 504),
     min_gate_history: int = 126,
     gate_names: Iterable[str] | None = None,
+    fit_on: Iterable[str] = ("changes",),
+    device: str = "auto",
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Causal discovery scan for accumulated changes residuals.
+    """Causal discovery scan for accumulated changes or levels residuals.
 
-    ``beta_lookback`` says how much history defines the daily conditional
-    move. ``residual_lookback`` independently says how many daily misses form
-    the level-like dislocation.  Gated and ungated threshold events are
-    evaluated together by :func:`backtest.lab.predict_scan`; no gate gets to
-    look at future percentile information.
+    Changes fits daily moves then independently accumulates daily misses over
+    ``residual_lookback`` bars. Levels fits the target level on the feature
+    level; its residual is already a level gap, so it has no residual window.
+    Gated and ungated cells compete with no future percentile information.
     """
     frame = aligned_panel(data, [target, feature])
     y, x = frame[target].cast(pl.Float64), frame[feature].cast(pl.Float64)
@@ -211,39 +213,140 @@ def dislocation_scan(
     signals: list[np.ndarray] = []
     combos: list[dict] = []
     conditions: dict[str, list[np.ndarray]] = {
-        "feature_level": [], "feature_move20": [], "target_vol20": [],
-        "beta": [], "r2": [], "resid_vol20": [],
+        # Feature and target state: the external environment in which the
+        # dislocation occurred.
+        "feature_level": [], "feature_move20": [], "feature_vol20": [],
+        "target_level": [], "target_move20": [], "target_vol20": [],
+        # Relationship quality/stability: direct equivalents of the mature
+        # strategy funnel's gate menu, using the exact current-window R².
+        "r2": [], "beta": [], "beta_cv": [], "model_quality": [],
+        "beta_vol20": [], "beta_mom10": [], "r2_vol20": [], "r2_mom10": [],
+        # Raw-residual state. OU gates intentionally wait for the later OU
+        # pass; this discovery scan is residual-first.
+        "resid_vol20": [], "resid_vol60": [], "resid_mom10": [],
     }
 
-    for beta_lb in beta_lookbacks:
-        reg = roll_lr_diff(x, y, lookback=int(beta_lb))
-        pad = n - len(reg)
-        innovation = pl.concat([
-            pl.Series([None] * pad, dtype=pl.Float64), reg["resid"],
+    bases = list(dict.fromkeys(fit_on))
+    unknown_bases = sorted(set(bases) - {"changes", "levels"})
+    if unknown_bases:
+        raise ValueError(
+            f"unknown regression basis: {unknown_bases}; expected 'changes' or 'levels'"
+        )
+    if not bases:
+        raise ValueError("choose at least one regression basis")
+
+    def exact_window_r2(a: pl.Series, b: pl.Series, lookback: int) -> pl.Series:
+        """True trailing single-factor R², not a sum of stale-fit errors.
+
+        For a one-factor OLS with intercept, R² is the squared correlation
+        inside the current regression window.  Computing it directly from the
+        current window's sufficient statistics avoids scoring old residuals
+        made with old coefficients.
+        """
+        moments = pl.DataFrame({"x": a, "y": b}).with_columns(
+            pl.col("x").rolling_sum(lookback, min_samples=lookback).alias("sx"),
+            pl.col("y").rolling_sum(lookback, min_samples=lookback).alias("sy"),
+            (pl.col("x") * pl.col("x")).rolling_sum(
+                lookback, min_samples=lookback
+            ).alias("sxx"),
+            (pl.col("y") * pl.col("y")).rolling_sum(
+                lookback, min_samples=lookback
+            ).alias("syy"),
+            (pl.col("x") * pl.col("y")).rolling_sum(
+                lookback, min_samples=lookback
+            ).alias("sxy"),
+            pl.col("x").is_not_null().cast(pl.Float64).rolling_sum(
+                lookback, min_samples=lookback
+            ).alias("n"),
+        ).with_columns(
+            (pl.col("n") * pl.col("sxx") - pl.col("sx") ** 2).alias("xx"),
+            (pl.col("n") * pl.col("syy") - pl.col("sy") ** 2).alias("yy"),
+            (pl.col("n") * pl.col("sxy") - pl.col("sx") * pl.col("sy")).alias("xy"),
+        )
+        return moments.select(
+            pl.when((pl.col("xx") > 0) & (pl.col("yy") > 0))
+            .then(pl.col("xy") ** 2 / (pl.col("xx") * pl.col("yy")))
+            .otherwise(None)
+            .alias("r2")
+        )["r2"]
+
+    def padded(reg: pl.DataFrame, name: str) -> pl.Series:
+        return pl.concat([
+            pl.Series([None] * (n - len(reg)), dtype=pl.Float64), reg[name],
         ])
-        beta = pl.concat([pl.Series([None] * pad, dtype=pl.Float64), reg["beta"]])
-        r2 = pl.concat([pl.Series([None] * pad, dtype=pl.Float64), reg["r2"]])
-        for residual_lb in residual_lookbacks:
-            dislocation = innovation.rolling_sum(
-                int(residual_lb), min_samples=int(residual_lb)
+
+    def add_signal(
+        basis: str, beta_lb: int, residual_lb: int | None,
+        dislocation: pl.Series, beta: pl.Series, r2: pl.Series,
+    ) -> None:
+        beta_stability = beta_cv(beta, lookback=beta_lb)
+        model_quality = quality_weight(r2, beta_stability)
+        for norm_lb in normalization_lookbacks:
+            z = dislocation / dislocation.rolling_std(
+                int(norm_lb), min_samples=int(norm_lb)
             )
-            for norm_lb in normalization_lookbacks:
-                z = dislocation / dislocation.rolling_std(
-                    int(norm_lb), min_samples=int(norm_lb)
-                )
-                signals.append(z.to_numpy().astype(float))
-                combos.append({
-                    "beta_lb": int(beta_lb),
-                    "residual_lb": int(residual_lb),
-                    "norm_lb": int(norm_lb),
-                })
-                conditions["feature_level"].append(x.to_numpy().astype(float))
-                conditions["feature_move20"].append(x.diff(20).to_numpy().astype(float))
-                conditions["target_vol20"].append(y.diff().rolling_std(20).to_numpy().astype(float))
-                conditions["beta"].append(beta.to_numpy().astype(float))
-                conditions["r2"].append(r2.to_numpy().astype(float))
-                conditions["resid_vol20"].append(
-                    dislocation.diff().rolling_std(20).to_numpy().astype(float)
+            signals.append(z.to_numpy().astype(float))
+            combos.append({
+                "fit_on": basis,
+                "beta_lb": int(beta_lb),
+                "residual_lb": residual_lb,
+                "norm_lb": int(norm_lb),
+            })
+            conditions["feature_level"].append(x.to_numpy().astype(float))
+            conditions["feature_move20"].append(x.diff(20).to_numpy().astype(float))
+            conditions["feature_vol20"].append(
+                x.diff().rolling_std(20).to_numpy().astype(float)
+            )
+            conditions["target_level"].append(y.to_numpy().astype(float))
+            conditions["target_move20"].append(y.diff(20).to_numpy().astype(float))
+            conditions["target_vol20"].append(
+                y.diff().rolling_std(20).to_numpy().astype(float)
+            )
+            conditions["beta"].append(beta.to_numpy().astype(float))
+            conditions["r2"].append(r2.to_numpy().astype(float))
+            conditions["beta_cv"].append(beta_stability.to_numpy().astype(float))
+            conditions["model_quality"].append(
+                model_quality.to_numpy().astype(float)
+            )
+            conditions["beta_vol20"].append(
+                beta.diff().rolling_std(20).to_numpy().astype(float)
+            )
+            conditions["beta_mom10"].append(beta.diff(10).to_numpy().astype(float))
+            conditions["r2_vol20"].append(
+                r2.diff().rolling_std(20).to_numpy().astype(float)
+            )
+            conditions["r2_mom10"].append(r2.diff(10).to_numpy().astype(float))
+            conditions["resid_vol20"].append(
+                dislocation.diff().rolling_std(20).to_numpy().astype(float)
+            )
+            conditions["resid_vol60"].append(
+                dislocation.diff().rolling_std(60).to_numpy().astype(float)
+            )
+            conditions["resid_mom10"].append(
+                dislocation.diff(10).to_numpy().astype(float)
+            )
+
+    for basis in bases:
+        for beta_lb in beta_lookbacks:
+            if basis == "changes":
+                reg = roll_lr_diff(x, y, lookback=int(beta_lb))
+                innovation = padded(reg, "resid")
+                beta = padded(reg, "beta")
+                r2 = exact_window_r2(x.diff(), y.diff(), int(beta_lb))
+                for residual_lb in residual_lookbacks:
+                    dislocation = innovation.rolling_sum(
+                        int(residual_lb), min_samples=int(residual_lb)
+                    )
+                    add_signal(
+                        basis, int(beta_lb), int(residual_lb), dislocation, beta, r2
+                    )
+            else:
+                reg = roll_lr(x, y, lookback=int(beta_lb))
+                # This residual is already a level gap. Re-accumulating it
+                # would be a separate model, not a levels regression.
+                add_signal(
+                    basis, int(beta_lb), None, padded(reg, "resid"),
+                    padded(reg, "beta"), exact_window_r2(x, y, int(beta_lb)),
                 )
 
     matrix = np.column_stack(signals)
@@ -263,6 +366,7 @@ def dislocation_scan(
         gate_min_history=min_gate_history,
         gate_windows=list(gate_windows),
         entry_col="entry_z",
+        device=device,
     ).with_columns(
         (pl.col("n_obs") / max(len(frame) / 252.0, 1.0)).alias("events_per_year")
     )
