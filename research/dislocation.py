@@ -30,8 +30,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
+import numpy as np
 import polars as pl
 
+from backtest.lab import predict_scan
 from stats import roll_lr_diff, roll_mlr_diff, roll_ou_features
 
 from .common import aligned_panel, fade_scorecard, threshold_scorecard
@@ -52,6 +54,7 @@ class DislocationStudy:
     beta_lookback: int = 126
     normalization_lookback: int = 63
     ou_lookback: int | None = 126
+    residual_lookback: int = 1
     ts_col: str = "ts"
 
     def __post_init__(self) -> None:
@@ -61,6 +64,8 @@ class DislocationStudy:
             raise ValueError("normalization_lookback must be >= 2")
         if self.ou_lookback is not None and self.ou_lookback < 2:
             raise ValueError("ou_lookback must be >= 2 or None")
+        if self.residual_lookback < 1:
+            raise ValueError("residual_lookback must be >= 1")
         if self.target in self.features:
             raise ValueError("target may not also be a dislocation feature")
 
@@ -110,6 +115,13 @@ class DislocationStudy:
                     ]
                 )
 
+        innovation = dislocation.alias("innovation")
+        # A changes regression produces daily unexplained moves.  The actual
+        # dislocation can be their trailing accumulation: a level-like gap
+        # that resets every window rather than inheriting an arbitrary anchor.
+        dislocation = innovation.rolling_sum(
+            self.residual_lookback, min_samples=self.residual_lookback
+        ).alias("dislocation")
         scale = dislocation.rolling_std(self.normalization_lookback).alias(
             "dislocation_scale"
         )
@@ -126,6 +138,7 @@ class DislocationStudy:
             }
         return frame.with_columns(
             target.diff().alias("target_move"),
+            innovation,
             dislocation,
             scale,
             score,
@@ -167,3 +180,90 @@ class DislocationStudy:
                 signal, signal_frame[self.target], thresholds, horizons
             ),
         }
+
+
+def dislocation_scan(
+    data: pl.DataFrame,
+    *,
+    target: str,
+    feature: str,
+    beta_lookbacks: Iterable[int],
+    residual_lookbacks: Iterable[int],
+    normalization_lookbacks: Iterable[int],
+    thresholds: Iterable[float],
+    horizons: Iterable[int],
+    gate_windows: Iterable[int] = (126, 252, 504),
+    min_gate_history: int = 126,
+    gate_names: Iterable[str] | None = None,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Causal discovery scan for accumulated changes residuals.
+
+    ``beta_lookback`` says how much history defines the daily conditional
+    move. ``residual_lookback`` independently says how many daily misses form
+    the level-like dislocation.  Gated and ungated threshold events are
+    evaluated together by :func:`backtest.lab.predict_scan`; no gate gets to
+    look at future percentile information.
+    """
+    frame = aligned_panel(data, [target, feature])
+    y, x = frame[target].cast(pl.Float64), frame[feature].cast(pl.Float64)
+    n = len(frame)
+    null1 = pl.Series([None], dtype=pl.Float64)
+    signals: list[np.ndarray] = []
+    combos: list[dict] = []
+    conditions: dict[str, list[np.ndarray]] = {
+        "feature_level": [], "feature_move20": [], "target_vol20": [],
+        "beta": [], "r2": [], "resid_vol20": [],
+    }
+
+    for beta_lb in beta_lookbacks:
+        reg = roll_lr_diff(x, y, lookback=int(beta_lb))
+        pad = n - len(reg)
+        innovation = pl.concat([
+            pl.Series([None] * pad, dtype=pl.Float64), reg["resid"],
+        ])
+        beta = pl.concat([pl.Series([None] * pad, dtype=pl.Float64), reg["beta"]])
+        r2 = pl.concat([pl.Series([None] * pad, dtype=pl.Float64), reg["r2"]])
+        for residual_lb in residual_lookbacks:
+            dislocation = innovation.rolling_sum(
+                int(residual_lb), min_samples=int(residual_lb)
+            )
+            for norm_lb in normalization_lookbacks:
+                z = dislocation / dislocation.rolling_std(
+                    int(norm_lb), min_samples=int(norm_lb)
+                )
+                signals.append(z.to_numpy().astype(float))
+                combos.append({
+                    "beta_lb": int(beta_lb),
+                    "residual_lb": int(residual_lb),
+                    "norm_lb": int(norm_lb),
+                })
+                conditions["feature_level"].append(x.to_numpy().astype(float))
+                conditions["feature_move20"].append(x.diff(20).to_numpy().astype(float))
+                conditions["target_vol20"].append(y.diff().rolling_std(20).to_numpy().astype(float))
+                conditions["beta"].append(beta.to_numpy().astype(float))
+                conditions["r2"].append(r2.to_numpy().astype(float))
+                conditions["resid_vol20"].append(
+                    dislocation.diff().rolling_std(20).to_numpy().astype(float)
+                )
+
+    matrix = np.column_stack(signals)
+    names = list(conditions) if gate_names is None else list(gate_names)
+    unknown = sorted(set(names) - set(conditions))
+    if unknown:
+        raise ValueError(f"unknown dislocation gate(s): {unknown}")
+    gates = {name: np.column_stack(conditions[name]) for name in names}
+    results = predict_scan(
+        matrix,
+        y.to_numpy(),
+        entries=list(thresholds),
+        horizons=list(horizons),
+        combos=combos,
+        gates=gates,
+        gate_buckets="regime",
+        gate_min_history=min_gate_history,
+        gate_windows=list(gate_windows),
+        entry_col="entry_z",
+    ).with_columns(
+        (pl.col("n_obs") / max(len(frame) / 252.0, 1.0)).alias("events_per_year")
+    )
+    return frame, results

@@ -61,7 +61,8 @@
 }
 
 .dashboard-page-loader .shimmer-loader,
-.dashboard-overview-loader .shimmer-loader {
+.dashboard-overview-loader .shimmer-loader,
+.research-panel-loader .shimmer-loader {
     position: fixed;
     top: 130px;
     left: 50%;

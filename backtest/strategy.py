@@ -1198,6 +1198,7 @@ class Strategy:
                 .then(pl.col("n_bars_active") / pl.col("n_trades"))
                 .otherwise(None)
                 .alias("avg_hold_bars"),
+                (pl.col("n_bars_active") / len(data)).alias("time_in_market_pct"),
             )
             .sort("sharpe", descending=True, nulls_last=True)
         )
@@ -1235,6 +1236,7 @@ class Strategy:
                 pl.col("pnl_per_trade_bps").round(2).alias("pnl/trd"),
                 (pl.col("hit_rate") * 100).round(1).alias("hit%"),
                 pl.col("avg_hold_bars").round(1).alias("hold"),
+                (pl.col("time_in_market_pct") * 100).round(1).alias("time%"),
                 pl.col("n_trades").alias("n"),
             )
 
@@ -1271,7 +1273,7 @@ class Strategy:
             "setup", "entry_signal", "beta_lb", "ou_lb", "entry_threshold",
             "predict_horizon", "gate", "gate_bucket", "gate_window",
             "exit_style", "exit_threshold", "sharpe", "total_pnl_bps", "hit_rate",
-            "pnl_per_trade_bps", "avg_hold_bars", "n_trades",
+            "pnl_per_trade_bps", "avg_hold_bars", "time_in_market_pct", "n_trades",
         )
         winners.write_parquet(self.exits_file)
         print(
@@ -1325,9 +1327,13 @@ class Strategy:
             total = float(st["pnl_bps"].sum())
             best = float(st["pnl_bps"][0])
             era_pnl = [0.0] * n_eras
+            active = np.zeros(len(dates), dtype=bool)
             for t in st.iter_rows(named=True):
                 era = min((t["entry_date"].year - y0) // self.era_years, n_eras - 1)
                 era_pnl[era] += t["pnl_bps"]
+                i0, i1 = date_ix.get(t["entry_date"]), date_ix.get(t["exit_date"])
+                if i0 is not None and i1 is not None:
+                    active[i0:i1] = True
             rows.append({
                 "setup": setup,
                 "n_trades": len(st),
@@ -1342,6 +1348,7 @@ class Strategy:
                     _ann_sharpe(_daily_pnl_from_trades(st.slice(1), date_ix, dlevel)),
                     3,
                 ),
+                "time_in_market_pct": round(float(active.mean()), 3),
                 "eras_pos": f"{sum(p > 0 for p in era_pnl)}/{n_eras}",
             })
         return pl.DataFrame(rows).sort("sharpe_ex_best", descending=True)

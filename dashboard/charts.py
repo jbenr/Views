@@ -21,7 +21,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.ticker import MaxNLocator, StrMethodFormatter
 
 from backtest.lab import parse_gate
-from utils.research_app import C0, C1, C2, DIM
+from utils.research_app import C0, C1, C2, DIM, ORANGE
 from utils.viz import Viz
 
 WINDOW_PRESETS = {"1M": 21, "3M": 63, "6M": 126, "YTD": "YTD", "1Y": 252, "2Y": 504, "5Y": 1260, "All": None}
@@ -127,13 +127,123 @@ def level_chart(
     open_entry: dict | None = None,
     window_bars: int | None = WINDOW_PRESETS[DEFAULT_WINDOW],
     date_range: tuple | None = None,
+    features: list[str] | None = None,
+    invert_features: bool = False,
 ) -> str:
-    """Tradable level, recent window, with trade entry/exit markers -- base64 PNG."""
-    frame = _pandas_indexed(data, [target])
+    """Tradable level with optional research inputs.
+
+    Inputs use the independently scaled left axis, while the tradable target
+    stays on the dashboard's standard right-hand BPS axis. This lets a target
+    and feature share time/plot space without one level scale flattening the
+    other.
+    """
+    features = [feature for feature in (features or []) if feature != target]
+    cols = [target, *features]
+    frame = _pandas_indexed(data, cols)
     frame = _slice_window(frame, window_bars, date_range)
+    display_features = features
+    if invert_features and features:
+        display_features = [f"-{feature}" for feature in features]
+        frame = frame.rename(columns={
+            feature: display for feature, display in zip(features, display_features)
+        })
+        frame[display_features] = -frame[display_features]
+        cols = [target, *display_features]
     markers = _trade_markers(trades, open_entry, frame.index.min(), frame.index.max())
-    return _PngViz().line(frame, cols=[target], title=target, yaxis_title="bps",
-                           markers=markers)
+    palette = (C2, C1, C0, DIM)
+    colors = {
+        target: ORANGE,
+        **{
+            feature: palette[i % len(palette)]
+            for i, feature in enumerate(display_features)
+        },
+    }
+    feature_title = display_features[0] if len(display_features) == 1 else "features"
+    return _PngViz().line(
+        frame, cols=cols, title=target, yaxis_title="bps",
+        yaxis_right_title=feature_title, left=display_features,
+        markers=markers, line_colors=colors,
+    )
+
+
+def hedge_weights_chart(
+    data: pl.DataFrame,
+    weight_cols: list[str],
+    fixed_priors: dict[str, float],
+    window_bars: int | str | None = WINDOW_PRESETS[DEFAULT_WINDOW],
+) -> str:
+    """Rolling hedge ratios in the same static treatment as a signal level.
+
+    The fitted ratios share one beta scale, so unlike a target-plus-feature
+    chart they deliberately use one right-hand axis. Fixed construction
+    weights are quiet dotted reference lines, not additional live series.
+    """
+    frame = _pandas_indexed(data, weight_cols)
+    frame = _slice_window(frame, window_bars, None)
+    labels = {col: col.removeprefix("w_") for col in weight_cols}
+    frame = frame.rename(columns=labels)
+    cols = [labels[col] for col in weight_cols]
+    hlines = [
+        {
+            "value": prior,
+            "label": f"{labels[col]} fixed {prior:g}",
+            "style": "dotted",
+            "color": DIM,
+            "alpha": 0.7,
+        }
+        for col, prior in fixed_priors.items()
+    ]
+    return _PngViz().line(
+        frame,
+        cols=cols,
+        title="rolling betas vs fixed weights",
+        yaxis_title="beta",
+        hlines=hlines,
+        line_colors={
+            col: (C2, C1, C0, DIM)[i % 4]
+            for i, col in enumerate(cols)
+        },
+    )
+
+
+def coverage_chart(coverage: pl.DataFrame) -> str:
+    """Series start/end ranges, drawn in the dashboard's static chart style."""
+    rows = [
+        row for row in coverage.iter_rows(named=True)
+        if row["first_valid"] is not None and row["last_valid"] is not None
+    ]
+    fig, ax = plt.subplots(figsize=(9, max(2.4, 0.52 * len(rows) + 1.2)))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("#FAFAFA")
+    fig.subplots_adjust(left=0.18, right=0.96, top=0.88, bottom=0.22)
+
+    for i, row in enumerate(rows):
+        is_overlap = row["series"] == "OVERLAP"
+        ax.hlines(
+            i, pd.Timestamp(row["first_valid"]), pd.Timestamp(row["last_valid"]),
+            color=ORANGE if is_overlap else C2,
+            linewidth=7 if is_overlap else 5,
+            alpha=1.0 if is_overlap else 0.75,
+        )
+    ax.set_yticks(range(len(rows)), [row["series"] for row in rows])
+    ax.invert_yaxis()
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=8))
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(ax.xaxis.get_major_locator()))
+    ax.grid(axis="x", color="#E6E6E6", linewidth=0.6)
+    ax.grid(axis="y", color="#F0F0F0", linewidth=0.6)
+    ax.tick_params(axis="both", labelsize=9, colors="#333", length=4, width=0.9)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    for spine in ("left", "bottom"):
+        ax.spines[spine].set_color("#333")
+        ax.spines[spine].set_linewidth(1.1)
+    fig.suptitle("SERIES COVERAGE", fontsize=11, fontweight="bold",
+                 color="#333", x=0.02, ha="left", y=0.98)
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight",
+                facecolor="white", edgecolor="white")
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def input_chart(

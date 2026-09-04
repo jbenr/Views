@@ -111,7 +111,14 @@ def long_to_wide(
         return empty.to_pandas().set_index("ts") if to_pandas else empty
 
     wide = (
-        df.with_columns(pl.col("ts").cast(pl.Date), pl.col("px").cast(pl.Float64))
+        df.with_columns(
+            pl.col("ts").cast(pl.Date),
+            # Bloomberg returns NaN (not NULL) for market-closed days, and the
+            # DB stores it as a real NaN float. polars drop_nulls does not drop
+            # NaN, so it would survive align_columns and then poison a whole
+            # rolling window. Normalize to null at the single point of entry.
+            pl.col("px").cast(pl.Float64).fill_nan(None),
+        )
         .pivot(index="ts", on="ticker", values="px")
         .sort("ts")
     )
@@ -162,6 +169,106 @@ def load_wide(
 
     long_df = query_db(sql, params=params)
     return long_to_wide(long_df, tickers, bps_cols=bps_cols, to_pandas=to_pandas)
+
+
+def swaption_point(expiry: str, tenor: int, strike: int = 0) -> str:
+    """Canonical column alias for one point on the swaption surface."""
+    suffix = "" if strike == 0 else f"_{strike:+d}"
+    return f"vol_{expiry}_{tenor}{suffix}"
+
+
+def load_swaption_wide(
+    points: Iterable[tuple[str, int]],
+    start: str,
+    end: str | None = None,
+    strike: int = 0,
+    to_pandas: bool = False,
+) -> Union[pl.DataFrame, pd.DataFrame]:
+    """Load ATM-relative swaption vols as a wide frame, one column per point.
+
+    md.swaption_vol is stored long and keyed (ts, expiry, tenor, strike), so
+    unlike md.index_eod there is no ticker to pivot on. Columns come back
+    named by `swaption_point`, e.g. ("1Mo", 30) -> "vol_1Mo_30".
+
+    Vols are normal vols in bps/yr and are already in bps -- do NOT pass these
+    through a bps_cols scaling the way index_eod yields need.
+
+    Args:
+        points: (expiry, tenor) pairs, e.g. [("1Mo", 30), ("3Mo", 10)].
+        start: Inclusive start date.
+        end: Optional inclusive end date.
+        strike: Strike offset in bps from ATM; 0 is the ATM surface.
+    """
+    pairs = [(str(e), int(t)) for e, t in points]
+    empty = pl.DataFrame(schema={"ts": pl.Date})
+    if not pairs:
+        return empty.to_pandas().set_index("ts") if to_pandas else empty
+
+    sql = """
+        SELECT ts, expiry, tenor, vol::float AS vol
+        FROM md.swaption_vol
+        WHERE ts >= %s AND strike = %s
+          AND expiry = ANY(%s) AND tenor = ANY(%s)
+    """
+    params: list = [
+        start,
+        strike,
+        list(dict.fromkeys(e for e, _ in pairs)),
+        list(dict.fromkeys(t for _, t in pairs)),
+    ]
+    if end is not None:
+        sql += " AND ts <= %s"
+        params.append(end)
+    sql += " ORDER BY ts"
+
+    long_df = query_db(sql, params=params)
+    if long_df.empty:
+        return empty.to_pandas().set_index("ts") if to_pandas else empty
+
+    # expiry and tenor are filtered independently in SQL, so the result is the
+    # full cross-product; keep only the pairs actually asked for.
+    wanted = [swaption_point(e, t, strike) for e, t in pairs]
+    suffix = "" if strike == 0 else f"_{strike:+d}"
+    wide = (
+        pl.from_pandas(long_df)
+        .with_columns(
+            pl.col("ts").cast(pl.Date),
+            pl.col("vol").cast(pl.Float64).fill_nan(None),  # see long_to_wide
+            (
+                pl.lit("vol_") + pl.col("expiry") + pl.lit("_")
+                + pl.col("tenor").cast(pl.Utf8) + pl.lit(suffix)
+            ).alias("point"),
+        )
+        .filter(pl.col("point").is_in(wanted))
+        .pivot(index="ts", on="point", values="vol")
+        .sort("ts")
+    )
+    if to_pandas:
+        return wide.to_pandas().set_index("ts")
+    return wide
+
+
+def swaption_last_updated(wake: bool = True) -> dict | None:
+    """Freshness of md.swaption_vol -- newest bar date and newest write time.
+
+    The sibling of `last_updated` for the surface, which has no ticker column
+    to filter on. Unlike md.index_eod this table has no updated_at, so the
+    write time is created_at and is a lower bound: a row re-upserted later
+    leaves no trace of it.
+    """
+    out = query_db(
+        """
+        SELECT MAX(ts) AS last_ts, MAX(created_at) AS last_written
+        FROM md.swaption_vol
+        """,
+        wake=wake,
+    )
+    if out.empty or pd.isna(out.loc[0, "last_ts"]):
+        return None
+    return {
+        "last_ts": out.loc[0, "last_ts"],
+        "last_written": out.loc[0, "last_written"],
+    }
 
 
 def last_updated(
