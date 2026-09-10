@@ -11,7 +11,7 @@ import time
 import traceback
 
 import polars as pl
-from dash import Input, Output, State, ctx, dcc, html, no_update
+from dash import ALL, Input, Output, State, ctx, dcc, html, no_update
 
 from dashboard.charts import (
     WINDOW_PRESETS,
@@ -34,6 +34,8 @@ from research.panel import (
 )
 from backtest.lab import scan_backend
 from research.dislocation import dislocation_scan
+from research.dislocation_backtest import run_grid
+from backtest.engine import TradeDef
 from utils.market_data import last_updated, swaption_last_updated
 from utils.research_app import (
     BORDER, C0, C1, DIM, ORANGE, PANEL, TEXT, make_app, run,
@@ -45,6 +47,7 @@ DEFAULT_TARGET = "10s20s30s"
 DEFAULT_FEATURES: list[str] = []
 BETA_LOOKBACKS = [63, 126, 189, 252, 504]
 DEFAULT_CHART_WINDOW = "6M"
+RESEARCH_CHART_MAX_WIDTH = "1120px"
 DISLOCATION_BETA_LBS = [63, 126, 252]
 DISLOCATION_RESIDUAL_LBS = [5, 10, 20, 40, 60, 100, 126]
 DISLOCATION_NORM_LBS = [63, 126]
@@ -189,7 +192,7 @@ def stub_tab(title: str, needs: list[str]) -> html.Div:
 
 
 def dislocation_tab() -> html.Div:
-    """Discovery only: gates and ungated cells compete before exits exist."""
+    """Discovery then exact trade-mechanics testing for one selected row."""
     values = [
         ("beta lookbacks", "dis-beta-lbs", DISLOCATION_BETA_LBS),
         ("residual windows", "dis-residual-lbs", DISLOCATION_RESIDUAL_LBS),
@@ -259,6 +262,79 @@ def dislocation_tab() -> html.Div:
                         overlay_style={"visibility": "visible", "opacity": 0.35},
                         parent_className="research-panel-loader"),
         ]),
+        html.Div(style={"borderTop": f"1px solid {BORDER}", "marginTop": 24,
+                        "paddingTop": 18}, children=[
+            heading("trade mechanics"),
+            html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)",
+                            "gap": 26, "alignItems": "start"}, children=[
+                dislocation_backtest_controls(),
+                dcc.Loading(html.Div(id="bt-out"),
+                            custom_spinner=shimmer_loader(image="guy.png", caption="backtesting"),
+                            overlay_style={"visibility": "visible", "opacity": 0.35},
+                            parent_className="research-panel-loader"),
+            ]),
+        ]),
+        dcc.Store(id="dis-board"),
+        dcc.Store(id="dis-candidate"),
+        dcc.Store(id="bt-grid"),
+    ])
+
+
+def dislocation_backtest_controls() -> html.Div:
+    """Controls deliberately limited to execution choices, not model refitting."""
+    return html.Div([
+        html.Div(id="bt-candidate", children=note(
+            "Choose Backtest on a row above to freeze its relationship and gate.", "dim"
+        )),
+        field("entry thresholds (z)", dcc.Dropdown(
+            id="bt-entry-zs", value=[1.5, 2.0, 2.5, 3.0], multi=True,
+            clearable=False,
+            options=[{"label": str(v), "value": v}
+                     for v in [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0]],
+            style={"fontSize": 12},
+        )),
+        field("exit styles", dcc.Checklist(
+            id="bt-exit-styles", value=["time", "band", "revert_frac"],
+            options=[
+                {"label": " time stop (business days)", "value": "time"},
+                {"label": " residual band (z)", "value": "band"},
+                {"label": " reversion fraction", "value": "revert_frac"},
+            ],
+            labelStyle={"display": "block", "fontSize": 12, "marginBottom": 6,
+                        "color": TEXT}, inputStyle={"marginRight": 5},
+        )),
+        field("time stops (d)", dcc.Dropdown(
+            id="bt-time-stops", value=[5, 10, 20, 40, 60], multi=True,
+            clearable=False,
+            options=[{"label": str(v), "value": v} for v in [3, 5, 10, 15, 20, 30, 40, 60, 80]],
+            style={"fontSize": 12},
+        )),
+        field("exit bands (z)", dcc.Dropdown(
+            id="bt-bands", value=[0.0, 0.5, 1.0], multi=True, clearable=False,
+            options=[{"label": str(v), "value": v} for v in [0.0, 0.25, 0.5, 0.75, 1.0, 1.25]],
+            style={"fontSize": 12},
+        )),
+        field("reversion fractions", dcc.Dropdown(
+            id="bt-revert-fracs", value=[0.25, 0.5, 0.75, 1.0], multi=True,
+            clearable=False,
+            options=[{"label": str(v), "value": v} for v in [0.25, 0.5, 0.75, 1.0]],
+            style={"fontSize": 12},
+        )),
+        field("hard stop (bp)", dcc.Dropdown(
+            id="bt-stop", value=25.0, clearable=False,
+            options=[
+                {"label": "none", "value": 0.0},
+                *[{"label": str(v), "value": v} for v in [10.0, 15.0, 25.0, 40.0, 60.0]],
+            ], style={"fontSize": 12},
+        )),
+        field("round-trip cost (bp)", dcc.Dropdown(
+            id="bt-cost", value=0.1, clearable=False,
+            options=[{"label": str(v), "value": v} for v in [0.0, 0.1, 0.25, 0.5, 1.0]],
+            style={"fontSize": 12},
+        )),
+        html.Button("Run backtest grid", id="bt-run", n_clicks=0,
+                    className="ref-btn", style={**btn_style(primary=True), "width": "100%"}),
+        html.Div(id="bt-run-info"),
     ])
 
 
@@ -367,14 +443,14 @@ def level_view(
 ) -> html.Div:
     """The target chart exactly as rendered in the live signal dashboard."""
     png = level_chart(data, target, features=features, invert_features=invert_features,
-                      window_bars=WINDOW_PRESETS[window])
+                      window_bars=WINDOW_PRESETS[window], fig_height=4.2)
     return html.Div([
         level_window_nav(window),
         html.Img(
             id="research-level-chart", src=f"data:image/png;base64,{png}",
             style={"width": "100%", "border": f"1px solid {BORDER}"},
         ),
-    ], style={"marginBottom": 14})
+    ], style={"marginBottom": 14, "maxWidth": RESEARCH_CHART_MAX_WIDTH})
 
 
 def weights_view(panel, window: str) -> html.Div:
@@ -389,12 +465,12 @@ def weights_view(panel, window: str) -> html.Div:
         for col in beta_cols
     }
     png = hedge_weights_chart(
-        panel.data, beta_cols, priors, WINDOW_PRESETS[window]
+        panel.data, beta_cols, priors, WINDOW_PRESETS[window], fig_height=3.5
     )
     return html.Div(html.Img(
         id="research-weight-chart", src=f"data:image/png;base64,{png}",
         style={"width": "100%", "border": f"1px solid {BORDER}"},
-    ), style={"marginBottom": 14})
+    ), style={"marginBottom": 14, "maxWidth": RESEARCH_CHART_MAX_WIDTH})
 
 
 def coverage_view(coverage: pl.DataFrame) -> html.Div:
@@ -402,7 +478,7 @@ def coverage_view(coverage: pl.DataFrame) -> html.Div:
     return html.Div(html.Img(
         src=f"data:image/png;base64,{png}",
         style={"width": "100%", "border": f"1px solid {BORDER}"},
-    ), style={"marginBottom": 14})
+    ), style={"marginBottom": 14, "maxWidth": RESEARCH_CHART_MAX_WIDTH})
 
 
 # ---- the load callback's output ---------------------------------------------
@@ -788,12 +864,12 @@ def register_callbacks(app) -> None:
         frame = pl.DataFrame(columns).with_columns(pl.col("ts").str.to_date())
         png = level_chart(
             frame, target, features=features, invert_features=invert_features,
-            window_bars=WINDOW_PRESETS[selected]
+            window_bars=WINDOW_PRESETS[selected], fig_height=4.2
         )
         weights_png = (
             f"data:image/png;base64,{hedge_weights_chart(
                 frame, weight_cols, chart_data.get('weight_priors', {}),
-                WINDOW_PRESETS[selected]
+                WINDOW_PRESETS[selected], fig_height=3.5
             )}"
             if weight_cols
             else no_update

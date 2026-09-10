@@ -129,6 +129,7 @@ def level_chart(
     date_range: tuple | None = None,
     features: list[str] | None = None,
     invert_features: bool = False,
+    fig_height: float | None = None,
 ) -> str:
     """Tradable level with optional research inputs.
 
@@ -159,7 +160,7 @@ def level_chart(
         },
     }
     feature_title = display_features[0] if len(display_features) == 1 else "features"
-    return _PngViz().line(
+    return _PngViz(fig_height=fig_height).line(
         frame, cols=cols, title=target, yaxis_title="bps",
         yaxis_right_title=feature_title, left=display_features,
         markers=markers, line_colors=colors,
@@ -171,6 +172,7 @@ def hedge_weights_chart(
     weight_cols: list[str],
     fixed_priors: dict[str, float],
     window_bars: int | str | None = WINDOW_PRESETS[DEFAULT_WINDOW],
+    fig_height: float | None = None,
 ) -> str:
     """Rolling hedge ratios in the same static treatment as a signal level.
 
@@ -193,7 +195,7 @@ def hedge_weights_chart(
         }
         for col, prior in fixed_priors.items()
     ]
-    return _PngViz().line(
+    return _PngViz(fig_height=fig_height).line(
         frame,
         cols=cols,
         title="rolling betas vs fixed weights",

@@ -356,7 +356,9 @@ def build_panel(
     if weighting not in {"fixed", "beta"}:
         raise ValueError("weighting must be 'fixed' or 'beta'")
     beta_cols: list[str] = []
-    leg_cols: list[str] = []
+    # Retain executable legs even for fixed baskets.  The displayed composite
+    # is useful for research, but the exact Engine re-marks the actual legs.
+    leg_cols: list[str] = list(target.legs)
     if len(target.legs) > 1:
         try:
             fitted = beta_weighted(
@@ -374,8 +376,6 @@ def build_panel(
             if weighting == "beta":
                 # the fitted level replaces the fixed one under the same name
                 frame = frame.drop(target.name).join(fitted, on="ts", how="left")
-                # Held-PnL diagnostics require the original legs.
-                leg_cols = list(target.legs)
             else:
                 # Fixed basket remains untouched; these weights are a visual
                 # comparison against the entered ratios, never model inputs.
