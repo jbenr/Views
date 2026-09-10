@@ -35,7 +35,6 @@ from research.panel import (
 from backtest.lab import scan_backend
 from research.dislocation import dislocation_scan
 from research.dislocation_backtest import run_grid
-from backtest.engine import TradeDef
 from utils.market_data import last_updated, swaption_last_updated
 from utils.research_app import (
     BORDER, C0, C1, DIM, ORANGE, PANEL, TEXT, make_app, run,
@@ -570,9 +569,40 @@ def panel_view(
     ])
 
 
+def board_row_picker(records: list[dict]) -> html.Div:
+    """One line per discovery-board row, aligned to its index, with a Backtest
+    action. table_div is the shared house table and has no room for a button
+    cell, so the picker is a separate compact list rather than a table column.
+    """
+    if not records:
+        return html.Div()
+    lines = []
+    for i, row in enumerate(records):
+        gate_desc = (
+            f"{row['gate']}:{row['gate_bucket']} w={row['gate_window']}"
+            if row["gate"] != "(none)" else "ungated"
+        )
+        label = (
+            f"#{i}  ic={row['ic']:.3f}  {row['fit_on']}  beta_lb={row['beta_lb']}  "
+            f"resid_lb={row['residual_lb'] if row['residual_lb'] is not None else '—'}  "
+            f"norm_lb={row['norm_lb']}  {gate_desc}"
+        )
+        lines.append(html.Div([
+            html.Span(label, style={"fontSize": 11, "fontFamily": "monospace",
+                                    "color": TEXT}),
+            html.Button("Backtest", id={"type": "dis-pick", "index": i},
+                        n_clicks=0, className="ref-btn",
+                        style={**btn_style(), "padding": "2px 10px", "fontSize": 11,
+                               "marginLeft": 12, "flexShrink": 0}),
+        ], style={"display": "flex", "alignItems": "center", "gap": 8,
+                  "padding": "3px 0", "borderBottom": f"1px solid {BORDER}"}))
+    return html.Div(lines, style={"maxHeight": 260, "overflowY": "auto",
+                                  "marginTop": 10})
+
+
 def dislocation_view(
     results: pl.DataFrame, feature: str, run_info: dict
-) -> html.Div:
+) -> tuple[html.Div, list[dict]]:
     """Compact discovery board. It deliberately does not call a cell a winner."""
     valid = results.filter(pl.col("n_obs") >= 30)
     gated = valid.filter(pl.col("gate") != "(none)")
@@ -592,9 +622,12 @@ def dislocation_view(
             .otherwise(pl.col("positive_windows_30plus").fill_null(0))
             .alias("positive_windows_30plus")
         )
-        .with_columns(pl.col("residual_lb").cast(pl.Utf8).fill_null("—"))
         .sort("ic", descending=True)
+        .head(40)
     )
+    # The board picker needs the real (nullable) residual_lb; the display
+    # table wants the "—" placeholder. Keep records before that string cast.
+    board_records = board.to_dicts()
     stats = [
         stat_block("feature", FEATURE_LABELS.get(feature, feature)),
         stat_block("cells tested", f"{len(results):,}"),
@@ -609,7 +642,8 @@ def dislocation_view(
         "gate_bucket", "gate_window", "positive_windows_30plus", "ic", "hit_rate",
         "n_obs", "events_per_year",
     ]
-    return html.Div([
+    display = board.with_columns(pl.col("residual_lb").cast(pl.Utf8).fill_null("—"))
+    view = html.Div([
         html.Div(stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
                                "marginBottom": 14, "paddingBottom": 12,
                                "borderBottom": f"1px solid {BORDER}"}),
@@ -617,8 +651,47 @@ def dislocation_view(
              "it is agreement, not proof. Exits, costs, time in market, and trade "
              "robustness are deliberately not scored here."),
         table_div(
-            board.select([col for col in cols if col in board.columns]).head(40).to_pandas(),
+            display.select([col for col in cols if col in display.columns]).to_pandas(),
             title="IC discovery board", max_rows=40, float_fmt=",.3f",
+        ),
+        note("Pick a row's Backtest button to freeze its relationship and gate "
+             "for exact trade-mechanics testing below.", "dim"),
+        board_row_picker(board_records),
+    ])
+    return view, board_records
+
+
+def backtest_grid_view(grid: pl.DataFrame, selected: dict) -> html.Div:
+    """Every requested entry/exit cell run through the exact Engine.
+
+    No refitting happens here -- the relationship and gate are frozen from
+    the discovery candidate; only trade mechanics vary across the grid.
+    """
+    best = selected["metrics"]
+    stats = [
+        stat_block("cells run", f"{len(grid):,}"),
+        stat_block("best sharpe", f"{best['sharpe']:.2f}"),
+        stat_block("best cell", f"z={best['entry_z']} · {best['exit_style']}={best['exit_param']}"),
+        stat_block("total pnl (best)", f"{best['total_pnl_bps']:,.0f} bps"),
+        stat_block("trades (best)", f"{best['n_trades']:,}"),
+        stat_block("hit rate (best)", f"{best['hit_rate']:.1%}"),
+        stat_block("time in market (best)", f"{best['time_in_market_pct']:.1%}"),
+    ]
+    cols = [
+        "entry_z", "exit_style", "exit_param", "sharpe", "total_pnl_bps",
+        "n_trades", "hit_rate", "avg_pnl_per_trade_bps", "median_pnl_bps",
+        "time_in_market_pct", "max_drawdown_bps", "open_trades",
+    ]
+    return html.Div([
+        html.Div(stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
+                               "marginBottom": 14, "paddingBottom": 12,
+                               "borderBottom": f"1px solid {BORDER}"}),
+        note("Exact Engine re-mark on the actual legs, transaction cost applied. "
+             "One row per requested entry/exit cell."),
+        table_div(
+            grid.select([c for c in cols if c in grid.columns])
+                .sort("sharpe", descending=True).to_pandas(),
+            title="backtest grid", max_rows=60, float_fmt=",.2f",
         ),
     ])
 
@@ -690,6 +763,7 @@ def register_callbacks(app) -> None:
     @app.callback(
         Output("dis-out", "children"),
         Output("dis-run-info", "children"),
+        Output("dis-board", "data"),
         Input("dis-run", "n_clicks"),
         State("research-level-data", "data"),
         State("dis-feature", "value"),
@@ -709,12 +783,12 @@ def register_callbacks(app) -> None:
         horizons, gates, gate_windows,
     ):
         if not stored:
-            return note("Load a target and this feature on Setup first.", "warn"), ""
+            return note("Load a target and this feature on Setup first.", "warn"), "", no_update
         if feature not in stored.get("features", []):
             return note(
                 f"{FEATURE_LABELS.get(feature, feature)} is not in the loaded panel. "
                 "Add it on Setup, then Load.", "warn"
-            ), ""
+            ), "", no_update
         try:
             target = stored["target"]
             rows = stored["rows"]
@@ -742,7 +816,7 @@ def register_callbacks(app) -> None:
                 note(f"{type(exc).__name__}: {exc}", "bad"),
                 html.Pre(traceback.format_exc(), style={"fontSize": 10, "color": DIM,
                                                         "whiteSpace": "pre-wrap"}),
-            ]), ""
+            ]), "", no_update
         info = {
             "backend": backend,
             "elapsed_s": elapsed_s,
@@ -752,7 +826,127 @@ def register_callbacks(app) -> None:
             f"Completed · {backend} · {len(results):,} cells in {elapsed_s:.2f}s",
             "good",
         )
-        return dislocation_view(results, feature, info), status
+        view, board_records = dislocation_view(results, feature, info)
+        board = {"target": target, "feature": feature, "rows": board_records}
+        return view, status, board
+
+    @app.callback(
+        Output("dis-candidate", "data"),
+        Output("bt-candidate", "children"),
+        Input({"type": "dis-pick", "index": ALL}, "n_clicks"),
+        State("dis-board", "data"),
+        prevent_initial_call=True,
+    )
+    def _pick_dislocation_candidate(n_clicks, board):
+        # Dash fires this the moment the row buttons first appear (all zero
+        # clicks), before any real click. Only a genuine click should freeze
+        # a candidate.
+        if not board or not any(n_clicks or []):
+            return no_update, no_update
+        triggered = ctx.triggered_id
+        if not isinstance(triggered, dict):
+            return no_update, no_update
+        rows = board["rows"]
+        idx = triggered["index"]
+        if idx >= len(rows):
+            return no_update, no_update
+        row = rows[idx]
+        candidate = {
+            "target": board["target"], "feature": board["feature"],
+            "fit_on": row["fit_on"], "beta_lb": int(row["beta_lb"]),
+            "residual_lb": (
+                None if row["residual_lb"] is None else int(row["residual_lb"])
+            ),
+            "norm_lb": int(row["norm_lb"]), "gate": row["gate"],
+            "gate_bucket": row["gate_bucket"], "gate_window": row["gate_window"],
+        }
+        gate_desc = (
+            f"{candidate['gate']}:{candidate['gate_bucket']} "
+            f"(window={candidate['gate_window']})"
+            if candidate["gate"] != "(none)" else "ungated"
+        )
+        label = (
+            f"{candidate['target']} vs "
+            f"{FEATURE_LABELS.get(candidate['feature'], candidate['feature'])} · "
+            f"{candidate['fit_on']} · beta_lb={candidate['beta_lb']} · "
+            f"resid_lb={candidate['residual_lb'] or '—'} · "
+            f"norm_lb={candidate['norm_lb']} · {gate_desc}"
+        )
+        return candidate, note(f"Frozen: {label}", "good")
+
+    @app.callback(
+        Output("bt-out", "children"),
+        Output("bt-run-info", "children"),
+        Output("bt-grid", "data"),
+        Input("bt-run", "n_clicks"),
+        State("dis-candidate", "data"),
+        State("research-level-data", "data"),
+        State("target", "value"), State("custom", "value"),
+        State("bt-entry-zs", "value"), State("bt-exit-styles", "value"),
+        State("bt-time-stops", "value"), State("bt-bands", "value"),
+        State("bt-revert-fracs", "value"), State("bt-stop", "value"),
+        State("bt-cost", "value"),
+        prevent_initial_call=True,
+        running=[
+            (Output("bt-run", "children"), "Running backtest…", "Run backtest grid"),
+            (Output("bt-run", "disabled"), True, False),
+        ],
+    )
+    def _run_backtest_grid(
+        _n, candidate, stored, target, custom, entry_zs, exit_styles,
+        time_stops, bands, revert_fracs, stop_bp, cost_bp,
+    ):
+        if not candidate:
+            return note("Choose Backtest on a discovery row first.", "warn"), "", no_update
+        if not stored:
+            return note("Load a target on Setup first.", "warn"), "", no_update
+        if candidate["target"] != stored["target"]:
+            return note(
+                "Loaded target has changed since discovery ran; rerun discovery "
+                "for the current target.", "warn",
+            ), "", no_update
+        if candidate["feature"] not in stored.get("features", []):
+            return note(
+                f"{FEATURE_LABELS.get(candidate['feature'], candidate['feature'])} is "
+                "not in the loaded panel. Add it on Setup, then Load.", "warn",
+            ), "", no_update
+        exit_params = {
+            style: values
+            for style, values in {
+                "time": time_stops, "band": bands, "revert_frac": revert_fracs,
+            }.items()
+            if style in (exit_styles or [])
+        }
+        if not exit_params or not entry_zs:
+            return note(
+                "Choose at least one entry threshold and one exit style.", "warn",
+            ), "", no_update
+        try:
+            selected_target = "custom" if custom and custom.strip() else target
+            trade = resolve_target(selected_target, custom)
+            rows = stored["rows"]
+            needed = list(dict.fromkeys([trade.name, candidate["feature"], *trade.legs]))
+            columns = {"ts": pl.Series([row["ts"] for row in rows], dtype=pl.Utf8)}
+            columns.update({
+                col: pl.Series([row[col] for row in rows], dtype=pl.Float64)
+                for col in needed
+            })
+            data = pl.DataFrame(columns).with_columns(pl.col("ts").str.to_date())
+            started = time.perf_counter()
+            grid, selected = run_grid(
+                data, trade, candidate,
+                entry_zs=entry_zs, exit_params=exit_params,
+                stop_loss_bps=(stop_bp or None), round_trip_cost_bps=cost_bp or 0.0,
+            )
+            elapsed_s = time.perf_counter() - started
+        except Exception as exc:
+            return html.Div([
+                note(f"{type(exc).__name__}: {exc}", "bad"),
+                html.Pre(traceback.format_exc(), style={"fontSize": 10, "color": DIM,
+                                                        "whiteSpace": "pre-wrap"}),
+            ]), "", no_update
+        status = note(f"Completed · {len(grid):,} cells in {elapsed_s:.2f}s", "good")
+        return backtest_grid_view(grid, selected), status, grid.to_dicts()
 
     @app.callback(
         Output("panel-out", "children"),
@@ -790,9 +984,12 @@ def register_callbacks(app) -> None:
             ]), None, no_update
         chart_features = list(panel.features)
         weight_cols = panel.beta_diagnostic_cols
-        chart_data = panel.data.select(
-            "ts", trade.name, *chart_features, *weight_cols
-        ).with_columns(
+        # Legs ride along so a later exact-mechanics backtest (Dislocation tab)
+        # can re-mark the actual tradeable instruments, not just the composite.
+        store_cols = list(dict.fromkeys(
+            [trade.name, *chart_features, *weight_cols, *trade.legs]
+        ))
+        chart_data = panel.data.select("ts", *store_cols).with_columns(
             pl.col("ts").cast(pl.Utf8)
         )
         if weight_cols:

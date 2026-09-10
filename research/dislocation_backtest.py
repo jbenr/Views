@@ -234,8 +234,10 @@ def run_grid(
     # Engine and signal frame must share precisely the same bar index.  The
     # feature can have a shorter history than the executable target legs, so
     # trim once here rather than silently attaching a shorter signal by row.
+    # An outright target's name is one of its own legs; dedupe or align_columns
+    # sees the same column requested twice and polars refuses the projection.
     data = align_columns(
-        data, [candidate["target"], candidate["feature"], *trade.legs]
+        data, list(dict.fromkeys([candidate["target"], candidate["feature"], *trade.legs]))
     ).sort("ts")
     # The relationship and its gate are invariant across entry and exit
     # mechanics.  Build them once; only the exact position state machine is
