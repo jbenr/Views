@@ -8,11 +8,13 @@ import polars as pl
 from research import artifacts
 
 
-def grid_spec(bases, beta, residual, norm, entries, horizons, gates, windows, signal, train):
+def grid_spec(bases, beta, residual, norm, entries, horizons, gates, windows, signal, train,
+              raw_entries=(1., 2., 3., 5., 10., 15.)):
     return dict(fit_on=sorted(bases), beta_lb=sorted(beta), residual_lb=sorted(residual),
                 norm_lb=sorted(norm), entry_z=sorted(entries), horizon=sorted(horizons),
                 gates=sorted(gates), gate_windows=sorted(windows) if gates else [],
-                signal_kind=sorted([signal] if isinstance(signal, str) else signal), train_fraction=float(train))
+                signal_kind=sorted([signal] if isinstance(signal, str) else signal), train_fraction=float(train),
+                raw_entry=sorted(raw_entries) if 'raw' in ([signal] if isinstance(signal, str) else signal) else [])
 
 
 def input_hash(stored, feature):
@@ -59,6 +61,8 @@ def compare_run(meta, requested, current_hash):
     else:
         missing = []
         for key in ('fit_on', 'beta_lb', 'norm_lb', 'entry_z', 'horizon', 'gates', 'gate_windows'):
+            if key == 'entry_z' and requested['signal_kind'] in ('raw', ['raw']):
+                continue
             extra = sorted(set(requested[key]) - set(saved[key]))
             if extra:
                 missing.append(f'{key}: {extra}')
@@ -73,6 +77,10 @@ def compare_run(meta, requested, current_hash):
         missing_signals = sorted(set(requested_signals) - set(saved_signals))
         if missing_signals:
             missing.append(f'signal_kind: {missing_signals}')
+        if 'raw' in requested_signals:
+            extra = sorted(set(requested.get('raw_entry', [])) - set(saved.get('raw_entry', [])))
+            if extra:
+                missing.append(f'raw_entry (target units): {extra}')
         for key in ('train_fraction',):
             if saved[key] != requested[key]:
                 missing.append(f'{key}: requested {requested[key]}, saved {saved[key]} (rerun required)')

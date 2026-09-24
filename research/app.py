@@ -58,6 +58,7 @@ DISLOCATION_BETA_LBS = [63, 126, 252]
 DISLOCATION_RESIDUAL_LBS = [5, 10, 20, 40, 60, 100, 126]
 DISLOCATION_NORM_LBS = [63, 126]
 DISLOCATION_THRESHOLDS = [1.0, 1.5, 2.0, 2.5]
+RAW_THRESHOLDS = [1.0, 2.0, 3.0, 5.0, 10.0, 15.0]
 DISLOCATION_HORIZONS = [5, 10, 20, 40]
 DISLOCATION_GATES = {
     "feature_level": "Feature · level",
@@ -229,8 +230,14 @@ def progress_view(state: dict, caption: str):
         html.Div(f"Stopped · {clock} elapsed" if failed else f"{count} · {clock} elapsed{eta}",
                  className="research-work-count"),
         *([] if failed else [bar]),
-        html.Div([html.Div(line, className="research-work-line") for line in state["history"][-4:]],
-                 className="research-work-log"),
+        html.Div([html.Div(line, className="research-work-line", title=line,
+                          key=str(state.get("message_count", len(state['history'])) - len(state['history']) + i),
+                          **{"data-line-id": str(state.get("message_count", len(state['history'])) - len(state['history']) + i)})
+                  for i, line in enumerate(state["history"])],
+                 className="research-work-log", tabIndex=0,
+                 title="Scroll up for earlier messages (latest 200 retained)",
+                 **{"aria-label": "Progress history, newest messages at the bottom",
+                    "data-log-key": caption, "data-run-id": str(state.get('started', ''))}),
     ]
     if finished:
         return html.Details([html.Summary(state["message"]), *content], className="research-work-finished")
@@ -269,10 +276,15 @@ def dislocation_tab() -> html.Div:
     ))]
     controls += [
         html.Div(id="dis-context"),
-        field("signals (select one or both)", dcc.Dropdown(id="dis-signal", value=["normalized"], multi=True, clearable=False,
+        field("signals (select any combination)", dcc.Dropdown(id="dis-signal", value=["normalized"], multi=True, clearable=False,
             options=[{"label": "Residual / rolling standard deviation", "value": "normalized"},
-                     {"label": "OU z-score", "value": "ou_z"}])),
+                     {"label": "OU z-score", "value": "ou_z"},
+                     {"label": "Raw residual (target units)", "value": "raw"}])),
         note("Both start from the same residual r. Scaled residual = r / rolling std(r). OU z = (r - fitted OU equilibrium) / rolling std(r).", "dim"),
+        field("raw entry thresholds (target units; bp for rates)", dcc.Dropdown(
+            id="dis-raw-thresholds", value=RAW_THRESHOLDS, multi=True, clearable=False,
+            options=[{'label': str(v), 'value': v} for v in [.5, 1., 2., 3., 5., 10., 15., 20., 25., 40., 50.]])),
+        note("Raw uses r directly, with no volatility scaling or centering. The normalization / OU window only affects OU gates and half-life exits for raw candidates; raw signals repeat across those windows.", "dim"),
         field("discovery period", dcc.Dropdown(id="dis-train", value=0.7, clearable=False,
             options=[{"label": "First 70%; evaluate later 30%", "value": 0.7},
                      {"label": "First 80%; evaluate later 20%", "value": 0.8},
@@ -366,18 +378,18 @@ def dislocation_backtest_controls() -> html.Div:
         html.Div(id="bt-candidate", children=note(
             "Choose Backtest on a row above to freeze its relationship and gate.", "dim"
         )),
-        field("entry thresholds (z)", dcc.Dropdown(
+        field("entry thresholds (selected signal units)", dcc.Dropdown(
             id="bt-entry-zs", value=[0.5], multi=True,
             clearable=False,
             options=[{"label": str(v), "value": v}
-                     for v in [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0]],
+                     for v in [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 5., 10., 15., 20., 25., 40., 50.]],
             style={"fontSize": 12},
         )),
         field("exit styles", dcc.Checklist(
             id="bt-exit-styles", value=["time", "band", "revert_frac", "half_life_frac"],
             options=[
                 {"label": " time stop (business days)", "value": "time"},
-                {"label": " residual band (z)", "value": "band"},
+                {"label": " residual band (selected signal units)", "value": "band"},
                 {"label": " reversion fraction", "value": "revert_frac"},
                 {"label": " entry half-life multiple", "value": "half_life_frac"},
             ],
@@ -390,9 +402,9 @@ def dislocation_backtest_controls() -> html.Div:
             options=[{"label": str(v), "value": v} for v in [3, 5, 10, 15, 20, 30, 40, 60, 80]],
             style={"fontSize": 12},
         )),
-        field("exit bands (z)", dcc.Dropdown(
+        field("exit bands (selected signal units)", dcc.Dropdown(
             id="bt-bands", value=[0.0, 0.25], multi=True, clearable=False,
-            options=[{"label": str(v), "value": v} for v in [0.0, 0.25, 0.5, 0.75, 1.0, 1.25]],
+            options=[{"label": str(v), "value": v} for v in [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 2., 3., 5., 10., 15., 20.]],
             style={"fontSize": 12},
         )),
         field("reversion fractions", dcc.Dropdown(
@@ -668,7 +680,7 @@ def board_row_picker(records: list[dict]) -> html.Div:
         )
         ic_label = f"{row['ic']:.3f}" if row['ic'] is not None else "n/a"
         label = (
-            f"#{i}  ic={ic_label}  {row.get('signal_kind', 'normalized')}  {row['fit_on']}  beta_lb={row['beta_lb']}  "
+            f"#{i + 1}  ic={ic_label}  {row.get('signal_kind', 'normalized')}  {row['fit_on']}  beta_lb={row['beta_lb']}  "
             f"resid_lb={row['residual_lb'] if row['residual_lb'] is not None else '—'}  "
             f"norm_lb={row['norm_lb']}  {gate_desc}"
         )
@@ -757,12 +769,12 @@ def dislocation_view(
         stat_block("rate", f"{run_info['cells_per_second']:,.0f} cells/s"),
     ]
     cols = [
-        "signal_kind", "fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate",
+        "#", "signal_kind", "signal_units", "fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate",
         "gate_bucket", "gate_window", "positive_windows_30plus", "model_family_median_ic", "ic", "hit_rate",
         "n_obs", "events_per_year", "later_ic", "later_event_hit_rate", "later_events",
         "n_non_overlapping", "overlap_fraction",
     ]
-    display = board.with_columns(pl.col("residual_lb").cast(pl.Utf8).fill_null("—"))
+    display = board.with_row_index("#", offset=1).with_columns(pl.col("residual_lb").cast(pl.Utf8).fill_null("—"))
     view = html.Div([
         html.Div(stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
                                "marginBottom": 14, "paddingBottom": 12,
@@ -772,7 +784,7 @@ def dislocation_view(
              "Forward windows can overlap. Later-period columns evaluate the same candidates; "
              "repeatedly choosing from them turns that period into research data."),
         table_div(
-            display.select([col for col in cols if col in display.columns]).rename({"hit_rate": "event_hit_rate"}).to_pandas(),
+            display.select([col for col in cols if col in display.columns]).rename({"hit_rate": "event_hit_rate", "entry_z": "entry_threshold"}).to_pandas(),
             title="IC discovery board", max_rows=40, float_fmt=",.3f",
         ),
         note("Pick a row's Backtest button to freeze its relationship and gate "
@@ -793,14 +805,14 @@ def backtest_grid_view(grid: pl.DataFrame, selected: dict) -> html.Div:
     stats = [
         stat_block("cells run", f"{len(grid):,}"),
         stat_block(f"selected {rank_metric}", f"{best[rank_metric]:.2f}"),
-        stat_block("best cell", f"z={best['entry_z']} · {best['exit_style']}={best['exit_param']}"),
+        stat_block("best cell", f"entry={best['entry_z']} ({best.get('signal_units', 'standard deviations')}) · {best['exit_style']}={best['exit_param']}"),
         stat_block("total pnl (best)", f"{best['total_pnl_bps']:,.0f} bps"),
         stat_block("trades (best)", f"{best['n_trades']:,}"),
         stat_block("winning closed trades (best)", f"{best['trade_win_rate']:.1%}"),
         stat_block("time in market (best)", f"{best['time_in_market_pct']:.1%}"),
     ]
     cols = [
-        "config_id", "entry_z", "exit_style", "exit_param", "stop_loss_bps", "sharpe", "total_pnl_bps",
+        "config_id", "signal_kind", "signal_units", "entry_z", "exit_style", "exit_param", "stop_loss_bps", "sharpe", "total_pnl_bps",
         "n_trades", "trade_win_rate", "avg_pnl_per_trade_bps", "median_pnl_bps",
         "avg_holding_days", "time_in_market_pct", "max_drawdown_bps", "open_trades",
         "earlier_sharpe", "later_sharpe", "earlier_pnl_bps", "later_pnl_bps",
@@ -868,7 +880,7 @@ def tabs() -> html.Div:
 
 def register_callbacks(app) -> None:
     sweep_controls = ["dis-signal", "dis-fit-on", "dis-beta-lbs", "dis-residual-lbs",
-        "dis-norm-lbs", "dis-thresholds", "dis-horizons", "dis-gates", "dis-gate-windows",
+        "dis-norm-lbs", "dis-thresholds", "dis-horizons", "dis-gates", "dis-gate-windows", "dis-raw-thresholds",
         "bt-entry-zs", "bt-exit-styles", "bt-time-stops", "bt-bands", "bt-revert-fracs",
         "bt-half-lives", "bt-stop"]
 
@@ -880,13 +892,14 @@ def register_callbacks(app) -> None:
                 for choices in options]
 
     @app.callback(Output("dis-grid-size", "children"),
-        *[Input(control, "value") for control in sweep_controls[:9]], Input("dis-train", "value"))
-    def _grid_size(signals, bases, beta, residual, norm, entries, horizons, gates, windows, train):
+        *[Input(control, "value") for control in sweep_controls[:10]], Input("dis-train", "value"))
+    def _grid_size(signals, bases, beta, residual, norm, entries, horizons, gates, windows, raw_entries, train):
         signals = [signals] if isinstance(signals, str) else signals or []
         models = len(signals)*len(beta or [])*len(norm or [])*(
             (len(residual or []) if 'changes' in (bases or []) else 0)
             + (1 if 'levels' in (bases or []) else 0))
-        cells = models*len(entries or [])*len(horizons or [])*(
+        threshold_count = sum(len(raw_entries or []) if s == 'raw' else len(entries or []) for s in signals)
+        cells = (models // max(len(signals), 1))*threshold_count*len(horizons or [])*(
             1+len(gates or [])*len(windows or [])*len(REGIME_GATE_BUCKETS))*(2 if train < 1 else 1)
         warning = (" Very large grid: saved scores alone may require many GB of RAM; consider narrowing selections."
                    if cells > 10_000_000 else "")
@@ -901,6 +914,10 @@ def register_callbacks(app) -> None:
     )
     def _set_dislocation_gates(_all, _none):
         return list(DISLOCATION_GATES) if ctx.triggered_id == "dis-gates-all" else []
+
+    @app.callback(Output("dis-raw-thresholds-field", "style"), Input("dis-signal", "value"))
+    def _raw_threshold_visibility(signals):
+        return {"marginBottom": 12} if 'raw' in (signals or []) else {"display": "none"}
 
     @app.callback(Output("custom-field", "style"), Output("beta-lb-field", "style"),
                   Output("beta-advanced", "style"), Input("target", "value"), Input("weighting", "value"))
@@ -981,15 +998,16 @@ def register_callbacks(app) -> None:
         Input("dis-gates", "value"), Input("dis-gate-windows", "value"),
         Input("dis-signal", "value"), Input("dis-train", "value"),
         Input("dis-board", "data"), State("dis-saved-run", "value"),
+        Input("dis-raw-thresholds", "value"),
     )
     def _find_saved(stored, feature, bases, beta, residual, norm, entries, horizons,
-                    gates, windows, signal, train, _board, selected):
+                    gates, windows, signal, train, _board, selected, raw_entries=None):
         if not stored or feature not in stored.get('features', []):
             return [], None, None
         request = grid_spec(bases or ['changes'], beta or DISLOCATION_BETA_LBS,
             residual or DISLOCATION_RESIDUAL_LBS, norm or DISLOCATION_NORM_LBS,
             entries or DISLOCATION_THRESHOLDS, horizons or DISLOCATION_HORIZONS,
-            gates or [], windows or [126, 252, 504], signal, train)
+            gates or [], windows or [126, 252, 504], signal, train, raw_entries or RAW_THRESHOLDS)
         fingerprint = input_hash(stored, feature)
         runs = list_runs(stored['target'], feature)
         runs.sort(key=lambda m: (m.get('input_sha256') == fingerprint,
@@ -1068,6 +1086,7 @@ def register_callbacks(app) -> None:
         State("dis-gate-windows", "value"),
         State("dis-signal", "value"), State("dis-train", "value"),
         State("dis-min-events", "value"), State("research-session", "data"),
+        State("dis-raw-thresholds", "value"),
         prevent_initial_call=True,
         running=[
             (Output("dis-run", "children"), "Running discovery…", "Run discovery"),
@@ -1076,7 +1095,7 @@ def register_callbacks(app) -> None:
     )
     def _run_dislocation(
         _n, stored, feature, fit_on, beta_lbs, residual_lbs, norm_lbs, thresholds,
-        horizons, gates, gate_windows, signal_kind, train_fraction, min_events, session,
+        horizons, gates, gate_windows, signal_kind, train_fraction, min_events, session, raw_entries=None,
     ):
         if not stored:
             return note("Load a target and this feature on Setup first.", "warn"), "", no_update
@@ -1102,7 +1121,7 @@ def register_callbacks(app) -> None:
                 beta_lookbacks=beta_lbs or DISLOCATION_BETA_LBS,
                 residual_lookbacks=residual_lbs or DISLOCATION_RESIDUAL_LBS,
                 normalization_lookbacks=norm_lbs or DISLOCATION_NORM_LBS,
-                thresholds=thresholds or DISLOCATION_THRESHOLDS,
+                thresholds=thresholds or DISLOCATION_THRESHOLDS, raw_thresholds=raw_entries or RAW_THRESHOLDS,
                 horizons=horizons or DISLOCATION_HORIZONS,
                 gate_names=gates or [],
                 gate_windows=gate_windows or [126, 252, 504],
@@ -1133,7 +1152,7 @@ def register_callbacks(app) -> None:
             grid=grid_spec(fit_on or ["changes"], beta_lbs or DISLOCATION_BETA_LBS,
                 residual_lbs or DISLOCATION_RESIDUAL_LBS, norm_lbs or DISLOCATION_NORM_LBS,
                 thresholds or DISLOCATION_THRESHOLDS, horizons or DISLOCATION_HORIZONS,
-                gates or [], gate_windows or [126, 252, 504], signal_kind, train_fraction),
+                gates or [], gate_windows or [126, 252, 504], signal_kind, train_fraction, raw_entries or RAW_THRESHOLDS),
             input_sha256=input_hash(stored, feature), legs=stored['legs'],
             weight_columns=stored.get('weight_columns', {}),
             signal_kind=signal_kind, min_events=min_events,
@@ -1192,7 +1211,7 @@ def register_callbacks(app) -> None:
         label = (
             f"{candidate['target']} vs "
             f"{FEATURE_LABELS.get(candidate['feature'], candidate['feature'])} · "
-            f"{candidate['signal_kind']} · {candidate['fit_on']} · beta_lb={candidate['beta_lb']} · "
+            f"{candidate['signal_kind']} ({'target units; bp for rates' if candidate['signal_kind'] == 'raw' else 'standard deviations'}) · {candidate['fit_on']} · beta_lb={candidate['beta_lb']} · "
             f"resid_lb={candidate['residual_lb'] or '—'} · "
             f"norm_lb={candidate['norm_lb']} · {gate_desc}"
         )

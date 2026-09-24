@@ -27,7 +27,7 @@ def candidate(**kwargs):
                 residual_lb=None, norm_lb=40, gate="(none)", signal_kind="ou_z", **kwargs)
 
 
-@pytest.mark.parametrize("kind", ["normalized", "ou_z"])
+@pytest.mark.parametrize("kind", ["normalized", "ou_z", "raw"])
 @pytest.mark.parametrize("basis", ["levels", "changes"])
 def test_discovery_and_execution_use_identical_signals(monkeypatch, kind, basis):
     import research.dislocation as module
@@ -68,6 +68,25 @@ def test_failed_progress_does_not_claim_completion():
                              elapsed=30, history=["Failed: invalid settings"]), "SCANNING")
     assert view.children[1].children == "Stopped · 0:30 elapsed"
     assert all(getattr(child, "role", None) != "progressbar" for child in view.children)
+
+
+def test_progress_log_retains_bounded_scroll_history():
+    from research import progress
+    from research.app import progress_view
+    progress.start('scroll-test', 'dis', 'Starting')
+    for i in range(205):
+        progress.update('scroll-test', 'dis', f'Model {i}', i, 300)
+    state = progress.snapshot('scroll-test', 'dis')
+    assert len(state['history']) == 200
+    assert state['history'][0] == 'Model 5'
+    view = progress_view(state, 'SEARCHING')
+    log = next(child for child in view.children if getattr(child, 'className', '') == 'research-work-log')
+    assert len(log.children) == 200
+    assert log.children[0].children == 'Model 5'
+    assert log.children[-1].children == 'Model 204'
+    assert log.tabIndex == 0
+    progress.start('scroll-test', 'dis', 'New run')
+    assert progress.snapshot('scroll-test', 'dis')['history'] == ['New run']
 
 
 def test_chart_inversion_redraws_cached_data_without_reload(monkeypatch):

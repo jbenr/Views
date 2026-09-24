@@ -5,6 +5,7 @@ from time import monotonic
 
 _lock = Lock()
 _tasks: dict[tuple[str, str], dict] = {}
+MAX_LOG_LINES = 200
 
 
 def update(session: str, task: str, message: str, done=0, total=0) -> None:
@@ -16,9 +17,12 @@ def update(session: str, task: str, message: str, done=0, total=0) -> None:
         key = (session, task)
         old = _tasks.get(key, {})
         history = old.get("history", [])
+        message_count = old.get("message_count", 0)
         if not history or history[-1] != message:
-            history = [*history, message][-6:]
+            history = [*history, message][-MAX_LOG_LINES:]
+            message_count += 1
         _tasks[key] = dict(message=message, done=done, total=total,
+                           message_count=message_count,
                            phase_started=(old.get("phase_started", now)
                                           if old.get("total") == total and done >= old.get("done", 0)
                                           else now),

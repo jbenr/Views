@@ -85,8 +85,21 @@
     background: #b39aa0;
     transition: width 180ms ease-out;
 }
-.research-work-log { width: 100%; }
+.research-work-log {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    overflow-anchor: none; /* Explicit message anchoring in research_log.js. */
+    max-height: 108.9px; /* Six lines at 11px * 1.65 line-height. */
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    pointer-events: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #c5b8bf transparent;
+}
 .research-work-line {
+    flex-shrink: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

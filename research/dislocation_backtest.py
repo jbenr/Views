@@ -95,9 +95,9 @@ def signal_frame(
         r2 = _window_r2(x, y, beta_lb)
 
     ou = roll_ou_features(resid, lookback=norm_lb)
-    if signal_kind not in {"normalized", "ou_z"}:
-        raise ValueError("signal_kind must be normalized or ou_z")
-    signal = ou["ou_z"] if signal_kind == "ou_z" else resid / resid.rolling_std(norm_lb, min_samples=norm_lb)
+    if signal_kind not in {"normalized", "ou_z", "raw"}:
+        raise ValueError("signal_kind must be normalized, ou_z or raw")
+    signal = resid if signal_kind == "raw" else ou["ou_z"] if signal_kind == "ou_z" else resid / resid.rolling_std(norm_lb, min_samples=norm_lb)
     stability = beta_cv(beta, lookback=beta_lb)
     conditions = {
         "feature_level": x,
@@ -313,6 +313,8 @@ def run_grid(
         row = {
             "config_id": str(done), "stop_loss_bps": stop,
             "execution_lag": execution_lag,
+            "signal_kind": candidate.get("signal_kind", "normalized"),
+            "signal_units": "target units" if candidate.get("signal_kind") == "raw" else "standard deviations",
             "entry_z": entry_z, "exit_style": style,
             "exit_param": exit_param, **metrics,
         }

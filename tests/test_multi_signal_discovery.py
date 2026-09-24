@@ -52,7 +52,7 @@ def test_select_all_uses_every_live_option_without_changing_defaults():
     actual = callback['callback'].__wrapped__(1, *options)
     assert actual == [[o['value'] for o in group if not o.get('disabled', False)] for group in options]
     assert controls['dis-signal'].value == ['normalized']
-    assert actual[0] == ['normalized', 'ou_z']
+    assert actual[0] == ['normalized', 'ou_z', 'raw']
     assert controls['dis-train'].value == .7
     assert app.server.test_client().get('/_dash-dependencies').status_code == 200
 

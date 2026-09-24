@@ -199,6 +199,7 @@ def dislocation_scan(
     fit_on: Iterable[str] = ("changes",),
     device: str = "auto",
     signal_kind: str | Iterable[str] = "normalized",
+    raw_thresholds: Iterable[float] = (1.0, 2.0, 3.0, 5.0, 10.0, 15.0),
     train_fraction: float = 1.0,
     progress: Callable[[int, int, str], None] | None = None,
     trade_legs: dict[str, float] | None = None,
@@ -213,8 +214,11 @@ def dislocation_scan(
     """
     frame = aligned_panel(data, list(dict.fromkeys([target, feature, *(trade_legs or {}), *(weight_columns or {}).values()])))
     signal_kinds = list(dict.fromkeys([signal_kind] if isinstance(signal_kind, str) else signal_kind))
-    if not signal_kinds or set(signal_kinds) - {"normalized", "ou_z"}:
-        raise ValueError("Choose normalized, ou_z, or both")
+    if not signal_kinds or set(signal_kinds) - {"normalized", "ou_z", "raw"}:
+        raise ValueError("Choose normalized, ou_z, raw, or a combination")
+    raw_thresholds = list(raw_thresholds)
+    if "raw" in signal_kinds and (not raw_thresholds or any(not np.isfinite(v) or v <= 0 for v in raw_thresholds)):
+        raise ValueError("Raw residual thresholds must be positive finite values in target units")
     if not 0.5 <= train_fraction <= 1:
         raise ValueError("train_fraction must be between 0.5 and 1")
     beta_lookbacks = list(beta_lookbacks)
@@ -341,13 +345,14 @@ def dislocation_scan(
             needs_ou = "ou_z" in signal_kinds or any(k in conditions for k in ("resid_phi", "resid_half_life"))
             ou = roll_ou_features(dislocation, lookback=int(norm_lb)) if needs_ou else None
             for kind in signal_kinds:
-                z = ou["ou_z"] if kind == "ou_z" else dislocation / dislocation.rolling_std(
+                z = dislocation if kind == "raw" else ou["ou_z"] if kind == "ou_z" else dislocation / dislocation.rolling_std(
                     int(norm_lb), min_samples=int(norm_lb)
                 )
                 signals.append(z.to_numpy().astype(float))
                 combos.append({
                     "fit_on": basis, "beta_lb": int(beta_lb), "residual_lb": residual_lb,
                     "norm_lb": int(norm_lb), "signal_kind": kind,
+                    "signal_units": "target units" if kind == "raw" else "standard deviations",
                 })
                 for name in names:
                     if name == "resid_phi":
@@ -419,7 +424,7 @@ def dislocation_scan(
                     if sample == "test":
                         v[:cutoff] = np.nan
             result = predict_scan(
-                values, levels, entries=thresholds, horizons=horizons,
+                values, levels, entries=raw_thresholds if combo['signal_kind'] == 'raw' else thresholds, horizons=horizons,
                 combos=[combo], gates={k: v[:stop] for k, v in local_gates.items()},
                 gate_buckets="regime", gate_min_history=min_gate_history,
                 gate_windows=gate_windows, entry_col="entry_z", device=device,
