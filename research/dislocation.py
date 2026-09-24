@@ -198,7 +198,7 @@ def dislocation_scan(
     gate_names: Iterable[str] | None = None,
     fit_on: Iterable[str] = ("changes",),
     device: str = "auto",
-    signal_kind: str = "normalized",
+    signal_kind: str | Iterable[str] = "normalized",
     train_fraction: float = 1.0,
     progress: Callable[[int, int, str], None] | None = None,
     trade_legs: dict[str, float] | None = None,
@@ -212,8 +212,9 @@ def dislocation_scan(
     Gated and ungated cells compete with no future percentile information.
     """
     frame = aligned_panel(data, list(dict.fromkeys([target, feature, *(trade_legs or {}), *(weight_columns or {}).values()])))
-    if signal_kind not in {"normalized", "ou_z"}:
-        raise ValueError("signal_kind must be normalized or ou_z")
+    signal_kinds = list(dict.fromkeys([signal_kind] if isinstance(signal_kind, str) else signal_kind))
+    if not signal_kinds or set(signal_kinds) - {"normalized", "ou_z"}:
+        raise ValueError("Choose normalized, ou_z, or both")
     if not 0.5 <= train_fraction <= 1:
         raise ValueError("train_fraction must be between 0.5 and 1")
     beta_lookbacks = list(beta_lookbacks)
@@ -337,24 +338,26 @@ def dislocation_scan(
         shared = {**external, **beta_conditions[key],
                   **{k: v.to_numpy().astype(float) for k, v in residual.items() if k in conditions}}
         for norm_lb in normalization_lookbacks:
-            needs_ou = signal_kind == "ou_z" or any(k in conditions for k in ("resid_phi", "resid_half_life"))
+            needs_ou = "ou_z" in signal_kinds or any(k in conditions for k in ("resid_phi", "resid_half_life"))
             ou = roll_ou_features(dislocation, lookback=int(norm_lb)) if needs_ou else None
-            z = ou["ou_z"] if signal_kind == "ou_z" else dislocation / dislocation.rolling_std(
-                int(norm_lb), min_samples=int(norm_lb)
-            )
-            signals.append(z.to_numpy().astype(float))
-            combos.append({
-                "fit_on": basis, "beta_lb": int(beta_lb), "residual_lb": residual_lb,
-                "norm_lb": int(norm_lb), "signal_kind": signal_kind,
-            })
-            for name in names:
-                if name == "resid_phi":
-                    value = (ou["ou_rho"] - 1).to_numpy().astype(float)
-                elif name == "resid_half_life":
-                    value = ou["half_life"].to_numpy().astype(float)
-                else:
-                    value = shared[name]
-                conditions[name].append(value)
+            for kind in signal_kinds:
+                z = ou["ou_z"] if kind == "ou_z" else dislocation / dislocation.rolling_std(
+                    int(norm_lb), min_samples=int(norm_lb)
+                )
+                signals.append(z.to_numpy().astype(float))
+                combos.append({
+                    "fit_on": basis, "beta_lb": int(beta_lb), "residual_lb": residual_lb,
+                    "norm_lb": int(norm_lb), "signal_kind": kind,
+                })
+                for name in names:
+                    if name == "resid_phi":
+                        value = (ou["ou_rho"] - 1).to_numpy().astype(float)
+                    elif name == "resid_half_life":
+                        value = ou["half_life"].to_numpy().astype(float)
+                    else:
+                        value = shared[name]
+                    conditions[name].append(value)
+
 
     for basis in bases:
         for beta_lb in beta_lookbacks:
@@ -428,6 +431,6 @@ def dislocation_scan(
             parts.append(result)
         if progress:
             progress(i + 1, len(combos),
-                     f"Scored model {i + 1}/{len(combos)} · {combo['fit_on']} · beta {combo['beta_lb']} · window {combo['norm_lb']} · gates and horizons")
+                     f"Scored {i + 1}/{len(combos)} · {combo['signal_kind']} · {combo['fit_on']} · beta {combo['beta_lb']} · residual {combo['residual_lb']} · norm {combo['norm_lb']}")
     results = pl.concat(parts, how="diagonal_relaxed")
     return frame, results

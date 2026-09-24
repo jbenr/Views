@@ -70,6 +70,40 @@ def test_failed_progress_does_not_claim_completion():
     assert all(getattr(child, "role", None) != "progressbar" for child in view.children)
 
 
+def test_chart_inversion_redraws_cached_data_without_reload(monkeypatch):
+    from types import SimpleNamespace
+    from copy import deepcopy
+    from research import app as ui
+    app = ui.build_app()
+    callback = next(v['callback'].__wrapped__ for v in app.callback_map.values()
+                    if v['callback'].__wrapped__.__name__ == '_resize_level')
+    stored = dict(target='y', features=['x'], invert_features=False,
+                  weight_cols=[], rows=panel(10).with_columns(pl.col('ts').cast(pl.Utf8)).to_dicts())
+    original = deepcopy(stored)
+    renders = []
+    monkeypatch.setattr(ui, 'level_chart', lambda data, target, **kwargs: renders.append(kwargs) or 'png')
+    def unexpected_load(*args, **kwargs):
+        pytest.fail('Inversion must not reload the panel')
+    monkeypatch.setattr(ui, 'build_panel', unexpected_load)
+    monkeypatch.setattr(ui, 'ctx', SimpleNamespace(triggered_id='invert-feature'))
+    result = callback(*([0]*len(ui.WINDOW_PRESETS)), ['invert'], stored, '6M')
+    assert result[0] == 'data:image/png;base64,png'
+    assert result[1] is ui.no_update
+    assert result[2] == '6M'
+    assert renders[-1]['invert_features'] is True
+    # Changing chart windows must use the live checkbox, not the load-time flag.
+    monkeypatch.setattr(ui, 'ctx', SimpleNamespace(triggered_id='research-level-window-1M'))
+    result = callback(*([1]*len(ui.WINDOW_PRESETS)), ['invert'], stored, '6M')
+    assert result[2] == '1M'
+    assert renders[-1]['invert_features'] is True
+    monkeypatch.setattr(ui, 'ctx', SimpleNamespace(triggered_id='invert-feature'))
+    callback(*([0]*len(ui.WINDOW_PRESETS)), [], stored, '1M')
+    assert renders[-1]['invert_features'] is False
+    assert stored == original
+    result = callback(*([0]*len(ui.WINDOW_PRESETS)), ['invert'], None, '6M')
+    assert result[0] is ui.no_update
+
+
 def test_discovery_training_scores_cannot_see_later_outcomes():
     data = panel()
     kwargs = dict(target="y", feature="x", beta_lookbacks=[30], residual_lookbacks=[10],
@@ -180,3 +214,16 @@ def test_app_discovery_to_exit_inspection_callback_flow(tmp_path, monkeypatch):
     # All callback results must survive Dash's JSON serialization.
     json.dumps([view, status, bt_view, detail, saved], cls=PlotlyJSONEncoder)
     assert len(list(tmp_path.iterdir())) == 2
+    options, run_id, query = callbacks['_find_saved'](stored, 'x', ['levels'], [30], [10], [40],
+        [.5], [5], [], [126], 'ou_z', .7, board, None)
+    assert options and run_id
+    summary = callbacks['_saved_summary'](run_id, query)
+    opened, opened_status, archived = callbacks['_open_saved'](1, run_id, 5, 'session')
+    assert archived['rows'] and archived['archive_id'] == run_id
+    assert archived['panel_id'] != stored['panel_id']
+    assert archived['rows'] == board['rows']
+    historical_candidate = dict(frozen, archive_id=run_id, panel_id=archived['panel_id'])
+    _, _, archived_exits = callbacks['_run_backtest_grid'](1, historical_candidate, None, 'ignored', None,
+        [.5], ['time'], [5], [0], [.5], [15], .1, [2], 1, 'session')
+    assert len(archived_exits['runs']) == 1
+    json.dumps([summary, opened, opened_status], cls=PlotlyJSONEncoder)

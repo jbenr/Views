@@ -35,10 +35,13 @@ from research.panel import (
     resolve_target,
 )
 from research.dislocation import dislocation_scan
+from backtest.lab import REGIME_GATE_BUCKETS
 from research.dislocation_backtest import run_grid, signal_frame, _entry_gate
 from backtest.validation import event_overlap_diagnostics
 from research.artifacts import save_run
+from research.saved_runs import grid_spec, input_hash, list_runs, compare_run, load_run, run_path
 from research import progress as work
+from research.preferences import load_preferences, save_preferences
 from backtest.engine import TradeDef
 from utils.research_app import (
     BORDER, C0, C1, DIM, ORANGE, PANEL, TEXT, make_app, run,
@@ -256,15 +259,20 @@ def dislocation_tab() -> html.Div:
         ("entry thresholds (z)", "dis-thresholds", DISLOCATION_THRESHOLDS),
         ("forward horizons", "dis-horizons", DISLOCATION_HORIZONS),
     ]
-    controls = [field("feature (load it on Setup first)", dcc.Dropdown(
+    controls = [html.Button("Select all sweep options", id="dis-select-all", n_clicks=0,
+                           className="ref-btn", style={**btn_style(), "marginBottom": 8}),
+        note("Selects every discovery and exit-grid option. Keeps target, feature, data split, costs and execution timing unchanged. Does not start a run; the full grid can be very large.", "dim"),
+        html.Div(id="dis-grid-size"),
+        field("feature (load it on Setup first)", dcc.Dropdown(
         id="dis-feature", value=None, clearable=False,
         options=[], style={"fontSize": 12},
     ))]
     controls += [
         html.Div(id="dis-context"),
-        field("signal", dcc.Dropdown(id="dis-signal", value="normalized", clearable=False,
-            options=[{"label": "Residual / rolling volatility", "value": "normalized"},
+        field("signals (select one or both)", dcc.Dropdown(id="dis-signal", value=["normalized"], multi=True, clearable=False,
+            options=[{"label": "Residual / rolling standard deviation", "value": "normalized"},
                      {"label": "OU z-score", "value": "ou_z"}])),
+        note("Both start from the same residual r. Scaled residual = r / rolling std(r). OU z = (r - fitted OU equilibrium) / rolling std(r).", "dim"),
         field("discovery period", dcc.Dropdown(id="dis-train", value=0.7, clearable=False,
             options=[{"label": "First 70%; evaluate later 30%", "value": 0.7},
                      {"label": "First 80%; evaluate later 20%", "value": 0.8},
@@ -319,6 +327,16 @@ def dislocation_tab() -> html.Div:
         html.Button("Run discovery", id="dis-run", n_clicks=0,
                     className="ref-btn", style={**btn_style(primary=True), "width": "100%"}),
         html.Div(id="dis-run-info"),
+        html.Details([
+            html.Summary("Saved discovery runs"),
+            field("matching target / feature", dcc.Dropdown(id="dis-saved-run", options=[],
+                  placeholder="Load a panel to find saved runs", style={"fontSize": 12})),
+            html.Div(id="dis-saved-summary"),
+            html.Button("Open saved run", id="dis-saved-open", n_clicks=0,
+                        className="ref-btn", style=btn_style()),
+            note("Opens the original snapshot. Run discovery above always starts a fresh run.", "dim"),
+        ], open=True, style={"marginTop": 16}),
+        dcc.Store(id="dis-saved-query"),
     ]
     return html.Div(style={"padding": "18px 24px"}, children=[
         heading("dislocation discovery"),
@@ -410,14 +428,16 @@ def dislocation_backtest_controls() -> html.Div:
 
 
 def controls() -> html.Div:
+    preferences = load_preferences(CATALOG, {name for names in FEATURE_GROUPS.values() for name in names},
+                                   DEFAULT_TARGET, DEFAULT_FEATURES)
     return html.Div(children=[
         field("target", dcc.Dropdown(
-            id="target", value=DEFAULT_TARGET, clearable=False,
+            id="target", value=preferences['target'], clearable=False,
             options=[{"label": TARGET_LABELS[n], "value": n} for n in sorted(CATALOG)]
                     + [{"label": "custom weights...", "value": "custom"}],
             style={"fontSize": 12})),
         field("custom weights", dcc.Input(
-            id="custom", type="text", placeholder="20y:2, 10y:-1, 30y:-1",
+            id="custom", type="text", value=preferences['custom'], placeholder="20y:2, 10y:-1, 30y:-1",
             debounce=True, style=INPUT)),
         field("leg weighting", dcc.RadioItems(
             id="weighting", value="fixed",
@@ -436,7 +456,7 @@ def controls() -> html.Div:
             id="beta-dependent", type="text", placeholder="auto (20y for 10s20s30s)",
             debounce=True, style=INPUT))], id="beta-advanced", style={"display": "none"}),
         field("features", dcc.Dropdown(
-            id="features", value=DEFAULT_FEATURES, multi=True,
+            id="features", value=preferences['features'], multi=True,
             options=[{"label": f"{group} · {FEATURE_LABELS.get(name, name)}", "value": name}
                      for group, names in FEATURE_GROUPS.items() for name in names],
             style={"fontSize": 12})),
@@ -646,8 +666,9 @@ def board_row_picker(records: list[dict]) -> html.Div:
             f"{row['gate']}:{row['gate_bucket']} w={row['gate_window']}"
             if row["gate"] != "(none)" else "ungated"
         )
+        ic_label = f"{row['ic']:.3f}" if row['ic'] is not None else "n/a"
         label = (
-            f"#{i}  ic={row['ic']:.3f}  {row['fit_on']}  beta_lb={row['beta_lb']}  "
+            f"#{i}  ic={ic_label}  {row.get('signal_kind', 'normalized')}  {row['fit_on']}  beta_lb={row['beta_lb']}  "
             f"resid_lb={row['residual_lb'] if row['residual_lb'] is not None else '—'}  "
             f"norm_lb={row['norm_lb']}  {gate_desc}"
         )
@@ -669,21 +690,23 @@ def dislocation_view(
     data: pl.DataFrame | None = None,
 ) -> tuple[html.Div, list[dict]]:
     """Compact discovery board. It deliberately does not call a cell a winner."""
+    if "signal_kind" not in results.columns:
+        results = results.with_columns(pl.lit("normalized").alias("signal_kind"))
     discovery = results.filter(pl.col("sample") != "test") if "sample" in results.columns else results
     valid = discovery.filter(pl.col("n_obs") >= min_events)
     valid = valid.with_columns(pl.col("ic").median().over(
-        ["fit_on", "entry_z", "horizon", "gate", "gate_bucket", "gate_window"]
+        ["signal_kind", "fit_on", "entry_z", "horizon", "gate", "gate_bucket", "gate_window"]
     ).alias("model_family_median_ic"))
     gated = valid.filter(pl.col("gate") != "(none)")
     agreement = (
         gated.filter(pl.col("ic") > 0)
-        .group_by("fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate", "gate_bucket")
+        .group_by("signal_kind", "fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate", "gate_bucket")
         .agg(pl.col("gate_window").n_unique().alias("positive_windows_30plus"))
     )
     board = (
         valid.join(
             agreement,
-            on=["fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate", "gate_bucket"],
+            on=["signal_kind", "fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate", "gate_bucket"],
             how="left",
             nulls_equal=True,
         )
@@ -696,7 +719,7 @@ def dislocation_view(
         .head(40)
     )
     if "sample" in results.columns and "test" in results["sample"].to_list():
-        keys = ["fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate", "gate_bucket", "gate_window"]
+        keys = ["signal_kind", "fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate", "gate_bucket", "gate_window"]
         later = results.filter(pl.col("sample") == "test").select(
             *keys, pl.col("ic").alias("later_ic"),
             pl.col("hit_rate").alias("later_event_hit_rate"), pl.col("n_obs").alias("later_events"))
@@ -734,7 +757,7 @@ def dislocation_view(
         stat_block("rate", f"{run_info['cells_per_second']:,.0f} cells/s"),
     ]
     cols = [
-        "fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate",
+        "signal_kind", "fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate",
         "gate_bucket", "gate_window", "positive_windows_30plus", "model_family_median_ic", "ic", "hit_rate",
         "n_obs", "events_per_year", "later_ic", "later_event_hit_rate", "later_events",
         "n_non_overlapping", "overlap_fraction",
@@ -844,6 +867,32 @@ def tabs() -> html.Div:
 
 
 def register_callbacks(app) -> None:
+    sweep_controls = ["dis-signal", "dis-fit-on", "dis-beta-lbs", "dis-residual-lbs",
+        "dis-norm-lbs", "dis-thresholds", "dis-horizons", "dis-gates", "dis-gate-windows",
+        "bt-entry-zs", "bt-exit-styles", "bt-time-stops", "bt-bands", "bt-revert-fracs",
+        "bt-half-lives", "bt-stop"]
+
+    @app.callback(*[Output(control, "value", allow_duplicate=True) for control in sweep_controls],
+        Input("dis-select-all", "n_clicks"),
+        *[State(control, "options") for control in sweep_controls], prevent_initial_call=True)
+    def _select_all_sweeps(_clicks, *options):
+        return [[option['value'] for option in choices if not option.get('disabled', False)]
+                for choices in options]
+
+    @app.callback(Output("dis-grid-size", "children"),
+        *[Input(control, "value") for control in sweep_controls[:9]], Input("dis-train", "value"))
+    def _grid_size(signals, bases, beta, residual, norm, entries, horizons, gates, windows, train):
+        signals = [signals] if isinstance(signals, str) else signals or []
+        models = len(signals)*len(beta or [])*len(norm or [])*(
+            (len(residual or []) if 'changes' in (bases or []) else 0)
+            + (1 if 'levels' in (bases or []) else 0))
+        cells = models*len(entries or [])*len(horizons or [])*(
+            1+len(gates or [])*len(windows or [])*len(REGIME_GATE_BUCKETS))*(2 if train < 1 else 1)
+        warning = (" Very large grid: saved scores alone may require many GB of RAM; consider narrowing selections."
+                   if cells > 10_000_000 else "")
+        return note(f"{models:,} models · {cells:,} discovery cells (including evaluation period)."+warning,
+                    'warn' if warning else 'dim')
+
     @app.callback(
         Output("dis-gates", "value"),
         Input("dis-gates-all", "n_clicks"),
@@ -887,6 +936,16 @@ def register_callbacks(app) -> None:
     def _invalidate_panel(_stored):
         return "", None, None, "", None, note("Choose Backtest on a discovery row to fill trade mechanics.")
 
+    @app.callback(
+        Output("dis-candidate", "data", allow_duplicate=True),
+        Output("bt-out", "children", allow_duplicate=True),
+        Output("bt-grid", "data", allow_duplicate=True),
+        Output("bt-candidate", "children", allow_duplicate=True),
+        Input("dis-board", "data"), prevent_initial_call=True,
+    )
+    def _invalidate_candidate_for_board(_board):
+        return None, "", None, note("Choose Backtest on a row from this discovery run.", "dim")
+
     @app.callback(*[Output(f"{name}-progress", "children") for name in ("load", "dis", "bt")],
                   Input("research-progress-poll", "n_intervals"), State("research-session", "data"))
     def _progress(_tick, session):
@@ -911,6 +970,89 @@ def register_callbacks(app) -> None:
             table_div(trades.to_pandas(), title="Closed trades · MAE/MFE measured on observations", max_rows=500)
             if len(trades) else note("No closed trades for this configuration."),
         ])
+
+    @app.callback(
+        Output("dis-saved-run", "options"), Output("dis-saved-run", "value"),
+        Output("dis-saved-query", "data"),
+        Input("research-level-data", "data"), Input("dis-feature", "value"),
+        Input("dis-fit-on", "value"), Input("dis-beta-lbs", "value"),
+        Input("dis-residual-lbs", "value"), Input("dis-norm-lbs", "value"),
+        Input("dis-thresholds", "value"), Input("dis-horizons", "value"),
+        Input("dis-gates", "value"), Input("dis-gate-windows", "value"),
+        Input("dis-signal", "value"), Input("dis-train", "value"),
+        Input("dis-board", "data"), State("dis-saved-run", "value"),
+    )
+    def _find_saved(stored, feature, bases, beta, residual, norm, entries, horizons,
+                    gates, windows, signal, train, _board, selected):
+        if not stored or feature not in stored.get('features', []):
+            return [], None, None
+        request = grid_spec(bases or ['changes'], beta or DISLOCATION_BETA_LBS,
+            residual or DISLOCATION_RESIDUAL_LBS, norm or DISLOCATION_NORM_LBS,
+            entries or DISLOCATION_THRESHOLDS, horizons or DISLOCATION_HORIZONS,
+            gates or [], windows or [126, 252, 504], signal, train)
+        fingerprint = input_hash(stored, feature)
+        runs = list_runs(stored['target'], feature)
+        runs.sort(key=lambda m: (m.get('input_sha256') == fingerprint,
+                                m.get('grid') == request), reverse=True)
+        options = [dict(value=m['run_id'], label=f"{m.get('created_at', m['run_id'])} | "
+                    f"{m['data_start']} to {m['data_end']} | "
+                    + ('same inputs' if m.get('input_sha256') == fingerprint else 'historical / unverified')) for m in runs]
+        value = selected if selected in {m['run_id'] for m in runs} else (runs[0]['run_id'] if runs else None)
+        return options, value, dict(grid=request, fingerprint=fingerprint,
+            target=stored['target'], feature=feature,
+            current_start=min(r['ts'] for r in stored['rows']),
+            current_end=max(r['ts'] for r in stored['rows']))
+
+    @app.callback(Output("dis-saved-summary", "children"),
+                  Input("dis-saved-run", "value"), Input("dis-saved-query", "data"))
+    def _saved_summary(run_id, query):
+        if not run_id or not query:
+            return note("No saved discovery runs for this loaded target / feature.", "dim")
+        meta = next((m for m in list_runs(query['target'], query['feature']) if m['run_id'] == run_id), None)
+        if meta is None:
+            return note("Saved run is no longer available.", "warn")
+        explanation = note(f"Saved: {meta['data_start']} to {meta['data_end']} ({meta['data_rows']:,} observations). "
+                    f"Loaded: {query['current_start']} to {query['current_end']}. "
+                    + compare_run(meta, query['grid'], query['fingerprint']), "dim")
+        settings = meta.get('grid', {})
+        return html.Div([explanation, html.Details([
+            html.Summary('Saved settings'),
+            *[note(f'{key}: {value}', 'dim') for key, value in settings.items()],
+            note(f"Leg weights: {meta.get('legs', 'not recorded')} · "
+                 f"Gate minimum history: {meta.get('gate_min_history', 'not recorded')}", 'dim'),
+        ], style={'marginBottom': 10})])
+
+    @app.callback(
+        Output("dis-out", "children", allow_duplicate=True),
+        Output("dis-run-info", "children", allow_duplicate=True),
+        Output("dis-board", "data", allow_duplicate=True),
+        Input("dis-saved-open", "n_clicks"), State("dis-saved-run", "value"),
+        State("dis-min-events", "value"), State("research-session", "data"),
+        prevent_initial_call=True,
+        running=[(Output("dis-saved-open", "disabled"), True, False)],
+    )
+    def _open_saved(_n, run_id, min_events, session):
+        if not run_id:
+            return no_update, note("Choose a saved run first.", "warn"), no_update
+        try:
+            work.start(session, 'dis', 'Opening saved snapshot and ranking saved scores')
+            meta, frame, results = load_run(run_id)
+            info = dict(meta, backend='Saved results (no scan)',
+                        elapsed_s=meta.get('elapsed_s', 0), cells_per_second=meta.get('cells_per_second', 0))
+            view, records = dislocation_view(results, meta['feature'], info, int(min_events or 30), frame)
+            fraction = float(meta.get('train_fraction', 1))
+            split = str(frame['ts'][int(len(frame)*fraction)]) if fraction < 1 else None
+            board = dict(target=meta['target'], feature=meta['feature'], rows=records,
+                panel_id='archive:'+run_id, split_date=split, run_path=str(run_path(run_id)),
+                archive_id=run_id, weight_columns=meta.get('weight_columns', {}))
+            text = (f"Opened saved run {run_id}: {frame['ts'].min()} to {frame['ts'].max()} · "
+                    f"{len(results):,} saved cells. Original settings/data; not a new scan. "
+                    "Exit tests use this saved snapshot and current engine code.")
+            work.update(session, 'dis', 'Completed · '+text, 1, 1)
+            return view, note(text, 'good'), board
+        except Exception as exc:
+            work.update(session, 'dis', f'Failed: {exc}')
+            return no_update, note(f'Cannot open saved run: {exc}', 'bad'), no_update
 
     @app.callback(
         Output("dis-out", "children"),
@@ -988,6 +1130,12 @@ def register_callbacks(app) -> None:
         )
         work.update(session, "dis", "Saving all discovery cells and ranking the discovery period")
         saved = save_run("discovery", frame, results, dict(feature=feature,
+            grid=grid_spec(fit_on or ["changes"], beta_lbs or DISLOCATION_BETA_LBS,
+                residual_lbs or DISLOCATION_RESIDUAL_LBS, norm_lbs or DISLOCATION_NORM_LBS,
+                thresholds or DISLOCATION_THRESHOLDS, horizons or DISLOCATION_HORIZONS,
+                gates or [], gate_windows or [126, 252, 504], signal_kind, train_fraction),
+            input_sha256=input_hash(stored, feature), legs=stored['legs'],
+            weight_columns=stored.get('weight_columns', {}),
             signal_kind=signal_kind, min_events=min_events,
             panel_id=stored["panel_id"], weighting=stored.get("weighting"),
             gate_min_history=126, **info))
@@ -1005,9 +1153,10 @@ def register_callbacks(app) -> None:
         Output("bt-entry-zs", "value"),
         Input({"type": "dis-pick", "index": ALL}, "n_clicks"),
         State("dis-board", "data"),
+        State("bt-entry-zs", "value"),
         prevent_initial_call=True,
     )
-    def _pick_dislocation_candidate(n_clicks, board):
+    def _pick_dislocation_candidate(n_clicks, board, entry_zs=None):
         # Dash fires this the moment the row buttons first appear (all zero
         # clicks), before any real click. Only a genuine click should freeze
         # a candidate.
@@ -1032,6 +1181,7 @@ def register_callbacks(app) -> None:
             "signal_kind": row.get("signal_kind", "normalized"),
             "entry_z": row["entry_z"], "panel_id": board["panel_id"],
             "split_date": board.get("split_date"), "discovery_run": board.get("run_path"),
+            "archive_id": board.get("archive_id"),
             "weight_columns": board.get("weight_columns", {}),
         }
         gate_desc = (
@@ -1042,11 +1192,11 @@ def register_callbacks(app) -> None:
         label = (
             f"{candidate['target']} vs "
             f"{FEATURE_LABELS.get(candidate['feature'], candidate['feature'])} · "
-            f"{candidate['fit_on']} · beta_lb={candidate['beta_lb']} · "
+            f"{candidate['signal_kind']} · {candidate['fit_on']} · beta_lb={candidate['beta_lb']} · "
             f"resid_lb={candidate['residual_lb'] or '—'} · "
             f"norm_lb={candidate['norm_lb']} · {gate_desc}"
         )
-        return candidate, note(f"Frozen: {label}", "good"), [row["entry_z"]]
+        return candidate, note(f"Frozen: {label}", "good"), (entry_zs if entry_zs and len(entry_zs) > 1 else [row["entry_z"]])
 
     @app.callback(
         Output("bt-out", "children"),
@@ -1073,6 +1223,15 @@ def register_callbacks(app) -> None:
     ):
         if not candidate:
             return note("Choose Backtest on a discovery row first.", "warn"), "", no_update
+        if candidate.get("archive_id"):
+            try:
+                meta, snapshot, _ = load_run(candidate['archive_id'], include_results=False)
+                if not meta.get('legs'):
+                    return note("This legacy run lacks saved trade weights. View its results, but rerun discovery to enable reliable exit tests.", "warn"), "", no_update
+                stored = dict(target=meta['target'], features=[meta['feature']], legs=meta['legs'],
+                    panel_id=candidate['panel_id'], rows=snapshot.with_columns(pl.col('ts').cast(pl.Utf8)).to_dicts())
+            except Exception as exc:
+                return note(f"Cannot open saved snapshot: {exc}", "bad"), "", no_update
         if not stored:
             return note("Load a target on Setup first.", "warn"), "", no_update
         if candidate.get("panel_id") != stored.get("panel_id"):
@@ -1205,6 +1364,10 @@ def register_callbacks(app) -> None:
             panel, trade, diag, chart_window or DEFAULT_CHART_WINDOW,
             "invert" in (invert_feature or []),
         )
+        try:
+            save_preferences(selected_target, chart_features, custom)
+        except OSError as exc:
+            view = html.Div([note(f"Panel loaded, but Setup preferences could not be saved: {exc}", "warn"), view])
         work.update(session, "load", "Completed · setup available in discovery", 4, 4)
         return view, {
             "target": trade.name,
@@ -1231,23 +1394,25 @@ def register_callbacks(app) -> None:
             Input(f"research-level-window-{key}", "n_clicks")
             for key in WINDOW_PRESETS
         ],
+        Input("invert-feature", "value"),
         State("research-level-data", "data"),
         State("research-level-window", "data"),
         prevent_initial_call=True,
     )
     def _resize_level(*args):
-        *clicks, chart_data, current = args
+        *clicks, invert_feature, chart_data, current = args
+        inversion_changed = ctx.triggered_id == "invert-feature"
         # Adding a freshly loaded chart also adds its buttons. Dash may invoke
         # this callback at that point with every n_clicks still zero; choosing
         # the first input would silently reset the user's window to 1M.
-        if not any(clicks):
+        if not inversion_changed and not any(clicks):
             return no_update, no_update, current, *[no_update] * len(WINDOW_PRESETS)
-        selected = ctx.triggered_id.removeprefix("research-level-window-")
+        selected = (current or DEFAULT_CHART_WINDOW) if inversion_changed else ctx.triggered_id.removeprefix("research-level-window-")
         if not chart_data:
             return no_update, no_update, current, *[no_update] * len(WINDOW_PRESETS)
         target = chart_data["target"]
         features = chart_data.get("features", [])
-        invert_features = bool(chart_data.get("invert_features"))
+        invert_features = "invert" in (invert_feature or [])
         rows = chart_data["rows"]
         # Dash serializes leading beta-warmup nulls as JSON null. Declare the
         # dtype rather than letting Polars infer a Null column from those rows.
@@ -1274,7 +1439,7 @@ def register_callbacks(app) -> None:
                 frame, weight_cols, chart_data.get('weight_priors', {}),
                 WINDOW_PRESETS[selected], fig_height=3.5
             )}"
-            if weight_cols
+            if weight_cols and not inversion_changed
             else no_update
         )
         return (

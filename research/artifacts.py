@@ -21,7 +21,8 @@ def save_run(kind: str, data: pl.DataFrame, results: pl.DataFrame,
     root = Path(__file__).parent.parent
     files = ["research/app.py", "research/dislocation.py", "research/dislocation_backtest.py",
              "research/panel.py", "backtest/engine.py", "backtest/lab.py", "stats/ols.py", "stats/ou.py"]
-    metadata = dict(metadata, created_at=datetime.now(timezone.utc).isoformat(),
+    metadata = dict(metadata, data_start=str(data['ts'].min()), data_end=str(data['ts'].max()),
+                    data_rows=len(data), created_at=datetime.now(timezone.utc).isoformat(),
                     source_sha256={name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in files})
     (path / "metadata.json").write_text(
         json.dumps(metadata, default=str, indent=2), encoding="utf-8")
