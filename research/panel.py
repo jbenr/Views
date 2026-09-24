@@ -320,6 +320,7 @@ def build_panel(
     weighting: str = "fixed",
     beta_lookback: int = BETA_LOOKBACK,
     beta_dependent: str | None = None,
+    progress=None,
 ) -> Panel:
     """Load every source the target and features need and assemble one frame.
 
@@ -335,8 +336,12 @@ def build_panel(
     tickers.update({a: EXO[a][0] for a in exo})
     bps_cols = [a for a in yields] + [a for a in exo if EXO[a][1]]
 
+    if progress:
+        progress(f"Reading {len(tickers)} market series from md.index_eod")
     frame = load_wide(tickers, start=start, end=end, bps_cols=bps_cols)
     if vols:
+        if progress:
+            progress(f"Reading {len(vols)} swaption volatility series")
         vol_frame = load_swaption_wide(
             [VOLS[v] for v in vols], start=start, end=end
         )
@@ -347,6 +352,8 @@ def build_panel(
     # right-only dates at the end rather than in date order -- so computing on
     # the unsorted frame and attaching to the sorted one silently pairs each
     # target value with the wrong day.
+    if progress:
+        progress("Aligning dates and building target and feature baskets")
     frame = frame.sort("ts")
     frame = frame.with_columns(
         target.composite_series(frame).alias(target.name),

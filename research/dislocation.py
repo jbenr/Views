@@ -28,7 +28,7 @@ stable convergence process worth trading.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 import polars as pl
@@ -198,6 +198,11 @@ def dislocation_scan(
     gate_names: Iterable[str] | None = None,
     fit_on: Iterable[str] = ("changes",),
     device: str = "auto",
+    signal_kind: str = "normalized",
+    train_fraction: float = 1.0,
+    progress: Callable[[int, int, str], None] | None = None,
+    trade_legs: dict[str, float] | None = None,
+    weight_columns: dict[str, str] | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Causal discovery scan for accumulated changes or levels residuals.
 
@@ -206,7 +211,26 @@ def dislocation_scan(
     level; its residual is already a level gap, so it has no residual window.
     Gated and ungated cells compete with no future percentile information.
     """
-    frame = aligned_panel(data, [target, feature])
+    frame = aligned_panel(data, list(dict.fromkeys([target, feature, *(trade_legs or {}), *(weight_columns or {}).values()])))
+    if signal_kind not in {"normalized", "ou_z"}:
+        raise ValueError("signal_kind must be normalized or ou_z")
+    if not 0.5 <= train_fraction <= 1:
+        raise ValueError("train_fraction must be between 0.5 and 1")
+    beta_lookbacks = list(beta_lookbacks)
+    residual_lookbacks = list(residual_lookbacks)
+    normalization_lookbacks = list(normalization_lookbacks)
+    thresholds, horizons, gate_windows = list(thresholds), list(horizons), list(gate_windows)
+    gate_names = None if gate_names is None else list(gate_names)
+    if min_gate_history < 1:
+        raise ValueError("min_gate_history must be >= 1")
+    if gate_names is None or gate_names:
+        invalid_windows = [w for w in gate_windows if w < min_gate_history]
+        if invalid_windows:
+            raise ValueError(
+                f"Gate percentile lookbacks {invalid_windows} are too short: "
+                f"gates require at least {min_gate_history} valid observations. "
+                f"Choose lookbacks >= {min_gate_history}, or select no gates."
+            )
     y, x = frame[target].cast(pl.Float64), frame[feature].cast(pl.Float64)
     n = len(frame)
     null1 = pl.Series([None], dtype=pl.Float64)
@@ -224,6 +248,7 @@ def dislocation_scan(
         # Raw-residual state. OU gates intentionally wait for the later OU
         # pass; this discovery scan is residual-first.
         "resid_vol20": [], "resid_vol60": [], "resid_mom10": [],
+        "resid_phi": [], "resid_half_life": [],
     }
 
     bases = list(dict.fromkeys(fit_on))
@@ -275,59 +300,66 @@ def dislocation_scan(
             pl.Series([None] * (n - len(reg)), dtype=pl.Float64), reg[name],
         ])
 
+    names = list(conditions) if gate_names is None else list(gate_names)
+    unknown = sorted(set(names) - set(conditions))
+    if unknown:
+        raise ValueError(f"unknown dislocation gate(s): {unknown}")
+    conditions = {name: [] for name in names}
+    external = {
+        "feature_level": x, "feature_move20": x.diff(20),
+        "feature_vol20": x.diff().rolling_std(20),
+        "target_level": y, "target_move20": y.diff(20),
+        "target_vol20": y.diff().rolling_std(20),
+    }
+    external = {k: v.to_numpy().astype(float) for k, v in external.items() if k in conditions}
+    beta_conditions = {}
+
     def add_signal(
         basis: str, beta_lb: int, residual_lb: int | None,
         dislocation: pl.Series, beta: pl.Series, r2: pl.Series,
     ) -> None:
-        beta_stability = beta_cv(beta, lookback=beta_lb)
-        model_quality = quality_weight(r2, beta_stability)
+        key = (basis, beta_lb)
+        if key not in beta_conditions:
+            stability = beta_cv(beta, lookback=beta_lb)
+            values = {
+                "beta": beta, "r2": r2, "beta_cv": stability,
+                "model_quality": quality_weight(r2, stability),
+                "beta_vol20": beta.diff().rolling_std(20), "beta_mom10": beta.diff(10),
+                "r2_vol20": r2.diff().rolling_std(20), "r2_mom10": r2.diff(10),
+            }
+            beta_conditions[key] = {k: v.to_numpy().astype(float)
+                                    for k, v in values.items() if k in conditions}
+        residual = {
+            "resid_vol20": dislocation.diff().rolling_std(20),
+            "resid_vol60": dislocation.diff().rolling_std(60),
+            "resid_mom10": dislocation.diff(10),
+        }
+        shared = {**external, **beta_conditions[key],
+                  **{k: v.to_numpy().astype(float) for k, v in residual.items() if k in conditions}}
         for norm_lb in normalization_lookbacks:
-            z = dislocation / dislocation.rolling_std(
+            needs_ou = signal_kind == "ou_z" or any(k in conditions for k in ("resid_phi", "resid_half_life"))
+            ou = roll_ou_features(dislocation, lookback=int(norm_lb)) if needs_ou else None
+            z = ou["ou_z"] if signal_kind == "ou_z" else dislocation / dislocation.rolling_std(
                 int(norm_lb), min_samples=int(norm_lb)
             )
             signals.append(z.to_numpy().astype(float))
             combos.append({
-                "fit_on": basis,
-                "beta_lb": int(beta_lb),
-                "residual_lb": residual_lb,
-                "norm_lb": int(norm_lb),
+                "fit_on": basis, "beta_lb": int(beta_lb), "residual_lb": residual_lb,
+                "norm_lb": int(norm_lb), "signal_kind": signal_kind,
             })
-            conditions["feature_level"].append(x.to_numpy().astype(float))
-            conditions["feature_move20"].append(x.diff(20).to_numpy().astype(float))
-            conditions["feature_vol20"].append(
-                x.diff().rolling_std(20).to_numpy().astype(float)
-            )
-            conditions["target_level"].append(y.to_numpy().astype(float))
-            conditions["target_move20"].append(y.diff(20).to_numpy().astype(float))
-            conditions["target_vol20"].append(
-                y.diff().rolling_std(20).to_numpy().astype(float)
-            )
-            conditions["beta"].append(beta.to_numpy().astype(float))
-            conditions["r2"].append(r2.to_numpy().astype(float))
-            conditions["beta_cv"].append(beta_stability.to_numpy().astype(float))
-            conditions["model_quality"].append(
-                model_quality.to_numpy().astype(float)
-            )
-            conditions["beta_vol20"].append(
-                beta.diff().rolling_std(20).to_numpy().astype(float)
-            )
-            conditions["beta_mom10"].append(beta.diff(10).to_numpy().astype(float))
-            conditions["r2_vol20"].append(
-                r2.diff().rolling_std(20).to_numpy().astype(float)
-            )
-            conditions["r2_mom10"].append(r2.diff(10).to_numpy().astype(float))
-            conditions["resid_vol20"].append(
-                dislocation.diff().rolling_std(20).to_numpy().astype(float)
-            )
-            conditions["resid_vol60"].append(
-                dislocation.diff().rolling_std(60).to_numpy().astype(float)
-            )
-            conditions["resid_mom10"].append(
-                dislocation.diff(10).to_numpy().astype(float)
-            )
+            for name in names:
+                if name == "resid_phi":
+                    value = (ou["ou_rho"] - 1).to_numpy().astype(float)
+                elif name == "resid_half_life":
+                    value = ou["half_life"].to_numpy().astype(float)
+                else:
+                    value = shared[name]
+                conditions[name].append(value)
 
     for basis in bases:
         for beta_lb in beta_lookbacks:
+            if progress:
+                progress(len(signals), 0, f"Fitting {basis} regression · lookback {beta_lb}")
             if basis == "changes":
                 reg = roll_lr_diff(x, y, lookback=int(beta_lb))
                 innovation = padded(reg, "resid")
@@ -354,20 +386,48 @@ def dislocation_scan(
     unknown = sorted(set(names) - set(conditions))
     if unknown:
         raise ValueError(f"unknown dislocation gate(s): {unknown}")
-    gates = {name: np.column_stack(conditions[name]) for name in names}
-    results = predict_scan(
-        matrix,
-        y.to_numpy(),
-        entries=list(thresholds),
-        horizons=list(horizons),
-        combos=combos,
-        gates=gates,
-        gate_buckets="regime",
-        gate_min_history=min_gate_history,
-        gate_windows=list(gate_windows),
-        entry_col="entry_z",
-        device=device,
-    ).with_columns(
-        (pl.col("n_obs") / max(len(frame) / 252.0, 1.0)).alias("events_per_year")
-    )
+    # Batch by model to expose completed work and bound gate-matrix memory.
+    cutoff = int(len(frame) * train_fraction)
+    held_moves = {}
+    if weight_columns:
+        for h in horizons:
+            moves = np.full(len(frame), np.nan)
+            if h < len(frame):
+                moves[:-h] = sum(frame[col].to_numpy()[:-h] * (frame[leg].to_numpy()[h:] - frame[leg].to_numpy()[:-h])
+                                 for leg, col in weight_columns.items())
+            held_moves[h] = moves
+    parts = []
+    if progress:
+        progress(0, len(combos), f"Scoring {len(combos):,} models with batched gate statistics")
+    for i, combo in enumerate(combos):
+        local_gates = {name: conditions[name][i][:, None] for name in names}
+        for sample in (["train", "test"] if cutoff < len(frame) else ["full"]):
+            stop = cutoff if sample == "train" else len(frame)
+            values = matrix[:stop, i:i+1].copy()
+            levels = y.to_numpy()[:stop].copy()
+            if sample == "test":
+                # Keep gate warmup but exclude pre-split forward outcomes.
+                levels[:cutoff] = np.nan
+            forwards = None
+            if held_moves:
+                forwards = {h: v[:stop].copy() for h, v in held_moves.items()}
+                for h, v in forwards.items():
+                    v[max(0, stop-h):] = np.nan
+                    if sample == "test":
+                        v[:cutoff] = np.nan
+            result = predict_scan(
+                values, levels, entries=thresholds, horizons=horizons,
+                combos=[combo], gates={k: v[:stop] for k, v in local_gates.items()},
+                gate_buckets="regime", gate_min_history=min_gate_history,
+                gate_windows=gate_windows, entry_col="entry_z", device=device,
+                forward_moves=forwards,
+            ).with_columns(
+                pl.lit(sample).alias("sample"),
+                (pl.col("n_obs") / max((stop - (cutoff if sample == "test" else 0)) / 252, 1)).alias("events_per_year"),
+            )
+            parts.append(result)
+        if progress:
+            progress(i + 1, len(combos),
+                     f"Scored model {i + 1}/{len(combos)} · {combo['fit_on']} · beta {combo['beta_lb']} · window {combo['norm_lb']} · gates and horizons")
+    results = pl.concat(parts, how="diagonal_relaxed")
     return frame, results

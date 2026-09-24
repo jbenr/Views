@@ -9,8 +9,10 @@ from __future__ import annotations
 import argparse
 import time
 import traceback
+from uuid import uuid4
 
 import polars as pl
+import numpy as np
 from dash import ALL, Input, Output, State, ctx, dcc, html, no_update
 
 from dashboard.charts import (
@@ -32,10 +34,12 @@ from research.panel import (
     diagnostics,
     resolve_target,
 )
-from backtest.lab import scan_backend
 from research.dislocation import dislocation_scan
-from research.dislocation_backtest import run_grid
-from utils.market_data import last_updated, swaption_last_updated
+from research.dislocation_backtest import run_grid, signal_frame, _entry_gate
+from backtest.validation import event_overlap_diagnostics
+from research.artifacts import save_run
+from research import progress as work
+from backtest.engine import TradeDef
 from utils.research_app import (
     BORDER, C0, C1, DIM, ORANGE, PANEL, TEXT, make_app, run,
     shimmer_loader, stat_block,
@@ -70,6 +74,8 @@ DISLOCATION_GATES = {
     "resid_vol20": "Residual · 20d volatility",
     "resid_vol60": "Residual · 60d volatility",
     "resid_mom10": "Residual · 10d change",
+    "resid_phi": "Residual · OU persistence",
+    "resid_half_life": "Residual · OU half-life",
 }
 DEFAULT_DISLOCATION_GATES = [
     "feature_level", "feature_move20", "target_vol20",
@@ -140,7 +146,7 @@ LABEL = {
     "display": "block", "marginBottom": 6,
 }
 INPUT = {
-    "width": "100%", "fontSize": 12, "fontFamily": "monospace",
+    "width": "100%", "fontSize": 12, "fontFamily": "Arial, Helvetica, sans-serif",
     "padding": "5px 8px", "border": f"1px solid {BORDER}",
     "borderRadius": 3, "color": TEXT, "outline": "none",
 }
@@ -161,8 +167,11 @@ def btn_style(primary: bool = False) -> dict:
 
 
 def field(label: str, control) -> html.Div:
+    control.style = {"fontFamily": "Arial, Helvetica, sans-serif", "fontSize": 12,
+                     **(getattr(control, "style", None) or {})}
     return html.Div([html.Span(label, style=LABEL), control],
-                    style={"marginBottom": 12})
+                    id=f"{control.id}-field", className="research-field",
+                    style={"marginBottom": 12, **({"display": "none"} if control.id in {"custom", "beta-lb"} else {})})
 
 
 def note(text: str, tone: str = "dim") -> html.Div:
@@ -179,9 +188,57 @@ def heading(text: str, right=None) -> html.Div:
                                  "gap": 12, "marginBottom": 12})
 
 
+def loading_panel(output_id: str, task: str, caption: str) -> html.Div:
+    return html.Div([
+        dcc.Loading(html.Div(id=output_id),
+                    # Progress owns the logo and log as one positioned unit.
+                    custom_spinner=html.Div(),
+                    overlay_style={"visibility": "visible", "opacity": 0.35},
+                    parent_className="research-panel-loader"),
+        html.Div(id=f"{task}-progress", role="status"),
+    ])
+
+
+def progress_view(state: dict, caption: str):
+    if not state:
+        return ""
+    done, total = state["done"], state["total"]
+    failed = state["message"].startswith("Failed:")
+    finished = state["message"].startswith(("Completed ·", "Failed:"))
+    fraction = min(1.0, max(0.0, done / total)) if total else None
+    count = f"{done:,} / {total:,} · {fraction:.0%}" if total else "Working"
+    elapsed = state["elapsed"]
+    clock = f"{int(elapsed)//60}:{int(elapsed)%60:02d}"
+    phase_elapsed = state.get("phase_elapsed", elapsed)
+    eta_seconds = phase_elapsed / done * (total-done) if total and 2 <= done < total else None
+    eta = ""
+    if eta_seconds is not None:
+        eta = (f" · ~{eta_seconds / 3600:.1f}h remaining" if eta_seconds >= 3600 else
+               f" · ~{eta_seconds / 60:.0f}m remaining" if eta_seconds >= 60 else
+               f" · ~{eta_seconds:.0f}s remaining")
+    bar = html.Div(html.Div(className="research-work-bar-fill", style={
+        "width": f"{fraction * 100:.1f}%" if fraction is not None else "28%",
+    }), className="research-work-bar", role="progressbar", **{
+        "aria-label": caption, "aria-valuemin": "0", "aria-valuemax": "100",
+        **({"aria-valuenow": str(round(fraction * 100))} if fraction is not None else {}),
+    })
+    content = [
+        html.Div(f"Stopped · {clock} elapsed" if failed else f"{count} · {clock} elapsed{eta}",
+                 className="research-work-count"),
+        *([] if failed else [bar]),
+        html.Div([html.Div(line, className="research-work-line") for line in state["history"][-4:]],
+                 className="research-work-log"),
+    ]
+    if finished:
+        return html.Details([html.Summary(state["message"]), *content], className="research-work-finished")
+    return html.Div([shimmer_loader(image="guy.png", caption=caption), *content],
+                    className="research-work-status", **{"aria-live": "polite"})
+
+
 def stub_tab(title: str, needs: list[str]) -> html.Div:
     return html.Div(style={"padding": "18px 24px", "maxWidth": 860}, children=[
         heading(title),
+        html.Div(id=f"{title.lower().replace(' ', '-')}-context"),
         note("Not built yet. Load a panel on the Setup tab first; this tab "
              "will read it. Outstanding before it can be trusted:"),
         html.Ul([html.Li(n, style={"fontSize": 12, "color": TEXT,
@@ -195,17 +252,25 @@ def dislocation_tab() -> html.Div:
     values = [
         ("beta lookbacks", "dis-beta-lbs", DISLOCATION_BETA_LBS),
         ("residual windows", "dis-residual-lbs", DISLOCATION_RESIDUAL_LBS),
-        ("normalization", "dis-norm-lbs", DISLOCATION_NORM_LBS),
+        ("normalization / OU lookbacks", "dis-norm-lbs", DISLOCATION_NORM_LBS),
         ("entry thresholds (z)", "dis-thresholds", DISLOCATION_THRESHOLDS),
         ("forward horizons", "dis-horizons", DISLOCATION_HORIZONS),
     ]
     controls = [field("feature (load it on Setup first)", dcc.Dropdown(
-        id="dis-feature", value="vol_1Mo_30", clearable=False,
-        options=[
-            {"label": FEATURE_LABELS.get(name, name), "value": name}
-            for name in FEATURE_LABELS
-        ], style={"fontSize": 12},
+        id="dis-feature", value=None, clearable=False,
+        options=[], style={"fontSize": 12},
     ))]
+    controls += [
+        html.Div(id="dis-context"),
+        field("signal", dcc.Dropdown(id="dis-signal", value="normalized", clearable=False,
+            options=[{"label": "Residual / rolling volatility", "value": "normalized"},
+                     {"label": "OU z-score", "value": "ou_z"}])),
+        field("discovery period", dcc.Dropdown(id="dis-train", value=0.7, clearable=False,
+            options=[{"label": "First 70%; evaluate later 30%", "value": 0.7},
+                     {"label": "First 80%; evaluate later 20%", "value": 0.8},
+                     {"label": "Full history (exploratory)", "value": 1.0}])),
+        field("minimum discovery events", dcc.Input(id="dis-min-events", type="number", value=30, min=5, step=5, style=INPUT)),
+    ]
     controls += [field("regression basis", dcc.Checklist(
         id="dis-fit-on", value=["changes", "levels"],
         options=[{"label": label, "value": value}
@@ -216,7 +281,10 @@ def dislocation_tab() -> html.Div:
     ))]
     controls += [field(label, dcc.Dropdown(
         id=id_, value=items, multi=True, clearable=False,
-        options=[{"label": str(item), "value": item} for item in items],
+        options=[{"label": str(item), "value": item} for item in sorted(set(items + (
+            [20, 40, 60, 100, 130, 140, 190, 252, 360, 410, 504] if "lbs" in id_
+            else [0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0] if id_ == "dis-thresholds"
+            else [5, 10, 20, 40, 60, 100])))],
         style={"fontSize": 12},
     )) for label, id_, items in values]
     controls += [
@@ -241,10 +309,11 @@ def dislocation_tab() -> html.Div:
             id="dis-gate-windows", value=[126, 252, 504], multi=True,
             clearable=False,
             options=[{"label": str(value), "value": value}
-                     for value in [63, 126, 252, 504]],
+                     for value in [126, 252, 504, 756, 1260, 1764]],
             style={"fontSize": 12},
         )),
-        note("Changes uses a windowed accumulated residual. Levels uses the raw "
+        note("Percentile gates require 126 valid observations; gate lookbacks must be at least 126. "
+             "Changes uses a windowed accumulated residual. Levels uses the raw "
              "level-regression residual, so residual window is shown as —. Ungated is "
              "always included. Each checked gate adds causal bucket variants.", "dim"),
         html.Button("Run discovery", id="dis-run", n_clicks=0,
@@ -256,10 +325,7 @@ def dislocation_tab() -> html.Div:
         html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)",
                         "gap": 26, "alignItems": "start"}, children=[
             html.Div(controls),
-            dcc.Loading(html.Div(id="dis-out"),
-                        custom_spinner=shimmer_loader(image="guy.png", caption="searching"),
-                        overlay_style={"visibility": "visible", "opacity": 0.35},
-                        parent_className="research-panel-loader"),
+            loading_panel("dis-out", "dis", "searching"),
         ]),
         html.Div(style={"borderTop": f"1px solid {BORDER}", "marginTop": 24,
                         "paddingTop": 18}, children=[
@@ -267,10 +333,7 @@ def dislocation_tab() -> html.Div:
             html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)",
                             "gap": 26, "alignItems": "start"}, children=[
                 dislocation_backtest_controls(),
-                dcc.Loading(html.Div(id="bt-out"),
-                            custom_spinner=shimmer_loader(image="guy.png", caption="backtesting"),
-                            overlay_style={"visibility": "visible", "opacity": 0.35},
-                            parent_className="research-panel-loader"),
+                loading_panel("bt-out", "bt", "backtesting"),
             ]),
         ]),
         dcc.Store(id="dis-board"),
@@ -286,18 +349,19 @@ def dislocation_backtest_controls() -> html.Div:
             "Choose Backtest on a row above to freeze its relationship and gate.", "dim"
         )),
         field("entry thresholds (z)", dcc.Dropdown(
-            id="bt-entry-zs", value=[1.5, 2.0, 2.5, 3.0], multi=True,
+            id="bt-entry-zs", value=[0.5], multi=True,
             clearable=False,
             options=[{"label": str(v), "value": v}
-                     for v in [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0]],
+                     for v in [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0]],
             style={"fontSize": 12},
         )),
         field("exit styles", dcc.Checklist(
-            id="bt-exit-styles", value=["time", "band", "revert_frac"],
+            id="bt-exit-styles", value=["time", "band", "revert_frac", "half_life_frac"],
             options=[
                 {"label": " time stop (business days)", "value": "time"},
                 {"label": " residual band (z)", "value": "band"},
                 {"label": " reversion fraction", "value": "revert_frac"},
+                {"label": " entry half-life multiple", "value": "half_life_frac"},
             ],
             labelStyle={"display": "block", "fontSize": 12, "marginBottom": 6,
                         "color": TEXT}, inputStyle={"marginRight": 5},
@@ -309,7 +373,7 @@ def dislocation_backtest_controls() -> html.Div:
             style={"fontSize": 12},
         )),
         field("exit bands (z)", dcc.Dropdown(
-            id="bt-bands", value=[0.0, 0.5, 1.0], multi=True, clearable=False,
+            id="bt-bands", value=[0.0, 0.25], multi=True, clearable=False,
             options=[{"label": str(v), "value": v} for v in [0.0, 0.25, 0.5, 0.75, 1.0, 1.25]],
             style={"fontSize": 12},
         )),
@@ -319,8 +383,13 @@ def dislocation_backtest_controls() -> html.Div:
             options=[{"label": str(v), "value": v} for v in [0.25, 0.5, 0.75, 1.0]],
             style={"fontSize": 12},
         )),
-        field("hard stop (bp)", dcc.Dropdown(
-            id="bt-stop", value=25.0, clearable=False,
+        field("half-life multiples", dcc.Dropdown(id="bt-half-lives", value=[0.5, 0.75, 1.0, 1.5, 2.0, 3.0], multi=True,
+            options=[{"label": str(v), "value": v} for v in [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]])),
+        field("execution", dcc.Dropdown(id="bt-lag", value=1, clearable=False,
+            options=[{"label": "Next observation (signal known before fill)", "value": 1},
+                     {"label": "Same observation (optimistic diagnostic)", "value": 0}])),
+        field("hard stops (bp)", dcc.Dropdown(
+            id="bt-stop", value=[15.0], multi=True, clearable=False,
             options=[
                 {"label": "none", "value": 0.0},
                 *[{"label": str(v), "value": v} for v in [10.0, 15.0, 25.0, 40.0, 60.0]],
@@ -363,9 +432,9 @@ def controls() -> html.Div:
             id="beta-lb", value=BETA_LOOKBACK, clearable=False,
             options=[{"label": str(v), "value": v} for v in BETA_LOOKBACKS],
             style={"fontSize": 12})),
-        field("beta dependent leg", dcc.Input(
+        html.Details([html.Summary("Advanced beta settings"), field("beta dependent leg", dcc.Input(
             id="beta-dependent", type="text", placeholder="auto (20y for 10s20s30s)",
-            debounce=True, style=INPUT)),
+            debounce=True, style=INPUT))], id="beta-advanced", style={"display": "none"}),
         field("features", dcc.Dropdown(
             id="features", value=DEFAULT_FEATURES, multi=True,
             options=[{"label": f"{group} · {FEATURE_LABELS.get(name, name)}", "value": name}
@@ -389,10 +458,10 @@ def controls() -> html.Div:
             html.Button("Load", id="load", n_clicks=0,
                         className="ref-btn",
                         style={**btn_style(primary=True), "flex": 1}),
-            html.Button("Ping DB", id="ping", n_clicks=0, className="ref-btn",
+            html.Button("Fill tabs", id="fill", n_clicks=0, className="ref-btn",
                         style=btn_style()),
         ]),
-        html.Div(id="ping-out"),
+        html.Div(id="fill-out"),
     ])
 
 
@@ -403,12 +472,7 @@ def setup_tab() -> html.Div:
                         "gridTemplateColumns": "300px minmax(0, 1fr)",
                         "gap": 26, "alignItems": "start"}, children=[
             controls(),
-            dcc.Loading(
-                html.Div(id="panel-out"),
-                custom_spinner=shimmer_loader(image="guy.png", caption="loading"),
-                overlay_style={"visibility": "visible", "opacity": 0.35},
-                parent_className="research-panel-loader",
-            ),
+            loading_panel("panel-out", "load", "loading"),
         ]),
         dcc.Store(id="research-level-data"),
         dcc.Store(id="research-level-window", data=DEFAULT_CHART_WINDOW),
@@ -601,10 +665,15 @@ def board_row_picker(records: list[dict]) -> html.Div:
 
 
 def dislocation_view(
-    results: pl.DataFrame, feature: str, run_info: dict
+    results: pl.DataFrame, feature: str, run_info: dict, min_events: int = 30,
+    data: pl.DataFrame | None = None,
 ) -> tuple[html.Div, list[dict]]:
     """Compact discovery board. It deliberately does not call a cell a winner."""
-    valid = results.filter(pl.col("n_obs") >= 30)
+    discovery = results.filter(pl.col("sample") != "test") if "sample" in results.columns else results
+    valid = discovery.filter(pl.col("n_obs") >= min_events)
+    valid = valid.with_columns(pl.col("ic").median().over(
+        ["fit_on", "entry_z", "horizon", "gate", "gate_bucket", "gate_window"]
+    ).alias("model_family_median_ic"))
     gated = valid.filter(pl.col("gate") != "(none)")
     agreement = (
         gated.filter(pl.col("ic") > 0)
@@ -616,22 +685,49 @@ def dislocation_view(
             agreement,
             on=["fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate", "gate_bucket"],
             how="left",
+            nulls_equal=True,
         )
         .with_columns(
             pl.when(pl.col("gate") == "(none)").then(None)
             .otherwise(pl.col("positive_windows_30plus").fill_null(0))
             .alias("positive_windows_30plus")
         )
-        .sort("ic", descending=True)
+        .sort(["model_family_median_ic", "ic"], descending=True, nulls_last=True)
         .head(40)
     )
+    if "sample" in results.columns and "test" in results["sample"].to_list():
+        keys = ["fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate", "gate_bucket", "gate_window"]
+        later = results.filter(pl.col("sample") == "test").select(
+            *keys, pl.col("ic").alias("later_ic"),
+            pl.col("hit_rate").alias("later_event_hit_rate"), pl.col("n_obs").alias("later_events"))
+        board = board.join(later, on=keys, how="left", nulls_equal=True)
     # The board picker needs the real (nullable) residual_lb; the display
     # table wants the "—" placeholder. Keep records before that string cast.
     board_records = board.to_dicts()
+    if data is not None:
+        cache = {}
+        cutoff = int(len(data) * run_info.get("train_fraction", 1.0))
+        for row in board_records:
+            key = tuple(row.get(k) for k in ("fit_on", "beta_lb", "residual_lb", "norm_lb", "signal_kind"))
+            if key not in cache:
+                cache[key] = signal_frame(data, target=run_info["target"], feature=feature,
+                    fit_on=row["fit_on"], beta_lb=row["beta_lb"], residual_lb=row["residual_lb"],
+                    norm_lb=row["norm_lb"], signal_kind=row.get("signal_kind", "normalized"))
+            state = cache[key]
+            z = state["signal"].to_numpy()
+            prev = np.r_[np.nan, z[:-1]]
+            e = row["entry_z"]
+            crossed = ((z >= e) & ~(prev >= e)) | ((z <= -e) & ~(prev <= -e))
+            events = np.flatnonzero(crossed & np.isfinite(z) & _entry_gate(state, row)
+                                   & (np.arange(len(z)) + row["horizon"] < cutoff))
+            evidence = event_overlap_diagnostics(events, row["horizon"])
+            row.update({k: evidence[k] for k in ("n_non_overlapping", "overlap_fraction")})
+        if board_records:
+            board = pl.DataFrame(board_records, infer_schema_length=None)
     stats = [
         stat_block("feature", FEATURE_LABELS.get(feature, feature)),
         stat_block("cells tested", f"{len(results):,}"),
-        stat_block("cells with ≥30 events", f"{len(valid):,}"),
+        stat_block(f"cells with ≥{min_events} events", f"{len(valid):,}"),
         stat_block("gated cells", f"{len(gated):,}"),
         stat_block("backend", run_info["backend"]),
         stat_block("elapsed", f"{run_info['elapsed_s']:.2f}s"),
@@ -639,19 +735,21 @@ def dislocation_view(
     ]
     cols = [
         "fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate",
-        "gate_bucket", "gate_window", "positive_windows_30plus", "ic", "hit_rate",
-        "n_obs", "events_per_year",
+        "gate_bucket", "gate_window", "positive_windows_30plus", "model_family_median_ic", "ic", "hit_rate",
+        "n_obs", "events_per_year", "later_ic", "later_event_hit_rate", "later_events",
+        "n_non_overlapping", "overlap_fraction",
     ]
     display = board.with_columns(pl.col("residual_lb").cast(pl.Utf8).fill_null("—"))
     view = html.Div([
         html.Div(stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
                                "marginBottom": 14, "paddingBottom": 12,
                                "borderBottom": f"1px solid {BORDER}"}),
-        note("Discovery only. 'Positive windows' means positive IC with ≥30 events; "
-             "it is agreement, not proof. Exits, costs, time in market, and trade "
-             "robustness are deliberately not scored here."),
+        note("Ranked by median discovery IC across tested model lookbacks, then individual IC. Event hit rate is the fraction of "
+             "threshold-crossing events with a favorable forward move, not winning trades. "
+             "Forward windows can overlap. Later-period columns evaluate the same candidates; "
+             "repeatedly choosing from them turns that period into research data."),
         table_div(
-            display.select([col for col in cols if col in display.columns]).to_pandas(),
+            display.select([col for col in cols if col in display.columns]).rename({"hit_rate": "event_hit_rate"}).to_pandas(),
             title="IC discovery board", max_rows=40, float_fmt=",.3f",
         ),
         note("Pick a row's Backtest button to freeze its relationship and gate "
@@ -668,39 +766,51 @@ def backtest_grid_view(grid: pl.DataFrame, selected: dict) -> html.Div:
     the discovery candidate; only trade mechanics vary across the grid.
     """
     best = selected["metrics"]
+    rank_metric = selected.get("rank_metric", "sharpe")
     stats = [
         stat_block("cells run", f"{len(grid):,}"),
-        stat_block("best sharpe", f"{best['sharpe']:.2f}"),
+        stat_block(f"selected {rank_metric}", f"{best[rank_metric]:.2f}"),
         stat_block("best cell", f"z={best['entry_z']} · {best['exit_style']}={best['exit_param']}"),
         stat_block("total pnl (best)", f"{best['total_pnl_bps']:,.0f} bps"),
         stat_block("trades (best)", f"{best['n_trades']:,}"),
-        stat_block("hit rate (best)", f"{best['hit_rate']:.1%}"),
+        stat_block("winning closed trades (best)", f"{best['trade_win_rate']:.1%}"),
         stat_block("time in market (best)", f"{best['time_in_market_pct']:.1%}"),
     ]
     cols = [
-        "entry_z", "exit_style", "exit_param", "sharpe", "total_pnl_bps",
-        "n_trades", "hit_rate", "avg_pnl_per_trade_bps", "median_pnl_bps",
-        "time_in_market_pct", "max_drawdown_bps", "open_trades",
+        "config_id", "entry_z", "exit_style", "exit_param", "stop_loss_bps", "sharpe", "total_pnl_bps",
+        "n_trades", "trade_win_rate", "avg_pnl_per_trade_bps", "median_pnl_bps",
+        "avg_holding_days", "time_in_market_pct", "max_drawdown_bps", "open_trades",
+        "earlier_sharpe", "later_sharpe", "earlier_pnl_bps", "later_pnl_bps",
+        "closed_pnl_bps",
     ]
     return html.Div([
         html.Div(stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
                                "marginBottom": 14, "paddingBottom": 12,
                                "borderBottom": f"1px solid {BORDER}"}),
         note("Exact Engine re-mark on the actual legs, transaction cost applied. "
-             "One row per requested entry/exit cell."),
+             "Every requested exit is tested. Stops are evaluated on observations, not "
+             "intraday fills. Ranking uses the earlier period when a split is selected. "
+             "Later daily P&L includes positions carried across the split. "
+             "This is a chronological diagnostic, not a complete walk-forward validation."),
         table_div(
             grid.select([c for c in cols if c in grid.columns])
-                .sort("sharpe", descending=True).to_pandas(),
+                .sort(rank_metric, descending=True).to_pandas(),
             title="backtest grid", max_rows=60, float_fmt=",.2f",
         ),
+        field("inspect configuration", dcc.Dropdown(id="bt-inspect", value=str(best["config_id"]),
+            options=[{"label": f"#{r['config_id']} · {r['exit_style']} {r['exit_param']} · entry {r['entry_z']} · stop {r['stop_loss_bps']}",
+                      "value": str(r["config_id"])} for r in grid.iter_rows(named=True)])),
+        html.Div(id="bt-detail"),
     ])
 
 
 # ---- app --------------------------------------------------------------------
 
 
-def tabs() -> dcc.Tabs:
-    return dcc.Tabs(id="bench-tabs", value="setup", children=[
+def tabs() -> html.Div:
+    return html.Div([dcc.Store(id="research-session", data=uuid4().hex),
+        dcc.Interval(id="research-progress-poll", interval=750),
+        dcc.Tabs(id="bench-tabs", value="setup", children=[
         dcc.Tab(label="Setup", value="setup", style=TAB_STYLE,
                 selected_style=SELECTED_TAB_STYLE, children=setup_tab()),
         dcc.Tab(label="Dislocation", value="dis", style=TAB_STYLE,
@@ -730,7 +840,7 @@ def tabs() -> dcc.Tabs:
                         "Surface factor_condition_number prominently -- multi-factor "
                         "levels regressions on collinear rates go unstable quietly.",
                     ])),
-    ])
+    ])], className="research-bench")
 
 
 def register_callbacks(app) -> None:
@@ -743,22 +853,64 @@ def register_callbacks(app) -> None:
     def _set_dislocation_gates(_all, _none):
         return list(DISLOCATION_GATES) if ctx.triggered_id == "dis-gates-all" else []
 
+    @app.callback(Output("custom-field", "style"), Output("beta-lb-field", "style"),
+                  Output("beta-advanced", "style"), Input("target", "value"), Input("weighting", "value"))
+    def _weight_controls(target, weighting):
+        show, hide = {"marginBottom": 12}, {"display": "none"}
+        return show if target == "custom" else hide, show if weighting == "beta" else hide, show if weighting == "beta" else hide
+
+    @app.callback(*[Output(f"{name}-field", "style") for name in
+                   ("bt-time-stops", "bt-bands", "bt-revert-fracs", "bt-half-lives")], Input("bt-exit-styles", "value"))
+    def _exit_controls(styles):
+        return [{"marginBottom": 12} if style in (styles or []) else {"display": "none"}
+                for style in ("time", "band", "revert_frac", "half_life_frac")]
+
+    @app.callback(Output("dis-feature", "options"), Output("dis-feature", "value"),
+                  Output("dis-context", "children"), Output("fill-out", "children"),
+                  Output("relative-value-context", "children"), Output("fair-value-context", "children"),
+                  Input("research-level-data", "data"), State("dis-feature", "value"))
+    def _fill(stored, current):
+        if not stored:
+            return [], None, "", "", "", ""
+        features = [f for f in stored.get("features", []) if f != stored["target"]]
+        options = [{"label": FEATURE_LABELS.get(f, f), "value": f} for f in features]
+        message = f"{stored['target']} · {stored.get('weighting', 'fixed')} legs · {len(stored['rows']):,} observations"
+        context = note(f"{message} · features: {', '.join(features) or 'none selected'}")
+        return options, current if current in features else (features[0] if features else None), context, note("Loaded setup carried into discovery. Choose a discovery row to fill trade mechanics.", "good"), context, context
+
     @app.callback(
-        Output("ping-out", "children"),
-        Input("ping", "n_clicks"),
-        prevent_initial_call=True,
+        Output("dis-out", "children", allow_duplicate=True), Output("dis-board", "data", allow_duplicate=True),
+        Output("dis-candidate", "data", allow_duplicate=True), Output("bt-out", "children", allow_duplicate=True),
+        Output("bt-grid", "data", allow_duplicate=True), Output("bt-candidate", "children", allow_duplicate=True),
+        Input("research-level-data", "data"), prevent_initial_call=True,
     )
-    def _ping(_n):
-        try:
-            idx, vol = last_updated(list(YIELDS.values())), swaption_last_updated()
-        except Exception as exc:
-            return note(f"database unreachable: {exc}", "bad")
-        out = []
-        for name, info in (("md.index_eod", idx), ("md.swaption_vol", vol)):
-            out.append(note(f"{name}: no rows", "bad") if info is None else
-                       note(f"{name}: {info['last_ts']} · written "
-                            f"{info['last_written']}", "good"))
-        return html.Div(out)
+    def _invalidate_panel(_stored):
+        return "", None, None, "", None, note("Choose Backtest on a discovery row to fill trade mechanics.")
+
+    @app.callback(*[Output(f"{name}-progress", "children") for name in ("load", "dis", "bt")],
+                  Input("research-progress-poll", "n_intervals"), State("research-session", "data"))
+    def _progress(_tick, session):
+        return [progress_view(work.snapshot(session, name), caption)
+                for name, caption in (("load", "loading"), ("dis", "searching"), ("bt", "backtesting"))]
+
+    @app.callback(Output("bt-detail", "children"), Input("bt-inspect", "value"), State("bt-grid", "data"))
+    def _inspect(config_id, stored):
+        run = (stored or {}).get("runs", {}).get(str(config_id))
+        if not run:
+            return note("Run a backtest grid to inspect trades.")
+        trades = pl.DataFrame(run["trades"], infer_schema_length=None)
+        return html.Div([
+            dcc.Graph(figure={"data": [{"x": [r['ts'] for r in run['equity']],
+                                       "y": [r['cumulative_pnl'] for r in run['equity']],
+                                       "type": "scatter", "mode": "lines", "name": "Net P&L"}],
+                              "layout": {"title": "Selected configuration · cumulative P&L", "yaxis": {"title": "bp"},
+                                         "height": 320, "margin": {"l": 55, "r": 20, "t": 45, "b": 40}}}),
+            table_div(pl.DataFrame(run["periods"]).to_pandas(), title="P&L by year", max_rows=50),
+            table_div(trades.group_by("exit_reason").agg(pl.len().alias("trades"), pl.col("pnl_bps").mean().alias("mean_pnl_bps")).to_pandas(),
+                      title="Exit reasons") if len(trades) else None,
+            table_div(trades.to_pandas(), title="Closed trades · MAE/MFE measured on observations", max_rows=500)
+            if len(trades) else note("No closed trades for this configuration."),
+        ])
 
     @app.callback(
         Output("dis-out", "children"),
@@ -772,6 +924,8 @@ def register_callbacks(app) -> None:
         State("dis-norm-lbs", "value"), State("dis-thresholds", "value"),
         State("dis-horizons", "value"), State("dis-gates", "value"),
         State("dis-gate-windows", "value"),
+        State("dis-signal", "value"), State("dis-train", "value"),
+        State("dis-min-events", "value"), State("research-session", "data"),
         prevent_initial_call=True,
         running=[
             (Output("dis-run", "children"), "Running discovery…", "Run discovery"),
@@ -780,7 +934,7 @@ def register_callbacks(app) -> None:
     )
     def _run_dislocation(
         _n, stored, feature, fit_on, beta_lbs, residual_lbs, norm_lbs, thresholds,
-        horizons, gates, gate_windows,
+        horizons, gates, gate_windows, signal_kind, train_fraction, min_events, session,
     ):
         if not stored:
             return note("Load a target and this feature on Setup first.", "warn"), "", no_update
@@ -790,18 +944,19 @@ def register_callbacks(app) -> None:
                 "Add it on Setup, then Load.", "warn"
             ), "", no_update
         try:
+            work.start(session, "dis", "Preparing loaded panel and discovery grid")
             target = stored["target"]
             rows = stored["rows"]
             frame = pl.DataFrame({
                 "ts": pl.Series([row["ts"] for row in rows], dtype=pl.Utf8),
-                target: pl.Series([row[target] for row in rows], dtype=pl.Float64),
-                feature: pl.Series([row[feature] for row in rows], dtype=pl.Float64),
+                **{col: pl.Series([row[col] for row in rows], dtype=pl.Float64)
+                   for col in dict.fromkeys([target, feature, *stored['legs'], *stored.get('weight_columns', {}).values()])},
             }).with_columns(pl.col("ts").str.to_date())
-            backend = scan_backend("auto")
+            backend = "CPU · batched gate statistics"
             started = time.perf_counter()
-            _, results = dislocation_scan(
+            frame, results = dislocation_scan(
                 frame, target=target, feature=feature,
-                fit_on=fit_on or ["changes"], device="auto",
+                fit_on=fit_on or ["changes"], device="cpu",
                 beta_lookbacks=beta_lbs or DISLOCATION_BETA_LBS,
                 residual_lookbacks=residual_lbs or DISLOCATION_RESIDUAL_LBS,
                 normalization_lookbacks=norm_lbs or DISLOCATION_NORM_LBS,
@@ -809,9 +964,13 @@ def register_callbacks(app) -> None:
                 horizons=horizons or DISLOCATION_HORIZONS,
                 gate_names=gates or [],
                 gate_windows=gate_windows or [126, 252, 504],
+                signal_kind=signal_kind, train_fraction=float(train_fraction),
+                trade_legs=stored['legs'], weight_columns=stored.get('weight_columns'),
+                progress=lambda done, total, message: work.update(session, "dis", message, done, total),
             )
             elapsed_s = time.perf_counter() - started
         except Exception as exc:
+            work.update(session, "dis", f"Failed: {exc}", 1, 1)
             return html.Div([
                 note(f"{type(exc).__name__}: {exc}", "bad"),
                 html.Pre(traceback.format_exc(), style={"fontSize": 10, "color": DIM,
@@ -821,18 +980,29 @@ def register_callbacks(app) -> None:
             "backend": backend,
             "elapsed_s": elapsed_s,
             "cells_per_second": len(results) / max(elapsed_s, 1e-9),
+            "train_fraction": train_fraction, "target": target,
         }
         status = note(
             f"Completed · {backend} · {len(results):,} cells in {elapsed_s:.2f}s",
             "good",
         )
-        view, board_records = dislocation_view(results, feature, info)
-        board = {"target": target, "feature": feature, "rows": board_records}
+        work.update(session, "dis", "Saving all discovery cells and ranking the discovery period")
+        saved = save_run("discovery", frame, results, dict(feature=feature,
+            signal_kind=signal_kind, min_events=min_events,
+            panel_id=stored["panel_id"], weighting=stored.get("weighting"),
+            gate_min_history=126, **info))
+        view, board_records = dislocation_view(results, feature, info, int(min_events or 30), frame)
+        split_date = str(frame["ts"][int(len(frame) * float(train_fraction))]) if float(train_fraction) < 1 else None
+        board = {"target": target, "feature": feature, "rows": board_records,
+                 "panel_id": stored["panel_id"], "split_date": split_date, "run_path": saved,
+                 "weight_columns": stored.get("weight_columns", {})}
+        work.update(session, "dis", f"Completed · {len(results):,} cells · saved {saved}", 1, 1)
         return view, status, board
 
     @app.callback(
         Output("dis-candidate", "data"),
         Output("bt-candidate", "children"),
+        Output("bt-entry-zs", "value"),
         Input({"type": "dis-pick", "index": ALL}, "n_clicks"),
         State("dis-board", "data"),
         prevent_initial_call=True,
@@ -842,14 +1012,14 @@ def register_callbacks(app) -> None:
         # clicks), before any real click. Only a genuine click should freeze
         # a candidate.
         if not board or not any(n_clicks or []):
-            return no_update, no_update
+            return no_update, no_update, no_update
         triggered = ctx.triggered_id
         if not isinstance(triggered, dict):
-            return no_update, no_update
+            return no_update, no_update, no_update
         rows = board["rows"]
         idx = triggered["index"]
         if idx >= len(rows):
-            return no_update, no_update
+            return no_update, no_update, no_update
         row = rows[idx]
         candidate = {
             "target": board["target"], "feature": board["feature"],
@@ -859,6 +1029,10 @@ def register_callbacks(app) -> None:
             ),
             "norm_lb": int(row["norm_lb"]), "gate": row["gate"],
             "gate_bucket": row["gate_bucket"], "gate_window": row["gate_window"],
+            "signal_kind": row.get("signal_kind", "normalized"),
+            "entry_z": row["entry_z"], "panel_id": board["panel_id"],
+            "split_date": board.get("split_date"), "discovery_run": board.get("run_path"),
+            "weight_columns": board.get("weight_columns", {}),
         }
         gate_desc = (
             f"{candidate['gate']}:{candidate['gate_bucket']} "
@@ -872,7 +1046,7 @@ def register_callbacks(app) -> None:
             f"resid_lb={candidate['residual_lb'] or '—'} · "
             f"norm_lb={candidate['norm_lb']} · {gate_desc}"
         )
-        return candidate, note(f"Frozen: {label}", "good")
+        return candidate, note(f"Frozen: {label}", "good"), [row["entry_z"]]
 
     @app.callback(
         Output("bt-out", "children"),
@@ -886,6 +1060,7 @@ def register_callbacks(app) -> None:
         State("bt-time-stops", "value"), State("bt-bands", "value"),
         State("bt-revert-fracs", "value"), State("bt-stop", "value"),
         State("bt-cost", "value"),
+        State("bt-half-lives", "value"), State("bt-lag", "value"), State("research-session", "data"),
         prevent_initial_call=True,
         running=[
             (Output("bt-run", "children"), "Running backtest…", "Run backtest grid"),
@@ -894,12 +1069,14 @@ def register_callbacks(app) -> None:
     )
     def _run_backtest_grid(
         _n, candidate, stored, target, custom, entry_zs, exit_styles,
-        time_stops, bands, revert_fracs, stop_bp, cost_bp,
+        time_stops, bands, revert_fracs, stop_bp, cost_bp, half_lives, lag, session,
     ):
         if not candidate:
             return note("Choose Backtest on a discovery row first.", "warn"), "", no_update
         if not stored:
             return note("Load a target on Setup first.", "warn"), "", no_update
+        if candidate.get("panel_id") != stored.get("panel_id"):
+            return note("The loaded panel changed. Run discovery and select a row from the new panel.", "warn"), "", no_update
         if candidate["target"] != stored["target"]:
             return note(
                 "Loaded target has changed since discovery ran; rerun discovery "
@@ -914,18 +1091,19 @@ def register_callbacks(app) -> None:
             style: values
             for style, values in {
                 "time": time_stops, "band": bands, "revert_frac": revert_fracs,
+                "half_life_frac": half_lives,
             }.items()
-            if style in (exit_styles or [])
+            if style in (exit_styles or []) and values
         }
         if not exit_params or not entry_zs:
             return note(
                 "Choose at least one entry threshold and one exit style.", "warn",
             ), "", no_update
         try:
-            selected_target = "custom" if custom and custom.strip() else target
-            trade = resolve_target(selected_target, custom)
+            work.start(session, "bt", "Building the frozen candidate signal and all exit combinations")
+            trade = TradeDef(stored["target"], stored["legs"])
             rows = stored["rows"]
-            needed = list(dict.fromkeys([trade.name, candidate["feature"], *trade.legs]))
+            needed = list(dict.fromkeys([trade.name, candidate["feature"], *trade.legs, *candidate.get("weight_columns", {}).values()]))
             columns = {"ts": pl.Series([row["ts"] for row in rows], dtype=pl.Utf8)}
             columns.update({
                 col: pl.Series([row[col] for row in rows], dtype=pl.Float64)
@@ -937,45 +1115,57 @@ def register_callbacks(app) -> None:
                 data, trade, candidate,
                 entry_zs=entry_zs, exit_params=exit_params,
                 stop_loss_bps=(stop_bp or None), round_trip_cost_bps=cost_bp or 0.0,
+                stop_losses=stop_bp or [None], execution_lag=int(lag),
+                progress=lambda done, total: work.update(session, "bt", f"Completed full backtest {done}/{total} · exits, stops, costs and trade logs", done, total),
             )
             elapsed_s = time.perf_counter() - started
         except Exception as exc:
+            work.update(session, "bt", f"Failed: {exc}", 1, 1)
             return html.Div([
                 note(f"{type(exc).__name__}: {exc}", "bad"),
                 html.Pre(traceback.format_exc(), style={"fontSize": 10, "color": DIM,
                                                         "whiteSpace": "pre-wrap"}),
             ]), "", no_update
         status = note(f"Completed · {len(grid):,} cells in {elapsed_s:.2f}s", "good")
-        return backtest_grid_view(grid, selected), status, grid.to_dicts()
+        work.update(session, "bt", "Saving every configuration's trades, equity and annual results")
+        saved = save_run("exits", data, grid, dict(candidate=candidate,
+            legs=stored["legs"], weighting=stored.get("weighting"), execution_lag=lag,
+            cost_bps=cost_bp, stop_losses=stop_bp), selected["runs"])
+        work.update(session, "bt", f"Completed · saved {saved}", len(grid), len(grid))
+        return backtest_grid_view(grid, selected), status, {"rows": grid.to_dicts(), "runs": selected["runs"], "run_path": saved}
 
     @app.callback(
         Output("panel-out", "children"),
         Output("research-level-data", "data"),
         Output("target", "value"),
         Input("load", "n_clicks"),
+        Input("fill", "n_clicks"),
         State("target", "value"), State("custom", "value"),
         State("weighting", "value"), State("beta-lb", "value"),
         State("beta-dependent", "value"),
         State("features", "value"), State("start", "value"),
         State("invert-feature", "value"),
         State("research-level-window", "data"),
+        State("research-session", "data"),
+        running=[(Output("load", "disabled"), True, False), (Output("fill", "disabled"), True, False)],
     )
     def _load(
-        _n, target, custom, weighting, beta_lb, beta_dependent, features, start,
-        invert_feature, chart_window,
+        _n, _fill_n, target, custom, weighting, beta_lb, beta_dependent, features, start,
+        invert_feature, chart_window, session,
     ):
         try:
-            # A populated basket is an explicit instruction, not decoration.
-            # Reflect that in the dropdown after Load so the selected target
-            # and the calculation can never disagree on screen.
-            selected_target = "custom" if custom and custom.strip() else target
+            work.start(session, "load", "Loading market history for the target and selected features")
+            selected_target = target
             trade = resolve_target(selected_target, custom)
             panel = build_panel(trade, features or [], start=start or START,
                                 weighting=weighting or "fixed",
                                 beta_lookback=int(beta_lb or BETA_LOOKBACK),
-                                beta_dependent=beta_dependent or None)
+                                beta_dependent=(beta_dependent or None) if weighting == "beta" else None,
+                                progress=lambda message: work.update(session, "load", message))
+            work.update(session, "load", "Computing coverage and relationship diagnostics", 2, 4)
             diag = diagnostics(panel)
         except Exception as exc:
+            work.update(session, "load", f"Failed: {exc}", 1, 1)
             return html.Div([
                 note(f"{type(exc).__name__}: {exc}", "bad"),
                 html.Pre(traceback.format_exc(),
@@ -992,6 +1182,15 @@ def register_callbacks(app) -> None:
         chart_data = panel.data.select("ts", *store_cols).with_columns(
             pl.col("ts").cast(pl.Utf8)
         )
+        weight_columns = {}
+        if panel.weighting == "beta" and len(trade.legs) > 1:
+            dep = dependent_leg(trade, panel.beta_dependent)
+            scale = float(trade.legs[dep])
+            weight_columns = {leg: f"held_weight_{leg}" for leg in trade.legs}
+            chart_data = chart_data.with_columns(*[
+                (pl.lit(scale) if leg == dep else -scale * pl.col(f"w_{leg}")).alias(col)
+                for leg, col in weight_columns.items()
+            ])
         if weight_cols:
             dependent = dependent_leg(trade, panel.beta_dependent)
             scale = float(trade.legs[dependent])
@@ -1001,11 +1200,18 @@ def register_callbacks(app) -> None:
             }
         else:
             weight_priors = {}
-        return panel_view(
+        work.update(session, "load", "Rendering charts and filling the research panel", 3, 4)
+        view = panel_view(
             panel, trade, diag, chart_window or DEFAULT_CHART_WINDOW,
             "invert" in (invert_feature or []),
-        ), {
+        )
+        work.update(session, "load", "Completed · setup available in discovery", 4, 4)
+        return view, {
             "target": trade.name,
+            "legs": trade.legs, "weighting": panel.weighting,
+            "weight_columns": weight_columns,
+            "beta_dependent": panel.beta_dependent, "beta_lookback": panel.beta_lookback,
+            "panel_id": uuid4().hex,
             "features": chart_features,
             "weight_cols": weight_cols,
             "weight_priors": weight_priors,

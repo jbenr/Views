@@ -987,6 +987,61 @@ def stateful_exit_scan(
     )
 
 
+def _predict_single_cpu(z, level, entries, horizons, combos, gates, gate_buckets,
+                        entry_col, gate_min_history, gate_windows, forward_moves):
+    """Batch gate sufficient statistics; no per-cell tables or GPU transfers."""
+    z = np.asarray(z, dtype=float).reshape(-1)
+    level = np.asarray(level, dtype=float)
+    masks = _gate_masks(gates, len(z), 1, gate_buckets, np,
+                        min_history=gate_min_history, windows=gate_windows)
+    labels = [("(none)", "all", None), *[(a, b, w) for a, b, w, _ in masks]]
+    allow = np.column_stack([np.ones(len(z), dtype=bool),
+                             *[m[:, 0] for _, _, _, m in masks]])
+    prev = np.r_[np.nan, z[:-1]]
+    finite = np.isfinite(z)
+    crossings = [(float(e), ((z >= e) & ~(prev >= e)) |
+                            ((z <= -e) & ~(prev <= -e))) for e in entries]
+    columns = {name: [] for name in [entry_col, "horizon", "gate", "gate_bucket",
+                                    "gate_window", "n_obs", "ic", "hit_rate", "fire_rate"]}
+    for horizon in horizons:
+        fwd = np.full(len(z), np.nan)
+        if forward_moves is not None:
+            fwd[:] = forward_moves[horizon]
+        elif horizon < len(z):
+            fwd[:-horizon] = level[horizon:] - level[:-horizon]
+        eligible = finite & np.isfinite(fwd)
+        eligible_n = allow[eligible].sum(axis=0)
+        for entry, crossed in crossings:
+            events = eligible & crossed
+            x, y = z[events], -fwd[events]
+            features = np.column_stack([np.ones(len(x)), x, y, x*y, x*x, y*y,
+                                         (-np.sign(x)*fwd[events] > 0).astype(float)])
+            sums = np.einsum("tg,tf->gf", allow[events], features, optimize=False)
+            n, sx, sy, sxy, sx2, sy2, wins = sums.T
+            with np.errstate(invalid="ignore", divide="ignore"):
+                den = np.sqrt((n*sx2-sx*sx)*(n*sy2-sy*sy))
+                ic = np.where((n > 1) & (den > 0), (n*sxy-sx*sy)/den, np.nan)
+                hit = np.where(n > 0, wins/n, np.nan)
+                fire = np.where(eligible_n > 0, n/eligible_n, np.nan)
+            size = len(labels)
+            for key, values in [(entry_col, [entry]*size), ("horizon", [int(horizon)]*size),
+                                ("gate", [v[0] for v in labels]),
+                                ("gate_bucket", [v[1] for v in labels]),
+                                ("gate_window", [v[2] for v in labels]),
+                                ("n_obs", n.astype(int)), ("ic", ic),
+                                ("hit_rate", hit), ("fire_rate", fire)]:
+                columns[key].extend(values)
+    result = pl.DataFrame(columns, schema_overrides={"gate_window": pl.Int64, "horizon": pl.Int32,
+                          "n_obs": pl.Int64, "ic": pl.Float64,
+                          "hit_rate": pl.Float64, "fire_rate": pl.Float64})
+    metadata = combos[0] if combos is not None else {"col": 0}
+    meta_schema = pl.DataFrame([metadata]).schema
+    return result.with_columns(*[pl.lit(v, dtype=meta_schema[k]).alias(k) for k, v in metadata.items()]).select(
+        *metadata, *columns
+    ).with_columns(pl.col("ic", "hit_rate", "fire_rate").fill_nan(None)).sort(
+        "ic", descending=True, nulls_last=True)
+
+
 def predict_scan(
     z: np.ndarray,
     level: np.ndarray,
@@ -1000,6 +1055,7 @@ def predict_scan(
     entry_col: str = "entry_threshold",
     gate_min_history: int = 252,
     gate_windows: Optional[list] = None,
+    forward_moves: Optional[dict[int, np.ndarray]] = None,
 ) -> pl.DataFrame:
     """Forward-horizon predictability scan for a signal matrix.
 
@@ -1014,6 +1070,14 @@ def predict_scan(
     ignored. Metrics are trigger-event diagnostics, not trade metrics: IC,
     directional hit rate, observation count, and fire rate.
     """
+    # Discovery submits single models: dispatch them to the batched CPU path
+    # in auto mode instead of launching thousands of tiny CUDA operations.
+    shape = z.shape
+    if device in {"cpu", "auto"} and (len(shape) == 1 or shape[1] == 1):
+        if combos is not None and len(combos) != 1:
+            raise ValueError(f"combos has {len(combos)} entries but z has 1 columns")
+        return _predict_single_cpu(z, level, entries, horizons, combos, gates,
+            gate_buckets, entry_col, gate_min_history, gate_windows, forward_moves)
     xp = _get_xp(device)
 
     z = xp.asarray(z, dtype=xp.float64)
@@ -1087,7 +1151,9 @@ def predict_scan(
     blocks: list[pl.DataFrame] = []
     for horizon in horizons:
         fwd = xp.full((t_len, 1), xp.nan, dtype=xp.float64)
-        if horizon < t_len:
+        if forward_moves is not None:
+            fwd[:, 0] = xp.asarray(forward_moves[horizon])
+        elif horizon < t_len:
             fwd[:-horizon, 0] = lv[horizon:] - lv[:-horizon]
         valid_fwd = xp.isfinite(fwd)
 

@@ -188,6 +188,8 @@ class SignalConfig:
 
     # Position limits per signal
     max_positions: int = 1
+    # Optional per-leg weight columns in the signal frame, frozen at entry.
+    entry_weight_columns: dict[str, str] | None = None
 
 
 def generate_signals(signal_series: pl.Series, config: SignalConfig) -> pl.DataFrame:
@@ -578,6 +580,10 @@ class Engine:
 
         tc = self.config.transaction_cost_bps
         slip = self.config.slippage_bps
+        leg_arrays = {leg: data[leg].to_numpy() for p in self.pipelines for leg in p.trade_def.legs}
+
+        def marked_level(position, index):
+            return sum(weight * leg_arrays[leg][index] for leg, weight in position.trade_def.legs.items())
 
         for i in range(n):
             date = dates[i]
@@ -607,7 +613,8 @@ class Engine:
                 realized_today = 0.0
                 for pos in positions:
                     pos.bars_held += 1
-                    current_pnl = pos.unrealized_pnl(level)
+                    held_level = marked_level(pos, i)
+                    current_pnl = pos.unrealized_pnl(held_level)
                     pos.peak_pnl = max(pos.peak_pnl, current_pnl)
 
                     exit_reason = None
@@ -629,7 +636,7 @@ class Engine:
 
                     # Custom exit function — fires after time_stop, before trailing_stop
                     if exit_reason is None and config.exit_fn is not None:
-                        bar_data = {"signal": signal_val, "level": level}
+                        bar_data = {"signal": signal_val, "level": held_level}
                         bar_data.update({
                             c: float(arr[i])
                             for c, arr in extras_arrays[name].items()
@@ -658,7 +665,7 @@ class Engine:
                                 entry_date=pos.entry_date,
                                 exit_date=date,
                                 entry_level=pos.entry_level,
-                                exit_level=level,
+                                exit_level=held_level,
                                 direction=pos.direction,
                                 size=pos.size,
                                 pnl_bps=pnl_bps,
@@ -695,11 +702,22 @@ class Engine:
                         if not config.entry_filter_fn(direction, filter_bar):
                             direction = None
 
+                    entry_trade = pipeline.trade_def
+                    entry_level = level
+                    if direction is not None and config.entry_weight_columns:
+                        weights = {leg: float(extras_arrays[name][column][i])
+                                   for leg, column in config.entry_weight_columns.items()}
+                        if not all(np.isfinite(w) for w in weights.values()):
+                            direction = None
+                        else:
+                            entry_trade = TradeDef(pipeline.trade_def.name, weights, pipeline.trade_def.trade_type)
+                            entry_level = sum(w * leg_arrays[leg][i] for leg, w in weights.items())
+
                     if direction is not None:
                         leg_sizes = {}
                         if self.config.dv01_map:
                             leg_sizes = size_dv01_neutral(
-                                pipeline.trade_def, self.config.dv01_map
+                                entry_trade, self.config.dv01_map
                             )
 
                         # Capture rolling time stop at entry (if provided by signal)
@@ -722,9 +740,9 @@ class Engine:
                         }
 
                         pos = Position(
-                            trade_def=pipeline.trade_def,
+                            trade_def=entry_trade,
                             entry_date=date,
-                            entry_level=level + (slip * direction),
+                            entry_level=entry_level + (slip * direction),
                             direction=direction,
                             size=entry_size,
                             entry_signal=float(signal_val),
@@ -735,7 +753,7 @@ class Engine:
                         active[name].append(pos)
 
                 # --- Daily PnL (daily change in mark-to-market) ---
-                current_unrealized = sum(p.unrealized_pnl(level) for p in active[name])
+                current_unrealized = sum(p.unrealized_pnl(marked_level(p, i)) for p in active[name])
                 daily_pnl_change = realized_today + current_unrealized - prev_unrealized[name]
                 prev_unrealized[name] = current_unrealized
 

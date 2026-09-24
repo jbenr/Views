@@ -1,0 +1,104 @@
+/* Keep controls consistent, including options rendered by newer Dash dropdowns. */
+.research-bench {
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 12px;
+}
+.research-field input,
+.research-field select,
+.research-field button,
+.research-field [role="combobox"],
+.research-field [role="listbox"],
+.research-field [role="option"] {
+    font-family: Arial, Helvetica, sans-serif !important;
+    font-size: 12px !important;
+    font-weight: 400;
+}
+.research-field label {
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 12px;
+    font-weight: 400 !important;
+}
+.research-field .dash-options-list-option-text,
+.research-field .dash-dropdown-value-item,
+.research-field .dash-dropdown-content {
+    font-family: Arial, Helvetica, sans-serif !important;
+    font-size: 12px !important;
+    font-weight: 400 !important;
+}
+.research-bench summary {
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 12px;
+    color: #727272;
+    cursor: pointer;
+    line-height: 1.6;
+}
+.research-field input[type="checkbox"],
+.research-field input[type="radio"] {
+    accent-color: #773141;
+}
+
+/* The logo, progress and rolling log have a single viewport anchor. */
+.research-work-status {
+    position: fixed;
+    top: 130px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1201;
+    width: min(460px, calc(100vw - 40px));
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 9px;
+    padding: 0 14px 14px;
+    pointer-events: none;
+    text-align: center;
+    color: #858087;
+    background: rgba(255, 255, 255, 0.92);
+    border-radius: 4px;
+}
+.research-work-status .shimmer-loader {
+    position: static;
+    transform: none;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin-bottom: 4px;
+}
+.research-work-count,
+.research-work-log {
+    font-family: Consolas, "SFMono-Regular", monospace;
+    font-size: 11px;
+    font-weight: 400;
+    line-height: 1.65;
+    font-variant-numeric: tabular-nums;
+}
+.research-work-bar {
+    width: 100%;
+    height: 3px;
+    overflow: hidden;
+    border-radius: 3px;
+    background: #eeebed;
+}
+.research-work-bar-fill {
+    height: 100%;
+    border-radius: inherit;
+    background: #b39aa0;
+    transition: width 180ms ease-out;
+}
+.research-work-log { width: 100%; }
+.research-work-line {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0.45;
+}
+.research-work-line:nth-last-child(3) { opacity: 0.6; }
+.research-work-line:nth-last-child(2) { opacity: 0.75; }
+.research-work-line:last-child { opacity: 1; color: #736971; }
+.research-work-finished { margin-top: 12px; color: #858087; }
+.research-work-finished summary { overflow-wrap: anywhere; }
+.research-work-finished .research-work-log { max-width: 600px; }
+.research-work-finished .research-work-bar { display: none; }
+@media (prefers-reduced-motion: reduce) {
+    .research-work-bar-fill { transition: none; }
+}

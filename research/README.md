@@ -1,0 +1,16 @@
+# Research app
+
+Run `python -m research.app` in the `2s10s` environment (port 8052).
+
+1. In **Setup**, choose the target, fixed or beta leg weights, features and data start. **Load** and **Fill tabs** both load the selected panel and carry its target/features into the research tabs. Custom weights appear only for a custom target; beta settings appear only for beta weighting. The dependent-leg override is under Advanced beta settings.
+2. In **Dislocation**, choose a loaded feature and scan regression bases, model lookbacks, normalization/OU windows, entry thresholds, forecast horizons and gates. Normalized residual and OU z-score are distinct choices. By default discovery uses the first 70% of the aligned sample and reports the later 30% separately. Rows are ranked by median IC across tested model lookbacks, then individual IC, using the discovery period only. Event hit rate measures favorable forward moves after threshold crossings, not winning trades. Non-overlapping event counts expose dependence between forward labels.
+3. Select **Backtest** on a discovery row. Its model, gate, panel snapshot and entry threshold carry into **Trade mechanics**. Test any combination of fixed observation counts, z-score bands, fractional signal reversion and entry-half-life multiples. All valid combinations run through the full engine with each selected hard stop and the specified round-trip cost. Exit bands at or above entry are excluded.
+4. Inspect any configuration's equity curve, yearly P&L, exit reasons and closed trades. **Trade win rate** counts profitable closed trades. Average trade P&L uses closed trades; total equity also includes open marks. MAE/MFE and stops use available observations, not intraday prices. A half-life timer is rounded up and frozen at entry. Invalid half-lives cannot open a half-life-exit trade.
+
+Progress beneath the loading logo reports database reads, regression fitting, completed discovery models and completed full backtests. The local server must run as one threaded process; progress is isolated per browser page and held in server memory.
+
+Execution defaults to the next observation, with signals, gates and weights shifted together. Beta leg weights are fixed at entry and actual held legs are marked through exit. Discovery also scores beta baskets using weights frozen at each event, avoiding gains from changing hedge ratios. Same-observation execution is available as an explicitly optimistic diagnostic.
+
+Every discovery/backtest run gets a new directory under `research/data/runs/`, with data, results, metadata and source fingerprints. Backtests also save trades, equity and yearly P&L for every configuration. They do not overwrite existing promoted strategy artifacts or alter live positions. Changing the loaded panel clears the previous results and requires fresh candidate selection.
+
+The earlier/later split is a chronological research diagnostic, not a complete walk-forward validation. Model coefficients continue to update causally. Later P&L includes positions carried across the split. Repeated selection using later results consumes that sample. Relative Value and Fair Value tabs retain their existing unfinished status but receive the loaded context.

@@ -22,7 +22,7 @@ from backtest.engine import (
     trade_log,
 )
 from backtest.lab import gate_allow_mask
-from stats import roll_lr, roll_lr_diff
+from stats import roll_lr, roll_lr_diff, roll_ou_features
 from stats.diagnostics import beta_cv, quality_weight
 from utils.market_data import align_columns
 
@@ -66,6 +66,7 @@ def signal_frame(
     beta_lb: int,
     residual_lb: int | None,
     norm_lb: int,
+    signal_kind: str = "normalized",
 ) -> pl.DataFrame:
     """One candidate's causal signal and gate-condition frame.
 
@@ -93,7 +94,10 @@ def signal_frame(
         resid, beta = reg["resid"], reg["beta"]
         r2 = _window_r2(x, y, beta_lb)
 
-    signal = resid / resid.rolling_std(norm_lb, min_samples=norm_lb)
+    ou = roll_ou_features(resid, lookback=norm_lb)
+    if signal_kind not in {"normalized", "ou_z"}:
+        raise ValueError("signal_kind must be normalized or ou_z")
+    signal = ou["ou_z"] if signal_kind == "ou_z" else resid / resid.rolling_std(norm_lb, min_samples=norm_lb)
     stability = beta_cv(beta, lookback=beta_lb)
     conditions = {
         "feature_level": x,
@@ -113,9 +117,12 @@ def signal_frame(
         "resid_vol20": resid.diff().rolling_std(20),
         "resid_vol60": resid.diff().rolling_std(60),
         "resid_mom10": resid.diff(10),
+        "resid_phi": ou["ou_rho"] - 1,
+        "resid_half_life": ou["half_life"],
     }
     return frame.select("ts").with_columns(
         signal.alias("signal"), resid.alias("resid"), beta.alias("beta"), r2.alias("r2"),
+        ou["half_life"].alias("half_life"),
         *[value.alias(f"gate_{name}") for name, value in conditions.items()],
     )
 
@@ -145,6 +152,7 @@ def make_pipeline(
     exit_param: float,
     stop_loss_bps: float | None,
     state: pl.DataFrame | None = None,
+    execution_lag: int = 0,
 ) -> BooleanSignalPipeline:
     """Build one exact Engine pipeline with same-day first-crossing entries."""
     if state is None:
@@ -157,6 +165,7 @@ def make_pipeline(
                 else int(candidate["residual_lb"])
             ),
             norm_lb=int(candidate["norm_lb"]),
+            signal_kind=candidate.get("signal_kind", "normalized"),
         )
     signal = state["signal"].to_numpy().astype(float)
     previous = np.concatenate([[np.nan], signal[:-1]])
@@ -175,16 +184,25 @@ def make_pipeline(
         exit_short = signal < exit_param
     elif exit_style == "revert_frac":
         exit_fn = profit_target(float(exit_param))
+    elif exit_style == "half_life_frac":
+        valid = np.isfinite(state["half_life"].to_numpy()) & (state["half_life"].to_numpy() > 0)
+        enter_long &= valid
+        enter_short &= valid
     else:
         raise ValueError(f"unknown exit style: {exit_style!r}")
 
     def compute(_data: pl.DataFrame) -> pl.DataFrame:
-        return state.select("signal", "resid", "beta", "r2").with_columns(
+        frame = state.select("signal", "resid", "beta", "r2", "half_life").with_columns(
             pl.Series("enter_long", enter_long),
             pl.Series("enter_short", enter_short),
             pl.Series("exit_long", exit_long),
             pl.Series("exit_short", exit_short),
         )
+        if exit_style == "half_life_frac":
+            frame = frame.with_columns((pl.col("half_life") * exit_param).ceil().alias("time_stop"))
+        if candidate.get("weight_columns"):
+            frame = frame.with_columns(*[data[c] for c in candidate["weight_columns"].values()])
+        return frame.shift(execution_lag)
 
     return BooleanSignalPipeline(
         name="dislocation",
@@ -195,6 +213,7 @@ def make_pipeline(
             time_stop_bars=time_stop,
             exit_fn=exit_fn,
             max_positions=1,
+            entry_weight_columns=candidate.get("weight_columns"),
         ),
     )
 
@@ -203,7 +222,15 @@ def _metrics(result) -> dict:
     metrics = dict(result.summary())
     trades = trade_log(result.closed_trades)
     n = int(metrics["n_trades"])
-    metrics["avg_pnl_per_trade_bps"] = metrics["total_pnl_bps"] / n if n else 0.0
+    metrics["avg_pnl_per_trade_bps"] = float(trades["pnl_bps"].mean()) if n else 0.0
+    metrics["trade_win_rate"] = metrics.pop("hit_rate")
+    # Equity includes open marks even when no trade has closed yet.
+    pnl = result.equity_curve["pnl_bps"].to_numpy()
+    equity = np.cumsum(pnl)
+    metrics["total_pnl_bps"] = float(pnl.sum())
+    metrics["closed_pnl_bps"] = float(trades["pnl_bps"].sum()) if n else 0.0
+    metrics["sharpe"] = float(pnl.mean()/pnl.std()*np.sqrt(252)) if len(pnl) and pnl.std() > 0 else 0.0
+    metrics["max_drawdown_bps"] = float(np.min(equity - np.maximum.accumulate(np.r_[0, equity])[1:])) if len(equity) else 0.0
     metrics["time_in_market_pct"] = float(
         (result.daily_pnl["position_count"] > 0).mean()
     ) if len(result.daily_pnl) else 0.0
@@ -229,6 +256,8 @@ def run_grid(
     stop_loss_bps: float | None = None,
     round_trip_cost_bps: float = 0.0,
     progress: Callable[[int, int], None] | None = None,
+    stop_losses: Iterable[float | None] | None = None,
+    execution_lag: int = 0,
 ) -> tuple[pl.DataFrame, dict]:
     """Run every requested entry/exit cell through the exact Engine."""
     # Engine and signal frame must share precisely the same bar index.  The
@@ -237,8 +266,11 @@ def run_grid(
     # An outright target's name is one of its own legs; dedupe or align_columns
     # sees the same column requested twice and polars refuses the projection.
     data = align_columns(
-        data, list(dict.fromkeys([candidate["target"], candidate["feature"], *trade.legs]))
+        data, list(dict.fromkeys([candidate["target"], candidate["feature"], *trade.legs,
+                                 *candidate.get("weight_columns", {}).values()]))
     ).sort("ts")
+    if execution_lag not in (0, 1):
+        raise ValueError("execution_lag must be 0 or 1")
     # The relationship and its gate are invariant across entry and exit
     # mechanics.  Build them once; only the exact position state machine is
     # repeated for each requested grid cell.
@@ -251,20 +283,27 @@ def run_grid(
             else int(candidate["residual_lb"])
         ),
         norm_lb=int(candidate["norm_lb"]),
+        signal_kind=candidate.get("signal_kind", "normalized"),
     )
     cells = [
-        (float(entry), style, float(param))
+        (float(entry), style, float(param), stop)
         for entry in entry_zs
         for style, params in exit_params.items()
         for param in params
+        for stop in (list(stop_losses) if stop_losses is not None else [stop_loss_bps])
+        if style != "band" or float(param) < float(entry)
     ]
     rows: list[dict] = []
     selected: dict = {}
-    for done, (entry_z, style, exit_param) in enumerate(cells, 1):
+    runs: dict = {}
+    rank_metric = "earlier_sharpe" if candidate.get("split_date") else "sharpe"
+    if not cells:
+        raise ValueError("No valid exit combinations: exit bands must be below entry thresholds")
+    for done, (entry_z, style, exit_param, stop) in enumerate(cells, 1):
         pipeline = make_pipeline(
             data, trade, candidate, entry_z=entry_z, exit_style=style,
-            exit_param=exit_param, stop_loss_bps=stop_loss_bps,
-            state=state,
+            exit_param=exit_param, stop_loss_bps=stop or None,
+            state=state, execution_lag=execution_lag,
         )
         result = Engine(BacktestConfig(
             transaction_cost_bps=round_trip_cost_bps,
@@ -272,17 +311,40 @@ def run_grid(
         )).add_signal(pipeline).run(data)
         metrics = _metrics(result)
         row = {
+            "config_id": str(done), "stop_loss_bps": stop,
+            "execution_lag": execution_lag,
             "entry_z": entry_z, "exit_style": style,
             "exit_param": exit_param, **metrics,
         }
+        if candidate.get("split_date"):
+            for label, predicate in (
+                ("earlier", pl.col("ts").cast(pl.Utf8) < candidate["split_date"]),
+                ("later", pl.col("ts").cast(pl.Utf8) >= candidate["split_date"]),
+            ):
+                pnl = result.daily_pnl.filter(predicate)["pnl_bps"]
+                std = float(pnl.std() or 0)
+                row[f"{label}_sharpe"] = float(pnl.mean() or 0) / std * np.sqrt(252) if std else 0.0
+                row[f"{label}_pnl_bps"] = float(pnl.sum() or 0)
         rows.append(row)
+        trades = trade_log(result.closed_trades).to_dicts()
+        for item in trades:
+            path = data.filter(pl.col("ts").is_between(item["entry_date"], item["exit_date"]))
+            held_trade = TradeDef(trade.name, {leg: item[f"entry_{col}"] for leg, col in candidate["weight_columns"].items()}) if candidate.get("weight_columns") else trade
+            moves = (held_trade.composite_series(path) - item["entry_level"]) * (1 if item["direction"] == "long" else -1)
+            item["mae_bps"] = min(0.0, float(moves.min() or 0))
+            item["mfe_bps"] = max(0.0, float(moves.max() or 0))
+        periods = result.daily_pnl.with_columns(pl.col("ts").dt.year().alias("year")).group_by("year").agg(
+            pl.col("pnl_bps").sum().alias("pnl_bps"),
+            (pl.col("position_count") > 0).sum().alias("active_days"),
+        ).sort("year").to_dicts()
+        runs[str(done)] = {"metrics": row, "trades": trades,
+                           "equity": result.equity_curve.to_dicts(), "periods": periods}
         # Preserve one fully inspectable run for the current best Sharpe.
-        if not selected or row["sharpe"] > selected["metrics"]["sharpe"]:
-            selected = {
-                "metrics": row,
-                "trades": trade_log(result.closed_trades).to_dicts(),
-                "equity": result.equity_curve.to_dicts(),
-            }
+        if not selected or (np.isfinite(row[rank_metric]) and
+                            (not np.isfinite(selected["metrics"][rank_metric]) or row[rank_metric] > selected["metrics"][rank_metric])):
+            selected = dict(runs[str(done)])
         if progress is not None:
             progress(done, len(cells))
+    selected["runs"] = runs
+    selected["rank_metric"] = rank_metric
     return pl.DataFrame(rows), selected
