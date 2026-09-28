@@ -213,6 +213,7 @@ def test_artifacts_save_every_configuration_without_overwriting(tmp_path, monkey
 
 
 def test_app_discovery_to_exit_inspection_callback_flow(tmp_path, monkeypatch):
+    from pathlib import Path
     from research import app as ui, artifacts
     from plotly.utils import PlotlyJSONEncoder
     monkeypatch.setattr(artifacts, "RUNS", tmp_path)
@@ -228,7 +229,11 @@ def test_app_discovery_to_exit_inspection_callback_flow(tmp_path, monkeypatch):
     frozen = {**row, "target": "y", "feature": "x", "panel_id": "test", "split_date": board["split_date"]}
     bt_view, _, saved = callbacks["_run_backtest_grid"](1, frozen, stored, "ignored", None,
         [0.5], ["time", "half_life_frac"], [5], [0], [0.5], [15], 0.1, [2], 1, "session")
-    assert isinstance(saved, dict) and len(saved["runs"]) == 2
+    # Every config's trades/equity/periods live on disk (see save_run), not
+    # duplicated into the Store -- that duplication was what made this
+    # callback's response balloon and appear to hang on a big grid.
+    assert isinstance(saved, dict) and "runs" not in saved and len(saved["rows"]) == 2
+    assert set(pl.read_parquet(Path(saved["run_path"]) / "trades.parquet")["config_id"]) == {"1", "2"}
     detail = callbacks["_inspect"]("1", saved)
     # All callback results must survive Dash's JSON serialization.
     json.dumps([view, status, bt_view, detail, saved], cls=PlotlyJSONEncoder)
@@ -244,5 +249,5 @@ def test_app_discovery_to_exit_inspection_callback_flow(tmp_path, monkeypatch):
     historical_candidate = dict(frozen, archive_id=run_id, panel_id=archived['panel_id'])
     _, _, archived_exits = callbacks['_run_backtest_grid'](1, historical_candidate, None, 'ignored', None,
         [.5], ['time'], [5], [0], [.5], [15], .1, [2], 1, 'session')
-    assert len(archived_exits['runs']) == 1
+    assert len(archived_exits['rows']) == 1
     json.dumps([summary, opened, opened_status], cls=PlotlyJSONEncoder)

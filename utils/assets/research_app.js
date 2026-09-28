@@ -121,4 +121,51 @@
       button.disabled = false;
     }
   });
+
+  /* Click-to-sort on tables from utils.viz.table_div(sortable=True). Pure DOM
+     reordering -- no Dash round trip -- so it works on any such table without
+     per-table wiring, and survives the table being replaced by a callback
+     since the listener is delegated on document rather than attached to the
+     header cells themselves.
+
+     Each <td> carries a data-sort attribute (see table_div's _sort_value)
+     holding either a numeric literal or a plain string; empty string means
+     "missing" and always sorts to the bottom regardless of direction. */
+  document.addEventListener("click", (event) => {
+    const th = event.target.closest(".viz-th-sortable");
+    if (!th) return;
+    const table = th.closest(".viz-table--sortable");
+    if (!table) return;
+    const headerRow = th.parentElement;
+    const colIndex = Array.prototype.indexOf.call(headerRow.children, th);
+    const tbody = table.querySelector("tbody");
+    if (!tbody) return;
+
+    const ascending = th.dataset.sortDir !== "asc";
+    Array.from(headerRow.children).forEach((cell) => {
+      if (cell !== th) delete cell.dataset.sortDir;
+      const arrow = cell.querySelector(".viz-sort-arrow");
+      if (arrow) arrow.textContent = cell === th ? (ascending ? " ▲" : " ▼") : "";
+    });
+    th.dataset.sortDir = ascending ? "asc" : "desc";
+
+    const rows = Array.from(tbody.children);
+    const valueOf = (row) => {
+      const cell = row.children[colIndex];
+      return cell ? cell.dataset.sort : "";
+    };
+    rows.sort((rowA, rowB) => {
+      const a = valueOf(rowA);
+      const b = valueOf(rowB);
+      if (a === "" && b === "") return 0;
+      if (a === "") return 1;
+      if (b === "") return -1;
+      const numA = Number(a);
+      const numB = Number(b);
+      const bothNumeric = a.trim() !== "" && b.trim() !== "" && !Number.isNaN(numA) && !Number.isNaN(numB);
+      const cmp = bothNumeric ? numA - numB : String(a).localeCompare(String(b));
+      return ascending ? cmp : -cmp;
+    });
+    rows.forEach((row) => tbody.appendChild(row));
+  });
 }());

@@ -25,6 +25,8 @@ The earlier/later split is a chronological research diagnostic, not a complete w
 
 ## Saved discovery runs
 
+The result board labels its own target definition, source and dates independently of Current Setup. Saved-run lookup defaults to verified matching target definitions: fixed versus beta weighting, leg coefficients, and (for beta targets) hedge lookback, dependent leg and weight-column mapping. These hedge settings are distinct from the discovery regression beta lookbacks. **Include other / unverified target definitions** exposes historical comparisons explicitly; loading one shows a mismatch warning. Unknown legacy settings are never inferred from the current Setup. Legacy results without complete trade weights are view-only.
+
 After loading a target and feature, **Saved discovery runs** automatically lists archived runs for that pair. Select a run to see its creation timestamp, exact data period, saved settings, missing requested settings, input-fingerprint comparison and calculation-code status. **Open saved run** ranks its existing scores without repeating discovery; it shows the whole archived grid, not just the currently requested subset. The minimum-events display filter remains adjustable when opening.
 
 **Run discovery** always starts a fresh run. New runs record the complete grid, trade weights, input fingerprint and snapshot dates. Historical data revisions count as changed inputs even when the last date is unchanged. Changed data or chronological splits require a fresh run: results are not silently stitched across snapshots. Missing settings are identified, but partial-grid continuation and in-flight checkpoints are not implemented.

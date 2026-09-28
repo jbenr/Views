@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import time
 import traceback
+from pathlib import Path
 from uuid import uuid4
 
 import polars as pl
@@ -40,6 +41,7 @@ from research.dislocation_backtest import run_grid, signal_frame, _entry_gate
 from backtest.validation import event_overlap_diagnostics
 from research.artifacts import save_run
 from research.saved_runs import grid_spec, input_hash, list_runs, compare_run, load_run, run_path
+from research.saved_runs import target_definition, definition_match, target_label
 from research import progress as work
 from research.preferences import load_preferences, save_preferences
 from backtest.engine import TradeDef
@@ -260,7 +262,7 @@ def stub_tab(title: str, needs: list[str]) -> html.Div:
 def dislocation_tab() -> html.Div:
     """Discovery then exact trade-mechanics testing for one selected row."""
     values = [
-        ("beta lookbacks", "dis-beta-lbs", DISLOCATION_BETA_LBS),
+        ("regression beta lookbacks", "dis-beta-lbs", DISLOCATION_BETA_LBS),
         ("residual windows", "dis-residual-lbs", DISLOCATION_RESIDUAL_LBS),
         ("normalization / OU lookbacks", "dis-norm-lbs", DISLOCATION_NORM_LBS),
         ("entry thresholds (z)", "dis-thresholds", DISLOCATION_THRESHOLDS),
@@ -341,7 +343,8 @@ def dislocation_tab() -> html.Div:
         html.Div(id="dis-run-info"),
         html.Details([
             html.Summary("Saved discovery runs"),
-            field("matching target / feature", dcc.Dropdown(id="dis-saved-run", options=[],
+            dcc.Checklist(id="dis-saved-other", value=[], options=[{'label': ' Include other / unverified target definitions', 'value': 'show'}]),
+            field("same target definition / feature", dcc.Dropdown(id="dis-saved-run", options=[],
                   placeholder="Load a panel to find saved runs", style={"fontSize": 12})),
             html.Div(id="dis-saved-summary"),
             html.Button("Open saved run", id="dis-saved-open", n_clicks=0,
@@ -665,7 +668,7 @@ def panel_view(
     ])
 
 
-def board_row_picker(records: list[dict]) -> html.Div:
+def board_row_picker(records: list[dict], enabled: bool = True) -> html.Div:
     """One line per discovery-board row, aligned to its index, with a Backtest
     action. table_div is the shared house table and has no room for a button
     cell, so the picker is a separate compact list rather than a table column.
@@ -688,6 +691,7 @@ def board_row_picker(records: list[dict]) -> html.Div:
             html.Span(label, style={"fontSize": 11, "fontFamily": "monospace",
                                     "color": TEXT}),
             html.Button("Backtest", id={"type": "dis-pick", "index": i},
+                        disabled=not enabled,
                         n_clicks=0, className="ref-btn",
                         style={**btn_style(), "padding": "2px 10px", "fontSize": 11,
                                "marginLeft": 12, "flexShrink": 0}),
@@ -760,6 +764,9 @@ def dislocation_view(
         if board_records:
             board = pl.DataFrame(board_records, infer_schema_length=None)
     stats = [
+        stat_block("result target", target_label(run_info)),
+        stat_block("result source", run_info.get('result_source', 'Fresh discovery')),
+        stat_block("result data period", run_info.get('data_period', 'Not recorded')),
         stat_block("feature", FEATURE_LABELS.get(feature, feature)),
         stat_block("cells tested", f"{len(results):,}"),
         stat_block(f"cells with ≥{min_events} events", f"{len(valid):,}"),
@@ -785,11 +792,11 @@ def dislocation_view(
              "repeatedly choosing from them turns that period into research data."),
         table_div(
             display.select([col for col in cols if col in display.columns]).rename({"hit_rate": "event_hit_rate", "entry_z": "entry_threshold"}).to_pandas(),
-            title="IC discovery board", max_rows=40, float_fmt=",.3f",
+            title="IC discovery board", max_rows=40, float_fmt=",.3f", sortable=True,
         ),
         note("Pick a row's Backtest button to freeze its relationship and gate "
              "for exact trade-mechanics testing below.", "dim"),
-        board_row_picker(board_records),
+        board_row_picker(board_records, enabled=run_info.get('can_backtest', True)),
     ])
     return view, board_records
 
@@ -940,7 +947,7 @@ def register_callbacks(app) -> None:
             return [], None, "", "", "", ""
         features = [f for f in stored.get("features", []) if f != stored["target"]]
         options = [{"label": FEATURE_LABELS.get(f, f), "value": f} for f in features]
-        message = f"{stored['target']} · {stored.get('weighting', 'fixed')} legs · {len(stored['rows']):,} observations"
+        message = f"Current Setup: {target_label(stored)} · {len(stored['rows']):,} observations"
         context = note(f"{message} · features: {', '.join(features) or 'none selected'}")
         return options, current if current in features else (features[0] if features else None), context, note("Loaded setup carried into discovery. Choose a discovery row to fill trade mechanics.", "good"), context, context
 
@@ -971,17 +978,29 @@ def register_callbacks(app) -> None:
 
     @app.callback(Output("bt-detail", "children"), Input("bt-inspect", "value"), State("bt-grid", "data"))
     def _inspect(config_id, stored):
-        run = (stored or {}).get("runs", {}).get(str(config_id))
-        if not run:
+        # save_run writes trades/equity/periods for every config_id to disk;
+        # read just the one being inspected rather than shipping the whole
+        # grid's detail to the browser upfront (see _run_backtest_grid).
+        saved_dir = Path((stored or {}).get("run_path", "")) if stored else None
+        if not saved_dir or not (saved_dir / "equity.parquet").is_file():
             return note("Run a backtest grid to inspect trades.")
-        trades = pl.DataFrame(run["trades"], infer_schema_length=None)
+        cid = str(config_id)
+        equity = pl.read_parquet(saved_dir / "equity.parquet").filter(pl.col("config_id") == cid)
+        if equity.is_empty():
+            return note("No saved detail for this configuration.")
+        periods_file = saved_dir / "periods.parquet"
+        periods = (pl.read_parquet(periods_file).filter(pl.col("config_id") == cid).drop("config_id")
+                   if periods_file.is_file() else pl.DataFrame())
+        trades_file = saved_dir / "trades.parquet"
+        trades = (pl.read_parquet(trades_file).filter(pl.col("config_id") == cid).drop("config_id")
+                  if trades_file.is_file() else pl.DataFrame())
         return html.Div([
-            dcc.Graph(figure={"data": [{"x": [r['ts'] for r in run['equity']],
-                                       "y": [r['cumulative_pnl'] for r in run['equity']],
+            dcc.Graph(figure={"data": [{"x": equity["ts"].to_list(),
+                                       "y": equity["cumulative_pnl"].to_list(),
                                        "type": "scatter", "mode": "lines", "name": "Net P&L"}],
                               "layout": {"title": "Selected configuration · cumulative P&L", "yaxis": {"title": "bp"},
                                          "height": 320, "margin": {"l": 55, "r": 20, "t": 45, "b": 40}}}),
-            table_div(pl.DataFrame(run["periods"]).to_pandas(), title="P&L by year", max_rows=50),
+            table_div(periods.to_pandas(), title="P&L by year", max_rows=50) if len(periods) else None,
             table_div(trades.group_by("exit_reason").agg(pl.len().alias("trades"), pl.col("pnl_bps").mean().alias("mean_pnl_bps")).to_pandas(),
                       title="Exit reasons") if len(trades) else None,
             table_div(trades.to_pandas(), title="Closed trades · MAE/MFE measured on observations", max_rows=500)
@@ -999,9 +1018,10 @@ def register_callbacks(app) -> None:
         Input("dis-signal", "value"), Input("dis-train", "value"),
         Input("dis-board", "data"), State("dis-saved-run", "value"),
         Input("dis-raw-thresholds", "value"),
+        Input("dis-saved-other", "value"),
     )
     def _find_saved(stored, feature, bases, beta, residual, norm, entries, horizons,
-                    gates, windows, signal, train, _board, selected, raw_entries=None):
+                    gates, windows, signal, train, _board, selected, raw_entries=None, show_other=None):
         if not stored or feature not in stored.get('features', []):
             return [], None, None
         request = grid_spec(bases or ['changes'], beta or DISLOCATION_BETA_LBS,
@@ -1010,13 +1030,18 @@ def register_callbacks(app) -> None:
             gates or [], windows or [126, 252, 504], signal, train, raw_entries or RAW_THRESHOLDS)
         fingerprint = input_hash(stored, feature)
         runs = list_runs(stored['target'], feature)
+        definition = target_definition(stored)
+        hidden = sum(definition_match(m, definition) != 'match' for m in runs)
+        if not show_other:
+            runs = [m for m in runs if definition_match(m, definition) == 'match']
         runs.sort(key=lambda m: (m.get('input_sha256') == fingerprint,
                                 m.get('grid') == request), reverse=True)
-        options = [dict(value=m['run_id'], label=f"{m.get('created_at', m['run_id'])} | "
+        options = [dict(value=m['run_id'], label=f"{target_label(m)} | {definition_match(m, definition)} | {m.get('created_at', m['run_id'])} | "
                     f"{m['data_start']} to {m['data_end']} | "
                     + ('same inputs' if m.get('input_sha256') == fingerprint else 'historical / unverified')) for m in runs]
         value = selected if selected in {m['run_id'] for m in runs} else (runs[0]['run_id'] if runs else None)
         return options, value, dict(grid=request, fingerprint=fingerprint,
+            target_definition=definition, hidden_definitions=hidden,
             target=stored['target'], feature=feature,
             current_start=min(r['ts'] for r in stored['rows']),
             current_end=max(r['ts'] for r in stored['rows']))
@@ -1025,11 +1050,14 @@ def register_callbacks(app) -> None:
                   Input("dis-saved-run", "value"), Input("dis-saved-query", "data"))
     def _saved_summary(run_id, query):
         if not run_id or not query:
-            return note("No saved discovery runs for this loaded target / feature.", "dim")
+            hidden = (query or {}).get('hidden_definitions', 0)
+            return note(f"No saved runs with a verified matching target definition. {hidden} other / unverified runs are hidden; use the checkbox to browse them explicitly.", "dim")
         meta = next((m for m in list_runs(query['target'], query['feature']) if m['run_id'] == run_id), None)
         if meta is None:
             return note("Saved run is no longer available.", "warn")
-        explanation = note(f"Saved: {meta['data_start']} to {meta['data_end']} ({meta['data_rows']:,} observations). "
+        explanation = note(f"Saved target: {target_label(meta)}. Current target: {target_label(query['target_definition'])}. "
+                    f"Target-definition comparison: {definition_match(meta, query['target_definition'])}. "
+                    f"Saved: {meta['data_start']} to {meta['data_end']} ({meta['data_rows']:,} observations). "
                     f"Loaded: {query['current_start']} to {query['current_end']}. "
                     + compare_run(meta, query['grid'], query['fingerprint']), "dim")
         settings = meta.get('grid', {})
@@ -1046,28 +1074,39 @@ def register_callbacks(app) -> None:
         Output("dis-board", "data", allow_duplicate=True),
         Input("dis-saved-open", "n_clicks"), State("dis-saved-run", "value"),
         State("dis-min-events", "value"), State("research-session", "data"),
+        State("dis-saved-query", "data"),
         prevent_initial_call=True,
         running=[(Output("dis-saved-open", "disabled"), True, False)],
     )
-    def _open_saved(_n, run_id, min_events, session):
+    def _open_saved(_n, run_id, min_events, session, query=None):
         if not run_id:
             return no_update, note("Choose a saved run first.", "warn"), no_update
         try:
             work.start(session, 'dis', 'Opening saved snapshot and ranking saved scores')
             meta, frame, results = load_run(run_id)
             info = dict(meta, backend='Saved results (no scan)',
+                        result_source=f'Archive {run_id}', data_period=f"{frame['ts'].min()} to {frame['ts'].max()}",
+                        can_backtest=bool(meta.get('legs')) and meta.get('weighting') in {'fixed', 'beta'}
+                            and (meta.get('weighting') != 'beta' or bool(meta.get('weight_columns'))),
                         elapsed_s=meta.get('elapsed_s', 0), cells_per_second=meta.get('cells_per_second', 0))
             view, records = dislocation_view(results, meta['feature'], info, int(min_events or 30), frame)
             fraction = float(meta.get('train_fraction', 1))
             split = str(frame['ts'][int(len(frame)*fraction)]) if fraction < 1 else None
             board = dict(target=meta['target'], feature=meta['feature'], rows=records,
                 panel_id='archive:'+run_id, split_date=split, run_path=str(run_path(run_id)),
-                archive_id=run_id, weight_columns=meta.get('weight_columns', {}))
-            text = (f"Opened saved run {run_id}: {frame['ts'].min()} to {frame['ts'].max()} · "
+                archive_id=run_id, weight_columns=meta.get('weight_columns', {}),
+                target_definition=target_definition(meta))
+            text = (f"Saved result target: {target_label(meta)}. Opened run {run_id}: {frame['ts'].min()} to {frame['ts'].max()} · "
                     f"{len(results):,} saved cells. Original settings/data; not a new scan. "
-                    "Exit tests use this saved snapshot and current engine code.")
+                    + ("Exit tests use this saved snapshot and current engine code." if info['can_backtest']
+                       else "View only: saved trade weights are incomplete; exit testing is disabled."))
+            mismatch = query and definition_match(meta, query.get('target_definition', {})) != 'match'
+            if mismatch:
+                warning = f"Historical comparison only: this is NOT a verified match for Current Setup ({target_label(query['target_definition'])})."
+                view = html.Div([note(warning, 'warn'), view])
+                text = warning + ' ' + text
             work.update(session, 'dis', 'Completed · '+text, 1, 1)
-            return view, note(text, 'good'), board
+            return view, note(text, 'warn' if mismatch else 'good'), board
         except Exception as exc:
             work.update(session, 'dis', f'Failed: {exc}')
             return no_update, note(f'Cannot open saved run: {exc}', 'bad'), no_update
@@ -1143,6 +1182,8 @@ def register_callbacks(app) -> None:
             "cells_per_second": len(results) / max(elapsed_s, 1e-9),
             "train_fraction": train_fraction, "target": target,
         }
+        info.update(target_definition(stored))
+        info.update(result_source='Fresh discovery', data_period=f"{frame['ts'].min()} to {frame['ts'].max()}")
         status = note(
             f"Completed · {backend} · {len(results):,} cells in {elapsed_s:.2f}s",
             "good",
@@ -1153,14 +1194,14 @@ def register_callbacks(app) -> None:
                 residual_lbs or DISLOCATION_RESIDUAL_LBS, norm_lbs or DISLOCATION_NORM_LBS,
                 thresholds or DISLOCATION_THRESHOLDS, horizons or DISLOCATION_HORIZONS,
                 gates or [], gate_windows or [126, 252, 504], signal_kind, train_fraction, raw_entries or RAW_THRESHOLDS),
-            input_sha256=input_hash(stored, feature), legs=stored['legs'],
-            weight_columns=stored.get('weight_columns', {}),
+            input_sha256=input_hash(stored, feature),
             signal_kind=signal_kind, min_events=min_events,
-            panel_id=stored["panel_id"], weighting=stored.get("weighting"),
+            panel_id=stored["panel_id"],
             gate_min_history=126, **info))
         view, board_records = dislocation_view(results, feature, info, int(min_events or 30), frame)
         split_date = str(frame["ts"][int(len(frame) * float(train_fraction))]) if float(train_fraction) < 1 else None
         board = {"target": target, "feature": feature, "rows": board_records,
+                 "target_definition": target_definition(stored),
                  "panel_id": stored["panel_id"], "split_date": split_date, "run_path": saved,
                  "weight_columns": stored.get("weight_columns", {})}
         work.update(session, "dis", f"Completed · {len(results):,} cells · saved {saved}", 1, 1)
@@ -1201,6 +1242,7 @@ def register_callbacks(app) -> None:
             "entry_z": row["entry_z"], "panel_id": board["panel_id"],
             "split_date": board.get("split_date"), "discovery_run": board.get("run_path"),
             "archive_id": board.get("archive_id"),
+            "target_definition": board.get("target_definition", {}),
             "weight_columns": board.get("weight_columns", {}),
         }
         gate_desc = (
@@ -1209,7 +1251,7 @@ def register_callbacks(app) -> None:
             if candidate["gate"] != "(none)" else "ungated"
         )
         label = (
-            f"{candidate['target']} vs "
+            f"{target_label(candidate.get('target_definition') or {'target': candidate['target']})} vs "
             f"{FEATURE_LABELS.get(candidate['feature'], candidate['feature'])} · "
             f"{candidate['signal_kind']} ({'target units; bp for rates' if candidate['signal_kind'] == 'raw' else 'standard deviations'}) · {candidate['fit_on']} · beta_lb={candidate['beta_lb']} · "
             f"resid_lb={candidate['residual_lb'] or '—'} · "
@@ -1245,9 +1287,12 @@ def register_callbacks(app) -> None:
         if candidate.get("archive_id"):
             try:
                 meta, snapshot, _ = load_run(candidate['archive_id'], include_results=False)
-                if not meta.get('legs'):
+                if (not meta.get('legs') or meta.get('weighting') not in {'fixed', 'beta'}
+                        or (meta.get('weighting') == 'beta' and not meta.get('weight_columns'))):
                     return note("This legacy run lacks saved trade weights. View its results, but rerun discovery to enable reliable exit tests.", "warn"), "", no_update
                 stored = dict(target=meta['target'], features=[meta['feature']], legs=meta['legs'],
+                    weighting=meta.get('weighting'), beta_lookback=meta.get('beta_lookback'),
+                    beta_dependent=meta.get('beta_dependent'), weight_columns=meta.get('weight_columns', {}),
                     panel_id=candidate['panel_id'], rows=snapshot.with_columns(pl.col('ts').cast(pl.Utf8)).to_dicts())
             except Exception as exc:
                 return note(f"Cannot open saved snapshot: {exc}", "bad"), "", no_update
@@ -1307,10 +1352,20 @@ def register_callbacks(app) -> None:
         status = note(f"Completed · {len(grid):,} cells in {elapsed_s:.2f}s", "good")
         work.update(session, "bt", "Saving every configuration's trades, equity and annual results")
         saved = save_run("exits", data, grid, dict(candidate=candidate,
-            legs=stored["legs"], weighting=stored.get("weighting"), execution_lag=lag,
+            legs=stored["legs"], weighting=stored.get("weighting"),
+            beta_lookback=stored.get('beta_lookback'), beta_dependent=stored.get('beta_dependent'),
+            weight_columns=stored.get('weight_columns', {}), execution_lag=lag,
             cost_bps=cost_bp, stop_losses=stop_bp), selected["runs"])
         work.update(session, "bt", f"Completed · saved {saved}", len(grid), len(grid))
-        return backtest_grid_view(grid, selected), status, {"rows": grid.to_dicts(), "runs": selected["runs"], "run_path": saved}
+        # Every configuration's trades/equity/periods were just written to
+        # saved (trades.parquet etc, one row per config_id) by save_run. Do
+        # not also duplicate that same data -- every cell's full equity
+        # curve, across up to thousands of cells -- into this Store; that
+        # payload has to be JSON-serialized and shipped to the browser on
+        # every run, which is what made this callback appear to hang after
+        # logging "Completed". _inspect reads a single config's detail back
+        # off disk instead.
+        return backtest_grid_view(grid, selected), status, {"rows": grid.to_dicts(), "run_path": saved}
 
     @app.callback(
         Output("panel-out", "children"),
@@ -1392,7 +1447,8 @@ def register_callbacks(app) -> None:
             "target": trade.name,
             "legs": trade.legs, "weighting": panel.weighting,
             "weight_columns": weight_columns,
-            "beta_dependent": panel.beta_dependent, "beta_lookback": panel.beta_lookback,
+            "beta_dependent": dependent_leg(trade, panel.beta_dependent) if panel.weighting == 'beta' else None,
+            "beta_lookback": panel.beta_lookback,
             "panel_id": uuid4().hex,
             "features": chart_features,
             "weight_cols": weight_cols,

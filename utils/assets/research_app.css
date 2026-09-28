@@ -22,6 +22,16 @@
     background: #f3f3f3;
 }
 
+/* table_div(sortable=True) headers. Sort behaviour lives in research_app.js. */
+.viz-th-sortable:hover {
+    background: #f0f0f0;
+}
+
+.viz-sort-arrow {
+    display: inline-block;
+    font-size: 9px;
+}
+
 @media (prefers-reduced-motion: reduce) {
     .ref-btn { transition: none; }
     .ref-btn:active { transform: none; }

@@ -33,6 +33,43 @@ def run_path(run_id):
     return path
 
 
+def target_definition(metadata):
+    definition = {key: metadata.get(key) for key in
+            ('target', 'weighting', 'legs', 'beta_lookback', 'beta_dependent', 'weight_columns')}
+    definition['weight_columns'] = metadata.get('weight_columns') or {}
+    return definition
+
+
+def definition_match(saved, current):
+    """Never infer a hedge definition from just a target name or old defaults."""
+    keys = ['target', 'weighting', 'legs']
+    if saved.get('weighting') == 'beta' or current.get('weighting') == 'beta':
+        keys += ['beta_lookback', 'beta_dependent', 'weight_columns']
+    unknown = False
+    for key in keys:
+        left, right = saved.get(key), current.get(key)
+        if left is None or right is None or (key in ('legs', 'weight_columns') and (not left or not right)):
+            unknown = True
+        elif left != right:
+            return 'different'
+    return 'unverified' if unknown else 'match'
+
+
+def target_label(metadata):
+    name = metadata.get('target', 'unknown target')
+    weighting = metadata.get('weighting')
+    if weighting == 'beta':
+        lookback = metadata.get('beta_lookback')
+        dependent = metadata.get('beta_dependent')
+        return (f"{name} · beta-weighted · hedge beta lookback {lookback if lookback is not None else 'unrecorded'} "
+                f"· dependent leg {dependent or 'unrecorded'}")
+    if weighting == 'fixed':
+        legs = metadata.get('legs')
+        weights = ', '.join(f'{leg}: {weight:g}' for leg, weight in legs.items()) if legs else 'weights unrecorded'
+        return f'{name} · fixed-weight · {weights}'
+    return f'{name} · weighting unrecorded (unverified)'
+
+
 def list_runs(target=None, feature=None):
     found = []
     for path in sorted(artifacts.RUNS.glob('*_discovery_*'), reverse=True):

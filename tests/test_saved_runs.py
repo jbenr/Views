@@ -48,3 +48,41 @@ def test_incomplete_runs_and_path_escape_are_rejected(tmp_path, monkeypatch):
     assert list_runs() == []
     with pytest.raises(ValueError):
         run_path('..')
+
+
+def test_target_definition_separates_fixed_beta_and_missing_history():
+    from research.saved_runs import definition_match, target_label
+    current = dict(target='10s30s', weighting='beta', legs={'10y': 1., '30y': -1.},
+                   beta_lookback=126, beta_dependent='30y', weight_columns={'10y': 'w10', '30y': 'w30'})
+    assert definition_match(dict(current), current) == 'match'
+    assert definition_match(dict(current, weighting='fixed'), current) == 'different'
+    assert definition_match(dict(current, beta_lookback=252), current) == 'different'
+    assert definition_match(dict(current, beta_dependent='10y'), current) == 'different'
+    assert definition_match(dict(current, beta_lookback=None), current) == 'unverified'
+    assert definition_match(dict(target='10s30s'), current) == 'unverified'
+    assert 'hedge beta lookback 126' in target_label(current)
+    assert 'fixed-weight' in target_label(dict(target='10s30s', weighting='fixed'))
+
+
+def test_archive_lookup_hides_other_target_definitions(tmp_path, monkeypatch):
+    from research import app as ui
+    monkeypatch.setattr(artifacts, 'RUNS', tmp_path)
+    data = pl.DataFrame(dict(ts=['2024-01-01', '2024-01-02'], y=[1., 2.], x=[2., 3.], wy=[1., 1.], wx=[-1., -1.]))
+    current = dict(target='y', feature='x', features=['x'], weighting='beta', legs={'y': 1., 'x': -1.},
+                   beta_lookback=126, beta_dependent='x', weight_columns={'y': 'wy', 'x': 'wx'}, rows=data.to_dicts())
+    paths = []
+    for extra in [{}, dict(weighting='fixed'), dict(beta_lookback=252), dict(beta_lookback=None)]:
+        meta = {k: v for k, v in dict(current, **extra).items() if k not in ('rows', 'features')}
+        paths.append(Path(artifacts.save_run('discovery', data, pl.DataFrame({'ic': [.2]}), meta)).name)
+    app = ui.build_app()
+    callback = next(v['callback'].__wrapped__ for v in app.callback_map.values()
+                    if v['callback'].__wrapped__.__name__ == '_find_saved')
+    args = (current, 'x', ['levels'], [63], [10], [126], [1.], [5], [], [126], ['ou_z'], .7, None, None)
+    options, chosen, query = callback(*args)
+    assert [o['value'] for o in options] == [paths[0]]
+    assert chosen == paths[0]
+    assert query['hidden_definitions'] == 3
+    assert 'beta-weighted' in options[0]['label']
+    options, _, _ = callback(*args, None, ['show'])
+    assert len(options) == 4
+    assert app.server.test_client().get('/_dash-dependencies').status_code == 200

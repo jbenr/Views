@@ -1461,6 +1461,7 @@ def table_div(
     headers=None,
     col_widths=None,
     table_style=None,
+    sortable=False,
 ):
     """Render a DataFrame as a plain HTML table -- the house table style.
 
@@ -1484,6 +1485,11 @@ def table_div(
 
     table_style adds CSS to the table element itself (rather than its scrolling
     wrapper), useful when a table needs a distinct surface within a panel.
+
+    sortable=True lets a click on a header sort the table by that column
+    (toggling ascending/descending), entirely client-side -- see
+    utils/assets/research_app.js. Off by default so existing tables are
+    unaffected; opt in per call.
     """
     from dash import html as dhtml
 
@@ -1492,6 +1498,17 @@ def table_div(
             return format(v, float_fmt)
         if isinstance(v, pd.Timestamp):
             return v.strftime("%Y-%m-%d")
+        return str(v)
+
+    def _sort_value(v):
+        if v is None:
+            return ""
+        if isinstance(v, (float, np.floating)):
+            return "" if np.isnan(v) else repr(float(v))
+        if isinstance(v, pd.Timestamp):
+            return v.isoformat()
+        if isinstance(v, (int, np.integer)):
+            return repr(int(v))
         return str(v)
 
     show = df.head(max_rows).copy()
@@ -1512,10 +1529,20 @@ def table_div(
         width = (col_widths or {}).get(col)
         return {**base, "width": width} if width else base
 
-    header = dhtml.Tr([
-        dhtml.Th(str(labels[col]), style=_with_width(th_style, col))
-        for col in render_cols
-    ])
+    if sortable:
+        header = dhtml.Tr([
+            dhtml.Th(
+                [str(labels[col]), dhtml.Span("", className="viz-sort-arrow")],
+                className="viz-th-sortable",
+                style={**_with_width(th_style, col), "cursor": "pointer"},
+            )
+            for col in render_cols
+        ])
+    else:
+        header = dhtml.Tr([
+            dhtml.Th(str(labels[col]), style=_with_width(th_style, col))
+            for col in render_cols
+        ])
     rows = []
     for record in show.to_dict("records"):
         cells = []
@@ -1525,7 +1552,8 @@ def table_div(
                 extra = cell_style(col, record[col], record)
                 if extra:
                     style = {**style, **extra}
-            cells.append(dhtml.Td(_fmt(record[col]), style=style))
+            extra_props = {"data-sort": _sort_value(record[col])} if sortable else {}
+            cells.append(dhtml.Td(_fmt(record[col]), style=style, **extra_props))
         rows.append(dhtml.Tr(cells))
 
     children = []
@@ -1544,7 +1572,7 @@ def table_div(
         base_table_style["tableLayout"] = "fixed"
     children.append(dhtml.Table(
         [dhtml.Thead(header), dhtml.Tbody(rows)],
-        className="viz-table",
+        className="viz-table viz-table--sortable" if sortable else "viz-table",
         style={**base_table_style, **(table_style or {})},
     ))
     style = {"overflowX": "auto", "marginBottom": "16px"}
