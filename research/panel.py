@@ -287,6 +287,86 @@ def beta_weighted(
     )
 
 
+@dataclass(frozen=True)
+class DerivedFeature:
+    """A feature that is the part of one series its hedges do not explain."""
+
+    name: str
+    dependent: str
+    hedges: tuple[str, ...]
+    lookback: int
+
+
+def parse_derived(spec: str) -> DerivedFeature:
+    """Parse '10y ~ 2y', '20y ~ 10y + 30y @ 63' into a canonical derived feature.
+
+    The canonical name ('10y~2y@126') is the panel column, so the same spec
+    always produces the same column and saved runs can tell specs apart.
+    """
+    body, _, lb = spec.partition("@")
+    dep, sep, rhs = body.partition("~")
+    hedges = tuple(h.strip() for h in rhs.split("+") if h.strip())
+    dep = dep.strip()
+    if not sep or not dep or not hedges:
+        raise ValueError(f"derived feature {spec!r} must look like '10y ~ 2y' or '20y ~ 10y + 30y @ 63'")
+    try:
+        lookback = int(lb.strip()) if lb.strip() else BETA_LOOKBACK
+    except ValueError as exc:
+        raise ValueError(f"derived feature lookback in {spec!r} is not an integer") from exc
+    if lookback < 20:
+        raise ValueError(f"derived feature lookback in {spec!r} must be >= 20")
+    for name in (dep, *hedges):
+        if name not in YIELDS and name not in EXO and name not in VOLS and name not in CATALOG:
+            raise ValueError(f"unknown series {name!r} in derived feature {spec!r}")
+    if dep in hedges or len(set(hedges)) != len(hedges):
+        raise ValueError(f"derived feature {spec!r} repeats a series")
+    return DerivedFeature(f"{dep}~{'+'.join(hedges)}@{lookback}", dep, hedges, lookback)
+
+
+def is_derived(name: str) -> bool:
+    return "~" in name
+
+
+def held_residual(
+    data: pl.DataFrame, feature: DerivedFeature, ts_col: str = "ts"
+) -> pl.DataFrame:
+    """Cumulative move of ``dependent`` left over after its beta hedge.
+
+    Each day's residual uses the hedge ratios fitted through the day before,
+    so the series is causal and is exactly the P&L of holding one unit of the
+    dependent leg against yesterday's beta hedge:
+
+        feature_t = SUM_s ( d dep_s - SUM_i beta_i,s-1 * d hedge_i,s )
+
+    This deliberately differs from ``beta_weighted``, which re-marks the whole
+    level at today's betas. Differencing that level adds -d beta * hedge level
+    to every daily change; with a 400bp hedge leg a 0.01 beta update is a 4bp
+    phantom move, which a changes regression would read as signal.
+
+    The level is anchored at zero when the betas warm up; only its changes and
+    windowed levels are meaningful. Returns ``ts`` and the feature column.
+    """
+    names = [feature.dependent, *feature.hedges]
+    frame = align_columns(data, names, date_col=ts_col).sort(ts_col)
+    reg = roll_mlr_diff(frame.select(feature.hedges), frame[feature.dependent],
+                        lookback=feature.lookback)
+    pad = len(frame) - len(reg)
+    dep = frame[feature.dependent].to_numpy().astype(float)
+    move = np.diff(dep, prepend=np.nan)
+    for hedge in feature.hedges:
+        beta = np.r_[np.full(pad, np.nan), reg[f"beta_{hedge}"].to_numpy().astype(float)]
+        hedge_move = np.diff(frame[hedge].to_numpy().astype(float), prepend=np.nan)
+        move = move - np.r_[np.nan, beta[:-1]] * hedge_move
+    level = np.full(len(frame), np.nan)
+    valid = np.flatnonzero(np.isfinite(move))
+    if len(valid):
+        # An ill-conditioned fit day is missing, not a zero move for the level.
+        first = valid[0]
+        level[first - 1:] = np.r_[0.0, np.nancumsum(move[first:])]
+        level[first:][~np.isfinite(move[first:])] = np.nan
+    return frame.select(ts_col).with_columns(pl.Series(feature.name, level, nan_to_null=True))
+
+
 def _needed_sources(
     target: TradeDef, features: list[str]
 ) -> tuple[list[str], list[str], list[str], list[str]]:
@@ -296,6 +376,15 @@ def _needed_sources(
     unknown_legs = set(target.legs) - yields - set(target_exo)
     if unknown_legs:
         raise ValueError(f"unknown target leg(s): {sorted(unknown_legs)}")
+    # A derived feature needs its components loaded, not itself.
+    expanded = []
+    for name in features:
+        if is_derived(name):
+            derived = parse_derived(name)
+            expanded.extend([derived.dependent, *derived.hedges])
+        else:
+            expanded.append(name)
+    features = list(dict.fromkeys(expanded))
     exo, vols, composites = [], [], []
     for name in features:
         if name in YIELDS:
@@ -359,6 +448,13 @@ def build_panel(
         target.composite_series(frame).alias(target.name),
         *[CATALOG[c].composite_series(frame).alias(c) for c in composites],
     )
+    for name in features:
+        if is_derived(name):
+            derived = parse_derived(name)
+            if derived.name != name:
+                raise ValueError(f"derived feature {name!r} is not canonical; use {derived.name!r}")
+            if name not in frame.columns:
+                frame = frame.join(held_residual(frame, derived), on="ts", how="left")
 
     if weighting not in {"fixed", "beta"}:
         raise ValueError("weighting must be 'fixed' or 'beta'")

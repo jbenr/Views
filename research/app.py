@@ -33,6 +33,8 @@ from research.panel import (
     build_panel,
     dependent_leg,
     diagnostics,
+    is_derived,
+    parse_derived,
     resolve_target,
 )
 from research.dislocation import dislocation_scan
@@ -442,9 +444,18 @@ def dislocation_backtest_controls() -> html.Div:
 # ---- setup tab --------------------------------------------------------------
 
 
+def _valid_derived(name: str) -> bool:
+    try:
+        return parse_derived(name).name == name
+    except ValueError:
+        return False
+
+
 def controls() -> html.Div:
     preferences = load_preferences(CATALOG, {name for names in FEATURE_GROUPS.values() for name in names},
-                                   DEFAULT_TARGET, DEFAULT_FEATURES)
+                                   DEFAULT_TARGET, DEFAULT_FEATURES, extra_feature=_valid_derived)
+    derived = [f for f in preferences['features'] if is_derived(f)]
+    preferences['features'] = [f for f in preferences['features'] if not is_derived(f)]
     return html.Div(children=[
         field("target", dcc.Dropdown(
             id="target", value=preferences['target'], clearable=False,
@@ -475,6 +486,11 @@ def controls() -> html.Div:
             options=[{"label": f"{group} · {FEATURE_LABELS.get(name, name)}", "value": name}
                      for group, names in FEATURE_GROUPS.items() for name in names],
             style={"fontSize": 12})),
+        field("derived features (residual / beta-weighted)", dcc.Input(
+            id="derived-features", type="text", value="; ".join(derived), debounce=True, style=INPUT,
+            placeholder="10y ~ 2y; swsp10 ~ 10y; 20y ~ 10y + 30y @ 63")),
+        note("Each is the dependent series' move left over after a rolling changes-beta hedge (default 126d), "
+             "using yesterday's betas and accumulated into a level. '10y ~ 2y' is beta-weighted 2s10s.", "dim"),
         dcc.Checklist(
             id="invert-feature", value=[],
             options=[{"label": " Invert feature in chart", "value": "invert"}],
@@ -1377,20 +1393,24 @@ def register_callbacks(app) -> None:
         State("weighting", "value"), State("beta-lb", "value"),
         State("beta-dependent", "value"),
         State("features", "value"), State("start", "value"),
-        State("invert-feature", "value"),
+        State("invert-feature", "value"), State("derived-features", "value"),
         State("research-level-window", "data"),
         State("research-session", "data"),
         running=[(Output("load", "disabled"), True, False), (Output("fill", "disabled"), True, False)],
     )
     def _load(
         _n, _fill_n, target, custom, weighting, beta_lb, beta_dependent, features, start,
-        invert_feature, chart_window, session,
+        invert_feature, derived, chart_window, session,
     ):
         try:
             work.start(session, "load", "Loading market history for the target and selected features")
             selected_target = target
             trade = resolve_target(selected_target, custom)
-            panel = build_panel(trade, features or [], start=start or START,
+            features = list(dict.fromkeys([
+                *(features or []),
+                *(parse_derived(spec).name for spec in (derived or "").split(";") if spec.strip()),
+            ]))
+            panel = build_panel(trade, features, start=start or START,
                                 weighting=weighting or "fixed",
                                 beta_lookback=int(beta_lb or BETA_LOOKBACK),
                                 beta_dependent=(beta_dependent or None) if weighting == "beta" else None,

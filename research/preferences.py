@@ -9,7 +9,7 @@ PREFERENCES = Path(__file__).parent / 'data' / 'preferences.json'
 _lock = Lock()
 
 
-def load_preferences(targets, features, default_target, default_features):
+def load_preferences(targets, features, default_target, default_features, extra_feature=lambda name: False):
     defaults = dict(target=default_target, features=list(default_features), custom=None)
     try:
         saved = json.loads(PREFERENCES.read_text(encoding='utf-8'))
@@ -24,7 +24,7 @@ def load_preferences(targets, features, default_target, default_features):
         selected = saved.get('features', default_features)
         if not isinstance(selected, list):
             selected = default_features
-        selected = list(dict.fromkeys(f for f in selected if isinstance(f, str) and f in features))
+        selected = list(dict.fromkeys(f for f in selected if isinstance(f, str) and (f in features or extra_feature(f))))
         return dict(target=target, features=selected, custom=custom if isinstance(custom, str) else None)
     except (OSError, ValueError):
         return defaults

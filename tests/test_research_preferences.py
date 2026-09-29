@@ -32,7 +32,7 @@ def test_setup_uses_latest_file_and_failed_load_does_not_overwrite(tmp_path, mon
     def get_values():
         result = {}
         def visit(node):
-            if getattr(node, 'id', None) in ('target', 'features', 'custom'):
+            if getattr(node, 'id', None) in ('target', 'features', 'custom', 'derived-features'):
                 result[node.id] = node.value
             children = getattr(node, 'children', [])
             for child in children if isinstance(children, list) else [children]:
@@ -43,6 +43,9 @@ def test_setup_uses_latest_file_and_failed_load_does_not_overwrite(tmp_path, mon
     preferences.save_preferences('10s30s', ['10y'])
     assert get_values()['target'] == '10s30s'
     assert get_values()['features'] == ['10y']
+    preferences.save_preferences('10s30s', ['10y', '10y~2y@126', 'bad~spec@1'])
+    assert get_values()['features'] == ['10y']
+    assert get_values()['derived-features'] == '10y~2y@126'
     preferences.save_preferences('custom', [], '10y:1, 30y:-1')
     assert get_values()['custom'] == '10y:1, 30y:-1'
     before = preferences.PREFERENCES.read_bytes()
@@ -52,5 +55,5 @@ def test_setup_uses_latest_file_and_failed_load_does_not_overwrite(tmp_path, mon
     def fail(*args, **kwargs):
         raise ValueError('test load failure')
     monkeypatch.setattr(ui, 'build_panel', fail)
-    callback(1, 0, '10s30s', None, 'fixed', 126, None, ['10y'], '2000-01-01', [], '6M', 'test')
+    callback(1, 0, '10s30s', None, 'fixed', 126, None, ['10y'], '2000-01-01', [], None, '6M', 'test')
     assert preferences.PREFERENCES.read_bytes() == before
