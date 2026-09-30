@@ -225,15 +225,24 @@ def test_app_discovery_to_exit_inspection_callback_flow(tmp_path, monkeypatch):
         [0.5], [5], [], [126], "ou_z", 0.7, 5, "session")
     assert isinstance(board, dict) and board["rows"]
     row = board["rows"][0]
-    assert row["n_non_overlapping"] <= row["n_obs"]
+    # Discovery rows are real backtests now, ranked on the discovery period.
+    assert row["n_trades"] >= 5 and "sharpe" in row and "later_sharpe" in row
+    assert board["cost_bps"] == 0.1 and board["execution_lag"] == 1
     frozen = {**row, "target": "y", "feature": "x", "panel_id": "test", "split_date": board["split_date"]}
     bt_view, _, saved = callbacks["_run_backtest_grid"](1, frozen, stored, "ignored", None,
         [0.5], ["time", "half_life_frac"], [5], [0], [0.5], [15], 0.1, [2], 1, "session")
-    # Every config's trades/equity/periods live on disk (see save_run), not
-    # duplicated into the Store -- that duplication was what made this
-    # callback's response balloon and appear to hang on a big grid.
+    # Trades/equity/periods live on disk, not in the Store. The vectorised
+    # grid saves exact Engine detail for its best cell; inspecting another
+    # cell reruns it through Engine, checks parity and adds it to the run.
     assert isinstance(saved, dict) and "runs" not in saved and len(saved["rows"]) == 2
-    assert set(pl.read_parquet(Path(saved["run_path"]) / "trades.parquet")["config_id"]) == {"1", "2"}
+    run_path = Path(saved["run_path"])
+    best = str(max(saved["rows"], key=lambda r: r["earlier_sharpe"])["config_id"])
+    other = ({"1", "2"} - {best}).pop()
+    assert set(pl.read_parquet(run_path / "equity.parquet")["config_id"]) == {best}
+    assert (run_path / "yearly.parquet").is_file()
+    detail = callbacks["_inspect"](other, saved)
+    assert "matches the vectorised grid" in json.dumps(detail, cls=PlotlyJSONEncoder)
+    assert set(pl.read_parquet(run_path / "equity.parquet")["config_id"]) == {"1", "2"}
     detail = callbacks["_inspect"]("1", saved)
     # All callback results must survive Dash's JSON serialization.
     json.dumps([view, status, bt_view, detail, saved], cls=PlotlyJSONEncoder)
@@ -251,3 +260,79 @@ def test_app_discovery_to_exit_inspection_callback_flow(tmp_path, monkeypatch):
         [.5], ['time'], [5], [0], [.5], [15], .1, [2], 1, 'session')
     assert len(archived_exits['rows']) == 1
     json.dumps([summary, opened, opened_status], cls=PlotlyJSONEncoder)
+
+
+def test_backtest_discovery_validation_pick_and_legacy_ic_runs(tmp_path, monkeypatch):
+    from pathlib import Path
+    from research import app as ui, artifacts
+    from research.saved_runs import grid_spec
+    from plotly.utils import PlotlyJSONEncoder
+    monkeypatch.setattr(artifacts, "RUNS", tmp_path)
+    app = ui.build_app()
+    callbacks = {v["callback"].__wrapped__.__name__: v["callback"].__wrapped__ for v in app.callback_map.values()}
+    stored = {"target": "y", "legs": {"y": 1}, "features": ["x"], "panel_id": "test",
+              "weighting": "fixed", "rows": panel().with_columns(pl.col("ts").cast(pl.Utf8)).to_dicts()}
+    args = (1, stored, "x", ["levels"], [30], [10], [40], [0.5], [5, 10], [], [126], "ou_z", 0.7, 5, "session", None)
+
+    refused, _, _ = callbacks["_run_dislocation"](*args, 0.25, 1, 0, "cv_mean", 0)
+    assert "needs cross-validation blocks" in json.dumps(refused, cls=PlotlyJSONEncoder)
+
+    view, _, board = callbacks["_run_dislocation"](*args, 0.25, 0, 3, "cv_mean", 2)
+    text = json.dumps(view, cls=PlotlyJSONEncoder)
+    assert "SELECTION CHECKS" in text and "PLACEBO" in text
+    meta = json.loads((Path(board["run_path"]) / "metadata.json").read_text(encoding="utf-8"))
+    assert meta["scoring"] == "backtest" and meta["cv_folds"] == 3 and len(meta["placebo"]) == 2
+    assert meta["selection_checks"] and meta["grid"]["cost_bps"] == 0.25
+
+    assert callbacks["_pick_dislocation_candidate"]([0] * len(board["rows"]), board, [0.5], [20]) == (no_update_marker(),) * 6
+    candidate, label, entries, stops, cost, lag = ui.freeze_candidate(board, 1, [0.5], [20])
+    row = board["rows"][1]
+    assert candidate["beta_lb"] == row["beta_lb"] and candidate["gate"] == row["gate"]
+    assert stops == sorted({20, row["horizon"]}) and cost == 0.25 and lag == 0
+
+    run_id = Path(board["run_path"]).name
+    reopened, _, archived = callbacks["_open_saved"](1, run_id, 5, "session")
+    assert "SELECTION CHECKS" in json.dumps(reopened, cls=PlotlyJSONEncoder)
+    assert archived["rows"] == board["rows"] and archived["cost_bps"] == 0.25
+
+    # A discovery run saved before backtest scoring still opens, on the IC board.
+    frame, results = dislocation_scan(panel(), target="y", feature="x", beta_lookbacks=[30], residual_lookbacks=[10],
+                                      normalization_lookbacks=[40], thresholds=[0.5], horizons=[5], gate_names=[],
+                                      fit_on=["levels"], signal_kind="ou_z", train_fraction=0.7, device="cpu")
+    legacy = artifacts.save_run("discovery", frame, results, dict(
+        feature="x", target="y", legs={"y": 1}, weighting="fixed", weight_columns={}, train_fraction=0.7,
+        grid=grid_spec(["levels"], [30], [10], [40], [0.5], [5], [], [126], "ou_z", 0.7)))
+    opened, status, legacy_board = callbacks["_open_saved"](1, Path(legacy).name, 5, "session")
+    assert "legacy IC board" in json.dumps(opened, cls=PlotlyJSONEncoder)
+    assert legacy_board["rows"] and "ic" in legacy_board["rows"][0]
+
+
+def no_update_marker():
+    from dash import no_update
+    return no_update
+
+
+def test_pnl_heatmap_sums_months_colours_by_sign_and_blanks_missing_months():
+    from research.app import pnl_heatmap
+    days = [date(2020, 11, 2) + timedelta(days=i) for i in range(90)]  # Nov 2020 .. Jan 2021
+    pnl = [1.0 if d.month == 11 else -2.0 if d.month == 12 else 0.5 for d in days]
+    equity = pl.DataFrame({"ts": days, "pnl_bps": pnl})
+    periods = pl.DataFrame({"year": [2020, 2021], "pnl_bps": [29.0 - 62.0, 15.0], "active_days": [60, 30]})
+    view = pnl_heatmap(equity, periods).to_plotly_json()
+    table_el = view["props"]["children"][1].to_plotly_json()
+    header = [th.children[0] if isinstance(th.children, list) else th.children
+              for th in table_el["props"]["children"][0].children.children]
+    assert header[:2] == ["year", "Jan"] and header[-2:] == ["full year", "active days"]
+    rows = table_el["props"]["children"][1].children
+    cells = {r.children[0].children: {header[i]: c for i, c in enumerate(r.children)} for r in rows}
+    assert cells["2020"]["Nov"].children == "29.0" and cells["2020"]["Dec"].children == "-62.0"
+    assert cells["2020"]["Jan"].children == "" and "background" not in cells["2020"]["Jan"].style
+    assert cells["2021"]["Jan"].children == "15.0"
+    blue, red = cells["2020"]["Nov"].style["background"], cells["2020"]["Dec"].style["background"]
+    assert blue.startswith("rgb(") and red.startswith("rgb(")
+    r, g, b = map(int, blue[4:-1].split(","))
+    assert b > r  # gains lean blue
+    r, g, b = map(int, red[4:-1].split(","))
+    assert r > b  # losses lean red; the largest loss is full strength with white ink
+    assert cells["2020"]["Dec"].style["color"] == "#FFFFFF"
+    assert cells["2020"]["full year"].style["fontWeight"] == "bold"

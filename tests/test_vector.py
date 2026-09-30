@@ -128,3 +128,35 @@ def test_stop_needs_a_loss_strictly_beyond_the_stop_like_engine():
     assert trades["exit_date"].to_list() == [data["ts"][5]]
     np.testing.assert_allclose(got.pnl[:, 0], pnl)
     assert got.metrics["n_trades"][0] == 1
+
+
+@pytest.mark.parametrize("variant", ["plain", "gated_split", "weighted_raw"])
+def test_vector_grid_reproduces_run_grid_table(variant):
+    from research.dislocation_backtest import run_grid, run_vector_grid
+    data = market()
+    trade = TradeDef("y", {"left": -1.0, "right": 1.0})
+    cand = dict(target="y", feature="x", fit_on="changes", beta_lb=60, residual_lb=10, norm_lb=80,
+                signal_kind="normalized", gate="(none)")
+    if variant == "gated_split":
+        cand.update(gate="resid_vol20", gate_bucket="high_75", gate_window=126, split_date="2021-06-01")
+    if variant == "weighted_raw":
+        cand.update(signal_kind="raw", weight_columns={"left": "wl", "right": "wr"}, split_date="2021-01-15")
+    entries = [3.0, 5.0] if variant == "weighted_raw" else [1.0, 1.5]
+    kwargs = dict(entry_zs=entries, exit_params={"time": [5, 20], "band": [0.0, 0.5], "revert_frac": [0.5],
+                                                 "half_life_frac": [1.0]},
+                  stop_losses=[None, 3.0], round_trip_cost_bps=0.25, execution_lag=1)
+    exact, exact_sel = run_grid(data, trade, cand, **kwargs)
+    fast, fast_sel, yearly, _ = run_vector_grid(data, trade, cand, **kwargs)
+    cols = [c for c in fast.columns if c in exact.columns]
+    assert set(exact.columns) - set(fast.columns) == {"median_pnl_bps"}
+    for col in cols:
+        a, b = exact[col].to_list(), fast[col].to_list()
+        if isinstance(a[0], float) or isinstance(b[0], float):
+            np.testing.assert_allclose(np.array(b, dtype=float), np.array(a, dtype=float), atol=1e-9, err_msg=col)
+        else:
+            assert a == b, col
+    assert fast_sel["metrics"]["config_id"] == exact_sel["metrics"]["config_id"]
+    assert fast_sel["trades"] == exact_sel["trades"]
+    per_year = yearly.group_by("config_id").agg(pl.col("pnl_bps").sum())
+    total = fast.join(per_year, on="config_id")
+    np.testing.assert_allclose(total["pnl_bps"].to_numpy(), total["total_pnl_bps"].to_numpy(), atol=1e-9)

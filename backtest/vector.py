@@ -55,6 +55,22 @@ class VectorResult:
                        self.fold_sumsq[:, mask].sum(axis=1))
 
 
+def _trade_summary(n_trades, n_wins, gross_profit, gross_loss, total, summary_dd) -> list[pl.Series]:
+    """Engine.summary's trade ratios, with its conventions: 0 with no trades, inf on a zero divisor."""
+    has = n_trades > 0
+    n_loss = n_trades - n_wins
+    with np.errstate(invalid="ignore", divide="ignore"):
+        avg_win = np.where(n_wins > 0, gross_profit / np.maximum(n_wins, 1), 0.0)
+        avg_loss = np.where(n_loss > 0, gross_loss / np.maximum(n_loss, 1), 0.0)
+        profit_factor = np.where(gross_loss != 0, np.abs(gross_profit / gross_loss), np.inf)
+        calmar = np.where(summary_dd != 0, total / np.abs(summary_dd), np.inf)
+        ratio = np.where(avg_loss != 0, np.abs(avg_win / avg_loss), np.inf)
+    return [pl.Series("avg_win_bps", avg_win), pl.Series("avg_loss_bps", avg_loss),
+            pl.Series("profit_factor", np.where(has, profit_factor, 0.0)),
+            pl.Series("calmar", np.where(has, calmar, 0.0)),
+            pl.Series("win_loss_ratio", np.where(has, ratio, 0.0))]
+
+
 def _sharpe(n: int, total: np.ndarray, total_sq: np.ndarray) -> np.ndarray:
     mean = total / n
     var = np.maximum(total_sq / n - mean * mean, 0.0)
@@ -66,7 +82,8 @@ def _sharpe(n: int, total: np.ndarray, total_sq: np.ndarray) -> np.ndarray:
 def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
             model, gate, entry, style, param, stop, cost, lag, fold, n_fold,
             keep, pnl_out, fold_sum, fold_sumsq, fold_trades, fold_wins,
-            total, closed_pnl, n_trades, n_wins, max_dd, days_held):
+            total, closed_pnl, n_trades, n_wins, max_dd, days_held,
+            gross_profit, gross_loss, closed_bars, open_end, summary_dd):
     n_bars, n_legs = legs.shape
     level = np.zeros(n_bars)
     for i in range(n_bars):
@@ -88,6 +105,9 @@ def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
         cum = 0.0
         peak = 0.0
         worst = 0.0
+        # Engine's summary drawdown (behind calmar) peaks from the first bar, not zero.
+        summary_peak = -np.inf
+        summary_worst = 0.0
         for i in range(n_bars):
             j = i - lag
             s = signals[m, j] if j >= 0 else np.nan
@@ -119,9 +139,13 @@ def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
                         fold_trades[k, f] += 1
                         n_trades[k] += 1
                         closed_pnl[k] += trade
+                        closed_bars[k] += bars
                         if trade > 0:
                             fold_wins[k, f] += 1
                             n_wins[k] += 1
+                            gross_profit[k] += trade
+                        else:
+                            gross_loss[k] += trade
                         pos = 0
                 if pos == 0 and j >= 0:
                     now = signals[m, j]
@@ -175,9 +199,13 @@ def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
             cum += daily
             peak = max(peak, cum)
             worst = min(worst, cum - peak)
+            summary_peak = max(summary_peak, cum)
+            summary_worst = min(summary_worst, cum - summary_peak)
             if keep[k] >= 0:
                 pnl_out[i, keep[k]] = daily
         max_dd[k] = worst
+        summary_dd[k] = summary_worst
+        open_end[k] = pos != 0
 
 
 def run_vector(
@@ -262,12 +290,16 @@ def run_vector(
     total, closed = np.zeros(n_cfg), np.zeros(n_cfg)
     n_trades, n_wins = np.zeros(n_cfg, np.int64), np.zeros(n_cfg, np.int64)
     max_dd, days_held = np.zeros(n_cfg), np.zeros(n_cfg, np.int64)
+    gross_profit, gross_loss = np.zeros(n_cfg), np.zeros(n_cfg)
+    closed_bars, open_end = np.zeros(n_cfg, np.int64), np.zeros(n_cfg, np.bool_)
+    summary_dd = np.zeros(n_cfg)
 
     _kernel(legs, np.asarray(leg_weights, dtype=np.float64), signals, half_life, gates, entry_w, use_w,
             model, gate, configs["entry"].cast(pl.Float64).to_numpy(), style,
             configs["exit_param"].cast(pl.Float64).to_numpy(), stop, float(cost), int(lag),
             fold, n_fold, keep_idx, pnl, fold_sum, fold_sumsq, fold_trades, fold_wins,
-            total, closed, n_trades, n_wins, max_dd, days_held)
+            total, closed, n_trades, n_wins, max_dd, days_held,
+            gross_profit, gross_loss, closed_bars, open_end, summary_dd)
 
     fold_days = np.bincount(fold, minlength=n_fold)
     metrics = configs.with_columns(
@@ -276,6 +308,12 @@ def run_vector(
         pl.Series("sharpe", _sharpe(n_bars, fold_sum.sum(axis=1), fold_sumsq.sum(axis=1))),
         pl.Series("max_drawdown_bps", max_dd),
         pl.Series("time_in_market_pct", days_held / n_bars),
+        pl.Series("avg_pnl_per_trade_bps", np.where(n_trades > 0, closed / np.maximum(n_trades, 1), 0.0)),
+        # Engine reports zero, not NaN, when nothing has closed.
+        pl.Series("avg_holding_days", np.where(n_trades > 0, closed_bars / np.maximum(n_trades, 1), 0.0)),
+        pl.Series("gross_profit_bps", gross_profit), pl.Series("gross_loss_bps", gross_loss),
+        pl.Series("open_trades", open_end.astype(np.int64)),
+        *_trade_summary(n_trades, n_wins, gross_profit, gross_loss, total, summary_dd),
     )
     return VectorResult(metrics, labels, fold_days, fold_sum, fold_sumsq, fold_trades, fold_wins,
                         pnl if kept else None)

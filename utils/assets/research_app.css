@@ -188,3 +188,41 @@
     mask-position: center;
     animation: shimmer-sweep 2.6s ease-in-out infinite;
 }
+
+
+/* Research controls: collapsible sections and folded explanations.
+   Sections read as quiet group headers; explanations stay one line until
+   opened so the sidebar shows controls, not prose. */
+.research-section {
+    border-top: 1px solid #DCDCDC;
+    padding: 8px 0 2px;
+}
+
+.research-section > summary {
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: bold;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: #333;
+    padding: 2px 0 8px;
+    list-style-position: inside;
+}
+
+.research-section-body {
+    padding-left: 2px;
+}
+
+.research-info {
+    margin: -4px 0 10px;
+}
+
+.research-info > summary {
+    cursor: pointer;
+    font-size: 11px;
+    color: #8A8A8A;
+}
+
+.research-info > summary:hover {
+    color: #333;
+}

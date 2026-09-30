@@ -22,6 +22,7 @@ from backtest.engine import (
     trade_log,
 )
 from backtest.lab import gate_allow_mask
+from backtest.vector import run_vector
 from stats import roll_lr, roll_lr_diff, roll_ou_features
 from stats.diagnostics import beta_cv, quality_weight
 from utils.market_data import align_columns
@@ -246,20 +247,9 @@ def _metrics(result) -> dict:
     return metrics
 
 
-def run_grid(
-    data: pl.DataFrame,
-    trade: TradeDef,
-    candidate: dict,
-    *,
-    entry_zs: Iterable[float],
-    exit_params: dict[str, Iterable[float]],
-    stop_loss_bps: float | None = None,
-    round_trip_cost_bps: float = 0.0,
-    progress: Callable[[int, int], None] | None = None,
-    stop_losses: Iterable[float | None] | None = None,
-    execution_lag: int = 0,
-) -> tuple[pl.DataFrame, dict]:
-    """Run every requested entry/exit cell through the exact Engine."""
+def _grid_inputs(data, trade, candidate, entry_zs, exit_params, stop_losses,
+                 stop_loss_bps, execution_lag) -> tuple[pl.DataFrame, pl.DataFrame, list[tuple]]:
+    """Aligned data, the frozen candidate's signal frame and the valid grid cells."""
     # Engine and signal frame must share precisely the same bar index.  The
     # feature can have a shorter history than the executable target legs, so
     # trim once here rather than silently attaching a shorter signal by row.
@@ -293,6 +283,106 @@ def run_grid(
         for stop in (list(stop_losses) if stop_losses is not None else [stop_loss_bps])
         if style != "band" or float(param) < float(entry)
     ]
+    return data, state, cells
+
+
+def run_detail(
+    data: pl.DataFrame,
+    trade: TradeDef,
+    candidate: dict,
+    *,
+    state: pl.DataFrame,
+    config_id: str,
+    entry_z: float,
+    exit_style: str,
+    exit_param: float,
+    stop_loss_bps: float | None,
+    round_trip_cost_bps: float,
+    execution_lag: int,
+) -> dict:
+    """One cell through the exact Engine: metrics row, trades with MAE/MFE, equity, years.
+
+    ``data`` must already be aligned to ``state`` (see ``_grid_inputs``).
+    """
+    pipeline = make_pipeline(
+        data, trade, candidate, entry_z=entry_z, exit_style=exit_style,
+        exit_param=exit_param, stop_loss_bps=stop_loss_bps or None,
+        state=state, execution_lag=execution_lag,
+    )
+    result = Engine(BacktestConfig(
+        transaction_cost_bps=round_trip_cost_bps,
+        max_total_positions=1,
+    )).add_signal(pipeline).run(data)
+    row = {
+        "config_id": config_id, "stop_loss_bps": stop_loss_bps,
+        "execution_lag": execution_lag,
+        "signal_kind": candidate.get("signal_kind", "normalized"),
+        "signal_units": "target units" if candidate.get("signal_kind") == "raw" else "standard deviations",
+        "entry_z": entry_z, "exit_style": exit_style,
+        "exit_param": exit_param, **_metrics(result),
+    }
+    if candidate.get("split_date"):
+        for label, predicate in (
+            ("earlier", pl.col("ts").cast(pl.Utf8) < candidate["split_date"]),
+            ("later", pl.col("ts").cast(pl.Utf8) >= candidate["split_date"]),
+        ):
+            pnl = result.daily_pnl.filter(predicate)["pnl_bps"]
+            std = float(pnl.std() or 0)
+            row[f"{label}_sharpe"] = float(pnl.mean() or 0) / std * np.sqrt(252) if std else 0.0
+            row[f"{label}_pnl_bps"] = float(pnl.sum() or 0)
+    trades = trade_log(result.closed_trades).to_dicts()
+    for item in trades:
+        path = data.filter(pl.col("ts").is_between(item["entry_date"], item["exit_date"]))
+        held_trade = TradeDef(trade.name, {leg: item[f"entry_{col}"] for leg, col in candidate["weight_columns"].items()}) if candidate.get("weight_columns") else trade
+        moves = (held_trade.composite_series(path) - item["entry_level"]) * (1 if item["direction"] == "long" else -1)
+        item["mae_bps"] = min(0.0, float(moves.min() or 0))
+        item["mfe_bps"] = max(0.0, float(moves.max() or 0))
+    periods = result.daily_pnl.with_columns(pl.col("ts").dt.year().alias("year")).group_by("year").agg(
+        pl.col("pnl_bps").sum().alias("pnl_bps"),
+        (pl.col("position_count") > 0).sum().alias("active_days"),
+    ).sort("year").to_dicts()
+    return {"metrics": row, "trades": trades,
+            "equity": result.equity_curve.to_dicts(), "periods": periods}
+
+
+def detail_for(
+    data: pl.DataFrame,
+    trade: TradeDef,
+    candidate: dict,
+    *,
+    config_id: str,
+    entry_z: float,
+    exit_style: str,
+    exit_param: float,
+    stop_loss_bps: float | None,
+    round_trip_cost_bps: float,
+    execution_lag: int,
+) -> dict:
+    """Exact Engine detail for one grid cell, on the same alignment as the grid."""
+    data, state, _ = _grid_inputs(data, trade, candidate, [], {}, None, None, execution_lag)
+    return run_detail(
+        data, trade, candidate, state=state, config_id=config_id, entry_z=entry_z,
+        exit_style=exit_style, exit_param=exit_param, stop_loss_bps=stop_loss_bps,
+        round_trip_cost_bps=round_trip_cost_bps, execution_lag=execution_lag,
+    )
+
+
+def run_grid(
+    data: pl.DataFrame,
+    trade: TradeDef,
+    candidate: dict,
+    *,
+    entry_zs: Iterable[float],
+    exit_params: dict[str, Iterable[float]],
+    stop_loss_bps: float | None = None,
+    round_trip_cost_bps: float = 0.0,
+    progress: Callable[[int, int], None] | None = None,
+    stop_losses: Iterable[float | None] | None = None,
+    execution_lag: int = 0,
+) -> tuple[pl.DataFrame, dict]:
+    """Run every requested entry/exit cell through the exact Engine."""
+    data, state, cells = _grid_inputs(data, trade, candidate, entry_zs, exit_params,
+                                      stop_losses, stop_loss_bps, execution_lag)
     rows: list[dict] = []
     selected: dict = {}
     runs: dict = {}
@@ -300,47 +390,14 @@ def run_grid(
     if not cells:
         raise ValueError("No valid exit combinations: exit bands must be below entry thresholds")
     for done, (entry_z, style, exit_param, stop) in enumerate(cells, 1):
-        pipeline = make_pipeline(
-            data, trade, candidate, entry_z=entry_z, exit_style=style,
-            exit_param=exit_param, stop_loss_bps=stop or None,
-            state=state, execution_lag=execution_lag,
+        run = run_detail(
+            data, trade, candidate, state=state, config_id=str(done), entry_z=entry_z,
+            exit_style=style, exit_param=exit_param, stop_loss_bps=stop,
+            round_trip_cost_bps=round_trip_cost_bps, execution_lag=execution_lag,
         )
-        result = Engine(BacktestConfig(
-            transaction_cost_bps=round_trip_cost_bps,
-            max_total_positions=1,
-        )).add_signal(pipeline).run(data)
-        metrics = _metrics(result)
-        row = {
-            "config_id": str(done), "stop_loss_bps": stop,
-            "execution_lag": execution_lag,
-            "signal_kind": candidate.get("signal_kind", "normalized"),
-            "signal_units": "target units" if candidate.get("signal_kind") == "raw" else "standard deviations",
-            "entry_z": entry_z, "exit_style": style,
-            "exit_param": exit_param, **metrics,
-        }
-        if candidate.get("split_date"):
-            for label, predicate in (
-                ("earlier", pl.col("ts").cast(pl.Utf8) < candidate["split_date"]),
-                ("later", pl.col("ts").cast(pl.Utf8) >= candidate["split_date"]),
-            ):
-                pnl = result.daily_pnl.filter(predicate)["pnl_bps"]
-                std = float(pnl.std() or 0)
-                row[f"{label}_sharpe"] = float(pnl.mean() or 0) / std * np.sqrt(252) if std else 0.0
-                row[f"{label}_pnl_bps"] = float(pnl.sum() or 0)
+        row = run["metrics"]
         rows.append(row)
-        trades = trade_log(result.closed_trades).to_dicts()
-        for item in trades:
-            path = data.filter(pl.col("ts").is_between(item["entry_date"], item["exit_date"]))
-            held_trade = TradeDef(trade.name, {leg: item[f"entry_{col}"] for leg, col in candidate["weight_columns"].items()}) if candidate.get("weight_columns") else trade
-            moves = (held_trade.composite_series(path) - item["entry_level"]) * (1 if item["direction"] == "long" else -1)
-            item["mae_bps"] = min(0.0, float(moves.min() or 0))
-            item["mfe_bps"] = max(0.0, float(moves.max() or 0))
-        periods = result.daily_pnl.with_columns(pl.col("ts").dt.year().alias("year")).group_by("year").agg(
-            pl.col("pnl_bps").sum().alias("pnl_bps"),
-            (pl.col("position_count") > 0).sum().alias("active_days"),
-        ).sort("year").to_dicts()
-        runs[str(done)] = {"metrics": row, "trades": trades,
-                           "equity": result.equity_curve.to_dicts(), "periods": periods}
+        runs[str(done)] = run
         # Preserve one fully inspectable run for the current best Sharpe.
         if not selected or (np.isfinite(row[rank_metric]) and
                             (not np.isfinite(selected["metrics"][rank_metric]) or row[rank_metric] > selected["metrics"][rank_metric])):
@@ -350,3 +407,88 @@ def run_grid(
     selected["runs"] = runs
     selected["rank_metric"] = rank_metric
     return pl.DataFrame(rows), selected
+
+
+def run_vector_grid(
+    data: pl.DataFrame,
+    trade: TradeDef,
+    candidate: dict,
+    *,
+    entry_zs: Iterable[float],
+    exit_params: dict[str, Iterable[float]],
+    stop_losses: Iterable[float | None] = (None,),
+    round_trip_cost_bps: float = 0.0,
+    execution_lag: int = 0,
+) -> tuple[pl.DataFrame, dict, pl.DataFrame, pl.DataFrame]:
+    """``run_grid``'s table from the vectorised engine; exact detail for the best cell only.
+
+    Same cells, candidate, alignment and metrics as ``run_grid`` (the parity
+    tests hold ``backtest.vector`` to ``Engine``), except the median trade,
+    which needs every trade and so is left to ``run_detail``. Returns the
+    grid, the selected best run (with its full detail under ``runs``), the
+    per-config yearly P&L and the aligned data the grid was run on.
+    """
+    data, state, cells = _grid_inputs(data, trade, candidate, entry_zs, exit_params,
+                                      stop_losses, None, execution_lag)
+    if not cells:
+        raise ValueError("No valid exit combinations: exit bands must be below entry thresholds")
+    gated = candidate.get("gate", "(none)") not in (None, "(none)")
+    configs = pl.DataFrame({
+        "model": [0] * len(cells), "gate": [0 if gated else -1] * len(cells),
+        "entry": [c[0] for c in cells], "exit_style": [c[1] for c in cells],
+        "exit_param": [c[2] for c in cells], "stop": [float(c[3] or 0.0) for c in cells],
+    })
+    weights = candidate.get("weight_columns")
+    split = candidate.get("split_date")
+    later = (data["ts"].cast(pl.Utf8) >= split).to_numpy() if split else np.zeros(len(data), dtype=bool)
+    # One fold per (year, side of the split): both views come from the same sums.
+    result = run_vector(
+        data.select(list(trade.legs)).to_numpy(), np.array(list(trade.legs.values()), dtype=float),
+        state["signal"].to_numpy()[None, :], configs,
+        half_life=state["half_life"].to_numpy()[None, :],
+        gates=_entry_gate(state, candidate)[None, :] if gated else None,
+        entry_weights=data.select([weights[leg] for leg in trade.legs]).to_numpy() if weights else None,
+        cost=round_trip_cost_bps, lag=execution_lag,
+        folds=data["ts"].dt.year().to_numpy() * 2 + later,
+    )
+    m = result.metrics
+    grid = pl.DataFrame({
+        "config_id": [str(i) for i in range(1, len(cells) + 1)],
+        "stop_loss_bps": [c[3] for c in cells],
+        "execution_lag": [execution_lag] * len(cells),
+        "signal_kind": [candidate.get("signal_kind", "normalized")] * len(cells),
+        "signal_units": ["target units" if candidate.get("signal_kind") == "raw" else "standard deviations"] * len(cells),
+        "entry_z": m["entry"], "exit_style": m["exit_style"], "exit_param": m["exit_param"],
+    }).with_columns(m.select(
+        "total_pnl_bps", "n_trades", "trade_win_rate", "sharpe", "max_drawdown_bps", "avg_holding_days",
+        "avg_pnl_per_trade_bps", "closed_pnl_bps", "time_in_market_pct", "open_trades",
+        "gross_profit_bps", "gross_loss_bps",
+        "avg_win_bps", "avg_loss_bps", "profit_factor", "calmar", "win_loss_ratio",
+    ))
+    if split:
+        is_later = result.folds % 2 == 1
+        for label, mask in (("earlier", ~is_later), ("later", is_later)):
+            # run_grid uses polars' sample std (ddof=1) for the split Sharpes.
+            n = result.fold_days[mask].sum()
+            total = result.fold_sum[:, mask].sum(axis=1)
+            sq = result.fold_sumsq[:, mask].sum(axis=1)
+            var = (sq - total * total / n) / (n - 1) if n > 1 else np.zeros(len(cells))
+            with np.errstate(invalid="ignore", divide="ignore"):
+                sharpe = np.where(var > 0, total / n / np.sqrt(np.maximum(var, 0)) * np.sqrt(252), 0.0)
+            grid = grid.with_columns(pl.Series(f"{label}_sharpe", sharpe), pl.Series(f"{label}_pnl_bps", total))
+    years = np.unique(result.folds // 2)
+    by_year = {y: result.folds // 2 == y for y in years}
+    yearly = pl.DataFrame({
+        "config_id": np.repeat(grid["config_id"].to_numpy(), len(years)),
+        "year": np.tile(years, len(cells)),
+        "pnl_bps": np.column_stack([result.fold_sum[:, by_year[y]].sum(axis=1) for y in years]).ravel(),
+        "trades": np.column_stack([result.fold_trades[:, by_year[y]].sum(axis=1) for y in years]).ravel(),
+    })
+    rank_metric = "earlier_sharpe" if split else "sharpe"
+    best = grid.row(int(np.argmax(grid[rank_metric].to_numpy())), named=True)
+    detail = run_detail(
+        data, trade, candidate, state=state, config_id=best["config_id"], entry_z=best["entry_z"],
+        exit_style=best["exit_style"], exit_param=best["exit_param"], stop_loss_bps=best["stop_loss_bps"],
+        round_trip_cost_bps=round_trip_cost_bps, execution_lag=execution_lag,
+    )
+    return grid, {**detail, "runs": {best["config_id"]: detail}, "rank_metric": rank_metric}, yearly, data

@@ -9,12 +9,17 @@ from research import artifacts
 
 
 def grid_spec(bases, beta, residual, norm, entries, horizons, gates, windows, signal, train,
-              raw_entries=(1., 2., 3., 5., 10., 15.)):
-    return dict(fit_on=sorted(bases), beta_lb=sorted(beta), residual_lb=sorted(residual),
+              raw_entries=(1., 2., 3., 5., 10., 15.), scoring='ic', cost=None, lag=None, cv_folds=0):
+    spec = dict(fit_on=sorted(bases), beta_lb=sorted(beta), residual_lb=sorted(residual),
                 norm_lb=sorted(norm), entry_z=sorted(entries), horizon=sorted(horizons),
                 gates=sorted(gates), gate_windows=sorted(windows) if gates else [],
                 signal_kind=sorted([signal] if isinstance(signal, str) else signal), train_fraction=float(train),
                 raw_entry=sorted(raw_entries) if 'raw' in ([signal] if isinstance(signal, str) else signal) else [])
+    if scoring == 'backtest':
+        # Backtest discovery results depend on trading costs, fill timing and CV blocks.
+        spec.update(scoring='backtest', cost_bps=float(cost or 0.0), execution_lag=int(lag if lag is not None else 1),
+                    cv_folds=int(cv_folds or 0))
+    return spec
 
 
 def input_hash(stored, feature):
@@ -118,9 +123,12 @@ def compare_run(meta, requested, current_hash):
             extra = sorted(set(requested.get('raw_entry', [])) - set(saved.get('raw_entry', [])))
             if extra:
                 missing.append(f'raw_entry (target units): {extra}')
-        for key in ('train_fraction',):
-            if saved[key] != requested[key]:
-                missing.append(f'{key}: requested {requested[key]}, saved {saved[key]} (rerun required)')
+        if saved.get('scoring', 'ic') != requested.get('scoring', 'ic'):
+            missing.append(f"scoring: saved {saved.get('scoring', 'ic (legacy)')}, requested "
+                           f"{requested.get('scoring', 'ic')} (rerun required)")
+        for key in ('train_fraction', 'cost_bps', 'execution_lag', 'cv_folds'):
+            if saved.get(key) != requested.get(key):
+                missing.append(f'{key}: requested {requested.get(key)}, saved {saved.get(key)} (rerun required)')
         messages.append('Missing requested settings: ' + '; '.join(missing) if missing
                         else 'Saved grid covers all requested settings. Opening shows the entire saved grid.')
     if meta.get('input_sha256') == current_hash:
@@ -130,7 +138,8 @@ def compare_run(meta, requested, current_hash):
     else:
         messages.append('Legacy input fingerprint unavailable; current-data equivalence is unverified.')
     root = Path(__file__).resolve().parent.parent
-    files = ['research/dislocation.py', 'backtest/lab.py', 'stats/ols.py', 'stats/ou.py']
+    files = ['research/dislocation.py', 'research/dislocation_backtest.py', 'backtest/lab.py',
+             'backtest/vector.py', 'backtest/validation.py', 'stats/ols.py', 'stats/ou.py']
     hashes = meta.get('source_sha256', {})
     changed = any(hashes.get(name) != hashlib.sha256((root/name).read_bytes()).hexdigest() for name in files)
     messages.append('Calculation code differs or is unverified; rerun to use current code.' if changed

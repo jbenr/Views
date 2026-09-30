@@ -541,8 +541,17 @@ def gate_allow_mask(
     allowed. Attach the mask to a strategy's signal frame and check it in
     entry_filter_fn so the exact Engine reproduces a shortlisted gate.
     """
-    _, kind, qs = parse_gate(spec)
     ranks = gate_percentile_rank(values, min_history=min_history, window=window)
+    return gate_allow_from_ranks(ranks, spec)
+
+
+def gate_allow_from_ranks(ranks: np.ndarray, spec: Union[tuple, list, dict]) -> np.ndarray:
+    """Entry-allow mask from precomputed causal percentile ranks.
+
+    Split from gate_allow_mask so a grid can rank a condition once and derive
+    every bucket from it, rather than re-ranking per bucket.
+    """
+    _, kind, qs = parse_gate(spec)
     finite = np.isfinite(ranks)
     if kind == "below":
         return finite & (ranks <= qs[0])

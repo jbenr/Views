@@ -271,3 +271,101 @@ def event_overlap_diagnostics(
         "overlap_fraction": float(np.mean(spacing < horizon)) if len(spacing) else 0.0,
         "median_spacing": float(np.median(spacing)) if len(spacing) else float("nan"),
     }
+
+
+# ── blocked cross-validation over per-fold P&L sums ─────────────────────────
+#
+# A research grid has no fitted parameters per fold -- every signal is causal
+# -- so "training" is the act of choosing a config. These helpers work on the
+# per-fold sufficient statistics that backtest.vector returns, so thousands of
+# configs are scored without holding their daily P&L.
+
+CV_SCORES = ("sharpe", "mean", "worst")
+
+
+def cv_fold_labels(n_bars: int, cut: int, folds: int, embargo: int) -> np.ndarray:
+    """Label each bar: blocks 0..folds-1 over the discovery period, -1, or ``folds``.
+
+    The discovery period ``[0, cut)`` is split into ``folds`` contiguous blocks.
+    The first ``embargo`` bars after each internal boundary are labelled -1
+    and never scored: a trade opened late in one block can still be marking
+    there, so dropping them keeps each block's P&L to trades opened inside
+    it. Bars from ``cut`` on (the untouched later period) are ``folds``.
+    """
+    if folds < 1 or not 0 < cut <= n_bars:
+        raise ValueError("need folds >= 1 and 0 < cut <= n_bars")
+    labels = np.full(n_bars, folds, dtype=np.int64)
+    edges = np.linspace(0, cut, folds + 1).round().astype(int)
+    for k in range(folds):
+        labels[edges[k]:edges[k + 1]] = k
+        if k:
+            labels[edges[k]:min(edges[k] + embargo, edges[k + 1])] = -1
+    return labels
+
+
+def pooled_sharpe(days: np.ndarray, sums: np.ndarray, sumsq: np.ndarray) -> np.ndarray:
+    """Annualised Sharpe (population std, as Engine) from summed fold statistics."""
+    n = np.asarray(days, dtype=float)
+    mean = np.divide(sums, n, out=np.zeros_like(sums, dtype=float), where=n > 0)
+    var = np.maximum(np.divide(sumsq, n, out=np.zeros_like(sums, dtype=float), where=n > 0) - mean * mean, 0.0)
+    return np.divide(mean, np.sqrt(var), out=np.zeros_like(mean), where=var > 0) * np.sqrt(252.0)
+
+
+def cv_scores(days: np.ndarray, sums: np.ndarray, sumsq: np.ndarray) -> dict[str, np.ndarray]:
+    """Per-config block Sharpes and their summaries; inputs are (folds,), (configs, folds)."""
+    per_fold = pooled_sharpe(days[None, :], sums, sumsq)
+    return {
+        "fold_sharpe": per_fold,
+        "mean": per_fold.mean(axis=1),
+        "worst": per_fold.min(axis=1),
+        "positive_share": (per_fold > 0).mean(axis=1),
+    }
+
+
+def _selection_score(days, sums, sumsq, folds, score):
+    if score == "sharpe":
+        return pooled_sharpe(days[folds].sum(), sums[:, folds].sum(axis=1), sumsq[:, folds].sum(axis=1))
+    per_fold = pooled_sharpe(days[folds][None, :], sums[:, folds], sumsq[:, folds])
+    return per_fold.mean(axis=1) if score == "mean" else per_fold.min(axis=1)
+
+
+def selection_checks(
+    days: np.ndarray,
+    sums: np.ndarray,
+    sumsq: np.ndarray,
+    score: str = "sharpe",
+    eligible: np.ndarray | None = None,
+) -> list[dict]:
+    """Does choosing the top config generalise to a block it never saw?
+
+    For each block, choose the best eligible config by ``score`` on the other
+    blocks (out-of-fold) and, separately, on earlier blocks only (walk-forward),
+    then report that config's Sharpe on the held-out block next to the median
+    eligible config's. A selection rule with no real information lands near
+    the median; one that generalises lands well above it.
+    """
+    if score not in CV_SCORES:
+        raise ValueError(f"score must be one of {CV_SCORES}")
+    folds = sums.shape[1]
+    keep = np.ones(sums.shape[0], dtype=bool) if eligible is None else np.asarray(eligible, dtype=bool)
+    if folds < 2 or not keep.any():
+        return []
+    idx = np.flatnonzero(keep)
+    days, sums, sumsq = np.asarray(days, dtype=float), sums[idx], sumsq[idx]
+    held_out = pooled_sharpe(days[None, :], sums, sumsq)
+    rows = []
+    for method in ("out-of-fold", "walk-forward"):
+        for k in range(1 if method == "walk-forward" else 0, folds):
+            chosen_from = [j for j in range(folds) if (j != k if method == "out-of-fold" else j < k)]
+            pick = int(np.argmax(_selection_score(days, sums, sumsq, chosen_from, score)))
+            others = held_out[:, k]
+            rows.append({
+                "method": method, "held_out_block": k + 1,
+                "chosen_on_blocks": ",".join(str(j + 1) for j in chosen_from),
+                "chosen_selection_score": float(_selection_score(days, sums[pick:pick + 1], sumsq[pick:pick + 1], chosen_from, score)[0]),
+                "chosen_held_out_sharpe": float(others[pick]),
+                "median_config_held_out_sharpe": float(np.median(others)),
+                "chosen_held_out_percentile": float((others < others[pick]).mean()),
+                "config_index": int(idx[pick]),
+            })
+    return rows

@@ -33,7 +33,9 @@ from typing import Callable, Iterable
 import numpy as np
 import polars as pl
 
-from backtest.lab import predict_scan
+from backtest.lab import REGIME_GATE_BUCKETS, gate_allow_from_ranks, gate_percentile_rank, predict_scan
+from backtest.validation import cv_fold_labels, cv_scores
+from backtest.vector import run_vector
 from stats.diagnostics import beta_cv, quality_weight
 from stats import roll_lr, roll_lr_diff, roll_mlr_diff, roll_ou_features
 
@@ -439,3 +441,211 @@ def dislocation_scan(
                      f"Scored {i + 1}/{len(combos)} · {combo['signal_kind']} · {combo['fit_on']} · beta {combo['beta_lb']} · residual {combo['residual_lb']} · norm {combo['norm_lb']}")
     results = pl.concat(parts, how="diagonal_relaxed")
     return frame, results
+
+
+RANK_RULES = {
+    "family": "Discovery Sharpe · family median across model lookbacks, then own",
+    "sharpe": "Discovery Sharpe",
+    "cv_mean": "CV · mean block Sharpe",
+    "cv_worst": "CV · worst block Sharpe",
+}
+_RANK_COLUMN = {"family": "family_median_sharpe", "sharpe": "sharpe",
+                "cv_mean": "cv_mean_sharpe", "cv_worst": "cv_worst_sharpe"}
+
+
+def backtest_scan(
+    data: pl.DataFrame,
+    *,
+    target: str,
+    feature: str,
+    legs: dict[str, float],
+    beta_lookbacks: Iterable[int],
+    residual_lookbacks: Iterable[int],
+    normalization_lookbacks: Iterable[int],
+    thresholds: Iterable[float],
+    holds: Iterable[int],
+    weight_columns: dict[str, str] | None = None,
+    fit_on: Iterable[str] = ("changes",),
+    signal_kind: str | Iterable[str] = "normalized",
+    raw_thresholds: Iterable[float] = (1.0, 2.0, 3.0, 5.0, 10.0, 15.0),
+    gate_names: Iterable[str] = (),
+    gate_windows: Iterable[int] = (126, 252, 504),
+    min_gate_history: int = 126,
+    cost_bps: float = 0.0,
+    execution_lag: int = 1,
+    train_fraction: float = 0.7,
+    cv_folds: int = 0,
+    progress: Callable[[int, int, str], None] | None = None,
+) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
+    """Discovery by real trades: every model x gate x entry x holding period, backtested.
+
+    Replaces the IC scan's forward-move scoring with the exact trade
+    semantics of Trade mechanics -- first-crossing entries, one position at a
+    time, a time-stop exit after ``holds`` bars, next-bar fills, costs and
+    entry-frozen beta weights -- run through ``backtest.vector``. The first
+    ``train_fraction`` of bars is the discovery period that ranks cells; the
+    rest is reported separately and never used to rank.
+
+    With ``cv_folds >= 2`` the discovery period is also split into blocks
+    (see ``backtest.validation.cv_fold_labels``; the embargo is the longest
+    holding period) and each cell gets block-Sharpe summaries. The per-block
+    sums are returned in the third element for ``selection_checks``.
+    """
+    from research.dislocation_backtest import signal_frame
+
+    signal_kinds = list(dict.fromkeys([signal_kind] if isinstance(signal_kind, str) else signal_kind))
+    if not signal_kinds or set(signal_kinds) - {"normalized", "ou_z", "raw"}:
+        raise ValueError("Choose normalized, ou_z, raw, or a combination")
+    bases = list(dict.fromkeys(fit_on))
+    if not bases or set(bases) - {"changes", "levels"}:
+        raise ValueError("choose regression bases from 'changes' and 'levels'")
+    holds = sorted({int(h) for h in holds})
+    if not holds or holds[0] < 1:
+        raise ValueError("holding periods must be >= 1 bar")
+    gate_names, gate_windows = list(gate_names), list(gate_windows)
+    if gate_names and any(w < min_gate_history for w in gate_windows):
+        raise ValueError(f"Gate percentile lookbacks must be >= {min_gate_history}; choose longer lookbacks or no gates.")
+    if not 0.5 <= train_fraction <= 1:
+        raise ValueError("train_fraction must be between 0.5 and 1")
+    if execution_lag not in (0, 1):
+        raise ValueError("execution_lag must be 0 or 1")
+
+    weight_columns = weight_columns or {}
+    frame = aligned_panel(data, list(dict.fromkeys([target, feature, *legs, *weight_columns.values()])))
+    n = len(frame)
+    cut = int(n * train_fraction)
+    folds = int(cv_folds) if cv_folds and cv_folds >= 2 else 1
+    labels = cv_fold_labels(n, cut, folds, embargo=max(holds))
+    leg_matrix = frame.select(list(legs)).to_numpy()
+    leg_weights = np.array(list(legs.values()), dtype=float)
+    entry_weights = frame.select([weight_columns[leg] for leg in legs]).to_numpy() if weight_columns else None
+
+    models = [
+        (kind, basis, int(beta), None if basis == "levels" else int(resid), int(norm))
+        for kind in signal_kinds for basis in bases for beta in beta_lookbacks
+        for resid in (residual_lookbacks if basis == "changes" else [None]) for norm in normalization_lookbacks
+    ]
+    rank_cache: dict = {}
+    parts, cv_sums, cv_sumsq = [], [], []
+    cv_days = None
+    for i, (kind, basis, beta, resid, norm) in enumerate(models):
+        if progress:
+            progress(i, len(models), f"Backtesting model {i + 1}/{len(models)} · {kind} · {basis} · beta {beta} · residual {resid or '—'} · norm {norm}")
+        state = signal_frame(frame, target=target, feature=feature, fit_on=basis, beta_lb=beta,
+                             residual_lb=resid, norm_lb=norm, signal_kind=kind)
+        gates, masks = [("(none)", "all", None)], []
+        for name in gate_names:
+            values = state[f"gate_{name}"].to_numpy().astype(float)
+            for window in gate_windows:
+                # Feature/target conditions repeat across models; rank them once.
+                key = (name, window, hash(values.tobytes()))
+                if key not in rank_cache:
+                    rank_cache[key] = gate_percentile_rank(values, min_history=min_gate_history, window=int(window))
+                for bucket in REGIME_GATE_BUCKETS:
+                    gates.append((name, bucket[0], int(window)))
+                    masks.append(gate_allow_from_ranks(rank_cache[key], (name, bucket[0])))
+        entries = [float(e) for e in (raw_thresholds if kind == "raw" else thresholds)]
+        cells = [(g, e, h) for g in range(len(gates)) for e in entries for h in holds]
+        configs = pl.DataFrame({
+            "model": [0] * len(cells), "gate": [g - 1 for g, _, _ in cells],
+            "entry": [e for _, e, _ in cells], "exit_style": ["time"] * len(cells),
+            "exit_param": [float(h) for _, _, h in cells],
+        })
+        result = run_vector(leg_matrix, leg_weights, state["signal"].to_numpy()[None, :], configs,
+                            gates=np.array(masks) if masks else None, entry_weights=entry_weights,
+                            cost=cost_bps, lag=execution_lag, folds=labels)
+        later = result.folds == folds
+        discovery = ~later
+        trades = result.fold_trades[:, discovery].sum(axis=1)
+        wins = result.fold_wins[:, discovery].sum(axis=1)
+        columns = {
+            "signal_kind": kind,
+            "signal_units": "target units" if kind == "raw" else "standard deviations",
+            "fit_on": basis, "beta_lb": beta, "residual_lb": resid, "norm_lb": norm,
+            "entry_z": [e for _, e, _ in cells], "horizon": [h for _, _, h in cells],
+            "gate": [gates[g][0] for g, _, _ in cells], "gate_bucket": [gates[g][1] for g, _, _ in cells],
+            "gate_window": pl.Series([gates[g][2] for g, _, _ in cells], dtype=pl.Int64),
+            "n_trades": trades,
+            "trades_per_year": trades / max(cut / 252, 1e-9),
+            "sharpe": result.sharpe(discovery),
+            "pnl_bps": result.fold_sum[:, discovery].sum(axis=1),
+            "win_rate": np.where(trades > 0, wins / np.maximum(trades, 1), np.nan),
+        }
+        if later.any() and result.fold_days[later].sum():
+            columns.update(later_sharpe=result.sharpe(later), later_pnl_bps=result.fold_sum[:, later].sum(axis=1),
+                           later_trades=result.fold_trades[:, later].sum(axis=1))
+        if folds >= 2:
+            core = (result.folds >= 0) & (result.folds < folds)
+            cv_days = result.fold_days[core]
+            cv_sums.append(result.fold_sum[:, core])
+            cv_sumsq.append(result.fold_sumsq[:, core])
+            scores = cv_scores(cv_days, cv_sums[-1], cv_sumsq[-1])
+            columns.update(cv_mean_sharpe=scores["mean"], cv_worst_sharpe=scores["worst"],
+                           cv_positive_share=scores["positive_share"])
+        parts.append(pl.DataFrame(columns))
+    if progress:
+        progress(len(models), len(models), f"Backtested {sum(len(p) for p in parts):,} cells")
+    results = pl.concat(parts, how="diagonal_relaxed").with_columns(
+        pl.col("residual_lb").cast(pl.Int64), pl.col("win_rate").fill_nan(None))
+    extras = {"cut": cut, "folds": folds, "labels": labels}
+    if folds >= 2:
+        extras.update(cv_days=cv_days, cv_sums=np.vstack(cv_sums), cv_sumsq=np.vstack(cv_sumsq))
+    return frame, results, extras
+
+
+def rank_board(results: pl.DataFrame, rank_by: str = "family", min_trades: int = 30) -> pl.DataFrame:
+    """Discovery-period ranking of backtest-scan cells; never looks at later columns.
+
+    ``family`` is the IC board's robustness idea kept on Sharpe: a cell's
+    family is every model lookback sharing its signal, basis, entry, holding
+    period and gate, and families are ranked by their median Sharpe first.
+    Returns every eligible cell with ``rank_score`` and a ``board_index``
+    that addresses the row in ``results``.
+    """
+    if rank_by not in RANK_RULES:
+        raise ValueError(f"rank_by must be one of {list(RANK_RULES)}")
+    column = _RANK_COLUMN[rank_by]
+    if column not in results.columns and column != "family_median_sharpe":
+        raise ValueError(f"{RANK_RULES[rank_by]} needs a cross-validated discovery run")
+    family = ["signal_kind", "fit_on", "entry_z", "horizon", "gate", "gate_bucket", "gate_window"]
+    eligible = (results.with_row_index("board_index")
+                .filter(pl.col("n_trades") >= min_trades)
+                .with_columns(pl.col("sharpe").median().over(family).alias("family_median_sharpe")))
+    keys = [column, "sharpe"] if column != "sharpe" else ["sharpe"]
+    return eligible.with_columns(pl.col(column).alias("rank_score")).sort(keys, descending=True, nulls_last=True)
+
+
+def placebo_scan(
+    data: pl.DataFrame,
+    *,
+    feature: str,
+    placebos: int,
+    rank_by: str = "family",
+    min_trades: int = 30,
+    progress: Callable[[int, int, str], None] | None = None,
+    **scan_kwargs,
+) -> list[dict]:
+    """The best discovery score the same grid finds when the feature is scrambled.
+
+    Each placebo circularly shifts the feature's daily changes by a different
+    offset (20%..80% of the sample), keeping its volatility and
+    autocorrelation but breaking any timing link to the target. The whole
+    grid is rerun and ranked with the same rule, so the resulting top scores
+    are what this search finds from noise alone.
+    """
+    frame = aligned_panel(data, list(dict.fromkeys([scan_kwargs["target"], feature, *scan_kwargs["legs"],
+                                                    *(scan_kwargs.get("weight_columns") or {}).values()])))
+    values = frame[feature].to_numpy().astype(float)
+    moves = np.diff(values, prepend=values[0])
+    offsets = np.linspace(0.2, 0.8, placebos) * len(values) if placebos > 1 else [0.5 * len(values)]
+    out = []
+    for i, offset in enumerate(offsets):
+        if progress:
+            progress(i, placebos, f"Placebo {i + 1}/{placebos}: feature changes shifted {int(offset):,} bars")
+        shifted = frame.with_columns(pl.Series(feature, values[0] + np.cumsum(np.roll(moves, int(offset)))))
+        _, results, _ = backtest_scan(shifted, feature=feature, **scan_kwargs)
+        board = rank_board(results, rank_by, min_trades)
+        out.append({"placebo": i + 1, "shift_bars": int(offset),
+                    "best_score": float(board["rank_score"][0]) if len(board) else float("nan"),
+                    "best_sharpe": float(board["sharpe"][0]) if len(board) else float("nan")})
+    return out

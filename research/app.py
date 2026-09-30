@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 import traceback
 from pathlib import Path
@@ -37,11 +38,11 @@ from research.panel import (
     parse_derived,
     resolve_target,
 )
-from research.dislocation import dislocation_scan
+from research.dislocation import RANK_RULES, backtest_scan, placebo_scan, rank_board
 from backtest.lab import REGIME_GATE_BUCKETS
-from research.dislocation_backtest import run_grid, signal_frame, _entry_gate
-from backtest.validation import event_overlap_diagnostics
-from research.artifacts import save_run
+from research.dislocation_backtest import detail_for, run_vector_grid, signal_frame, _entry_gate
+from backtest.validation import event_overlap_diagnostics, selection_checks
+from research.artifacts import append_details, save_run
 from research.saved_runs import grid_spec, input_hash, list_runs, compare_run, load_run, run_path
 from research.saved_runs import target_definition, definition_match, target_label
 from research import progress as work
@@ -188,6 +189,26 @@ def note(text: str, tone: str = "dim") -> html.Div:
                                  "marginTop": 6, "lineHeight": 1.5})
 
 
+TABLE_HEIGHT = 560  # about 20 rows under a sticky header; the rest scrolls
+
+
+def info(summary: str, *text: str) -> html.Details:
+    """Explanatory text folded behind a one-line summary."""
+    return html.Details([html.Summary(summary), *[note(t, "dim") for t in text]],
+                        className="research-info")
+
+
+def section(title: str, children: list, open: bool = True) -> html.Details:
+    """A collapsible group of controls."""
+    return html.Details([html.Summary(title), html.Div(children, className="research-section-body")],
+                        open=open, className="research-section")
+
+
+def table(df, title=None, **kwargs) -> html.Div:
+    """House table that shows about 20 rows and scrolls for the rest."""
+    return table_div(df, title=title, max_rows=kwargs.pop("max_rows", 2000), max_height=TABLE_HEIGHT, **kwargs)
+
+
 def heading(text: str, right=None) -> html.Div:
     kids = [html.Div(text.upper(), style=HEADING)]
     if right is not None:
@@ -262,110 +283,125 @@ def stub_tab(title: str, needs: list[str]) -> html.Div:
 
 
 def dislocation_tab() -> html.Div:
-    """Discovery then exact trade-mechanics testing for one selected row."""
-    values = [
-        ("regression beta lookbacks", "dis-beta-lbs", DISLOCATION_BETA_LBS),
-        ("residual windows", "dis-residual-lbs", DISLOCATION_RESIDUAL_LBS),
-        ("normalization / OU lookbacks", "dis-norm-lbs", DISLOCATION_NORM_LBS),
-        ("entry thresholds (z)", "dis-thresholds", DISLOCATION_THRESHOLDS),
-        ("forward horizons", "dis-horizons", DISLOCATION_HORIZONS),
-    ]
-    controls = [html.Button("Select all sweep options", id="dis-select-all", n_clicks=0,
-                           className="ref-btn", style={**btn_style(), "marginBottom": 8}),
-        note("Selects every discovery and exit-grid option. Keeps target, feature, data split, costs and execution timing unchanged. Does not start a run; the full grid can be very large.", "dim"),
-        html.Div(id="dis-grid-size"),
-        field("feature (load it on Setup first)", dcc.Dropdown(
-        id="dis-feature", value=None, clearable=False,
-        options=[], style={"fontSize": 12},
-    ))]
-    controls += [
+    """Discovery by real backtests, then trade-mechanics testing for one selected row."""
+    def multi(label, id_, value, choices):
+        return field(label, dcc.Dropdown(
+            id=id_, value=value, multi=True, clearable=False,
+            options=[{"label": str(v), "value": v} for v in sorted(set(value) | set(choices))]))
+
+    lookbacks = [20, 40, 60, 100, 130, 140, 190, 252, 360, 410, 504]
+    controls = [
+        field("feature (load it on Setup first)", dcc.Dropdown(id="dis-feature", value=None, clearable=False, options=[])),
         html.Div(id="dis-context"),
-        field("signals (select any combination)", dcc.Dropdown(id="dis-signal", value=["normalized"], multi=True, clearable=False,
-            options=[{"label": "Residual / rolling standard deviation", "value": "normalized"},
-                     {"label": "OU z-score", "value": "ou_z"},
-                     {"label": "Raw residual (target units)", "value": "raw"}])),
-        note("Both start from the same residual r. Scaled residual = r / rolling std(r). OU z = (r - fitted OU equilibrium) / rolling std(r).", "dim"),
-        field("raw entry thresholds (target units; bp for rates)", dcc.Dropdown(
-            id="dis-raw-thresholds", value=RAW_THRESHOLDS, multi=True, clearable=False,
-            options=[{'label': str(v), 'value': v} for v in [.5, 1., 2., 3., 5., 10., 15., 20., 25., 40., 50.]])),
-        note("Raw uses r directly, with no volatility scaling or centering. The normalization / OU window only affects OU gates and half-life exits for raw candidates; raw signals repeat across those windows.", "dim"),
-        field("discovery period", dcc.Dropdown(id="dis-train", value=0.7, clearable=False,
-            options=[{"label": "First 70%; evaluate later 30%", "value": 0.7},
-                     {"label": "First 80%; evaluate later 20%", "value": 0.8},
-                     {"label": "Full history (exploratory)", "value": 1.0}])),
-        field("minimum discovery events", dcc.Input(id="dis-min-events", type="number", value=30, min=5, step=5, style=INPUT)),
-    ]
-    controls += [field("regression basis", dcc.Checklist(
-        id="dis-fit-on", value=["changes", "levels"],
-        options=[{"label": label, "value": value}
-                 for value, label in DISLOCATION_FIT_BASES.items()],
-        labelStyle={"display": "block", "fontSize": 12, "marginBottom": 6,
-                    "color": TEXT},
-        inputStyle={"marginRight": 5},
-    ))]
-    controls += [field(label, dcc.Dropdown(
-        id=id_, value=items, multi=True, clearable=False,
-        options=[{"label": str(item), "value": item} for item in sorted(set(items + (
-            [20, 40, 60, 100, 130, 140, 190, 252, 360, 410, 504] if "lbs" in id_
-            else [0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0] if id_ == "dis-thresholds"
-            else [5, 10, 20, 40, 60, 100])))],
-        style={"fontSize": 12},
-    )) for label, id_, items in values]
-    controls += [
-        field("gate conditions", dcc.Dropdown(
-            id="dis-gates", value=DEFAULT_DISLOCATION_GATES, multi=True,
-            clearable=True,
-            options=[{"label": label, "value": name}
-                     for name, label in DISLOCATION_GATES.items()],
-            style={"fontSize": 12},
-        )),
-        html.Div(style={"display": "flex", "gap": 7, "marginTop": -7,
-                        "marginBottom": 12}, children=[
-            html.Button("All", id="dis-gates-all", n_clicks=0,
-                        className="ref-btn", style=btn_style()),
-            html.Button("None", id="dis-gates-none", n_clicks=0,
-                        className="ref-btn", style=btn_style()),
-            html.Span("None = ungated only", style={
-                "fontSize": 10, "color": DIM, "alignSelf": "center",
-            }),
+        section("Signal model", [
+            field("signals", dcc.Dropdown(id="dis-signal", value=["normalized"], multi=True, clearable=False,
+                options=[{"label": "Residual / rolling std", "value": "normalized"},
+                         {"label": "OU z-score", "value": "ou_z"},
+                         {"label": "Raw residual (target units)", "value": "raw"}])),
+            field("regression basis", dcc.Checklist(
+                id="dis-fit-on", value=["changes", "levels"],
+                options=[{"label": label, "value": value} for value, label in DISLOCATION_FIT_BASES.items()],
+                labelStyle={"display": "block", "fontSize": 12, "marginBottom": 4, "color": TEXT},
+                inputStyle={"marginRight": 5})),
+            multi("regression beta lookbacks", "dis-beta-lbs", DISLOCATION_BETA_LBS, lookbacks),
+            multi("residual windows (changes basis)", "dis-residual-lbs", DISLOCATION_RESIDUAL_LBS, lookbacks),
+            multi("normalization / OU lookbacks", "dis-norm-lbs", DISLOCATION_NORM_LBS, lookbacks),
+            info("About the signals and bases",
+                 "All signals start from the same residual r. Scaled residual = r / rolling std(r). "
+                 "OU z = (r - fitted OU equilibrium) / rolling std(r). Raw uses r directly in target units.",
+                 "Changes fits daily moves and accumulates the unexplained part over the residual window. "
+                 "Levels uses the level-regression residual, so it has no residual window (shown as —).",
+                 "For raw signals the normalization / OU window only affects OU gates, so raw cells repeat across it."),
         ]),
-        field("gate percentile lookbacks", dcc.Dropdown(
-            id="dis-gate-windows", value=[126, 252, 504], multi=True,
-            clearable=False,
-            options=[{"label": str(value), "value": value}
-                     for value in [126, 252, 504, 756, 1260, 1764]],
-            style={"fontSize": 12},
-        )),
-        note("Percentile gates require 126 valid observations; gate lookbacks must be at least 126. "
-             "Changes uses a windowed accumulated residual. Levels uses the raw "
-             "level-regression residual, so residual window is shown as —. Ungated is "
-             "always included. Each checked gate adds causal bucket variants.", "dim"),
+        section("Entries & holding", [
+            multi("entry thresholds (z)", "dis-thresholds", DISLOCATION_THRESHOLDS, [0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0]),
+            field("raw entry thresholds (target units)", dcc.Dropdown(
+                id="dis-raw-thresholds", value=RAW_THRESHOLDS, multi=True, clearable=False,
+                options=[{"label": str(v), "value": v} for v in [.5, 1., 2., 3., 5., 10., 15., 20., 25., 40., 50.]])),
+            multi("holding periods (time stop, bars)", "dis-horizons", DISLOCATION_HORIZONS, [3, 5, 10, 20, 40, 60, 100]),
+            field("minimum discovery-period trades", dcc.Input(id="dis-min-events", type="number", value=30, min=5, step=5, style=INPUT)),
+            info("How discovery trades",
+                 "Every cell is a real backtest: enter on the first threshold crossing, hold one position at a time, "
+                 "exit after the holding period, with the fills, costs and entry-frozen beta weights below. "
+                 "Trade mechanics then varies exits and stops for one chosen row."),
+        ]),
+        section("Gates", [
+            field("gate conditions", dcc.Dropdown(
+                id="dis-gates", value=DEFAULT_DISLOCATION_GATES, multi=True, clearable=True,
+                options=[{"label": label, "value": name} for name, label in DISLOCATION_GATES.items()])),
+            html.Div(style={"display": "flex", "gap": 7, "marginTop": -6, "marginBottom": 12}, children=[
+                html.Button("All", id="dis-gates-all", n_clicks=0, className="ref-btn", style=btn_style()),
+                html.Button("None", id="dis-gates-none", n_clicks=0, className="ref-btn", style=btn_style()),
+                html.Span("None = ungated only", style={"fontSize": 10, "color": DIM, "alignSelf": "center"}),
+            ]),
+            field("gate percentile lookbacks", dcc.Dropdown(
+                id="dis-gate-windows", value=[126, 252, 504], multi=True, clearable=False,
+                options=[{"label": str(v), "value": v} for v in [126, 252, 504, 756, 1260, 1764]])),
+            info("About gates",
+                 "Each checked condition is ranked against its own trailing history (causal percentiles) and "
+                 "adds 12 regime buckets per lookback. Ungated cells are always included. Percentile gates need "
+                 "126 valid observations, so lookbacks must be at least 126."),
+        ], open=False),
+        section("Costs & execution", [
+            field("round-trip cost (bp)", dcc.Dropdown(id="dis-cost", value=0.1, clearable=False,
+                options=[{"label": str(v), "value": v} for v in [0.0, 0.1, 0.25, 0.5, 1.0]])),
+            field("execution", dcc.Dropdown(id="dis-lag", value=1, clearable=False,
+                options=[{"label": "Next observation (signal known before fill)", "value": 1},
+                         {"label": "Same observation (optimistic diagnostic)", "value": 0}])),
+        ]),
+        section("Sample & validation", [
+            field("discovery period", dcc.Dropdown(id="dis-train", value=0.7, clearable=False,
+                options=[{"label": "First 70%; hold out later 30%", "value": 0.7},
+                         {"label": "First 80%; hold out later 20%", "value": 0.8},
+                         {"label": "Full history (exploratory)", "value": 1.0}])),
+            field("cross-validation blocks", dcc.Dropdown(id="dis-cv", value=0, clearable=False,
+                options=[{"label": "Off", "value": 0}, *[{"label": f"{k} blocks", "value": k} for k in (3, 5, 8, 10)]])),
+            field("rank by", dcc.Dropdown(id="dis-rank", value="family", clearable=False,
+                options=[{"label": label, "value": value} for value, label in RANK_RULES.items()])),
+            field("placebo runs", dcc.Dropdown(id="dis-placebo", value=0, clearable=False,
+                options=[{"label": "Off", "value": 0}, *[{"label": str(k), "value": k} for k in (5, 10, 25, 50)]])),
+            info("About validation",
+                 "Ranking only ever uses the discovery period; the held-out later period is reported, never ranked on.",
+                 "Cross-validation splits the discovery period into blocks, dropping the first longest-holding-period "
+                 "bars after each boundary so no trade is scored in a block it was not opened in. Each cell gets its "
+                 "block Sharpes; the selection checks then ask whether picking the top cell on some blocks picks a "
+                 "good cell on a block it never saw (out-of-fold, and walk-forward using earlier blocks only).",
+                 "Placebo runs rerun the whole grid with the feature's daily changes circularly shifted, which keeps "
+                 "its behaviour but breaks any link to the target. If the real top score does not beat the "
+                 "placebos' top scores, the search is finding noise. Each placebo costs one full discovery run."),
+        ]),
+        html.Div(style={"display": "flex", "gap": 8, "alignItems": "center", "margin": "4px 0 6px"}, children=[
+            html.Button("Select all sweep options", id="dis-select-all", n_clicks=0, className="ref-btn", style=btn_style()),
+        ]),
+        info("What Select all does",
+             "Selects every discovery and exit-grid option. Keeps target, feature, data split, costs, validation and "
+             "execution unchanged, and does not start a run."),
+        html.Div(id="dis-grid-size"),
         html.Button("Run discovery", id="dis-run", n_clicks=0,
-                    className="ref-btn", style={**btn_style(primary=True), "width": "100%"}),
+                    className="ref-btn", style={**btn_style(primary=True), "width": "100%", "marginTop": 6}),
         html.Div(id="dis-run-info"),
-        html.Details([
-            html.Summary("Saved discovery runs"),
-            dcc.Checklist(id="dis-saved-other", value=[], options=[{'label': ' Include other / unverified target definitions', 'value': 'show'}]),
+        section("Saved discovery runs", [
+            dcc.Checklist(id="dis-saved-other", value=[], options=[{"label": " Include other / unverified target definitions", "value": "show"}],
+                          style={"fontSize": 11, "marginBottom": 8}),
             field("same target definition / feature", dcc.Dropdown(id="dis-saved-run", options=[],
-                  placeholder="Load a panel to find saved runs", style={"fontSize": 12})),
+                  placeholder="Load a panel to find saved runs")),
             html.Div(id="dis-saved-summary"),
-            html.Button("Open saved run", id="dis-saved-open", n_clicks=0,
-                        className="ref-btn", style=btn_style()),
-            note("Opens the original snapshot. Run discovery above always starts a fresh run.", "dim"),
-        ], open=True, style={"marginTop": 16}),
+            html.Button("Open saved run", id="dis-saved-open", n_clicks=0, className="ref-btn", style=btn_style()),
+            note("Opens the original snapshot. Run discovery always starts a fresh run.", "dim"),
+        ], open=False),
         dcc.Store(id="dis-saved-query"),
     ]
     return html.Div(style={"padding": "18px 24px"}, children=[
         heading("dislocation discovery"),
-        html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)",
+        html.Div(style={"display": "grid", "gridTemplateColumns": "320px minmax(0, 1fr)",
                         "gap": 26, "alignItems": "start"}, children=[
-            html.Div(controls),
+            html.Div(controls, className="research-controls"),
             loading_panel("dis-out", "dis", "searching"),
         ]),
         html.Div(style={"borderTop": f"1px solid {BORDER}", "marginTop": 24,
                         "paddingTop": 18}, children=[
             heading("trade mechanics"),
-            html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)",
+            html.Div(style={"display": "grid", "gridTemplateColumns": "320px minmax(0, 1fr)",
                             "gap": 26, "alignItems": "start"}, children=[
                 dislocation_backtest_controls(),
                 loading_panel("bt-out", "bt", "backtesting"),
@@ -379,62 +415,46 @@ def dislocation_tab() -> html.Div:
 
 def dislocation_backtest_controls() -> html.Div:
     """Controls deliberately limited to execution choices, not model refitting."""
-    return html.Div([
+    def multi(label, id_, value, choices):
+        return field(label, dcc.Dropdown(id=id_, value=value, multi=True, clearable=False,
+                                         options=[{"label": str(v), "value": v} for v in choices]))
+
+    return html.Div(className="research-controls", children=[
         html.Div(id="bt-candidate", children=note(
-            "Choose Backtest on a row above to freeze its relationship and gate.", "dim"
-        )),
-        field("entry thresholds (selected signal units)", dcc.Dropdown(
-            id="bt-entry-zs", value=[0.5], multi=True,
-            clearable=False,
-            options=[{"label": str(v), "value": v}
-                     for v in [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 5., 10., 15., 20., 25., 40., 50.]],
-            style={"fontSize": 12},
-        )),
-        field("exit styles", dcc.Checklist(
-            id="bt-exit-styles", value=["time", "band", "revert_frac", "half_life_frac"],
-            options=[
-                {"label": " time stop (business days)", "value": "time"},
-                {"label": " residual band (selected signal units)", "value": "band"},
-                {"label": " reversion fraction", "value": "revert_frac"},
-                {"label": " entry half-life multiple", "value": "half_life_frac"},
-            ],
-            labelStyle={"display": "block", "fontSize": 12, "marginBottom": 6,
-                        "color": TEXT}, inputStyle={"marginRight": 5},
-        )),
-        field("time stops (d)", dcc.Dropdown(
-            id="bt-time-stops", value=[5, 10, 20, 40, 60], multi=True,
-            clearable=False,
-            options=[{"label": str(v), "value": v} for v in [3, 5, 10, 15, 20, 30, 40, 60, 80]],
-            style={"fontSize": 12},
-        )),
-        field("exit bands (selected signal units)", dcc.Dropdown(
-            id="bt-bands", value=[0.0, 0.25], multi=True, clearable=False,
-            options=[{"label": str(v), "value": v} for v in [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 2., 3., 5., 10., 15., 20.]],
-            style={"fontSize": 12},
-        )),
-        field("reversion fractions", dcc.Dropdown(
-            id="bt-revert-fracs", value=[0.25, 0.5, 0.75, 1.0], multi=True,
-            clearable=False,
-            options=[{"label": str(v), "value": v} for v in [0.25, 0.5, 0.75, 1.0]],
-            style={"fontSize": 12},
-        )),
-        field("half-life multiples", dcc.Dropdown(id="bt-half-lives", value=[0.5, 0.75, 1.0, 1.5, 2.0, 3.0], multi=True,
-            options=[{"label": str(v), "value": v} for v in [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]])),
-        field("execution", dcc.Dropdown(id="bt-lag", value=1, clearable=False,
-            options=[{"label": "Next observation (signal known before fill)", "value": 1},
-                     {"label": "Same observation (optimistic diagnostic)", "value": 0}])),
-        field("hard stops (bp)", dcc.Dropdown(
-            id="bt-stop", value=[15.0], multi=True, clearable=False,
-            options=[
-                {"label": "none", "value": 0.0},
-                *[{"label": str(v), "value": v} for v in [10.0, 15.0, 25.0, 40.0, 60.0]],
-            ], style={"fontSize": 12},
-        )),
-        field("round-trip cost (bp)", dcc.Dropdown(
-            id="bt-cost", value=0.1, clearable=False,
-            options=[{"label": str(v), "value": v} for v in [0.0, 0.1, 0.25, 0.5, 1.0]],
-            style={"fontSize": 12},
-        )),
+            "Select a discovery row, then Backtest selected row, to freeze its relationship and gate.", "dim")),
+        section("Entries", [
+            multi("entry thresholds (selected signal units)", "bt-entry-zs", [0.5],
+                  [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 5., 10., 15., 20., 25., 40., 50.]),
+        ]),
+        section("Exits", [
+            field("exit styles", dcc.Checklist(
+                id="bt-exit-styles", value=["time", "band", "revert_frac", "half_life_frac"],
+                options=[
+                    {"label": " time stop (business days)", "value": "time"},
+                    {"label": " residual band (selected signal units)", "value": "band"},
+                    {"label": " reversion fraction", "value": "revert_frac"},
+                    {"label": " entry half-life multiple", "value": "half_life_frac"},
+                ],
+                labelStyle={"display": "block", "fontSize": 12, "marginBottom": 4, "color": TEXT},
+                inputStyle={"marginRight": 5})),
+            multi("time stops (d)", "bt-time-stops", [5, 10, 20, 40, 60], [3, 5, 10, 15, 20, 30, 40, 60, 80, 100]),
+            multi("exit bands (selected signal units)", "bt-bands", [0.0, 0.25],
+                  [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 2., 3., 5., 10., 15., 20.]),
+            multi("reversion fractions", "bt-revert-fracs", [0.25, 0.5, 0.75, 1.0], [0.25, 0.5, 0.75, 1.0]),
+            multi("half-life multiples", "bt-half-lives", [0.5, 0.75, 1.0, 1.5, 2.0, 3.0], [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]),
+        ]),
+        section("Stops, costs & execution", [
+            field("hard stops (bp)", dcc.Dropdown(
+                id="bt-stop", value=[15.0], multi=True, clearable=False,
+                options=[{"label": "none", "value": 0.0},
+                         *[{"label": str(v), "value": v} for v in [10.0, 15.0, 25.0, 40.0, 60.0]]])),
+            field("round-trip cost (bp)", dcc.Dropdown(
+                id="bt-cost", value=0.1, clearable=False,
+                options=[{"label": str(v), "value": v} for v in [0.0, 0.1, 0.25, 0.5, 1.0]])),
+            field("execution", dcc.Dropdown(id="bt-lag", value=1, clearable=False,
+                options=[{"label": "Next observation (signal known before fill)", "value": 1},
+                         {"label": "Same observation (optimistic diagnostic)", "value": 0}])),
+        ]),
         html.Button("Run backtest grid", id="bt-run", n_clicks=0,
                     className="ref-btn", style={**btn_style(primary=True), "width": "100%"}),
         html.Div(id="bt-run-info"),
@@ -684,6 +704,9 @@ def panel_view(
     ])
 
 
+BOARD_ROWS = 40  # rows shown on a discovery board; the full grid is saved
+
+
 def board_row_picker(records: list[dict], enabled: bool = True) -> html.Div:
     """One line per discovery-board row, aligned to its index, with a Backtest
     action. table_div is the shared house table and has no room for a button
@@ -697,11 +720,13 @@ def board_row_picker(records: list[dict], enabled: bool = True) -> html.Div:
             f"{row['gate']}:{row['gate_bucket']} w={row['gate_window']}"
             if row["gate"] != "(none)" else "ungated"
         )
-        ic_label = f"{row['ic']:.3f}" if row['ic'] is not None else "n/a"
+        score = ("ic", row.get("ic")) if "ic" in row else ("sharpe", row.get("sharpe"))
+        score_label = f"{score[1]:.3f}" if score[1] is not None else "n/a"
         label = (
-            f"#{i + 1}  ic={ic_label}  {row.get('signal_kind', 'normalized')}  {row['fit_on']}  beta_lb={row['beta_lb']}  "
+            f"#{i + 1}  {score[0]}={score_label}  {row.get('signal_kind', 'normalized')}  {row['fit_on']}  beta_lb={row['beta_lb']}  "
             f"resid_lb={row['residual_lb'] if row['residual_lb'] is not None else '—'}  "
             f"norm_lb={row['norm_lb']}  {gate_desc}"
+            + (f"  hold={row['horizon']}" if "ic" not in row else "")
         )
         lines.append(html.Div([
             html.Span(label, style={"fontSize": 11, "fontFamily": "monospace",
@@ -717,11 +742,104 @@ def board_row_picker(records: list[dict], enabled: bool = True) -> html.Div:
                                   "marginTop": 10})
 
 
+def _display_board(board: pl.DataFrame, cols: list[str]) -> pl.DataFrame:
+    shown = board.with_row_index("#", offset=1).with_columns(
+        pl.col("residual_lb").cast(pl.Utf8).fill_null("—"))
+    return shown.select([c for c in cols if c in shown.columns])
+
+
+def run_stats(run_info: dict, feature: str, extra: list) -> html.Div:
+    stats = [
+        stat_block("result target", target_label(run_info)),
+        stat_block("result source", run_info.get("result_source", "Fresh discovery")),
+        stat_block("result data period", run_info.get("data_period", "Not recorded")),
+        stat_block("feature", FEATURE_LABELS.get(feature, feature)),
+        *extra,
+        stat_block("elapsed", f"{run_info.get('elapsed_s', 0):.2f}s"),
+    ]
+    return html.Div(stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap", "marginBottom": 14,
+                                  "paddingBottom": 12, "borderBottom": f"1px solid {BORDER}"})
+
+
+def validation_view(checks: list[dict], placebo: list[dict], real_score: float | None, rank_by: str) -> html.Div:
+    """Whether picking the top of this board is likely to mean anything."""
+    parts = []
+    if checks:
+        frame = pl.DataFrame(checks)
+        lines = []
+        for method, group in frame.group_by("method", maintain_order=True):
+            pct = group["chosen_held_out_percentile"].mean()
+            chosen = group["chosen_held_out_sharpe"].mean()
+            median = group["median_config_held_out_sharpe"].mean()
+            verdict = ("generalises: the chosen cell beats most cells on blocks it never saw" if pct >= 0.75 else
+                       "does not generalise: the chosen cell lands near or below the typical cell on unseen blocks")
+            lines.append(note(f"{method[0]}: picking the top cell {verdict} · average held-out Sharpe "
+                              f"{chosen:.2f} vs median cell {median:.2f} · average percentile {pct:.0%}",
+                              "good" if pct >= 0.75 else "warn"))
+        parts += [html.Div("SELECTION CHECKS", style={"fontWeight": "bold", "fontSize": 11, "color": "#333"}),
+                  *lines,
+                  html.Details([html.Summary("Per-block detail"),
+                                table(frame.drop("config_index").to_pandas(), float_fmt=",.2f")],
+                               className="research-info")]
+    if placebo:
+        scores = np.array([p["best_score"] for p in placebo])
+        beaten = int(np.sum(scores >= real_score)) if real_score is not None else len(scores)
+        p_value = (1 + beaten) / (1 + len(scores))
+        parts += [
+            html.Div("PLACEBO", style={"fontWeight": "bold", "fontSize": 11, "color": "#333", "marginTop": 10}),
+            note(f"Real top score {real_score:.3f} ({RANK_RULES[rank_by]}) vs placebo top scores: median "
+                 f"{np.median(scores):.3f}, max {scores.max():.3f}. {beaten} of {len(scores)} placebos matched or beat it "
+                 f"(p ≈ {p_value:.2f}).", "good" if p_value <= 0.05 else "warn"),
+            html.Details([html.Summary("Placebo runs"), table(pl.DataFrame(placebo).to_pandas(), float_fmt=",.3f")],
+                         className="research-info"),
+        ]
+    if not parts:
+        return html.Div()
+    return html.Div(parts, style={"marginBottom": 14, "paddingBottom": 12, "borderBottom": f"1px solid {BORDER}"})
+
+
+def backtest_discovery_view(
+    results: pl.DataFrame, feature: str, run_info: dict, min_trades: int = 30,
+    rank_by: str = "family", checks: list | None = None, placebo: list | None = None,
+) -> tuple[html.Div, list[dict]]:
+    """Discovery board of real backtests, ranked on the discovery period only."""
+    ranked = rank_board(results, rank_by, min_trades)
+    board = ranked.head(BOARD_ROWS)
+    real_score = float(board["rank_score"][0]) if len(board) else None
+    cols = ["#", "signal_kind", "fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate",
+            "gate_bucket", "gate_window", "rank_score", "family_median_sharpe", "sharpe", "cv_mean_sharpe",
+            "cv_worst_sharpe", "cv_positive_share", "n_trades", "trades_per_year", "win_rate", "pnl_bps",
+            "later_sharpe", "later_pnl_bps", "later_trades"]
+    display = _display_board(board, cols).rename({"horizon": "hold", "entry_z": "entry"})
+    records = board.to_dicts()
+    view = html.Div([
+        run_stats(run_info, feature, [
+            stat_block("cells backtested", f"{len(results):,}"),
+            stat_block(f"cells with ≥{min_trades} trades", f"{len(ranked):,}"),
+            stat_block("ranked by", RANK_RULES[rank_by]),
+            stat_block("cost · execution", f"{run_info.get('cost_bps', 0)} bp · "
+                       f"{'next bar' if run_info.get('execution_lag', 1) else 'same bar'}"),
+        ]),
+        validation_view(checks or [], placebo or [], real_score, rank_by),
+        info("How to read this board",
+             "Each row is a real backtest of one model, gate, entry and holding period. Sharpe, trades, win rate and "
+             "P&L are for the discovery period; rank_score is the column named in ranked by. Later columns are the "
+             "held-out period: they are never used to rank, and choosing rows by them turns that period into "
+             "research data. Family median is the median Sharpe across model lookbacks for the same signal, "
+             f"basis, entry, holding period and gate. The top {BOARD_ROWS} rows are shown; every cell is saved."),
+        table(display.to_pandas(), title="backtest discovery board", max_rows=BOARD_ROWS, float_fmt=",.3f", sortable=True),
+        note("Pick a row's Backtest button to freeze its relationship and gate "
+             "for exact trade-mechanics testing below.", "dim"),
+        board_row_picker(records, enabled=run_info.get("can_backtest", True)),
+    ])
+    return view, records
+
+
 def dislocation_view(
     results: pl.DataFrame, feature: str, run_info: dict, min_events: int = 30,
     data: pl.DataFrame | None = None,
 ) -> tuple[html.Div, list[dict]]:
-    """Compact discovery board. It deliberately does not call a cell a winner."""
+    """Legacy IC board, kept so saved IC discovery runs still open."""
     if "signal_kind" not in results.columns:
         results = results.with_columns(pl.lit("normalized").alias("signal_kind"))
     discovery = results.filter(pl.col("sample") != "test") if "sample" in results.columns else results
@@ -779,46 +897,87 @@ def dislocation_view(
             row.update({k: evidence[k] for k in ("n_non_overlapping", "overlap_fraction")})
         if board_records:
             board = pl.DataFrame(board_records, infer_schema_length=None)
-    stats = [
-        stat_block("result target", target_label(run_info)),
-        stat_block("result source", run_info.get('result_source', 'Fresh discovery')),
-        stat_block("result data period", run_info.get('data_period', 'Not recorded')),
-        stat_block("feature", FEATURE_LABELS.get(feature, feature)),
-        stat_block("cells tested", f"{len(results):,}"),
-        stat_block(f"cells with ≥{min_events} events", f"{len(valid):,}"),
-        stat_block("gated cells", f"{len(gated):,}"),
-        stat_block("backend", run_info["backend"]),
-        stat_block("elapsed", f"{run_info['elapsed_s']:.2f}s"),
-        stat_block("rate", f"{run_info['cells_per_second']:,.0f} cells/s"),
-    ]
     cols = [
         "#", "signal_kind", "signal_units", "fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "horizon", "gate",
         "gate_bucket", "gate_window", "positive_windows_30plus", "model_family_median_ic", "ic", "hit_rate",
         "n_obs", "events_per_year", "later_ic", "later_event_hit_rate", "later_events",
         "n_non_overlapping", "overlap_fraction",
     ]
-    display = board.with_row_index("#", offset=1).with_columns(pl.col("residual_lb").cast(pl.Utf8).fill_null("—"))
+    display = _display_board(board, cols).rename({"hit_rate": "event_hit_rate", "entry_z": "entry_threshold"})
     view = html.Div([
-        html.Div(stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
-                               "marginBottom": 14, "paddingBottom": 12,
-                               "borderBottom": f"1px solid {BORDER}"}),
-        note("Ranked by median discovery IC across tested model lookbacks, then individual IC. Event hit rate is the fraction of "
-             "threshold-crossing events with a favorable forward move, not winning trades. "
-             "Forward windows can overlap. Later-period columns evaluate the same candidates; "
-             "repeatedly choosing from them turns that period into research data."),
-        table_div(
-            display.select([col for col in cols if col in display.columns]).rename({"hit_rate": "event_hit_rate", "entry_z": "entry_threshold"}).to_pandas(),
-            title="IC discovery board", max_rows=40, float_fmt=",.3f", sortable=True,
-        ),
+        run_stats(run_info, feature, [
+            stat_block("cells tested", f"{len(results):,}"),
+            stat_block(f"cells with ≥{min_events} events", f"{len(valid):,}"),
+            stat_block("gated cells", f"{len(gated):,}"),
+            stat_block("scoring", "IC (legacy)"),
+        ]),
+        info("How to read this legacy IC board",
+             "Saved before discovery switched to real backtests. Ranked by median discovery IC across tested model "
+             "lookbacks, then individual IC. Event hit rate is the fraction of threshold-crossing events with a "
+             "favourable forward move, not winning trades. Forward windows can overlap. Later-period columns "
+             "evaluate the same candidates; repeatedly choosing from them turns that period into research data."),
+        table(display.to_pandas(), title="IC discovery board", max_rows=40, float_fmt=",.3f", sortable=True),
         note("Pick a row's Backtest button to freeze its relationship and gate "
              "for exact trade-mechanics testing below.", "dim"),
-        board_row_picker(board_records, enabled=run_info.get('can_backtest', True)),
+        board_row_picker(board_records, enabled=run_info.get("can_backtest", True)),
     ])
     return view, board_records
 
 
+GAIN, LOSS, FLAT = (42, 120, 214), (227, 73, 72), (240, 239, 236)  # diverging blue / red, gray midpoint
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _diverging(value, scale: float) -> dict | None:
+    """Cell fill for P&L on a symmetric scale; dark fills switch to white ink."""
+    if value is None or not isinstance(value, (int, float)) or np.isnan(value) or scale <= 0:
+        return None
+    weight = min(abs(value) / scale, 1.0)
+    pole = GAIN if value > 0 else LOSS
+    rgb = [round(f + (p - f) * weight) for f, p in zip(FLAT, pole)]
+    return {"background": f"rgb({rgb[0]},{rgb[1]},{rgb[2]})", "color": "#FFFFFF" if weight > 0.6 else TEXT,
+            "borderBottom": "2px solid #FFFFFF", "borderRight": "2px solid #FFFFFF"}
+
+
+def pnl_heatmap(equity: pl.DataFrame, periods: pl.DataFrame) -> html.Div:
+    """Monthly P&L by year, coloured by sign and size, with the full-year total."""
+    monthly = (equity.with_columns(pl.col("ts").cast(pl.Date))
+               .group_by(pl.col("ts").dt.year().alias("year"), pl.col("ts").dt.month().alias("month"))
+               .agg(pl.col("pnl_bps").sum()))
+    grid = monthly.pivot(on="month", index="year", values="pnl_bps").rename(
+        {str(m): MONTHS[m - 1] for m in range(1, 13)}, strict=False)
+    grid = grid.with_columns(*[pl.lit(None, dtype=pl.Float64).alias(m) for m in MONTHS if m not in grid.columns])
+    if len(periods):
+        grid = grid.join(periods.select("year", pl.col("pnl_bps").alias("full_year"), "active_days"),
+                         on="year", how="left")
+    else:
+        grid = grid.with_columns(pl.sum_horizontal(MONTHS).alias("full_year"), pl.lit(None).alias("active_days"))
+    grid = grid.sort("year")
+    values = MONTHS + ["full_year"]
+    month_scale = float(np.nanmax(np.abs(grid.select(MONTHS).to_numpy().astype(float)))) if len(grid) else 0.0
+    year_scale = float(np.nanmax(np.abs(grid["full_year"].to_numpy().astype(float)))) if len(grid) else 0.0
+    # Cells show formatted text (blank where a month has no data); raw numbers
+    # ride along unrendered as raw_<col> so the fill still keys off the value.
+    shown = grid.with_columns(
+        *[pl.col(c).alias(f"raw_{c}") for c in values],
+        *[pl.col(c).map_elements(lambda v: f"{v:,.1f}", return_dtype=pl.Utf8).fill_null("").alias(c) for c in values],
+        pl.col("year").cast(pl.Utf8), pl.col("active_days").cast(pl.Utf8).fill_null(""),
+    )
+
+    def colour(column, _value, row):
+        if column in MONTHS:
+            return _diverging(row[f"raw_{column}"], month_scale)
+        if column == "full_year":
+            return {**(_diverging(row["raw_full_year"], year_scale) or {}), "fontWeight": "bold"}
+        return None
+
+    return table(shown.to_pandas(), title="P&L by month and year (bp) · blue gains, red losses; full year on its own scale",
+                 columns=["year", *MONTHS, "full_year", "active_days"], cell_style=colour,
+                 headers={"full_year": "full year", "active_days": "active days"})
+
+
 def backtest_grid_view(grid: pl.DataFrame, selected: dict) -> html.Div:
-    """Every requested entry/exit cell run through the exact Engine.
+    """Every requested entry/exit cell for the frozen candidate.
 
     No refitting happens here -- the relationship and gate are frozen from
     the discovery candidate; only trade mechanics vary across the grid.
@@ -841,20 +1000,20 @@ def backtest_grid_view(grid: pl.DataFrame, selected: dict) -> html.Div:
         "earlier_sharpe", "later_sharpe", "earlier_pnl_bps", "later_pnl_bps",
         "closed_pnl_bps",
     ]
+    ordered = grid.sort(rank_metric, descending=True)
     return html.Div([
         html.Div(stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
                                "marginBottom": 14, "paddingBottom": 12,
                                "borderBottom": f"1px solid {BORDER}"}),
-        note("Exact Engine re-mark on the actual legs, transaction cost applied. "
-             "Every requested exit is tested. Stops are evaluated on observations, not "
-             "intraday fills. Ranking uses the earlier period when a split is selected. "
-             "Later daily P&L includes positions carried across the split. "
-             "This is a chronological diagnostic, not a complete walk-forward validation."),
-        table_div(
-            grid.select([c for c in cols if c in grid.columns])
-                .sort(rank_metric, descending=True).to_pandas(),
-            title="backtest grid", max_rows=60, float_fmt=",.2f",
-        ),
+        info("How this grid is computed",
+             "Every cell runs through the vectorised engine (backtest/vector.py), which tests hold to the exact "
+             "Engine trade for trade. Inspecting a configuration reruns it through Engine itself and reports any disagreement, "
+             "with its median trade P&L. Legs are re-marked and transaction cost applied. Stops are evaluated on "
+             "observations, not intraday fills. Ranking uses the earlier period when a split is selected. Later "
+             "daily P&L includes positions carried across the split. This is a chronological diagnostic, not a "
+             "complete walk-forward validation."),
+        table(ordered.select([c for c in cols if c in ordered.columns]).to_pandas(),
+              title="backtest grid", max_rows=60, float_fmt=",.2f", sortable=True),
         field("inspect configuration", dcc.Dropdown(id="bt-inspect", value=str(best["config_id"]),
             options=[{"label": f"#{r['config_id']} · {r['exit_style']} {r['exit_param']} · entry {r['entry_z']} · stop {r['stop_loss_bps']}",
                       "value": str(r["config_id"])} for r in grid.iter_rows(named=True)])),
@@ -901,6 +1060,49 @@ def tabs() -> html.Div:
     ])], className="research-bench")
 
 
+def freeze_candidate(board: dict, idx: int, entry_zs=None, time_stops=None) -> tuple:
+    """Freeze one board row for Trade mechanics.
+
+    Returns the candidate, its label, and the entry thresholds, time stops,
+    cost and fill timing Trade mechanics should start from: the row's own
+    holding period, cost and execution carry over so the grid starts from the
+    trade the discovery row actually described.
+    """
+    row = board["rows"][idx]
+    candidate = {
+        "target": board["target"], "feature": board["feature"],
+        "fit_on": row["fit_on"], "beta_lb": int(row["beta_lb"]),
+        "residual_lb": (
+            None if row["residual_lb"] is None else int(row["residual_lb"])
+        ),
+        "norm_lb": int(row["norm_lb"]), "gate": row["gate"],
+        "gate_bucket": row["gate_bucket"], "gate_window": row["gate_window"],
+        "signal_kind": row.get("signal_kind", "normalized"),
+        "entry_z": row["entry_z"], "panel_id": board["panel_id"],
+        "split_date": board.get("split_date"), "discovery_run": board.get("run_path"),
+        "archive_id": board.get("archive_id"),
+        "target_definition": board.get("target_definition", {}),
+        "weight_columns": board.get("weight_columns", {}),
+    }
+    gate_desc = (
+        f"{candidate['gate']}:{candidate['gate_bucket']} "
+        f"(window={candidate['gate_window']})"
+        if candidate["gate"] != "(none)" else "ungated"
+    )
+    label = (
+        f"{target_label(candidate.get('target_definition') or {'target': candidate['target']})} vs "
+        f"{FEATURE_LABELS.get(candidate['feature'], candidate['feature'])} · "
+        f"{candidate['signal_kind']} ({'target units; bp for rates' if candidate['signal_kind'] == 'raw' else 'standard deviations'}) · {candidate['fit_on']} · beta_lb={candidate['beta_lb']} · "
+        f"resid_lb={candidate['residual_lb'] or '—'} · "
+        f"norm_lb={candidate['norm_lb']} · {gate_desc} · discovery hold {row['horizon']}"
+    )
+    stops = sorted({*(time_stops or []), int(row["horizon"])})
+    cost, lag = board.get("cost_bps"), board.get("execution_lag")
+    return (candidate, note(f"Frozen: {label}", "good"),
+            entry_zs if entry_zs and len(entry_zs) > 1 else [row["entry_z"]], stops,
+            no_update if cost is None else cost, no_update if lag is None else lag)
+
+
 def register_callbacks(app) -> None:
     sweep_controls = ["dis-signal", "dis-fit-on", "dis-beta-lbs", "dis-residual-lbs",
         "dis-norm-lbs", "dis-thresholds", "dis-horizons", "dis-gates", "dis-gate-windows", "dis-raw-thresholds",
@@ -918,15 +1120,15 @@ def register_callbacks(app) -> None:
         *[Input(control, "value") for control in sweep_controls[:10]], Input("dis-train", "value"))
     def _grid_size(signals, bases, beta, residual, norm, entries, horizons, gates, windows, raw_entries, train):
         signals = [signals] if isinstance(signals, str) else signals or []
-        models = len(signals)*len(beta or [])*len(norm or [])*(
+        per_kind = len(beta or [])*len(norm or [])*(
             (len(residual or []) if 'changes' in (bases or []) else 0)
             + (1 if 'levels' in (bases or []) else 0))
-        threshold_count = sum(len(raw_entries or []) if s == 'raw' else len(entries or []) for s in signals)
-        cells = (models // max(len(signals), 1))*threshold_count*len(horizons or [])*(
-            1+len(gates or [])*len(windows or [])*len(REGIME_GATE_BUCKETS))*(2 if train < 1 else 1)
-        warning = (" Very large grid: saved scores alone may require many GB of RAM; consider narrowing selections."
+        gate_cells = 1 + len(gates or [])*len(windows or [])*len(REGIME_GATE_BUCKETS)
+        entry_count = sum(len(raw_entries or []) if s == 'raw' else len(entries or []) for s in signals)
+        cells = per_kind*entry_count*len(horizons or [])*gate_cells
+        warning = (" Very large grid: the results table alone may need several GB of RAM; consider narrowing selections."
                    if cells > 10_000_000 else "")
-        return note(f"{models:,} models · {cells:,} discovery cells (including evaluation period)."+warning,
+        return note(f"{per_kind*len(signals):,} models · {cells:,} backtested discovery cells."+warning,
                     'warn' if warning else 'dim')
 
     @app.callback(
@@ -994,32 +1196,60 @@ def register_callbacks(app) -> None:
 
     @app.callback(Output("bt-detail", "children"), Input("bt-inspect", "value"), State("bt-grid", "data"))
     def _inspect(config_id, stored):
-        # save_run writes trades/equity/periods for every config_id to disk;
-        # read just the one being inspected rather than shipping the whole
-        # grid's detail to the browser upfront (see _run_backtest_grid).
+        # The grid's run saves exact Engine detail for its best cell only. Any
+        # other cell is rerun through Engine on first inspection and added to
+        # the run, so its trades are exact and saved like the best cell's.
         saved_dir = Path((stored or {}).get("run_path", "")) if stored else None
-        if not saved_dir or not (saved_dir / "equity.parquet").is_file():
+        if not saved_dir or not (saved_dir / "metadata.json").is_file():
             return note("Run a backtest grid to inspect trades.")
         cid = str(config_id)
-        equity = pl.read_parquet(saved_dir / "equity.parquet").filter(pl.col("config_id") == cid)
+        row = next((r for r in stored.get("rows", []) if str(r["config_id"]) == cid), None)
+        equity_file = saved_dir / "equity.parquet"
+        equity = (pl.read_parquet(equity_file).filter(pl.col("config_id") == cid)
+                  if equity_file.is_file() else pl.DataFrame())
+        detail = None
         if equity.is_empty():
-            return note("No saved detail for this configuration.")
+            if row is None:
+                return note("No such configuration in this grid.")
+            try:
+                meta = json.loads((saved_dir / "metadata.json").read_text(encoding="utf-8"))
+                candidate = meta["candidate"]
+                detail = detail_for(
+                    pl.read_parquet(saved_dir / "data.parquet"), TradeDef(candidate["target"], meta["legs"]),
+                    candidate, config_id=cid, entry_z=row["entry_z"], exit_style=row["exit_style"],
+                    exit_param=row["exit_param"], stop_loss_bps=row["stop_loss_bps"],
+                    round_trip_cost_bps=meta.get("cost_bps") or 0.0, execution_lag=int(meta["execution_lag"]),
+                )
+                append_details(saved_dir, {cid: detail})
+            except Exception as exc:
+                return note(f"Exact Engine rerun failed: {type(exc).__name__}: {exc}", "bad")
+            equity = pl.read_parquet(equity_file).filter(pl.col("config_id") == cid)
+        parity = None
+        if row is not None and detail is not None:
+            gap = max(abs(detail["metrics"]["sharpe"] - row["sharpe"]),
+                      abs(detail["metrics"]["total_pnl_bps"] - row["total_pnl_bps"]))
+            same = gap < 1e-6 and detail["metrics"]["n_trades"] == row["n_trades"]
+            parity = note(f"Exact Engine rerun {'matches' if same else 'DISAGREES WITH'} the vectorised grid "
+                          f"(max |difference| in Sharpe/P&L {gap:.1e}; trades {detail['metrics']['n_trades']} vs {row['n_trades']}).",
+                          "good" if same else "bad")
         periods_file = saved_dir / "periods.parquet"
         periods = (pl.read_parquet(periods_file).filter(pl.col("config_id") == cid).drop("config_id")
                    if periods_file.is_file() else pl.DataFrame())
         trades_file = saved_dir / "trades.parquet"
         trades = (pl.read_parquet(trades_file).filter(pl.col("config_id") == cid).drop("config_id")
                   if trades_file.is_file() else pl.DataFrame())
+        median = note(f"Median closed-trade P&L: {trades['pnl_bps'].median():,.2f} bps", "dim") if len(trades) else None
         return html.Div([
+            parity, median,
             dcc.Graph(figure={"data": [{"x": equity["ts"].to_list(),
                                        "y": equity["cumulative_pnl"].to_list(),
                                        "type": "scatter", "mode": "lines", "name": "Net P&L"}],
                               "layout": {"title": "Selected configuration · cumulative P&L", "yaxis": {"title": "bp"},
                                          "height": 320, "margin": {"l": 55, "r": 20, "t": 45, "b": 40}}}),
-            table_div(periods.to_pandas(), title="P&L by year", max_rows=50) if len(periods) else None,
-            table_div(trades.group_by("exit_reason").agg(pl.len().alias("trades"), pl.col("pnl_bps").mean().alias("mean_pnl_bps")).to_pandas(),
+            pnl_heatmap(equity, periods),
+            table(trades.group_by("exit_reason").agg(pl.len().alias("trades"), pl.col("pnl_bps").mean().alias("mean_pnl_bps")).to_pandas(),
                       title="Exit reasons") if len(trades) else None,
-            table_div(trades.to_pandas(), title="Closed trades · MAE/MFE measured on observations", max_rows=500)
+            table(trades.to_pandas(), title="Closed trades · MAE/MFE measured on observations")
             if len(trades) else note("No closed trades for this configuration."),
         ])
 
@@ -1035,15 +1265,18 @@ def register_callbacks(app) -> None:
         Input("dis-board", "data"), State("dis-saved-run", "value"),
         Input("dis-raw-thresholds", "value"),
         Input("dis-saved-other", "value"),
+        Input("dis-cost", "value"), Input("dis-lag", "value"), Input("dis-cv", "value"),
     )
     def _find_saved(stored, feature, bases, beta, residual, norm, entries, horizons,
-                    gates, windows, signal, train, _board, selected, raw_entries=None, show_other=None):
+                    gates, windows, signal, train, _board, selected, raw_entries=None, show_other=None,
+                    cost=0.1, lag=1, cv=0):
         if not stored or feature not in stored.get('features', []):
             return [], None, None
         request = grid_spec(bases or ['changes'], beta or DISLOCATION_BETA_LBS,
             residual or DISLOCATION_RESIDUAL_LBS, norm or DISLOCATION_NORM_LBS,
             entries or DISLOCATION_THRESHOLDS, horizons or DISLOCATION_HORIZONS,
-            gates or [], windows or [126, 252, 504], signal, train, raw_entries or RAW_THRESHOLDS)
+            gates or [], windows or [126, 252, 504], signal, train, raw_entries or RAW_THRESHOLDS,
+            scoring="backtest", cost=cost, lag=lag, cv_folds=cv)
         fingerprint = input_hash(stored, feature)
         runs = list_runs(stored['target'], feature)
         definition = target_definition(stored)
@@ -1105,13 +1338,19 @@ def register_callbacks(app) -> None:
                         can_backtest=bool(meta.get('legs')) and meta.get('weighting') in {'fixed', 'beta'}
                             and (meta.get('weighting') != 'beta' or bool(meta.get('weight_columns'))),
                         elapsed_s=meta.get('elapsed_s', 0), cells_per_second=meta.get('cells_per_second', 0))
-            view, records = dislocation_view(results, meta['feature'], info, int(min_events or 30), frame)
+            if meta.get('scoring') == 'backtest':
+                view, records = backtest_discovery_view(
+                    results, meta['feature'], info, int(min_events or meta.get('min_events') or 30),
+                    meta.get('rank_by', 'family'), meta.get('selection_checks'), meta.get('placebo'))
+            else:
+                view, records = dislocation_view(results, meta['feature'], info, int(min_events or 30), frame)
             fraction = float(meta.get('train_fraction', 1))
             split = str(frame['ts'][int(len(frame)*fraction)]) if fraction < 1 else None
             board = dict(target=meta['target'], feature=meta['feature'], rows=records,
                 panel_id='archive:'+run_id, split_date=split, run_path=str(run_path(run_id)),
                 archive_id=run_id, weight_columns=meta.get('weight_columns', {}),
-                target_definition=target_definition(meta))
+                target_definition=target_definition(meta),
+                cost_bps=meta.get('cost_bps'), execution_lag=meta.get('execution_lag'))
             text = (f"Saved result target: {target_label(meta)}. Opened run {run_id}: {frame['ts'].min()} to {frame['ts'].max()} · "
                     f"{len(results):,} saved cells. Original settings/data; not a new scan. "
                     + ("Exit tests use this saved snapshot and current engine code." if info['can_backtest']
@@ -1142,6 +1381,8 @@ def register_callbacks(app) -> None:
         State("dis-signal", "value"), State("dis-train", "value"),
         State("dis-min-events", "value"), State("research-session", "data"),
         State("dis-raw-thresholds", "value"),
+        State("dis-cost", "value"), State("dis-lag", "value"), State("dis-cv", "value"),
+        State("dis-rank", "value"), State("dis-placebo", "value"),
         prevent_initial_call=True,
         running=[
             (Output("dis-run", "children"), "Running discovery…", "Run discovery"),
@@ -1151,6 +1392,7 @@ def register_callbacks(app) -> None:
     def _run_dislocation(
         _n, stored, feature, fit_on, beta_lbs, residual_lbs, norm_lbs, thresholds,
         horizons, gates, gate_windows, signal_kind, train_fraction, min_events, session, raw_entries=None,
+        cost=0.1, lag=1, cv=0, rank_by="family", placebos=0,
     ):
         if not stored:
             return note("Load a target and this feature on Setup first.", "warn"), "", no_update
@@ -1159,6 +1401,10 @@ def register_callbacks(app) -> None:
                 f"{FEATURE_LABELS.get(feature, feature)} is not in the loaded panel. "
                 "Add it on Setup, then Load.", "warn"
             ), "", no_update
+        rank_by = rank_by or "family"
+        if rank_by.startswith("cv") and not cv:
+            return note("CV ranking needs cross-validation blocks: choose a block count under Sample & validation.", "warn"), "", no_update
+        min_trades = int(min_events or 30)
         try:
             work.start(session, "dis", "Preparing loaded panel and discovery grid")
             target = stored["target"]
@@ -1168,22 +1414,35 @@ def register_callbacks(app) -> None:
                 **{col: pl.Series([row[col] for row in rows], dtype=pl.Float64)
                    for col in dict.fromkeys([target, feature, *stored['legs'], *stored.get('weight_columns', {}).values()])},
             }).with_columns(pl.col("ts").str.to_date())
-            backend = "CPU · batched gate statistics"
-            started = time.perf_counter()
-            frame, results = dislocation_scan(
-                frame, target=target, feature=feature,
-                fit_on=fit_on or ["changes"], device="cpu",
+            scan = dict(
+                target=target, legs=stored["legs"], weight_columns=stored.get("weight_columns") or None,
+                fit_on=fit_on or ["changes"],
                 beta_lookbacks=beta_lbs or DISLOCATION_BETA_LBS,
                 residual_lookbacks=residual_lbs or DISLOCATION_RESIDUAL_LBS,
                 normalization_lookbacks=norm_lbs or DISLOCATION_NORM_LBS,
                 thresholds=thresholds or DISLOCATION_THRESHOLDS, raw_thresholds=raw_entries or RAW_THRESHOLDS,
-                horizons=horizons or DISLOCATION_HORIZONS,
-                gate_names=gates or [],
-                gate_windows=gate_windows or [126, 252, 504],
+                holds=horizons or DISLOCATION_HORIZONS,
+                gate_names=gates or [], gate_windows=gate_windows or [126, 252, 504],
                 signal_kind=signal_kind, train_fraction=float(train_fraction),
-                trade_legs=stored['legs'], weight_columns=stored.get('weight_columns'),
+                cost_bps=float(cost or 0.0), execution_lag=int(lag), cv_folds=int(cv or 0),
+            )
+            backend = "Vectorised backtests (backtest/vector.py)"
+            started = time.perf_counter()
+            frame, results, extras = backtest_scan(
+                frame, feature=feature, **scan,
                 progress=lambda done, total, message: work.update(session, "dis", message, done, total),
             )
+            checks = []
+            if extras["folds"] >= 2:
+                work.update(session, "dis", "Selection checks: out-of-fold and walk-forward")
+                checks = selection_checks(
+                    extras["cv_days"], extras["cv_sums"], extras["cv_sumsq"],
+                    {"cv_mean": "mean", "cv_worst": "worst"}.get(rank_by, "sharpe"),
+                    eligible=(results["n_trades"] >= min_trades).to_numpy())
+            placebo = placebo_scan(
+                frame, feature=feature, placebos=int(placebos), rank_by=rank_by, min_trades=min_trades,
+                progress=lambda done, total, message: work.update(session, "dis", message, done, total), **scan,
+            ) if placebos else []
             elapsed_s = time.perf_counter() - started
         except Exception as exc:
             work.update(session, "dis", f"Failed: {exc}", 1, 1)
@@ -1197,11 +1456,13 @@ def register_callbacks(app) -> None:
             "elapsed_s": elapsed_s,
             "cells_per_second": len(results) / max(elapsed_s, 1e-9),
             "train_fraction": train_fraction, "target": target,
+            "cost_bps": float(cost or 0.0), "execution_lag": int(lag),
         }
         info.update(target_definition(stored))
         info.update(result_source='Fresh discovery', data_period=f"{frame['ts'].min()} to {frame['ts'].max()}")
         status = note(
-            f"Completed · {backend} · {len(results):,} cells in {elapsed_s:.2f}s",
+            f"Completed · {len(results):,} backtested cells"
+            + (f" + {len(placebo)} placebo runs" if placebo else "") + f" in {elapsed_s:.1f}s",
             "good",
         )
         work.update(session, "dis", "Saving all discovery cells and ranking the discovery period")
@@ -1209,17 +1470,20 @@ def register_callbacks(app) -> None:
             grid=grid_spec(fit_on or ["changes"], beta_lbs or DISLOCATION_BETA_LBS,
                 residual_lbs or DISLOCATION_RESIDUAL_LBS, norm_lbs or DISLOCATION_NORM_LBS,
                 thresholds or DISLOCATION_THRESHOLDS, horizons or DISLOCATION_HORIZONS,
-                gates or [], gate_windows or [126, 252, 504], signal_kind, train_fraction, raw_entries or RAW_THRESHOLDS),
+                gates or [], gate_windows or [126, 252, 504], signal_kind, train_fraction, raw_entries or RAW_THRESHOLDS,
+                scoring="backtest", cost=cost, lag=lag, cv_folds=cv),
             input_sha256=input_hash(stored, feature),
-            signal_kind=signal_kind, min_events=min_events,
+            signal_kind=signal_kind, min_events=min_trades, scoring="backtest", rank_by=rank_by,
+            cv_folds=int(cv or 0), selection_checks=checks, placebo=placebo,
             panel_id=stored["panel_id"],
             gate_min_history=126, **info))
-        view, board_records = dislocation_view(results, feature, info, int(min_events or 30), frame)
+        view, board_records = backtest_discovery_view(results, feature, info, min_trades, rank_by, checks, placebo)
         split_date = str(frame["ts"][int(len(frame) * float(train_fraction))]) if float(train_fraction) < 1 else None
         board = {"target": target, "feature": feature, "rows": board_records,
                  "target_definition": target_definition(stored),
                  "panel_id": stored["panel_id"], "split_date": split_date, "run_path": saved,
-                 "weight_columns": stored.get("weight_columns", {})}
+                 "weight_columns": stored.get("weight_columns", {}),
+                 "cost_bps": float(cost or 0.0), "execution_lag": int(lag)}
         work.update(session, "dis", f"Completed · {len(results):,} cells · saved {saved}", 1, 1)
         return view, status, board
 
@@ -1227,53 +1491,25 @@ def register_callbacks(app) -> None:
         Output("dis-candidate", "data"),
         Output("bt-candidate", "children"),
         Output("bt-entry-zs", "value"),
+        Output("bt-time-stops", "value", allow_duplicate=True),
+        Output("bt-cost", "value"),
+        Output("bt-lag", "value"),
         Input({"type": "dis-pick", "index": ALL}, "n_clicks"),
         State("dis-board", "data"),
         State("bt-entry-zs", "value"),
+        State("bt-time-stops", "value"),
         prevent_initial_call=True,
     )
-    def _pick_dislocation_candidate(n_clicks, board, entry_zs=None):
+    def _pick_dislocation_candidate(n_clicks, board, entry_zs=None, time_stops=None):
         # Dash fires this the moment the row buttons first appear (all zero
         # clicks), before any real click. Only a genuine click should freeze
         # a candidate.
         if not board or not any(n_clicks or []):
-            return no_update, no_update, no_update
+            return (no_update,) * 6
         triggered = ctx.triggered_id
-        if not isinstance(triggered, dict):
-            return no_update, no_update, no_update
-        rows = board["rows"]
-        idx = triggered["index"]
-        if idx >= len(rows):
-            return no_update, no_update, no_update
-        row = rows[idx]
-        candidate = {
-            "target": board["target"], "feature": board["feature"],
-            "fit_on": row["fit_on"], "beta_lb": int(row["beta_lb"]),
-            "residual_lb": (
-                None if row["residual_lb"] is None else int(row["residual_lb"])
-            ),
-            "norm_lb": int(row["norm_lb"]), "gate": row["gate"],
-            "gate_bucket": row["gate_bucket"], "gate_window": row["gate_window"],
-            "signal_kind": row.get("signal_kind", "normalized"),
-            "entry_z": row["entry_z"], "panel_id": board["panel_id"],
-            "split_date": board.get("split_date"), "discovery_run": board.get("run_path"),
-            "archive_id": board.get("archive_id"),
-            "target_definition": board.get("target_definition", {}),
-            "weight_columns": board.get("weight_columns", {}),
-        }
-        gate_desc = (
-            f"{candidate['gate']}:{candidate['gate_bucket']} "
-            f"(window={candidate['gate_window']})"
-            if candidate["gate"] != "(none)" else "ungated"
-        )
-        label = (
-            f"{target_label(candidate.get('target_definition') or {'target': candidate['target']})} vs "
-            f"{FEATURE_LABELS.get(candidate['feature'], candidate['feature'])} · "
-            f"{candidate['signal_kind']} ({'target units; bp for rates' if candidate['signal_kind'] == 'raw' else 'standard deviations'}) · {candidate['fit_on']} · beta_lb={candidate['beta_lb']} · "
-            f"resid_lb={candidate['residual_lb'] or '—'} · "
-            f"norm_lb={candidate['norm_lb']} · {gate_desc}"
-        )
-        return candidate, note(f"Frozen: {label}", "good"), (entry_zs if entry_zs and len(entry_zs) > 1 else [row["entry_z"]])
+        if not isinstance(triggered, dict) or triggered["index"] >= len(board["rows"]):
+            return (no_update,) * 6
+        return freeze_candidate(board, triggered["index"], entry_zs, time_stops)
 
     @app.callback(
         Output("bt-out", "children"),
@@ -1350,12 +1586,12 @@ def register_callbacks(app) -> None:
             })
             data = pl.DataFrame(columns).with_columns(pl.col("ts").str.to_date())
             started = time.perf_counter()
-            grid, selected = run_grid(
+            work.update(session, "bt", "Running every cell through the vectorised engine; exact Engine detail for the best")
+            grid, selected, yearly, _ = run_vector_grid(
                 data, trade, candidate,
                 entry_zs=entry_zs, exit_params=exit_params,
-                stop_loss_bps=(stop_bp or None), round_trip_cost_bps=cost_bp or 0.0,
+                round_trip_cost_bps=cost_bp or 0.0,
                 stop_losses=stop_bp or [None], execution_lag=int(lag),
-                progress=lambda done, total: work.update(session, "bt", f"Completed full backtest {done}/{total} · exits, stops, costs and trade logs", done, total),
             )
             elapsed_s = time.perf_counter() - started
         except Exception as exc:
@@ -1366,21 +1602,17 @@ def register_callbacks(app) -> None:
                                                         "whiteSpace": "pre-wrap"}),
             ]), "", no_update
         status = note(f"Completed · {len(grid):,} cells in {elapsed_s:.2f}s", "good")
-        work.update(session, "bt", "Saving every configuration's trades, equity and annual results")
+        work.update(session, "bt", "Saving every configuration's results and yearly P&L, and the best one's trades")
         saved = save_run("exits", data, grid, dict(candidate=candidate,
             legs=stored["legs"], weighting=stored.get("weighting"),
             beta_lookback=stored.get('beta_lookback'), beta_dependent=stored.get('beta_dependent'),
             weight_columns=stored.get('weight_columns', {}), execution_lag=lag,
-            cost_bps=cost_bp, stop_losses=stop_bp), selected["runs"])
+            cost_bps=cost_bp, stop_losses=stop_bp, engine="vector"), selected["runs"])
+        yearly.write_parquet(Path(saved) / "yearly.parquet")
         work.update(session, "bt", f"Completed · saved {saved}", len(grid), len(grid))
-        # Every configuration's trades/equity/periods were just written to
-        # saved (trades.parquet etc, one row per config_id) by save_run. Do
-        # not also duplicate that same data -- every cell's full equity
-        # curve, across up to thousands of cells -- into this Store; that
-        # payload has to be JSON-serialized and shipped to the browser on
-        # every run, which is what made this callback appear to hang after
-        # logging "Completed". _inspect reads a single config's detail back
-        # off disk instead.
+        # Only the best cell's trades/equity/periods were written by
+        # save_run; _inspect reads or creates one config's detail on disk
+        # rather than shipping every cell's equity curve to the browser.
         return backtest_grid_view(grid, selected), status, {"rows": grid.to_dicts(), "run_path": saved}
 
     @app.callback(
