@@ -32,9 +32,10 @@ def market(n=900, seed=5):
     })
 
 
-def engine_pnl(data, trade, cand, state, entry, style, param, stop, cost, lag):
+def engine_pnl(data, trade, cand, state, entry, style, param, stop, cost, lag, cap=None, signal_stop=None):
     pipe = make_pipeline(data, trade, cand, entry_z=entry, exit_style=style, exit_param=param,
-                         stop_loss_bps=stop or None, state=state, execution_lag=lag)
+                         stop_loss_bps=stop or None, state=state, execution_lag=lag,
+                         half_life_cap=cap or None, signal_stop=signal_stop or None)
     result = Engine(BacktestConfig(transaction_cost_bps=cost, max_total_positions=1)).add_signal(pipe).run(data)
     return result.equity_curve["pnl_bps"].to_numpy(), trade_log(result.closed_trades)
 
@@ -67,7 +68,9 @@ def test_vector_matches_engine_on_random_configs(seed):
         gate = int(rng.integers(len(GATES)))
         rows.append(dict(model=0, gate=gate - 1, entry=scale * float(rng.choice([0.5, 1.0, 1.5, 2.0])),
                          exit_style=style, exit_param=float(rng.choice(STYLES[style])),
-                         stop=float(rng.choice([0.0, 2.0, 5.0]))))
+                         stop=float(rng.choice([0.0, 2.0, 5.0])),
+                         signal_stop=scale * float(rng.choice([0.0, 0.25, 1.0])),
+                         cap=float(rng.choice([0.0, 0.5, 2.0])) if style in ("band", "revert_frac") else 0.0))
     configs = pl.DataFrame(rows).filter((pl.col("exit_style") != "band") | (pl.col("exit_param") < pl.col("entry")))
     lag, cost = seed % 2, 0.3
 
@@ -83,7 +86,7 @@ def test_vector_matches_engine_on_random_configs(seed):
         name, bucket, window = GATES[row["gate"] + 1]
         cand_k = {**cand, "gate": name, "gate_bucket": bucket, "gate_window": window}
         pnl, trades = engine_pnl(engine_data, trade, cand_k, state, row["entry"], row["exit_style"],
-                                 row["exit_param"], row["stop"], cost, lag)
+                                 row["exit_param"], row["stop"], cost, lag, row["cap"], row["signal_stop"])
         np.testing.assert_allclose(got.pnl[:, k], pnl, atol=1e-9, err_msg=str(row))
         metrics = got.metrics.row(k, named=True)
         assert metrics["n_trades"] == len(trades), row
@@ -144,7 +147,8 @@ def test_vector_grid_reproduces_run_grid_table(variant):
     entries = [3.0, 5.0] if variant == "weighted_raw" else [1.0, 1.5]
     kwargs = dict(entry_zs=entries, exit_params={"time": [5, 20], "band": [0.0, 0.5], "revert_frac": [0.5],
                                                  "half_life_frac": [1.0]},
-                  stop_losses=[None, 3.0], round_trip_cost_bps=0.25, execution_lag=1)
+                  stop_losses=[None, 3.0], round_trip_cost_bps=0.25, execution_lag=1,
+                  half_life_caps=[None, 1.0], signal_stops=[None, 0.5])
     exact, exact_sel = run_grid(data, trade, cand, **kwargs)
     fast, fast_sel, yearly, _ = run_vector_grid(data, trade, cand, **kwargs)
     cols = [c for c in fast.columns if c in exact.columns]
@@ -160,3 +164,19 @@ def test_vector_grid_reproduces_run_grid_table(variant):
     per_year = yearly.group_by("config_id").agg(pl.col("pnl_bps").sum())
     total = fast.join(per_year, on="config_id")
     np.testing.assert_allclose(total["pnl_bps"].to_numpy(), total["total_pnl_bps"].to_numpy(), atol=1e-9)
+
+
+
+def test_signal_stop_exits_when_the_dislocation_extends_and_cap_bounds_band_trades():
+    # long entry at -2 (fills bar 2); the signal extends to -3.2 on bar 4 -> signal stop
+    signal = np.array([0.0, -2.0, -2.5, -3.2, -3.0, -1.0, 0.5, 0.5])
+    level = np.arange(8, dtype=float)
+    configs = pl.DataFrame(dict(model=[0, 0, 0], entry=[1.5] * 3, exit_style=["band"] * 3, exit_param=[0.0] * 3,
+                                signal_stop=[1.0, 0.0, 0.0], cap=[0.0, 0.0, 1.0]))
+    half_life = np.full(8, 2.0)
+    got = run_vector(level[:, None], np.ones(1), signal[None, :], configs, half_life=half_life[None, :], lag=1, keep=[0, 1, 2])
+    # signal stop: -3.2 < -2.0 - 1.0 on signal bar 3, filled bar 4 -> held bars 3..4 = 2 bars
+    assert got.metrics["avg_holding_days"].to_list() == [2.0, 5.0, 2.0]
+    # no stop: band exit once the signal crosses back above 0 (signal bar 6 -> fill bar 7);
+    # cap: ceil(2 x 1) = 2 bars
+    assert got.metrics["n_trades"].to_list() == [1, 1, 1]

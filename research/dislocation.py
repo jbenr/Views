@@ -453,6 +453,10 @@ _RANK_COLUMN = {"family": "family_median_sharpe", "sharpe": "sharpe",
                 "cv_mean": "cv_mean_sharpe", "cv_worst": "cv_worst_sharpe"}
 
 
+EXIT_COLUMNS = ["exit_style", "exit_param", "half_life_cap", "signal_stop", "stop_loss_bps"]
+OPEN_ENDED_EMBARGO = 63  # CV buffer (bars) for exits without a fixed length
+
+
 def backtest_scan(
     data: pl.DataFrame,
     *,
@@ -463,7 +467,10 @@ def backtest_scan(
     residual_lookbacks: Iterable[int],
     normalization_lookbacks: Iterable[int],
     thresholds: Iterable[float],
-    holds: Iterable[int],
+    exit_params: dict[str, Iterable[float]],
+    stop_losses: Iterable[float | None] = (None,),
+    half_life_caps: Iterable[float | None] = (None,),
+    signal_stops: Iterable[float | None] = (None,),
     weight_columns: dict[str, str] | None = None,
     fit_on: Iterable[str] = ("changes",),
     signal_kind: str | Iterable[str] = "normalized",
@@ -477,21 +484,23 @@ def backtest_scan(
     cv_folds: int = 0,
     progress: Callable[[int, int, str], None] | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
-    """Discovery by real trades: every model x gate x entry x holding period, backtested.
+    """Discovery by real trades: every model x gate x entry x exit, backtested.
 
-    Replaces the IC scan's forward-move scoring with the exact trade
-    semantics of Trade mechanics -- first-crossing entries, one position at a
-    time, a time-stop exit after ``holds`` bars, next-bar fills, costs and
-    entry-frozen beta weights -- run through ``backtest.vector``. The first
-    ``train_fraction`` of bars is the discovery period that ranks cells; the
-    rest is reported separately and never used to rank.
+    Each cell is a full trade specification -- first-crossing entry, one
+    position at a time, one exit rule from ``exit_params`` (the Trade
+    mechanics exits: time, band, revert_frac, half_life_frac) optionally with
+    a half-life cap, a signal stop and a P&L stop -- run through
+    ``backtest.vector`` with next-bar fills, costs and entry-frozen beta
+    weights. Setups are therefore judged with the exits that suit them rather
+    than one fixed holding period. The first ``train_fraction`` of bars is the
+    discovery period that ranks cells; the rest is reported, never ranked on.
 
     With ``cv_folds >= 2`` the discovery period is also split into blocks
-    (see ``backtest.validation.cv_fold_labels``; the embargo is the longest
-    holding period) and each cell gets block-Sharpe summaries. The per-block
-    sums are returned in the third element for ``selection_checks``.
+    (see ``backtest.validation.cv_fold_labels``). The embargo is the longest
+    time stop, or ``OPEN_ENDED_EMBARGO`` bars when any exit has no fixed
+    length. The per-block sums are returned for ``selection_checks``.
     """
-    from research.dislocation_backtest import signal_frame
+    from research.dislocation_backtest import exit_cells, signal_frame
 
     signal_kinds = list(dict.fromkeys([signal_kind] if isinstance(signal_kind, str) else signal_kind))
     if not signal_kinds or set(signal_kinds) - {"normalized", "ou_z", "raw"}:
@@ -499,9 +508,11 @@ def backtest_scan(
     bases = list(dict.fromkeys(fit_on))
     if not bases or set(bases) - {"changes", "levels"}:
         raise ValueError("choose regression bases from 'changes' and 'levels'")
-    holds = sorted({int(h) for h in holds})
-    if not holds or holds[0] < 1:
-        raise ValueError("holding periods must be >= 1 bar")
+    exit_params = {style: list(values) for style, values in exit_params.items() if values}
+    if not exit_params:
+        raise ValueError("choose at least one exit style with at least one parameter")
+    if any(float(v) < 1 for v in exit_params.get("time", [])):
+        raise ValueError("time stops must be >= 1 bar")
     gate_names, gate_windows = list(gate_names), list(gate_windows)
     if gate_names and any(w < min_gate_history for w in gate_windows):
         raise ValueError(f"Gate percentile lookbacks must be >= {min_gate_history}; choose longer lookbacks or no gates.")
@@ -515,43 +526,56 @@ def backtest_scan(
     n = len(frame)
     cut = int(n * train_fraction)
     folds = int(cv_folds) if cv_folds and cv_folds >= 2 else 1
-    labels = cv_fold_labels(n, cut, folds, embargo=max(holds))
+    embargo = max([int(round(float(v))) for v in exit_params.get("time", [])]
+                  + ([OPEN_ENDED_EMBARGO] if set(exit_params) - {"time"} else []))
+    labels = cv_fold_labels(n, cut, folds, embargo=embargo)
     leg_matrix = frame.select(list(legs)).to_numpy()
     leg_weights = np.array(list(legs.values()), dtype=float)
     entry_weights = frame.select([weight_columns[leg] for leg in legs]).to_numpy() if weight_columns else None
+    exits = {kind: exit_cells(raw_thresholds if kind == "raw" else thresholds, exit_params,
+                              stop_losses, half_life_caps, signal_stops) for kind in signal_kinds}
 
     models = [
         (kind, basis, int(beta), None if basis == "levels" else int(resid), int(norm))
         for kind in signal_kinds for basis in bases for beta in beta_lookbacks
         for resid in (residual_lookbacks if basis == "changes" else [None]) for norm in normalization_lookbacks
     ]
-    rank_cache: dict = {}
+    # Feature/target conditions are identical for every model: rank them once.
+    # Model conditions repeat only within one (signal, basis, beta) group, so
+    # their ranks are dropped when the group changes, bounding memory.
+    shared_ranks: dict = {}
+    group_ranks: dict = {}
+    group = None
     parts, cv_sums, cv_sumsq = [], [], []
     cv_days = None
     for i, (kind, basis, beta, resid, norm) in enumerate(models):
         if progress:
             progress(i, len(models), f"Backtesting model {i + 1}/{len(models)} · {kind} · {basis} · beta {beta} · residual {resid or '—'} · norm {norm}")
+        if (kind, basis, beta) != group:
+            group, group_ranks = (kind, basis, beta), {}
         state = signal_frame(frame, target=target, feature=feature, fit_on=basis, beta_lb=beta,
                              residual_lb=resid, norm_lb=norm, signal_kind=kind)
         gates, masks = [("(none)", "all", None)], []
         for name in gate_names:
             values = state[f"gate_{name}"].to_numpy().astype(float)
+            cache = shared_ranks if name.startswith(("feature_", "target_")) else group_ranks
             for window in gate_windows:
-                # Feature/target conditions repeat across models; rank them once.
                 key = (name, window, hash(values.tobytes()))
-                if key not in rank_cache:
-                    rank_cache[key] = gate_percentile_rank(values, min_history=min_gate_history, window=int(window))
+                if key not in cache:
+                    cache[key] = gate_percentile_rank(values, min_history=min_gate_history, window=int(window))
                 for bucket in REGIME_GATE_BUCKETS:
                     gates.append((name, bucket[0], int(window)))
-                    masks.append(gate_allow_from_ranks(rank_cache[key], (name, bucket[0])))
-        entries = [float(e) for e in (raw_thresholds if kind == "raw" else thresholds)]
-        cells = [(g, e, h) for g in range(len(gates)) for e in entries for h in holds]
+                    masks.append(gate_allow_from_ranks(cache[key], (name, bucket[0])))
+        spec = exits[kind]
+        cells = [(g, c) for g in range(len(gates)) for c in spec]
         configs = pl.DataFrame({
-            "model": [0] * len(cells), "gate": [g - 1 for g, _, _ in cells],
-            "entry": [e for _, e, _ in cells], "exit_style": ["time"] * len(cells),
-            "exit_param": [float(h) for _, _, h in cells],
+            "model": [0] * len(cells), "gate": [g - 1 for g, _ in cells],
+            "entry": [c[0] for _, c in cells], "exit_style": [c[1] for _, c in cells],
+            "exit_param": [c[2] for _, c in cells], "stop": [float(c[3] or 0.0) for _, c in cells],
+            "cap": [float(c[4] or 0.0) for _, c in cells], "signal_stop": [float(c[5] or 0.0) for _, c in cells],
         })
         result = run_vector(leg_matrix, leg_weights, state["signal"].to_numpy()[None, :], configs,
+                            half_life=state["half_life"].to_numpy()[None, :],
                             gates=np.array(masks) if masks else None, entry_weights=entry_weights,
                             cost=cost_bps, lag=execution_lag, folds=labels)
         later = result.folds == folds
@@ -562,14 +586,19 @@ def backtest_scan(
             "signal_kind": kind,
             "signal_units": "target units" if kind == "raw" else "standard deviations",
             "fit_on": basis, "beta_lb": beta, "residual_lb": resid, "norm_lb": norm,
-            "entry_z": [e for _, e, _ in cells], "horizon": [h for _, _, h in cells],
-            "gate": [gates[g][0] for g, _, _ in cells], "gate_bucket": [gates[g][1] for g, _, _ in cells],
-            "gate_window": pl.Series([gates[g][2] for g, _, _ in cells], dtype=pl.Int64),
+            "entry_z": [c[0] for _, c in cells],
+            "exit_style": [c[1] for _, c in cells], "exit_param": [c[2] for _, c in cells],
+            "half_life_cap": pl.Series([c[4] for _, c in cells], dtype=pl.Float64),
+            "signal_stop": pl.Series([c[5] for _, c in cells], dtype=pl.Float64),
+            "stop_loss_bps": pl.Series([c[3] for _, c in cells], dtype=pl.Float64),
+            "gate": [gates[g][0] for g, _ in cells], "gate_bucket": [gates[g][1] for g, _ in cells],
+            "gate_window": pl.Series([gates[g][2] for g, _ in cells], dtype=pl.Int64),
             "n_trades": trades,
             "trades_per_year": trades / max(cut / 252, 1e-9),
             "sharpe": result.sharpe(discovery),
             "pnl_bps": result.fold_sum[:, discovery].sum(axis=1),
             "win_rate": np.where(trades > 0, wins / np.maximum(trades, 1), np.nan),
+            "avg_holding_days": result.metrics["avg_holding_days"],
         }
         if later.any() and result.fold_days[later].sum():
             columns.update(later_sharpe=result.sharpe(later), later_pnl_bps=result.fold_sum[:, later].sum(axis=1),
@@ -587,7 +616,7 @@ def backtest_scan(
         progress(len(models), len(models), f"Backtested {sum(len(p) for p in parts):,} cells")
     results = pl.concat(parts, how="diagonal_relaxed").with_columns(
         pl.col("residual_lb").cast(pl.Int64), pl.col("win_rate").fill_nan(None))
-    extras = {"cut": cut, "folds": folds, "labels": labels}
+    extras = {"cut": cut, "folds": folds, "labels": labels, "embargo": embargo}
     if folds >= 2:
         extras.update(cv_days=cv_days, cv_sums=np.vstack(cv_sums), cv_sumsq=np.vstack(cv_sumsq))
     return frame, results, extras
@@ -597,8 +626,8 @@ def rank_board(results: pl.DataFrame, rank_by: str = "family", min_trades: int =
     """Discovery-period ranking of backtest-scan cells; never looks at later columns.
 
     ``family`` is the IC board's robustness idea kept on Sharpe: a cell's
-    family is every model lookback sharing its signal, basis, entry, holding
-    period and gate, and families are ranked by their median Sharpe first.
+    family is every model lookback sharing its signal, basis, entry, exit and
+    gate, and families are ranked by their median Sharpe first.
     Returns every eligible cell with ``rank_score`` and a ``board_index``
     that addresses the row in ``results``.
     """
@@ -607,7 +636,7 @@ def rank_board(results: pl.DataFrame, rank_by: str = "family", min_trades: int =
     column = _RANK_COLUMN[rank_by]
     if column not in results.columns and column != "family_median_sharpe":
         raise ValueError(f"{RANK_RULES[rank_by]} needs a cross-validated discovery run")
-    family = ["signal_kind", "fit_on", "entry_z", "horizon", "gate", "gate_bucket", "gate_window"]
+    family = ["signal_kind", "fit_on", "entry_z", *EXIT_COLUMNS, "gate", "gate_bucket", "gate_window"]
     eligible = (results.with_row_index("board_index")
                 .filter(pl.col("n_trades") >= min_trades)
                 .with_columns(pl.col("sharpe").median().over(family).alias("family_median_sharpe")))
@@ -631,7 +660,8 @@ def placebo_scan(
     offset (20%..80% of the sample), keeping its volatility and
     autocorrelation but breaking any timing link to the target. The whole
     grid is rerun and ranked with the same rule, so the resulting top scores
-    are what this search finds from noise alone.
+    are what this search finds from noise alone. Progress counts models
+    across all placebos, so a long run shows where it is and how long is left.
     """
     frame = aligned_panel(data, list(dict.fromkeys([scan_kwargs["target"], feature, *scan_kwargs["legs"],
                                                     *(scan_kwargs.get("weight_columns") or {}).values()])))
@@ -640,10 +670,12 @@ def placebo_scan(
     offsets = np.linspace(0.2, 0.8, placebos) * len(values) if placebos > 1 else [0.5 * len(values)]
     out = []
     for i, offset in enumerate(offsets):
-        if progress:
-            progress(i, placebos, f"Placebo {i + 1}/{placebos}: feature changes shifted {int(offset):,} bars")
+        def inner(done, total, message, i=i, offset=offset):
+            if progress:
+                progress(i * total + done, placebos * total,
+                         f"Placebo {i + 1}/{placebos} (feature shifted {int(offset):,} bars) · {message}")
         shifted = frame.with_columns(pl.Series(feature, values[0] + np.cumsum(np.roll(moves, int(offset)))))
-        _, results, _ = backtest_scan(shifted, feature=feature, **scan_kwargs)
+        _, results, _ = backtest_scan(shifted, feature=feature, progress=inner, **scan_kwargs)
         board = rank_board(results, rank_by, min_trades)
         out.append({"placebo": i + 1, "shift_bars": int(offset),
                     "best_score": float(board["rank_score"][0]) if len(board) else float("nan"),

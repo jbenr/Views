@@ -284,11 +284,18 @@ def test_backtest_discovery_validation_pick_and_legacy_ic_runs(tmp_path, monkeyp
     assert meta["scoring"] == "backtest" and meta["cv_folds"] == 3 and len(meta["placebo"]) == 2
     assert meta["selection_checks"] and meta["grid"]["cost_bps"] == 0.25
 
-    assert callbacks["_pick_dislocation_candidate"]([0] * len(board["rows"]), board, [0.5], [20]) == (no_update_marker(),) * 6
-    candidate, label, entries, stops, cost, lag = ui.freeze_candidate(board, 1, [0.5], [20])
+    untouched = callbacks["_pick_dislocation_candidate"]([0] * len(board["rows"]), board, [0.5], *[None] * 8)
+    assert untouched == (no_update_marker(),) * (5 + len(ui.MECHANICS_EXITS))
+    candidate, label, entries, *exits, cost, lag = ui.freeze_candidate(
+        board, 1, [0.5], {"bt-time-stops": [20], "bt-exit-styles": ["band"], "bt-stop": [15.0]})
+    exits = dict(zip(ui.MECHANICS_EXITS, exits))
     row = board["rows"][1]
     assert candidate["beta_lb"] == row["beta_lb"] and candidate["gate"] == row["gate"]
-    assert stops == sorted({20, row["horizon"]}) and cost == 0.25 and lag == 0
+    # the row's own exit is added to what was selected, so the grid contains the discovery trade
+    assert exits["bt-exit-styles"] == ["band", row["exit_style"]]
+    assert exits["bt-time-stops"] == sorted({20, int(row["exit_param"])})
+    assert exits["bt-stop"] == [0.0, 15.0] and exits["bt-caps"] == [0.0] and exits["bt-signal-stops"] == [0.0]
+    assert cost == 0.25 and lag == 0
 
     run_id = Path(board["run_path"]).name
     reopened, _, archived = callbacks["_open_saved"](1, run_id, 5, "session")
@@ -336,3 +343,15 @@ def test_pnl_heatmap_sums_months_colours_by_sign_and_blanks_missing_months():
     assert r > b  # losses lean red; the largest loss is full strength with white ink
     assert cells["2020"]["Dec"].style["color"] == "#FFFFFF"
     assert cells["2020"]["full year"].style["fontWeight"] == "bold"
+
+
+def test_trade_mechanics_select_all_fills_entries_exits_and_stops_only():
+    from research import app as ui
+    app = ui.build_app()
+    callbacks = {v["callback"].__wrapped__.__name__: v["callback"].__wrapped__ for v in app.callback_map.values()}
+    options = [[{"label": str(v), "value": v} for v in values] for values in
+               ([0.5, 1.0], ["time", "band"], [5, 10], [0.0], [0.5], [1.0, 2.0], [0.0, 15.0])]
+    assert callbacks["_select_all_mechanics"](1, *options) == [
+        [0.5, 1.0], ["time", "band"], [5, 10], [0.0], [0.5], [1.0, 2.0], [0.0, 15.0]]
+    outputs = next(k for k, v in app.callback_map.items() if v["callback"].__wrapped__.__name__ == "_select_all_mechanics")
+    assert "bt-cost" not in outputs and "bt-lag" not in outputs

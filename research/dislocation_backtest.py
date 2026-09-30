@@ -154,8 +154,17 @@ def make_pipeline(
     stop_loss_bps: float | None,
     state: pl.DataFrame | None = None,
     execution_lag: int = 0,
+    half_life_cap: float | None = None,
+    signal_stop: float | None = None,
 ) -> BooleanSignalPipeline:
-    """Build one exact Engine pipeline with same-day first-crossing entries."""
+    """Build one exact Engine pipeline with same-day first-crossing entries.
+
+    ``signal_stop`` exits once the signal moves that far beyond its entry
+    value, away from zero (the dislocation extending, not reverting).
+    ``half_life_cap`` caps a band or reversion-fraction trade at
+    ceil(entry half-life x cap) bars; no cap when that half-life is not
+    positive.
+    """
     if state is None:
         state = signal_frame(
             data,
@@ -191,6 +200,17 @@ def make_pipeline(
         enter_short &= valid
     else:
         raise ValueError(f"unknown exit style: {exit_style!r}")
+    if half_life_cap and exit_style not in ("band", "revert_frac"):
+        raise ValueError("a half-life cap applies to band and revert_frac exits only")
+    if signal_stop:
+        target = exit_fn
+
+        def exit_fn(pos, bar):
+            beyond = (bar["signal"] < pos.entry_signal - signal_stop if pos.direction == 1
+                      else bar["signal"] > pos.entry_signal + signal_stop)
+            if beyond:
+                return "signal_stop"
+            return target(pos, bar) if target is not None else None
 
     def compute(_data: pl.DataFrame) -> pl.DataFrame:
         frame = state.select("signal", "resid", "beta", "r2", "half_life").with_columns(
@@ -201,6 +221,10 @@ def make_pipeline(
         )
         if exit_style == "half_life_frac":
             frame = frame.with_columns((pl.col("half_life") * exit_param).ceil().alias("time_stop"))
+        elif half_life_cap:
+            frame = frame.with_columns(
+                pl.when(pl.col("half_life") > 0).then((pl.col("half_life") * half_life_cap).ceil())
+                .otherwise(None).alias("time_stop"))
         if candidate.get("weight_columns"):
             frame = frame.with_columns(*[data[c] for c in candidate["weight_columns"].values()])
         return frame.shift(execution_lag)
@@ -247,8 +271,36 @@ def _metrics(result) -> dict:
     return metrics
 
 
+def exit_cells(
+    entry_zs: Iterable[float],
+    exit_params: dict[str, Iterable[float]],
+    stop_losses: Iterable[float | None] = (None,),
+    half_life_caps: Iterable[float | None] = (None,),
+    signal_stops: Iterable[float | None] = (None,),
+) -> list[tuple]:
+    """Every (entry, exit style, exit param, P&L stop, half-life cap, signal stop) cell.
+
+    Bands at or above the entry are skipped (they would exit immediately), and
+    half-life caps only multiply band and reversion-fraction exits. 0 and None
+    both mean "none" for stops and caps.
+    """
+    none = lambda values: sorted({float(v) if v else None for v in values}, key=lambda v: -1 if v is None else v)
+    caps, sstops, stops = none(half_life_caps or [None]), none(signal_stops or [None]), none(stop_losses or [None])
+    return [
+        (float(entry), style, float(param), stop, cap, sstop)
+        for entry in entry_zs
+        for style, params in exit_params.items()
+        for param in params
+        if style != "band" or float(param) < float(entry)
+        for cap in (caps if style in ("band", "revert_frac") else [None])
+        for sstop in sstops
+        for stop in stops
+    ]
+
+
 def _grid_inputs(data, trade, candidate, entry_zs, exit_params, stop_losses,
-                 stop_loss_bps, execution_lag) -> tuple[pl.DataFrame, pl.DataFrame, list[tuple]]:
+                 stop_loss_bps, execution_lag, half_life_caps=(None,),
+                 signal_stops=(None,)) -> tuple[pl.DataFrame, pl.DataFrame, list[tuple]]:
     """Aligned data, the frozen candidate's signal frame and the valid grid cells."""
     # Engine and signal frame must share precisely the same bar index.  The
     # feature can have a shorter history than the executable target legs, so
@@ -275,14 +327,9 @@ def _grid_inputs(data, trade, candidate, entry_zs, exit_params, stop_losses,
         norm_lb=int(candidate["norm_lb"]),
         signal_kind=candidate.get("signal_kind", "normalized"),
     )
-    cells = [
-        (float(entry), style, float(param), stop)
-        for entry in entry_zs
-        for style, params in exit_params.items()
-        for param in params
-        for stop in (list(stop_losses) if stop_losses is not None else [stop_loss_bps])
-        if style != "band" or float(param) < float(entry)
-    ]
+    cells = exit_cells(entry_zs, exit_params,
+                       list(stop_losses) if stop_losses is not None else [stop_loss_bps],
+                       half_life_caps, signal_stops)
     return data, state, cells
 
 
@@ -299,6 +346,8 @@ def run_detail(
     stop_loss_bps: float | None,
     round_trip_cost_bps: float,
     execution_lag: int,
+    half_life_cap: float | None = None,
+    signal_stop: float | None = None,
 ) -> dict:
     """One cell through the exact Engine: metrics row, trades with MAE/MFE, equity, years.
 
@@ -308,6 +357,7 @@ def run_detail(
         data, trade, candidate, entry_z=entry_z, exit_style=exit_style,
         exit_param=exit_param, stop_loss_bps=stop_loss_bps or None,
         state=state, execution_lag=execution_lag,
+        half_life_cap=half_life_cap, signal_stop=signal_stop,
     )
     result = Engine(BacktestConfig(
         transaction_cost_bps=round_trip_cost_bps,
@@ -319,7 +369,8 @@ def run_detail(
         "signal_kind": candidate.get("signal_kind", "normalized"),
         "signal_units": "target units" if candidate.get("signal_kind") == "raw" else "standard deviations",
         "entry_z": entry_z, "exit_style": exit_style,
-        "exit_param": exit_param, **_metrics(result),
+        "exit_param": exit_param, "half_life_cap": half_life_cap, "signal_stop": signal_stop,
+        **_metrics(result),
     }
     if candidate.get("split_date"):
         for label, predicate in (
@@ -357,6 +408,8 @@ def detail_for(
     stop_loss_bps: float | None,
     round_trip_cost_bps: float,
     execution_lag: int,
+    half_life_cap: float | None = None,
+    signal_stop: float | None = None,
 ) -> dict:
     """Exact Engine detail for one grid cell, on the same alignment as the grid."""
     data, state, _ = _grid_inputs(data, trade, candidate, [], {}, None, None, execution_lag)
@@ -364,6 +417,7 @@ def detail_for(
         data, trade, candidate, state=state, config_id=config_id, entry_z=entry_z,
         exit_style=exit_style, exit_param=exit_param, stop_loss_bps=stop_loss_bps,
         round_trip_cost_bps=round_trip_cost_bps, execution_lag=execution_lag,
+        half_life_cap=half_life_cap, signal_stop=signal_stop,
     )
 
 
@@ -379,21 +433,25 @@ def run_grid(
     progress: Callable[[int, int], None] | None = None,
     stop_losses: Iterable[float | None] | None = None,
     execution_lag: int = 0,
+    half_life_caps: Iterable[float | None] = (None,),
+    signal_stops: Iterable[float | None] = (None,),
 ) -> tuple[pl.DataFrame, dict]:
     """Run every requested entry/exit cell through the exact Engine."""
     data, state, cells = _grid_inputs(data, trade, candidate, entry_zs, exit_params,
-                                      stop_losses, stop_loss_bps, execution_lag)
+                                      stop_losses, stop_loss_bps, execution_lag,
+                                      half_life_caps, signal_stops)
     rows: list[dict] = []
     selected: dict = {}
     runs: dict = {}
     rank_metric = "earlier_sharpe" if candidate.get("split_date") else "sharpe"
     if not cells:
         raise ValueError("No valid exit combinations: exit bands must be below entry thresholds")
-    for done, (entry_z, style, exit_param, stop) in enumerate(cells, 1):
+    for done, (entry_z, style, exit_param, stop, cap, sstop) in enumerate(cells, 1):
         run = run_detail(
             data, trade, candidate, state=state, config_id=str(done), entry_z=entry_z,
             exit_style=style, exit_param=exit_param, stop_loss_bps=stop,
             round_trip_cost_bps=round_trip_cost_bps, execution_lag=execution_lag,
+            half_life_cap=cap, signal_stop=sstop,
         )
         row = run["metrics"]
         rows.append(row)
@@ -419,6 +477,8 @@ def run_vector_grid(
     stop_losses: Iterable[float | None] = (None,),
     round_trip_cost_bps: float = 0.0,
     execution_lag: int = 0,
+    half_life_caps: Iterable[float | None] = (None,),
+    signal_stops: Iterable[float | None] = (None,),
 ) -> tuple[pl.DataFrame, dict, pl.DataFrame, pl.DataFrame]:
     """``run_grid``'s table from the vectorised engine; exact detail for the best cell only.
 
@@ -429,7 +489,7 @@ def run_vector_grid(
     per-config yearly P&L and the aligned data the grid was run on.
     """
     data, state, cells = _grid_inputs(data, trade, candidate, entry_zs, exit_params,
-                                      stop_losses, None, execution_lag)
+                                      stop_losses, None, execution_lag, half_life_caps, signal_stops)
     if not cells:
         raise ValueError("No valid exit combinations: exit bands must be below entry thresholds")
     gated = candidate.get("gate", "(none)") not in (None, "(none)")
@@ -437,6 +497,7 @@ def run_vector_grid(
         "model": [0] * len(cells), "gate": [0 if gated else -1] * len(cells),
         "entry": [c[0] for c in cells], "exit_style": [c[1] for c in cells],
         "exit_param": [c[2] for c in cells], "stop": [float(c[3] or 0.0) for c in cells],
+        "cap": [float(c[4] or 0.0) for c in cells], "signal_stop": [float(c[5] or 0.0) for c in cells],
     })
     weights = candidate.get("weight_columns")
     split = candidate.get("split_date")
@@ -459,6 +520,8 @@ def run_vector_grid(
         "signal_kind": [candidate.get("signal_kind", "normalized")] * len(cells),
         "signal_units": ["target units" if candidate.get("signal_kind") == "raw" else "standard deviations"] * len(cells),
         "entry_z": m["entry"], "exit_style": m["exit_style"], "exit_param": m["exit_param"],
+        "half_life_cap": pl.Series([c[4] for c in cells], dtype=pl.Float64),
+        "signal_stop": pl.Series([c[5] for c in cells], dtype=pl.Float64),
     }).with_columns(m.select(
         "total_pnl_bps", "n_trades", "trade_win_rate", "sharpe", "max_drawdown_bps", "avg_holding_days",
         "avg_pnl_per_trade_bps", "closed_pnl_bps", "time_in_market_pct", "open_trades",
@@ -490,5 +553,6 @@ def run_vector_grid(
         data, trade, candidate, state=state, config_id=best["config_id"], entry_z=best["entry_z"],
         exit_style=best["exit_style"], exit_param=best["exit_param"], stop_loss_bps=best["stop_loss_bps"],
         round_trip_cost_bps=round_trip_cost_bps, execution_lag=execution_lag,
+        half_life_cap=best["half_life_cap"], signal_stop=best["signal_stop"],
     )
     return grid, {**detail, "runs": {best["config_id"]: detail}, "rank_metric": rank_metric}, yearly, data

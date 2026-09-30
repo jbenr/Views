@@ -80,7 +80,7 @@ def _sharpe(n: int, total: np.ndarray, total_sq: np.ndarray) -> np.ndarray:
 
 @njit(parallel=True, cache=True)
 def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
-            model, gate, entry, style, param, stop, cost, lag, fold, n_fold,
+            model, gate, entry, style, param, stop, sig_stop, cap, cost, lag, fold, n_fold,
             keep, pnl_out, fold_sum, fold_sumsq, fold_trades, fold_wins,
             total, closed_pnl, n_trades, n_wins, max_dd, days_held,
             gross_profit, gross_loss, closed_bars, open_end, summary_dd):
@@ -94,6 +94,7 @@ def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
 
     for k in prange(model.shape[0]):
         m, g, e, st, p, sl = model[k], gate[k], entry[k], style[k], param[k], stop[k]
+        ss, cp = sig_stop[k], cap[k]
         time_stop = int(np.round(p)) if st == 0 else 0
         w = np.empty(n_legs)
         pos = 0
@@ -125,9 +126,12 @@ def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
                         out = (pos == 1 and s > -p) or (pos == -1 and s < p)
                     if sl > 0 and cur < -sl:
                         out = True
+                    if ss > 0 and ((pos == 1 and s < entry_sig - ss) or (pos == -1 and s > entry_sig + ss)):
+                        out = True
                     if st == 0 and time_stop > 0 and bars >= time_stop:
                         out = True
-                    if st == 3 and bars >= dyn:
+                    # half-life exits and half-life caps on band/reversion exits
+                    if dyn > 0 and bars >= dyn:
                         out = True
                     if not out and st == 2:
                         target = entry_sig * (1.0 - p)
@@ -180,8 +184,13 @@ def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
                         pos = direction
                         bars = 0
                         entry_sig = s
+                        dyn = 0
                         if st == 3:
                             dyn = max(1, int(np.round(np.ceil(half_life[m, j] * p))))
+                        elif cp > 0 and (st == 1 or st == 2):
+                            hl = half_life[m, j]
+                            if np.isfinite(hl) and hl > 0:
+                                dyn = max(1, int(np.round(np.ceil(hl * cp))))
                 unreal = 0.0
                 if pos != 0:
                     held = 0.0
@@ -229,8 +238,12 @@ def run_vector(
     signals       (models, bars) unshifted signal per model.
     configs       columns ``model`` (row of ``signals``), ``entry``,
                   ``exit_style`` (a key of EXIT_STYLES), ``exit_param``, and
-                  optional ``gate`` (row of ``gates``; -1/null = ungated) and
-                  ``stop`` (P&L stop in bps; 0/null = none).
+                  optional ``gate`` (row of ``gates``; -1/null = ungated),
+                  ``stop`` (P&L stop in bps; 0/null = none), ``signal_stop``
+                  (exit once the signal moves this far beyond its entry value,
+                  away from zero, in signal units; 0/null = none) and ``cap``
+                  (band/revert_frac only: exit after ceil(entry half-life x
+                  cap) bars when that half-life is positive; 0/null = none).
     half_life     (models, bars), required by half_life_frac configs.
     gates         (gate masks, bars) boolean entry-allow masks, unshifted.
     entry_weights (bars, legs) weights frozen at entry, replacing
@@ -267,9 +280,13 @@ def run_vector(
         raise ValueError("gate masks must be (gates, bars) and cover every config gate index")
     stop = (configs["stop"].fill_null(0.0).cast(pl.Float64).to_numpy()
             if "stop" in configs.columns else np.zeros(len(configs)))
+    sig_stop = (configs["signal_stop"].fill_null(0.0).cast(pl.Float64).to_numpy()
+                if "signal_stop" in configs.columns else np.zeros(len(configs)))
+    cap = (configs["cap"].fill_null(0.0).cast(pl.Float64).to_numpy()
+           if "cap" in configs.columns else np.zeros(len(configs)))
     if half_life is None:
-        if (style == EXIT_STYLES["half_life_frac"]).any():
-            raise ValueError("half_life_frac configs need half_life")
+        if (style == EXIT_STYLES["half_life_frac"]).any() or (cap > 0).any():
+            raise ValueError("half_life_frac configs and half-life caps need half_life")
         half_life = np.full((1, 1), np.nan)
     half_life = np.ascontiguousarray(np.atleast_2d(half_life), dtype=np.float64)
     use_w = entry_weights is not None
@@ -296,7 +313,7 @@ def run_vector(
 
     _kernel(legs, np.asarray(leg_weights, dtype=np.float64), signals, half_life, gates, entry_w, use_w,
             model, gate, configs["entry"].cast(pl.Float64).to_numpy(), style,
-            configs["exit_param"].cast(pl.Float64).to_numpy(), stop, float(cost), int(lag),
+            configs["exit_param"].cast(pl.Float64).to_numpy(), stop, sig_stop, cap, float(cost), int(lag),
             fold, n_fold, keep_idx, pnl, fold_sum, fold_sumsq, fold_trades, fold_wins,
             total, closed, n_trades, n_wins, max_dd, days_held,
             gross_profit, gross_loss, closed_bars, open_end, summary_dd)

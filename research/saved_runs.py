@@ -9,7 +9,7 @@ from research import artifacts
 
 
 def grid_spec(bases, beta, residual, norm, entries, horizons, gates, windows, signal, train,
-              raw_entries=(1., 2., 3., 5., 10., 15.), scoring='ic', cost=None, lag=None, cv_folds=0):
+              raw_entries=(1., 2., 3., 5., 10., 15.), scoring='ic', cost=None, lag=None, cv_folds=0, exits=None):
     spec = dict(fit_on=sorted(bases), beta_lb=sorted(beta), residual_lb=sorted(residual),
                 norm_lb=sorted(norm), entry_z=sorted(entries), horizon=sorted(horizons),
                 gates=sorted(gates), gate_windows=sorted(windows) if gates else [],
@@ -18,7 +18,7 @@ def grid_spec(bases, beta, residual, norm, entries, horizons, gates, windows, si
     if scoring == 'backtest':
         # Backtest discovery results depend on trading costs, fill timing and CV blocks.
         spec.update(scoring='backtest', cost_bps=float(cost or 0.0), execution_lag=int(lag if lag is not None else 1),
-                    cv_folds=int(cv_folds or 0))
+                    cv_folds=int(cv_folds or 0), exits=exits)
     return spec
 
 
@@ -126,7 +126,7 @@ def compare_run(meta, requested, current_hash):
         if saved.get('scoring', 'ic') != requested.get('scoring', 'ic'):
             missing.append(f"scoring: saved {saved.get('scoring', 'ic (legacy)')}, requested "
                            f"{requested.get('scoring', 'ic')} (rerun required)")
-        for key in ('train_fraction', 'cost_bps', 'execution_lag', 'cv_folds'):
+        for key in ('train_fraction', 'cost_bps', 'execution_lag', 'cv_folds', 'exits'):
             if saved.get(key) != requested.get(key):
                 missing.append(f'{key}: requested {requested.get(key)}, saved {saved.get(key)} (rerun required)')
         messages.append('Missing requested settings: ' + '; '.join(missing) if missing

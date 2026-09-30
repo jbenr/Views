@@ -28,7 +28,9 @@ def market(n=900, seed=11):
 
 
 SCAN = dict(target="y", feature="x", beta_lookbacks=[40], residual_lookbacks=[10], normalization_lookbacks=[60],
-            thresholds=[1.0, 1.5], holds=[5, 15], fit_on=["changes", "levels"], signal_kind=["normalized", "ou_z"],
+            thresholds=[1.0, 1.5], exit_params={"time": [5, 15], "band": [0.0], "revert_frac": [0.5], "half_life_frac": [1.0]},
+            half_life_caps=[None, 2.0], signal_stops=[None, 1.0], stop_losses=[None, 3.0],
+            fit_on=["changes", "levels"], signal_kind=["normalized", "ou_z"],
             gate_names=["resid_vol20", "feature_level"], gate_windows=[126], cost_bps=0.25, execution_lag=1,
             train_fraction=0.7)
 
@@ -44,12 +46,19 @@ def test_every_discovery_cell_is_the_engine_trade_it_describes(weighted):
     gated = results.filter(pl.col("gate") != "(none)")
     rows = [results.row(int(i), named=True) for i in rng.choice(len(results), 6, replace=False)]
     rows += [gated.row(int(i), named=True) for i in rng.choice(len(gated), 6, replace=False)]
+    # and one cell of every exit style, capped and signal-stopped where they apply
+    for style in ("time", "band", "revert_frac", "half_life_frac"):
+        pick = results.filter((pl.col("exit_style") == style) & pl.col("signal_stop").is_not_null()
+                              & (pl.col("half_life_cap").is_not_null() | ~pl.col("exit_style").is_in(["band", "revert_frac"])))
+        rows.append(pick.row(int(rng.integers(len(pick))), named=True))
     for row in rows:
         cand = {k: row[k] for k in ("fit_on", "beta_lb", "residual_lb", "norm_lb", "signal_kind",
                                     "gate", "gate_bucket", "gate_window")}
         cand.update(target="y", feature="x", split_date=split, **({"weight_columns": weights} if weights else {}))
         exact, selected = run_grid(data, TradeDef("y", legs), cand, entry_zs=[row["entry_z"]],
-                                   exit_params={"time": [row["horizon"]]}, round_trip_cost_bps=0.25, execution_lag=1)
+                                   exit_params={row["exit_style"]: [row["exit_param"]]}, stop_losses=[row["stop_loss_bps"]],
+                                   half_life_caps=[row["half_life_cap"]], signal_stops=[row["signal_stop"]],
+                                   round_trip_cost_bps=0.25, execution_lag=1)
         e = exact.row(0, named=True)
         assert row["pnl_bps"] == pytest.approx(e["earlier_pnl_bps"], abs=1e-9), row
         assert row["later_pnl_bps"] == pytest.approx(e["later_pnl_bps"], abs=1e-9), row
@@ -125,3 +134,27 @@ def test_cv_columns_ranking_and_placebo():
                            **{k: v for k, v in SCAN.items() if k != "feature"}, legs={"left": -1.0, "right": 1.0})
     assert len(placebo) == 2 and all(np.isfinite(p["best_score"]) for p in placebo)
     assert placebo[0]["shift_bars"] != placebo[1]["shift_bars"]
+
+
+
+def test_exit_cells_skip_bands_at_entry_and_cap_only_signal_exits():
+    from research.dislocation_backtest import exit_cells
+    cells = exit_cells([1.0], {"time": [5], "band": [0.0, 1.0], "half_life_frac": [1.0]},
+                       stop_losses=[0, 10.0], half_life_caps=[None, 2.0], signal_stops=[0.0])
+    styles = [(c[1], c[2], c[4]) for c in cells]
+    assert ("band", 1.0, None) not in styles and ("band", 1.0, 2.0) not in styles
+    assert {c[4] for c in cells if c[1] != "band"} == {None}
+    assert {c[4] for c in cells if c[1] == "band"} == {None, 2.0}
+    assert {c[3] for c in cells} == {None, 10.0} and {c[5] for c in cells} == {None}
+    assert len(cells) == (1 + 2 + 1) * 2  # time, band x 2 caps, half-life; x 2 stops
+
+
+def test_placebo_progress_counts_models_across_every_placebo():
+    seen = []
+    placebo_scan(market(), feature="x", placebos=2, rank_by="sharpe", min_trades=5,
+                 progress=lambda done, total, message: seen.append((done, total, message)),
+                 **{k: v for k, v in SCAN.items() if k != "feature"}, legs={"left": -1.0, "right": 1.0})
+    totals = {t for _, t, _ in seen}
+    assert totals == {2 * 4}  # 2 placebos x 4 models
+    assert [d for d, _, _ in seen] == sorted(d for d, _, _ in seen)
+    assert seen[-1][0] == 8 and "Placebo 2/2" in seen[-1][2] and "model" in seen[1][2]
