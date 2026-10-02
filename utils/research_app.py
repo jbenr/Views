@@ -263,8 +263,14 @@ def make_app(
     return app
 
 
-def run(app: Dash, port: int = 8050, host: str = "127.0.0.1") -> None:
-    """Start the app. Uses the debug flag set in make_app()."""
+def run(app: Dash, port: int = 8050, host: str = "127.0.0.1", reload: bool = False) -> None:
+    """Start the app. Uses the debug flag set in make_app().
+
+    The file-watching reloader is off unless asked for. With it on, saving any
+    source file restarts the server, killing running jobs; and if that restart
+    fails (a half-saved file, or numba worker threads torn down mid-kernel),
+    Werkzeug exits the whole server.
+    """
     debug = getattr(app, "_ra_debug", True)
-    print(f"  {app.title}  →  http://{host}:{port}  (debug={debug})")
-    app.run(host=host, port=port, debug=debug)
+    print(f"  {app.title}  →  http://{host}:{port}  (debug={debug}, reload={reload})")
+    app.run(host=host, port=port, debug=debug, use_reloader=reload)

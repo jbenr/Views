@@ -212,7 +212,31 @@ def test_artifacts_save_every_configuration_without_overwriting(tmp_path, monkey
     assert json.loads((first / "metadata.json").read_text())["target"] == "y"
 
 
-def test_app_discovery_to_exit_inspection_callback_flow(tmp_path, monkeypatch):
+@pytest.fixture
+def job_dir(tmp_path, monkeypatch):
+    from research import jobs
+    path = tmp_path.parent / f"{tmp_path.name}_jobs"
+    monkeypatch.setattr(jobs, "JOBS", path)
+    return path
+
+
+def run_as_job(callbacks, name, *args, **kwargs):
+    """Click Run as the page does, wait for the background job, return what the page then shows."""
+    from research import jobs
+    kind = "dis" if name == "_run_dislocation" else "bt"
+    before = jobs.latest(kind)
+    info = callbacks[name](*args, **kwargs)
+    record = jobs.latest(kind)
+    if record is None or (before and record["id"] == before["id"]):
+        return info, None, None  # refused before a job started
+    record = jobs.wait(record["id"])
+    other = jobs.latest("bt" if kind == "dis" else "dis")
+    shown = {kind: None, ("bt" if kind == "dis" else "dis"): other and other["id"]}
+    out = callbacks["_job_results"](1, shown["dis"], shown["bt"], 5)
+    return out[0:3] if kind == "dis" else out[4:7]
+
+
+def test_app_discovery_to_exit_inspection_callback_flow(tmp_path, monkeypatch, job_dir):
     from pathlib import Path
     from research import app as ui, artifacts
     from plotly.utils import PlotlyJSONEncoder
@@ -221,7 +245,7 @@ def test_app_discovery_to_exit_inspection_callback_flow(tmp_path, monkeypatch):
     callbacks = {v["callback"].__wrapped__.__name__: v["callback"].__wrapped__ for v in app.callback_map.values()}
     stored = {"target": "y", "legs": {"y": 1}, "features": ["x"], "panel_id": "test",
               "weighting": "fixed", "rows": panel().with_columns(pl.col("ts").cast(pl.Utf8)).to_dicts()}
-    view, status, board = callbacks["_run_dislocation"](1, stored, "x", ["levels"], [30], [10], [40],
+    view, status, board = run_as_job(callbacks, "_run_dislocation", 1, stored, "x", ["levels"], [30], [10], [40],
         [0.5], [5], [], [126], "ou_z", 0.7, 5, "session")
     assert isinstance(board, dict) and board["rows"]
     row = board["rows"][0]
@@ -229,7 +253,7 @@ def test_app_discovery_to_exit_inspection_callback_flow(tmp_path, monkeypatch):
     assert row["n_trades"] >= 5 and "sharpe" in row and "later_sharpe" in row
     assert board["cost_bps"] == 0.1 and board["execution_lag"] == 1
     frozen = {**row, "target": "y", "feature": "x", "panel_id": "test", "split_date": board["split_date"]}
-    bt_view, _, saved = callbacks["_run_backtest_grid"](1, frozen, stored, "ignored", None,
+    bt_view, _, saved = run_as_job(callbacks, "_run_backtest_grid", 1, frozen, stored, "ignored", None,
         [0.5], ["time", "half_life_frac"], [5], [0], [0.5], [15], 0.1, [2], 1, "session")
     # Trades/equity/periods live on disk, not in the Store. The vectorised
     # grid saves exact Engine detail for its best cell; inspecting another
@@ -256,13 +280,13 @@ def test_app_discovery_to_exit_inspection_callback_flow(tmp_path, monkeypatch):
     assert archived['panel_id'] != stored['panel_id']
     assert archived['rows'] == board['rows']
     historical_candidate = dict(frozen, archive_id=run_id, panel_id=archived['panel_id'])
-    _, _, archived_exits = callbacks['_run_backtest_grid'](1, historical_candidate, None, 'ignored', None,
+    _, _, archived_exits = run_as_job(callbacks, '_run_backtest_grid', 1, historical_candidate, None, 'ignored', None,
         [.5], ['time'], [5], [0], [.5], [15], .1, [2], 1, 'session')
     assert len(archived_exits['rows']) == 1
     json.dumps([summary, opened, opened_status], cls=PlotlyJSONEncoder)
 
 
-def test_backtest_discovery_validation_pick_and_legacy_ic_runs(tmp_path, monkeypatch):
+def test_backtest_discovery_validation_pick_and_legacy_ic_runs(tmp_path, monkeypatch, job_dir):
     from pathlib import Path
     from research import app as ui, artifacts
     from research.saved_runs import grid_spec
@@ -274,10 +298,10 @@ def test_backtest_discovery_validation_pick_and_legacy_ic_runs(tmp_path, monkeyp
               "weighting": "fixed", "rows": panel().with_columns(pl.col("ts").cast(pl.Utf8)).to_dicts()}
     args = (1, stored, "x", ["levels"], [30], [10], [40], [0.5], [5, 10], [], [126], "ou_z", 0.7, 5, "session", None)
 
-    refused, _, _ = callbacks["_run_dislocation"](*args, 0.25, 1, 0, "cv_mean", 0)
+    refused = callbacks["_run_dislocation"](*args, 0.25, 1, 0, "cv_mean", 0)
     assert "needs cross-validation blocks" in json.dumps(refused, cls=PlotlyJSONEncoder)
 
-    view, _, board = callbacks["_run_dislocation"](*args, 0.25, 0, 3, "cv_mean", 2)
+    view, _, board = run_as_job(callbacks, "_run_dislocation", *args, 0.25, 0, 3, "cv_mean", 2)
     text = json.dumps(view, cls=PlotlyJSONEncoder)
     assert "SELECTION CHECKS" in text and "PLACEBO" in text
     meta = json.loads((Path(board["run_path"]) / "metadata.json").read_text(encoding="utf-8"))

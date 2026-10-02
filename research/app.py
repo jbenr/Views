@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
+import os
 import time
 import traceback
 from pathlib import Path
@@ -43,10 +45,10 @@ from backtest.lab import REGIME_GATE_BUCKETS
 from research.dislocation_backtest import detail_for, exit_cells, run_vector_grid, signal_frame, _entry_gate
 from backtest.validation import event_overlap_diagnostics, selection_checks
 from research.artifacts import append_details, save_run
-from research.saved_runs import grid_spec, input_hash, list_runs, compare_run, load_run, run_path
+from research.saved_runs import grid_spec, input_hash, list_exit_runs, list_runs, compare_run, load_run, run_path
 from research.saved_runs import target_definition, definition_match, target_label
-from research import progress as work
-from research.preferences import load_preferences, save_preferences
+from research import jobs, progress as work
+from research.preferences import load_controls, load_preferences, save_controls, save_preferences
 from backtest.engine import TradeDef
 from utils.research_app import (
     BORDER, C0, C1, DIM, ORANGE, PANEL, TEXT, make_app, run,
@@ -453,7 +455,7 @@ def dislocation_tab() -> html.Div:
         ], open=False),
         dcc.Store(id="dis-saved-query"),
     ]
-    return html.Div(style={"padding": "18px 24px"}, children=[
+    return remember_controls(html.Div(style={"padding": "18px 24px"}, children=[
         heading("dislocation discovery"),
         html.Div(style={"display": "grid", "gridTemplateColumns": "320px minmax(0, 1fr)",
                         "gap": 26, "alignItems": "start"}, children=[
@@ -472,7 +474,51 @@ def dislocation_tab() -> html.Div:
         dcc.Store(id="dis-board"),
         dcc.Store(id="dis-candidate"),
         dcc.Store(id="bt-grid"),
-    ])
+        dcc.Store(id="controls-saved"),
+        dcc.Store(id="dis-rendered"),
+        dcc.Store(id="bt-rendered"),
+    ]), load_controls())
+
+
+REMEMBERED = [
+    "dis-signal", "dis-fit-on", "dis-beta-lbs", "dis-residual-lbs", "dis-norm-lbs", "dis-thresholds",
+    "dis-raw-thresholds", "dis-min-events", "dis-exit-styles", "dis-horizons", "dis-bands", "dis-revert-fracs",
+    "dis-half-lives", "dis-caps", "dis-signal-stops", "dis-stops", "dis-gates", "dis-gate-windows", "dis-cost",
+    "dis-lag", "dis-train", "dis-cv", "dis-rank", "dis-placebo",
+    "bt-entry-zs", "bt-exit-styles", "bt-time-stops", "bt-bands", "bt-revert-fracs", "bt-half-lives", "bt-caps",
+    "bt-signal-stops", "bt-stop", "bt-cost", "bt-lag",
+]
+
+
+def remember_controls(tree, saved: dict):
+    """Give each REMEMBERED control its last saved value, if that value is still offered.
+
+    Values no longer among a control's options are dropped; a multi-select
+    left empty, or a single choice that is gone, keeps its default. The
+    walk sets values in place and returns the tree.
+    """
+    def visit(node):
+        if not hasattr(node, "to_plotly_json"):
+            return
+        key = getattr(node, "id", None)
+        if isinstance(key, str) and key in REMEMBERED and key in saved:
+            value, options = saved[key], getattr(node, "options", None)
+            if options is None:  # free inputs (e.g. minimum trades)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    node.value = value
+            else:
+                allowed = [o["value"] if isinstance(o, dict) else o for o in options]
+                if isinstance(node.value, list) and isinstance(value, list):
+                    kept = [v for v in value if v in allowed]
+                    if kept or not value:
+                        node.value = kept
+                elif not isinstance(node.value, list) and value in allowed:
+                    node.value = value
+        children = getattr(node, "children", None)
+        for child in children if isinstance(children, (list, tuple)) else [children]:
+            visit(child)
+    visit(tree)
+    return tree
 
 
 def dislocation_backtest_controls() -> html.Div:
@@ -502,6 +548,11 @@ def dislocation_backtest_controls() -> html.Div:
         html.Button("Run backtest grid", id="bt-run", n_clicks=0,
                     className="ref-btn", style={**btn_style(primary=True), "width": "100%"}),
         html.Div(id="bt-run-info"),
+        section("Saved backtest grids", [
+            field("saved grid", dcc.Dropdown(id="bt-saved-run", options=[], placeholder="No saved grids yet")),
+            html.Button("Open saved grid", id="bt-saved-open", n_clicks=0, className="ref-btn", style=btn_style()),
+            note("Reopens a grid's saved results; inspecting a configuration reruns it exactly.", "dim"),
+        ], open=False),
     ])
 
 
@@ -1182,6 +1233,185 @@ def freeze_candidate(board: dict, idx: int, entry_zs=None, current: dict | None 
             no_update if cost is None else cost, no_update if lag is None else lag)
 
 
+JOB_SESSION = "jobs"  # progress for background jobs is shared by every page, so reloads see it
+
+
+def discovery_job(stored: dict, feature: str, settings: dict) -> dict:
+    """One discovery run, start to saved result. Runs as a background job.
+
+    ``settings`` holds the validated discovery controls. Returns the saved
+    run's path and a one-line summary; the page renders the result from disk.
+    """
+    def progress(done, total, message):
+        work.update(JOB_SESSION, "dis", message, done, total)
+
+    s = settings
+    work.start(JOB_SESSION, "dis", "Preparing loaded panel and discovery grid")
+    try:
+        target = stored["target"]
+        rows = stored["rows"]
+        frame = pl.DataFrame({
+            "ts": pl.Series([row["ts"] for row in rows], dtype=pl.Utf8),
+            **{col: pl.Series([row[col] for row in rows], dtype=pl.Float64)
+               for col in dict.fromkeys([target, feature, *stored['legs'], *stored.get('weight_columns', {}).values()])},
+        }).with_columns(pl.col("ts").str.to_date())
+        scan = dict(
+            target=target, legs=stored["legs"], weight_columns=stored.get("weight_columns") or None,
+            fit_on=s["fit_on"], beta_lookbacks=s["beta_lbs"], residual_lookbacks=s["residual_lbs"],
+            normalization_lookbacks=s["norm_lbs"], thresholds=s["thresholds"], raw_thresholds=s["raw_entries"],
+            exit_params=s["exit_params"], stop_losses=s["stops"] or [None], half_life_caps=s["caps"] or [None],
+            signal_stops=s["signal_stops"] or [None], gate_names=s["gates"], gate_windows=s["gate_windows"],
+            signal_kind=s["signal_kind"], train_fraction=float(s["train_fraction"]),
+            cost_bps=float(s["cost"] or 0.0), execution_lag=int(s["lag"]), cv_folds=int(s["cv"] or 0),
+        )
+        started = time.perf_counter()
+        frame, results, extras = backtest_scan(frame, feature=feature, progress=progress, **scan)
+        scan_s = time.perf_counter() - started
+        checks = []
+        if extras["folds"] >= 2:
+            eligible = int((results["n_trades"] >= s["min_trades"]).sum())
+            progress(0, 0, f"Selection checks on {eligible:,} cells with ≥{s['min_trades']} trades: "
+                           f"re-choosing the top cell {2 * extras['folds'] - 1} times, out-of-fold and walk-forward")
+            checks = selection_checks(
+                extras["cv_days"], extras["cv_sums"], extras["cv_sumsq"],
+                {"cv_mean": "mean", "cv_worst": "worst"}.get(s["rank_by"], "sharpe"),
+                eligible=(results["n_trades"] >= s["min_trades"]).to_numpy())
+        placebo = []
+        if s["placebos"]:
+            progress(0, 0, f"Starting {int(s['placebos'])} placebo runs: each reruns all {len(results):,} cells "
+                           f"with the feature scrambled, about {scan_s:,.0f}s each "
+                           f"(~{scan_s * int(s['placebos']) / 60:,.0f} min in total)")
+            placebo = placebo_scan(frame, feature=feature, placebos=int(s["placebos"]), rank_by=s["rank_by"],
+                                   min_trades=s["min_trades"], progress=progress, **scan)
+        elapsed_s = time.perf_counter() - started
+        info = {
+            "backend": "Vectorised backtests (backtest/vector.py)",
+            "elapsed_s": elapsed_s,
+            "cells_per_second": len(results) / max(elapsed_s, 1e-9),
+            "train_fraction": s["train_fraction"], "target": target,
+            "cost_bps": float(s["cost"] or 0.0), "execution_lag": int(s["lag"]),
+        }
+        info.update(target_definition(stored))
+        info.update(result_source='Fresh discovery', data_period=f"{frame['ts'].min()} to {frame['ts'].max()}")
+        progress(0, 0, "Saving all discovery cells")
+        saved = save_run("discovery", frame, results, dict(feature=feature,
+            grid=grid_spec(s["fit_on"], s["beta_lbs"], s["residual_lbs"], s["norm_lbs"], s["thresholds"],
+                           s["horizons"], s["gates"], s["gate_windows"], s["signal_kind"], s["train_fraction"],
+                           s["raw_entries"], scoring="backtest", cost=s["cost"], lag=s["lag"], cv_folds=s["cv"],
+                           exits=s["exits"]),
+            input_sha256=input_hash(stored, feature),
+            signal_kind=s["signal_kind"], min_events=s["min_trades"], scoring="backtest", rank_by=s["rank_by"],
+            cv_folds=int(s["cv"] or 0), selection_checks=checks, placebo=placebo,
+            panel_id=stored["panel_id"], gate_min_history=126, **info))
+    except Exception as exc:
+        work.update(JOB_SESSION, "dis", f"Failed: {exc}", 1, 1)
+        raise
+    summary = (f"{len(results):,} backtested cells" + (f" + {len(placebo)} placebo runs" if placebo else "")
+               + f" in {elapsed_s:.1f}s")
+    work.update(JOB_SESSION, "dis", f"Completed · {summary} · saved {saved}", 1, 1)
+    return {"run_path": saved, "summary": summary}
+
+
+def render_discovery(run_id: str, min_events=None, fresh: bool = False, query: dict | None = None):
+    """A saved discovery run as (view, status note, board), for fresh jobs and reopened runs alike.
+
+    The board is built from the run's own snapshot, so picking a row and
+    testing exits works whether or not a panel is loaded on this page.
+    """
+    meta, frame, results = load_run(run_id)
+    info = dict(meta, data_period=f"{frame['ts'].min()} to {frame['ts'].max()}",
+                can_backtest=bool(meta.get('legs')) and meta.get('weighting') in {'fixed', 'beta'}
+                    and (meta.get('weighting') != 'beta' or bool(meta.get('weight_columns'))),
+                elapsed_s=meta.get('elapsed_s', 0), cells_per_second=meta.get('cells_per_second', 0))
+    if not fresh:
+        info.update(backend='Saved results (no scan)', result_source=f'Archive {run_id}')
+    if meta.get('scoring') == 'backtest':
+        view, records = backtest_discovery_view(
+            results, meta['feature'], info, int(min_events or meta.get('min_events') or 30),
+            meta.get('rank_by', 'family'), meta.get('selection_checks'), meta.get('placebo'))
+    else:
+        view, records = dislocation_view(results, meta['feature'], info, int(min_events or 30), frame)
+    fraction = float(meta.get('train_fraction', 1))
+    split = str(frame['ts'][int(len(frame)*fraction)]) if fraction < 1 else None
+    board = dict(target=meta['target'], feature=meta['feature'], rows=records,
+        panel_id='archive:'+run_id, split_date=split, run_path=str(run_path(run_id)),
+        archive_id=run_id, weight_columns=meta.get('weight_columns', {}),
+        target_definition=target_definition(meta),
+        cost_bps=meta.get('cost_bps'), execution_lag=meta.get('execution_lag'))
+    if fresh:
+        text = f"Completed · {len(results):,} backtested cells in {info['elapsed_s']:.1f}s · saved as {run_id}"
+    else:
+        text = (f"Saved result target: {target_label(meta)}. Opened run {run_id}: {frame['ts'].min()} to {frame['ts'].max()} · "
+                f"{len(results):,} saved cells. Original settings/data; not a new scan. "
+                + ("Exit tests use this saved snapshot and current engine code." if info['can_backtest']
+                   else "View only: saved trade weights are incomplete; exit testing is disabled."))
+    tone = 'good'
+    if query and definition_match(meta, query.get('target_definition', {})) != 'match':
+        warning = f"Historical comparison only: this is NOT a verified match for Current Setup ({target_label(query['target_definition'])})."
+        view = html.Div([note(warning, 'warn'), view])
+        text, tone = warning + ' ' + text, 'warn'
+    return view, note(text, tone), board
+
+
+def mechanics_job(stored: dict, candidate: dict, settings: dict) -> dict:
+    """One trade-mechanics grid, start to saved result. Runs as a background job."""
+    s = settings
+    work.start(JOB_SESSION, "bt", "Building the frozen candidate signal and all exit combinations")
+    try:
+        trade = TradeDef(stored["target"], stored["legs"])
+        rows = stored["rows"]
+        needed = list(dict.fromkeys([trade.name, candidate["feature"], *trade.legs, *candidate.get("weight_columns", {}).values()]))
+        columns = {"ts": pl.Series([row["ts"] for row in rows], dtype=pl.Utf8)}
+        columns.update({col: pl.Series([row[col] for row in rows], dtype=pl.Float64) for col in needed})
+        data = pl.DataFrame(columns).with_columns(pl.col("ts").str.to_date())
+        started = time.perf_counter()
+        work.update(JOB_SESSION, "bt", "Running every cell through the vectorised engine; exact Engine detail for the best")
+        grid, selected, yearly, _ = run_vector_grid(
+            data, trade, candidate, entry_zs=s["entry_zs"], exit_params=s["exit_params"],
+            round_trip_cost_bps=s["cost"] or 0.0, stop_losses=s["stops"] or [None], execution_lag=int(s["lag"]),
+            half_life_caps=s["caps"] or [None], signal_stops=s["signal_stops"] or [None],
+        )
+        elapsed_s = time.perf_counter() - started
+        work.update(JOB_SESSION, "bt", "Saving every configuration's results and yearly P&L, and the best one's trades")
+        saved = save_run("exits", data, grid, dict(candidate=candidate,
+            legs=stored["legs"], weighting=stored.get("weighting"),
+            beta_lookback=stored.get('beta_lookback'), beta_dependent=stored.get('beta_dependent'),
+            weight_columns=stored.get('weight_columns', {}), execution_lag=s["lag"],
+            cost_bps=s["cost"], stop_losses=s["stops"], half_life_caps=s["caps"], signal_stops=s["signal_stops"],
+            engine="vector", rank_metric=selected["rank_metric"], best_config_id=selected["metrics"]["config_id"],
+            elapsed_s=elapsed_s), selected["runs"])
+        yearly.write_parquet(Path(saved) / "yearly.parquet")
+    except Exception as exc:
+        work.update(JOB_SESSION, "bt", f"Failed: {exc}", 1, 1)
+        raise
+    summary = f"{len(grid):,} cells in {elapsed_s:.2f}s"
+    work.update(JOB_SESSION, "bt", f"Completed · {summary} · saved {saved}", len(grid), len(grid))
+    return {"run_path": saved, "summary": summary}
+
+
+def render_mechanics(saved: str | Path):
+    """A saved trade-mechanics grid as (view, status note, grid store)."""
+    path = Path(saved)
+    meta = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
+    grid = pl.read_parquet(path / "results.parquet")
+    candidate = meta.get("candidate", {})
+    rank_metric = meta.get("rank_metric") or ("earlier_sharpe" if candidate.get("split_date") else "sharpe")
+    best_id = meta.get("best_config_id") or grid.sort(rank_metric, descending=True)["config_id"][0]
+    best = grid.filter(pl.col("config_id") == str(best_id)).row(0, named=True)
+    text = (f"Completed · {len(grid):,} cells"
+            + (f" in {meta['elapsed_s']:.2f}s" if meta.get("elapsed_s") is not None else "")
+            + f" · {candidate.get('target', '')} vs {candidate.get('feature', '')} · saved as {path.name}")
+    return (backtest_grid_view(grid, {"metrics": best, "rank_metric": rank_metric}), note(text, "good"),
+            {"rows": grid.to_dicts(), "run_path": str(path), "discovery_run": candidate.get("discovery_run")})
+
+
+def job_failure(record: dict) -> html.Div:
+    return html.Div([
+        note(f"{record.get('error') or 'Job did not finish.'}", "bad"),
+        html.Pre(record.get("traceback") or "", style={"fontSize": 10, "color": DIM, "whiteSpace": "pre-wrap"}),
+    ])
+
+
 def register_callbacks(app) -> None:
     sweep_controls = ["dis-signal", "dis-fit-on", "dis-beta-lbs", "dis-residual-lbs",
         "dis-norm-lbs", "dis-thresholds", "dis-horizons", "dis-gates", "dis-gate-windows", "dis-raw-thresholds",
@@ -1207,6 +1437,16 @@ def register_callbacks(app) -> None:
     grid_inputs = ["dis-signal", "dis-fit-on", "dis-beta-lbs", "dis-residual-lbs", "dis-norm-lbs", "dis-thresholds",
                    "dis-raw-thresholds", "dis-gates", "dis-gate-windows", "dis-exit-styles", "dis-horizons", "dis-bands",
                    "dis-revert-fracs", "dis-half-lives", "dis-caps", "dis-signal-stops", "dis-stops", "dis-cv", "dis-placebo"]
+
+    @app.callback(Output("controls-saved", "data"), *[Input(control, "value") for control in REMEMBERED],
+                  prevent_initial_call=True)
+    def _remember_controls(*values):
+        # Any change, by hand, Select all or a picked row, becomes the next page's starting point.
+        try:
+            save_controls(dict(zip(REMEMBERED, values)))
+        except OSError:
+            return no_update
+        return True
 
     @app.callback(Output("dis-grid-size", "children"), *[Input(control, "value") for control in grid_inputs])
     def _grid_size(signals, bases, beta, residual, norm, entries, raw_entries, gates, windows, styles, times,
@@ -1283,9 +1523,12 @@ def register_callbacks(app) -> None:
         Output("dis-out", "children", allow_duplicate=True), Output("dis-board", "data", allow_duplicate=True),
         Output("dis-candidate", "data", allow_duplicate=True), Output("bt-out", "children", allow_duplicate=True),
         Output("bt-grid", "data", allow_duplicate=True), Output("bt-candidate", "children", allow_duplicate=True),
-        Input("research-level-data", "data"), prevent_initial_call=True,
+        Input("research-level-data", "data"), State("dis-board", "data"), prevent_initial_call=True,
     )
-    def _invalidate_panel(_stored):
+    def _invalidate_panel(_stored, board):
+        # Boards read from saved runs carry their own snapshot; a new panel does not change them.
+        if board and board.get("archive_id"):
+            return (no_update,) * 6
         return "", None, None, "", None, note("Choose Backtest on a discovery row to fill trade mechanics.")
 
     @app.callback(
@@ -1293,15 +1536,18 @@ def register_callbacks(app) -> None:
         Output("bt-out", "children", allow_duplicate=True),
         Output("bt-grid", "data", allow_duplicate=True),
         Output("bt-candidate", "children", allow_duplicate=True),
-        Input("dis-board", "data"), prevent_initial_call=True,
+        Input("dis-board", "data"), State("bt-grid", "data"), prevent_initial_call=True,
     )
-    def _invalidate_candidate_for_board(_board):
+    def _invalidate_candidate_for_board(board, grid):
+        # A grid tested on this board's own run (e.g. both reattached after a reload) stays.
+        if board and grid and grid.get("discovery_run") == board.get("run_path"):
+            return (no_update,) * 4
         return None, "", None, note("Choose Backtest on a row from this discovery run.", "dim")
 
     @app.callback(*[Output(f"{name}-progress", "children") for name in ("load", "dis", "bt")],
                   Input("research-progress-poll", "n_intervals"), State("research-session", "data"))
     def _progress(_tick, session):
-        return [progress_view(work.snapshot(session, name), caption)
+        return [progress_view(work.snapshot(session if name == "load" else JOB_SESSION, name), caption)
                 for name, caption in (("load", "loading"), ("dis", "searching"), ("bt", "backtesting"))]
 
     @app.callback(Output("bt-detail", "children"), Input("bt-inspect", "value"), State("bt-grid", "data"))
@@ -1442,45 +1688,12 @@ def register_callbacks(app) -> None:
         if not run_id:
             return no_update, note("Choose a saved run first.", "warn"), no_update
         try:
-            work.start(session, 'dis', 'Opening saved snapshot and ranking saved scores')
-            meta, frame, results = load_run(run_id)
-            info = dict(meta, backend='Saved results (no scan)',
-                        result_source=f'Archive {run_id}', data_period=f"{frame['ts'].min()} to {frame['ts'].max()}",
-                        can_backtest=bool(meta.get('legs')) and meta.get('weighting') in {'fixed', 'beta'}
-                            and (meta.get('weighting') != 'beta' or bool(meta.get('weight_columns'))),
-                        elapsed_s=meta.get('elapsed_s', 0), cells_per_second=meta.get('cells_per_second', 0))
-            if meta.get('scoring') == 'backtest':
-                view, records = backtest_discovery_view(
-                    results, meta['feature'], info, int(min_events or meta.get('min_events') or 30),
-                    meta.get('rank_by', 'family'), meta.get('selection_checks'), meta.get('placebo'))
-            else:
-                view, records = dislocation_view(results, meta['feature'], info, int(min_events or 30), frame)
-            fraction = float(meta.get('train_fraction', 1))
-            split = str(frame['ts'][int(len(frame)*fraction)]) if fraction < 1 else None
-            board = dict(target=meta['target'], feature=meta['feature'], rows=records,
-                panel_id='archive:'+run_id, split_date=split, run_path=str(run_path(run_id)),
-                archive_id=run_id, weight_columns=meta.get('weight_columns', {}),
-                target_definition=target_definition(meta),
-                cost_bps=meta.get('cost_bps'), execution_lag=meta.get('execution_lag'))
-            text = (f"Saved result target: {target_label(meta)}. Opened run {run_id}: {frame['ts'].min()} to {frame['ts'].max()} · "
-                    f"{len(results):,} saved cells. Original settings/data; not a new scan. "
-                    + ("Exit tests use this saved snapshot and current engine code." if info['can_backtest']
-                       else "View only: saved trade weights are incomplete; exit testing is disabled."))
-            mismatch = query and definition_match(meta, query.get('target_definition', {})) != 'match'
-            if mismatch:
-                warning = f"Historical comparison only: this is NOT a verified match for Current Setup ({target_label(query['target_definition'])})."
-                view = html.Div([note(warning, 'warn'), view])
-                text = warning + ' ' + text
-            work.update(session, 'dis', 'Completed · '+text, 1, 1)
-            return view, note(text, 'warn' if mismatch else 'good'), board
+            return render_discovery(run_id, min_events, fresh=False, query=query)
         except Exception as exc:
-            work.update(session, 'dis', f'Failed: {exc}')
             return no_update, note(f'Cannot open saved run: {exc}', 'bad'), no_update
 
     @app.callback(
-        Output("dis-out", "children"),
-        Output("dis-run-info", "children"),
-        Output("dis-board", "data"),
+        Output("dis-run-info", "children", allow_duplicate=True),
         Input("dis-run", "n_clicks"),
         State("research-level-data", "data"),
         State("dis-feature", "value"),
@@ -1498,10 +1711,6 @@ def register_callbacks(app) -> None:
         State("dis-half-lives", "value"), State("dis-caps", "value"), State("dis-signal-stops", "value"),
         State("dis-stops", "value"),
         prevent_initial_call=True,
-        running=[
-            (Output("dis-run", "children"), "Running discovery…", "Run discovery"),
-            (Output("dis-run", "disabled"), True, False),
-        ],
     )
     def _run_dislocation(
         _n, stored, feature, fit_on, beta_lbs, residual_lbs, norm_lbs, thresholds,
@@ -1509,114 +1718,42 @@ def register_callbacks(app) -> None:
         cost=0.1, lag=1, cv=0, rank_by="family", placebos=0, exit_styles=None, bands=None, revert_fracs=None,
         half_lives=None, caps=None, signal_stops=None, stops=None,
     ):
+        if jobs.running("dis"):
+            return note("A discovery job is already running; its progress is shown on the right.", "warn")
         if not stored:
-            return note("Load a target and this feature on Setup first.", "warn"), "", no_update
+            return note("Load a target and this feature on Setup first.", "warn")
         if feature not in stored.get("features", []):
             return note(
                 f"{FEATURE_LABELS.get(feature, feature)} is not in the loaded panel. "
                 "Add it on Setup, then Load.", "warn"
-            ), "", no_update
+            )
         rank_by = rank_by or "family"
         if rank_by.startswith("cv") and not cv:
-            return note("CV ranking needs cross-validation blocks: choose a block count under Sample & validation.", "warn"), "", no_update
+            return note("CV ranking needs cross-validation blocks: choose a block count under Sample & validation.", "warn")
         min_trades = int(min_events or 30)
         exit_params = {style: values for style, values in {
             "time": horizons or DISLOCATION_HORIZONS, "band": bands, "revert_frac": revert_fracs,
             "half_life_frac": half_lives}.items() if style in (exit_styles or ["time"]) and values}
         if not exit_params:
-            return note("Choose at least one exit style with at least one parameter under Exits.", "warn"), "", no_update
+            return note("Choose at least one exit style with at least one parameter under Exits.", "warn")
         exits = dict(styles=sorted(exit_params), **{style: sorted(v) for style, v in exit_params.items()},
                      half_life_caps=sorted(caps or [0.0]), signal_stops=sorted(signal_stops or [0.0]),
                      stops=sorted(stops or [0.0]))
+        settings = dict(
+            fit_on=fit_on or ["changes"], beta_lbs=beta_lbs or DISLOCATION_BETA_LBS,
+            residual_lbs=residual_lbs or DISLOCATION_RESIDUAL_LBS, norm_lbs=norm_lbs or DISLOCATION_NORM_LBS,
+            thresholds=thresholds or DISLOCATION_THRESHOLDS, raw_entries=raw_entries or RAW_THRESHOLDS,
+            horizons=horizons or DISLOCATION_HORIZONS, gates=gates or [], gate_windows=gate_windows or [126, 252, 504],
+            signal_kind=signal_kind, train_fraction=train_fraction, min_trades=min_trades, cost=cost, lag=lag,
+            cv=cv, rank_by=rank_by, placebos=placebos, exit_params=exit_params, exits=exits, caps=caps,
+            signal_stops=signal_stops, stops=stops)
         try:
-            work.start(session, "dis", "Preparing loaded panel and discovery grid")
-            target = stored["target"]
-            rows = stored["rows"]
-            frame = pl.DataFrame({
-                "ts": pl.Series([row["ts"] for row in rows], dtype=pl.Utf8),
-                **{col: pl.Series([row[col] for row in rows], dtype=pl.Float64)
-                   for col in dict.fromkeys([target, feature, *stored['legs'], *stored.get('weight_columns', {}).values()])},
-            }).with_columns(pl.col("ts").str.to_date())
-            scan = dict(
-                target=target, legs=stored["legs"], weight_columns=stored.get("weight_columns") or None,
-                fit_on=fit_on or ["changes"],
-                beta_lookbacks=beta_lbs or DISLOCATION_BETA_LBS,
-                residual_lookbacks=residual_lbs or DISLOCATION_RESIDUAL_LBS,
-                normalization_lookbacks=norm_lbs or DISLOCATION_NORM_LBS,
-                thresholds=thresholds or DISLOCATION_THRESHOLDS, raw_thresholds=raw_entries or RAW_THRESHOLDS,
-                exit_params=exit_params, stop_losses=stops or [None], half_life_caps=caps or [None],
-                signal_stops=signal_stops or [None],
-                gate_names=gates or [], gate_windows=gate_windows or [126, 252, 504],
-                signal_kind=signal_kind, train_fraction=float(train_fraction),
-                cost_bps=float(cost or 0.0), execution_lag=int(lag), cv_folds=int(cv or 0),
-            )
-            backend = "Vectorised backtests (backtest/vector.py)"
-            started = time.perf_counter()
-            frame, results, extras = backtest_scan(
-                frame, feature=feature, **scan,
-                progress=lambda done, total, message: work.update(session, "dis", message, done, total),
-            )
-            scan_s = time.perf_counter() - started
-            checks = []
-            if extras["folds"] >= 2:
-                eligible = int((results["n_trades"] >= min_trades).sum())
-                work.update(session, "dis", f"Selection checks on {eligible:,} cells with ≥{min_trades} trades: "
-                                            f"re-choosing the top cell {2 * extras['folds'] - 1} times, out-of-fold and walk-forward")
-                checks = selection_checks(
-                    extras["cv_days"], extras["cv_sums"], extras["cv_sumsq"],
-                    {"cv_mean": "mean", "cv_worst": "worst"}.get(rank_by, "sharpe"),
-                    eligible=(results["n_trades"] >= min_trades).to_numpy())
-            if placebos:
-                work.update(session, "dis", f"Starting {int(placebos)} placebo runs: each reruns all {len(results):,} cells "
-                                            f"with the feature scrambled, about {scan_s:,.0f}s each "
-                                            f"(~{scan_s * int(placebos) / 60:,.0f} min in total)")
-            placebo = placebo_scan(
-                frame, feature=feature, placebos=int(placebos), rank_by=rank_by, min_trades=min_trades,
-                progress=lambda done, total, message: work.update(session, "dis", message, done, total), **scan,
-            ) if placebos else []
-            elapsed_s = time.perf_counter() - started
-        except Exception as exc:
-            work.update(session, "dis", f"Failed: {exc}", 1, 1)
-            return html.Div([
-                note(f"{type(exc).__name__}: {exc}", "bad"),
-                html.Pre(traceback.format_exc(), style={"fontSize": 10, "color": DIM,
-                                                        "whiteSpace": "pre-wrap"}),
-            ]), "", no_update
-        info = {
-            "backend": backend,
-            "elapsed_s": elapsed_s,
-            "cells_per_second": len(results) / max(elapsed_s, 1e-9),
-            "train_fraction": train_fraction, "target": target,
-            "cost_bps": float(cost or 0.0), "execution_lag": int(lag),
-        }
-        info.update(target_definition(stored))
-        info.update(result_source='Fresh discovery', data_period=f"{frame['ts'].min()} to {frame['ts'].max()}")
-        status = note(
-            f"Completed · {len(results):,} backtested cells"
-            + (f" + {len(placebo)} placebo runs" if placebo else "") + f" in {elapsed_s:.1f}s",
-            "good",
-        )
-        work.update(session, "dis", "Saving all discovery cells and ranking the discovery period")
-        saved = save_run("discovery", frame, results, dict(feature=feature,
-            grid=grid_spec(fit_on or ["changes"], beta_lbs or DISLOCATION_BETA_LBS,
-                residual_lbs or DISLOCATION_RESIDUAL_LBS, norm_lbs or DISLOCATION_NORM_LBS,
-                thresholds or DISLOCATION_THRESHOLDS, horizons or DISLOCATION_HORIZONS,
-                gates or [], gate_windows or [126, 252, 504], signal_kind, train_fraction, raw_entries or RAW_THRESHOLDS,
-                scoring="backtest", cost=cost, lag=lag, cv_folds=cv, exits=exits),
-            input_sha256=input_hash(stored, feature),
-            signal_kind=signal_kind, min_events=min_trades, scoring="backtest", rank_by=rank_by,
-            cv_folds=int(cv or 0), selection_checks=checks, placebo=placebo,
-            panel_id=stored["panel_id"],
-            gate_min_history=126, **info))
-        view, board_records = backtest_discovery_view(results, feature, info, min_trades, rank_by, checks, placebo)
-        split_date = str(frame["ts"][int(len(frame) * float(train_fraction))]) if float(train_fraction) < 1 else None
-        board = {"target": target, "feature": feature, "rows": board_records,
-                 "target_definition": target_definition(stored),
-                 "panel_id": stored["panel_id"], "split_date": split_date, "run_path": saved,
-                 "weight_columns": stored.get("weight_columns", {}),
-                 "cost_bps": float(cost or 0.0), "execution_lag": int(lag)}
-        work.update(session, "dis", f"Completed · {len(results):,} cells · saved {saved}", 1, 1)
-        return view, status, board
+            jobs.submit("dis", f"{stored['target']} vs {feature} discovery",
+                        lambda: discovery_job(stored, feature, settings))
+        except jobs.JobRunning:
+            return note("A discovery job is already running; its progress is shown on the right.", "warn")
+        return note("Discovery started as a background job. It keeps running if you reload or leave this page; "
+                    "the result appears here when it finishes.", "dim")
 
     @app.callback(
         Output("dis-candidate", "data"),
@@ -1644,9 +1781,7 @@ def register_callbacks(app) -> None:
         return freeze_candidate(board, triggered["index"], entry_zs, dict(zip(MECHANICS_EXITS, exits)))
 
     @app.callback(
-        Output("bt-out", "children"),
-        Output("bt-run-info", "children"),
-        Output("bt-grid", "data"),
+        Output("bt-run-info", "children", allow_duplicate=True),
         Input("bt-run", "n_clicks"),
         State("dis-candidate", "data"),
         State("research-level-data", "data"),
@@ -1658,43 +1793,41 @@ def register_callbacks(app) -> None:
         State("bt-half-lives", "value"), State("bt-lag", "value"), State("research-session", "data"),
         State("bt-caps", "value"), State("bt-signal-stops", "value"),
         prevent_initial_call=True,
-        running=[
-            (Output("bt-run", "children"), "Running backtest…", "Run backtest grid"),
-            (Output("bt-run", "disabled"), True, False),
-        ],
     )
     def _run_backtest_grid(
         _n, candidate, stored, target, custom, entry_zs, exit_styles,
         time_stops, bands, revert_fracs, stop_bp, cost_bp, half_lives, lag, session, caps=None, signal_stops=None,
     ):
+        if jobs.running("bt"):
+            return note("A backtest grid is already running; its progress is shown on the right.", "warn")
         if not candidate:
-            return note("Choose Backtest on a discovery row first.", "warn"), "", no_update
+            return note("Choose Backtest on a discovery row first.", "warn")
         if candidate.get("archive_id"):
             try:
                 meta, snapshot, _ = load_run(candidate['archive_id'], include_results=False)
                 if (not meta.get('legs') or meta.get('weighting') not in {'fixed', 'beta'}
                         or (meta.get('weighting') == 'beta' and not meta.get('weight_columns'))):
-                    return note("This legacy run lacks saved trade weights. View its results, but rerun discovery to enable reliable exit tests.", "warn"), "", no_update
+                    return note("This legacy run lacks saved trade weights. View its results, but rerun discovery to enable reliable exit tests.", "warn")
                 stored = dict(target=meta['target'], features=[meta['feature']], legs=meta['legs'],
                     weighting=meta.get('weighting'), beta_lookback=meta.get('beta_lookback'),
                     beta_dependent=meta.get('beta_dependent'), weight_columns=meta.get('weight_columns', {}),
                     panel_id=candidate['panel_id'], rows=snapshot.with_columns(pl.col('ts').cast(pl.Utf8)).to_dicts())
             except Exception as exc:
-                return note(f"Cannot open saved snapshot: {exc}", "bad"), "", no_update
+                return note(f"Cannot open saved snapshot: {exc}", "bad")
         if not stored:
-            return note("Load a target on Setup first.", "warn"), "", no_update
+            return note("Load a target on Setup first.", "warn")
         if candidate.get("panel_id") != stored.get("panel_id"):
-            return note("The loaded panel changed. Run discovery and select a row from the new panel.", "warn"), "", no_update
+            return note("The loaded panel changed. Run discovery and select a row from the new panel.", "warn")
         if candidate["target"] != stored["target"]:
             return note(
                 "Loaded target has changed since discovery ran; rerun discovery "
                 "for the current target.", "warn",
-            ), "", no_update
+            )
         if candidate["feature"] not in stored.get("features", []):
             return note(
                 f"{FEATURE_LABELS.get(candidate['feature'], candidate['feature'])} is "
                 "not in the loaded panel. Add it on Setup, then Load.", "warn",
-            ), "", no_update
+            )
         exit_params = {
             style: values
             for style, values in {
@@ -1706,49 +1839,71 @@ def register_callbacks(app) -> None:
         if not exit_params or not entry_zs:
             return note(
                 "Choose at least one entry threshold and one exit style.", "warn",
-            ), "", no_update
-        try:
-            work.start(session, "bt", "Building the frozen candidate signal and all exit combinations")
-            trade = TradeDef(stored["target"], stored["legs"])
-            rows = stored["rows"]
-            needed = list(dict.fromkeys([trade.name, candidate["feature"], *trade.legs, *candidate.get("weight_columns", {}).values()]))
-            columns = {"ts": pl.Series([row["ts"] for row in rows], dtype=pl.Utf8)}
-            columns.update({
-                col: pl.Series([row[col] for row in rows], dtype=pl.Float64)
-                for col in needed
-            })
-            data = pl.DataFrame(columns).with_columns(pl.col("ts").str.to_date())
-            started = time.perf_counter()
-            work.update(session, "bt", "Running every cell through the vectorised engine; exact Engine detail for the best")
-            grid, selected, yearly, _ = run_vector_grid(
-                data, trade, candidate,
-                entry_zs=entry_zs, exit_params=exit_params,
-                round_trip_cost_bps=cost_bp or 0.0,
-                stop_losses=stop_bp or [None], execution_lag=int(lag),
-                half_life_caps=caps or [None], signal_stops=signal_stops or [None],
             )
-            elapsed_s = time.perf_counter() - started
+        settings = dict(entry_zs=entry_zs, exit_params=exit_params, cost=cost_bp, stops=stop_bp, lag=lag,
+                        caps=caps, signal_stops=signal_stops)
+        try:
+            jobs.submit("bt", f"{candidate['target']} vs {candidate['feature']} trade mechanics",
+                        lambda: mechanics_job(stored, candidate, settings))
+        except jobs.JobRunning:
+            return note("A backtest grid is already running; its progress is shown on the right.", "warn")
+        return note("Backtest grid started as a background job; the result appears here when it finishes.", "dim")
+
+    @app.callback(
+        Output("dis-out", "children", allow_duplicate=True),
+        Output("dis-run-info", "children", allow_duplicate=True),
+        Output("dis-board", "data", allow_duplicate=True),
+        Output("dis-rendered", "data"),
+        Output("bt-out", "children", allow_duplicate=True),
+        Output("bt-run-info", "children", allow_duplicate=True),
+        Output("bt-grid", "data", allow_duplicate=True),
+        Output("bt-rendered", "data"),
+        Output("dis-run", "disabled"), Output("dis-run", "children"),
+        Output("bt-run", "disabled"), Output("bt-run", "children"),
+        Input("research-progress-poll", "n_intervals"),
+        State("dis-rendered", "data"), State("bt-rendered", "data"), State("dis-min-events", "value"),
+        prevent_initial_call=True,
+    )
+    def _job_results(_tick, dis_shown, bt_shown, min_events):
+        """Show each kind's latest job: progress while it runs, its result once, after reloads too."""
+        out = []
+        for kind, label in (("dis", "Run discovery"), ("bt", "Run backtest grid")):
+            record = jobs.latest(kind)
+            view = info = store = shown = no_update
+            if record and record["status"] in jobs.FINISHED and record["id"] != (dis_shown if kind == "dis" else bt_shown):
+                shown = record["id"]
+                try:
+                    if record["status"] != "done":
+                        view, info, store = job_failure(record), note(f"Job {record['status']}: {record.get('error')}", "bad"), no_update
+                    elif kind == "dis":
+                        view, info, store = render_discovery(Path(record["result"]["run_path"]).name, min_events, fresh=True)
+                    else:
+                        view, info, store = render_mechanics(record["result"]["run_path"])
+                except Exception as exc:
+                    view, info = job_failure(dict(error=f"Cannot show result: {exc}", traceback=traceback.format_exc())), no_update
+            busy = bool(record) and record["status"] == "running"
+            out.append((view, info, store, shown, busy, "Running… (background job)" if busy else label))
+        (dv, di, ds, dr, dbusy, dlabel), (bv, bi, bs, br, bbusy, blabel) = out
+        return dv, di, ds, dr, bv, bi, bs, br, dbusy, dlabel, bbusy, blabel
+
+    @app.callback(Output("bt-saved-run", "options"), Input("bt-grid", "data"), Input("bench-tabs", "value"))
+    def _saved_grids(_grid, _tab):
+        return [{"label": m["label"], "value": m["path"]} for m in list_exit_runs()]
+
+    @app.callback(
+        Output("bt-out", "children", allow_duplicate=True),
+        Output("bt-run-info", "children", allow_duplicate=True),
+        Output("bt-grid", "data", allow_duplicate=True),
+        Input("bt-saved-open", "n_clicks"), State("bt-saved-run", "value"),
+        prevent_initial_call=True,
+    )
+    def _open_saved_grid(_n, saved):
+        if not saved:
+            return no_update, note("Choose a saved grid first.", "warn"), no_update
+        try:
+            return render_mechanics(saved)
         except Exception as exc:
-            work.update(session, "bt", f"Failed: {exc}", 1, 1)
-            return html.Div([
-                note(f"{type(exc).__name__}: {exc}", "bad"),
-                html.Pre(traceback.format_exc(), style={"fontSize": 10, "color": DIM,
-                                                        "whiteSpace": "pre-wrap"}),
-            ]), "", no_update
-        status = note(f"Completed · {len(grid):,} cells in {elapsed_s:.2f}s", "good")
-        work.update(session, "bt", "Saving every configuration's results and yearly P&L, and the best one's trades")
-        saved = save_run("exits", data, grid, dict(candidate=candidate,
-            legs=stored["legs"], weighting=stored.get("weighting"),
-            beta_lookback=stored.get('beta_lookback'), beta_dependent=stored.get('beta_dependent'),
-            weight_columns=stored.get('weight_columns', {}), execution_lag=lag,
-            cost_bps=cost_bp, stop_losses=stop_bp, half_life_caps=caps, signal_stops=signal_stops,
-            engine="vector"), selected["runs"])
-        yearly.write_parquet(Path(saved) / "yearly.parquet")
-        work.update(session, "bt", f"Completed · saved {saved}", len(grid), len(grid))
-        # Only the best cell's trades/equity/periods were written by
-        # save_run; _inspect reads or creates one config's detail on disk
-        # rather than shipping every cell's equity curve to the browser.
-        return backtest_grid_view(grid, selected), status, {"rows": grid.to_dicts(), "run_path": saved}
+            return no_update, note(f"Cannot open saved grid: {exc}", "bad"), no_update
 
     @app.callback(
         Output("panel-out", "children"),
@@ -1916,11 +2071,31 @@ def build_app():
     return app
 
 
+CRASH_LOG = Path(__file__).parent / "data" / "logs" / "crashes.log"
+
+
+def record_native_crashes(path: Path = CRASH_LOG):
+    """Write every thread's Python stack to ``path`` if the process dies natively.
+
+    A crash inside compiled code (access violation, abort) kills the server
+    with no traceback in the terminal; this log shows what each thread was
+    running at that moment. Returns the open file, which must stay open.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    log = open(path, "a", encoding="utf-8")
+    log.write(f"\n=== research server started {time.strftime('%Y-%m-%d %H:%M:%S')} · pid {os.getpid()} ===\n")
+    log.flush()
+    faulthandler.enable(file=log, all_threads=True)
+    return log
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="research bench")
     parser.add_argument("--port", type=int, default=8052)
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
+    crash_log = record_native_crashes()  # noqa: F841 - faulthandler writes to it until exit
+    print(f"  Native crashes are recorded in {CRASH_LOG}")
     run(build_app(), port=args.port, host=args.host)
 
 

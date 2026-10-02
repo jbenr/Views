@@ -31,19 +31,47 @@ def load_preferences(targets, features, default_target, default_features, extra_
 
 
 def save_preferences(target, features, custom=None):
-    payload = dict(target=target, features=list(features), custom=custom if target == 'custom' else None)
-    # A reader sees either the old complete file or the new complete file.
+    _update(dict(target=target, features=list(features), custom=custom if target == 'custom' else None))
+
+
+def load_controls() -> dict:
+    """Last values of the research controls, by component id; {} if none or unreadable."""
+    try:
+        saved = json.loads(PREFERENCES.read_text(encoding='utf-8'))
+        controls = saved.get('controls') if isinstance(saved, dict) else None
+        return controls if isinstance(controls, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_controls(values: dict) -> None:
+    _update(dict(controls=dict(values)))
+
+
+def _update(changes: dict) -> None:
+    """Merge ``changes`` into the file, keeping every other saved key."""
     with _lock:
-        PREFERENCES.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = None
         try:
-            with NamedTemporaryFile(mode='w', encoding='utf-8', dir=PREFERENCES.parent,
-                                    prefix='preferences-', suffix='.tmp', delete=False) as stream:
-                temp_path = Path(stream.name)
-                json.dump(payload, stream, indent=2)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temp_path, PREFERENCES)
-        finally:
-            if temp_path is not None and temp_path.exists():
-                temp_path.unlink()
+            current = json.loads(PREFERENCES.read_text(encoding='utf-8'))
+            payload = current if isinstance(current, dict) else {}
+        except (OSError, ValueError):
+            payload = {}
+        payload.update(changes)
+        _write(payload)
+
+
+def _write(payload: dict) -> None:
+    """Atomic replace: a reader sees either the old complete file or the new one. Caller holds _lock."""
+    PREFERENCES.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with NamedTemporaryFile(mode='w', encoding='utf-8', dir=PREFERENCES.parent,
+                                prefix='preferences-', suffix='.tmp', delete=False) as stream:
+            temp_path = Path(stream.name)
+            json.dump(payload, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, PREFERENCES)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()

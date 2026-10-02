@@ -83,7 +83,7 @@ def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
             model, gate, entry, style, param, stop, sig_stop, cap, cost, lag, fold, n_fold,
             keep, pnl_out, fold_sum, fold_sumsq, fold_trades, fold_wins,
             total, closed_pnl, n_trades, n_wins, max_dd, days_held,
-            gross_profit, gross_loss, closed_bars, open_end, summary_dd):
+            gross_profit, gross_loss, closed_bars, open_end, summary_dd, held_w):
     n_bars, n_legs = legs.shape
     level = np.zeros(n_bars)
     for i in range(n_bars):
@@ -96,7 +96,11 @@ def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
         m, g, e, st, p, sl = model[k], gate[k], entry[k], style[k], param[k], stop[k]
         ss, cp = sig_stop[k], cap[k]
         time_stop = int(np.round(p)) if st == 0 else 0
-        w = np.empty(n_legs)
+        # Frozen entry weights live in this config's row of held_w, indexed in
+        # place. Allocating (or slicing) an array here makes numba hoist one
+        # buffer out of the parallel loop and share it, refcount included,
+        # across threads: a data race whose refcounting corrupted memory and
+        # crashed the research server natively.
         pos = 0
         bars = 0
         dyn = 0
@@ -119,7 +123,7 @@ def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
                     bars += 1
                     held = 0.0
                     for leg in range(n_legs):
-                        held += w[leg] * legs[i, leg]
+                        held += held_w[k, leg] * legs[i, leg]
                     cur = pos * (held - entry_level)
                     out = False
                     if st == 1:
@@ -167,17 +171,17 @@ def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
                     if direction != 0:
                         if use_entry_w:
                             for leg in range(n_legs):
-                                w[leg] = entry_w[j, leg]
-                                if not np.isfinite(w[leg]):
+                                held_w[k, leg] = entry_w[j, leg]
+                                if not np.isfinite(held_w[k, leg]):
                                     direction = 0
                         else:
                             for leg in range(n_legs):
-                                w[leg] = fixed_w[leg]
+                                held_w[k, leg] = fixed_w[leg]
                     if direction != 0:
                         if use_entry_w:
                             acc = 0.0
                             for leg in range(n_legs):
-                                acc += w[leg] * legs[i, leg]
+                                acc += held_w[k, leg] * legs[i, leg]
                             entry_level = acc
                         else:
                             entry_level = level[i]
@@ -195,7 +199,7 @@ def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
                 if pos != 0:
                     held = 0.0
                     for leg in range(n_legs):
-                        held += w[leg] * legs[i, leg]
+                        held += held_w[k, leg] * legs[i, leg]
                     unreal = pos * (held - entry_level)
                 daily = realized + unreal - prev_unreal
                 prev_unreal = unreal
@@ -310,13 +314,14 @@ def run_vector(
     gross_profit, gross_loss = np.zeros(n_cfg), np.zeros(n_cfg)
     closed_bars, open_end = np.zeros(n_cfg, np.int64), np.zeros(n_cfg, np.bool_)
     summary_dd = np.zeros(n_cfg)
+    held_w = np.zeros((n_cfg, legs.shape[1]))
 
     _kernel(legs, np.asarray(leg_weights, dtype=np.float64), signals, half_life, gates, entry_w, use_w,
             model, gate, configs["entry"].cast(pl.Float64).to_numpy(), style,
             configs["exit_param"].cast(pl.Float64).to_numpy(), stop, sig_stop, cap, float(cost), int(lag),
             fold, n_fold, keep_idx, pnl, fold_sum, fold_sumsq, fold_trades, fold_wins,
             total, closed, n_trades, n_wins, max_dd, days_held,
-            gross_profit, gross_loss, closed_bars, open_end, summary_dd)
+            gross_profit, gross_loss, closed_bars, open_end, summary_dd, held_w)
 
     fold_days = np.bincount(fold, minlength=n_fold)
     metrics = configs.with_columns(

@@ -10,10 +10,21 @@ own Dash server/registry, just the rendering.
 from __future__ import annotations
 
 import base64
+import functools
+import threading
 from io import BytesIO
 
-import matplotlib.dates as mdates
-import matplotlib.pyplot as plt
+import matplotlib
+
+# Charts render inside Dash request threads. The interactive default (TkAgg on
+# Windows) may only be touched from the thread that created it: drawing from a
+# request thread and freeing Tk objects from another crashes the whole server
+# ("Tcl_AsyncDelete: async handler deleted by the wrong thread"). Agg never
+# opens a window, so choose it once, before pyplot loads.
+matplotlib.use("Agg")
+
+import matplotlib.dates as mdates  # noqa: E402
+import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -24,6 +35,19 @@ from backtest.lab import parse_gate
 from utils.research_app import C0, C1, C2, DIM, ORANGE
 from utils.viz import Viz
 
+# pyplot keeps one process-wide figure registry and is not thread-safe: two
+# requests drawing at once can corrupt it. One chart renders at a time.
+_RENDER_LOCK = threading.RLock()
+
+
+def _one_at_a_time(render):
+    @functools.wraps(render)
+    def wrapper(*args, **kwargs):
+        with _RENDER_LOCK:
+            return render(*args, **kwargs)
+    return wrapper
+
+
 WINDOW_PRESETS = {"1M": 21, "3M": 63, "6M": 126, "YTD": "YTD", "1Y": 252, "2Y": 504, "5Y": 1260, "All": None}
 DEFAULT_WINDOW = "2Y"
 
@@ -33,7 +57,8 @@ class _PngViz(Viz):
     notebook widget / PlotlyViz's live-server registry."""
 
     def __init__(self, *args, fig_height: float | None = None, **kwargs):
-        plt.switch_backend("Agg")  # safe off the Dash callback thread
+        # No plt.switch_backend here: it closes every open figure, including
+        # ones another request is still drawing. Agg is chosen at import.
         super().__init__(*args, **kwargs)
         self.fig_height = fig_height
 
@@ -120,6 +145,7 @@ def _trade_markers(
     return groups
 
 
+@_one_at_a_time
 def level_chart(
     data: pl.DataFrame,
     target: str,
@@ -167,6 +193,7 @@ def level_chart(
     )
 
 
+@_one_at_a_time
 def hedge_weights_chart(
     data: pl.DataFrame,
     weight_cols: list[str],
@@ -208,6 +235,7 @@ def hedge_weights_chart(
     )
 
 
+@_one_at_a_time
 def coverage_chart(coverage: pl.DataFrame) -> str:
     """Series start/end ranges, drawn in the dashboard's static chart style."""
     rows = [
@@ -248,6 +276,7 @@ def coverage_chart(coverage: pl.DataFrame) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+@_one_at_a_time
 def input_chart(
     data: pl.DataFrame,
     feature: str,
@@ -272,6 +301,7 @@ def input_chart(
     )
 
 
+@_one_at_a_time
 def signal_chart(
     data: pl.DataFrame,
     sig_frame: pl.DataFrame,
@@ -318,6 +348,7 @@ def _gate_bucket_description(kind: str, qs: tuple[float, ...]) -> str:
     return f"OUTSIDE {pct[0]}TH–{pct[1]}TH PCT"
 
 
+@_one_at_a_time
 def gate_chart(
     data: pl.DataFrame,
     sig_frame: pl.DataFrame,
@@ -417,6 +448,7 @@ def _window_pnl_frame(
     return frame
 
 
+@_one_at_a_time
 def pnl_chart(
     equity_curve: pl.DataFrame,
     window_bars: int | None = WINDOW_PRESETS[DEFAULT_WINDOW],
@@ -443,6 +475,7 @@ def pnl_chart(
     )
 
 
+@_one_at_a_time
 def return_distribution_chart(trades: pl.DataFrame | None) -> str:
     """Histogram of realized, net closed-trade returns in basis points.
 

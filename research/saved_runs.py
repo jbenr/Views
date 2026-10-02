@@ -95,6 +95,25 @@ def list_runs(target=None, feature=None):
     return found
 
 
+def list_exit_runs(limit=100):
+    """Saved trade-mechanics grids, newest first, with a one-line label each."""
+    found = []
+    for path in sorted(artifacts.RUNS.glob('*_exits_*'), reverse=True)[:limit]:
+        try:
+            meta = json.loads((path / 'metadata.json').read_text(encoding='utf-8'))
+            if not (path / 'results.parquet').is_file():
+                continue
+            c = meta.get('candidate', {})
+            gate = f"{c.get('gate')}:{c.get('gate_bucket')}" if c.get('gate') not in (None, '(none)') else 'ungated'
+            found.append(dict(path=str(path.resolve()), label=(
+                f"{meta.get('created_at', path.name)[:16]} · {c.get('target')} vs {c.get('feature')} · "
+                f"{c.get('signal_kind', 'normalized')} {c.get('fit_on')} beta {c.get('beta_lb')} "
+                f"resid {c.get('residual_lb') or '—'} norm {c.get('norm_lb')} · {gate}")))
+        except (OSError, ValueError):
+            continue
+    return found
+
+
 def compare_run(meta, requested, current_hash):
     saved = meta.get('grid')
     messages = []
