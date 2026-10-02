@@ -540,3 +540,59 @@ def return_distribution_chart(trades: pl.DataFrame | None) -> str:
                 facecolor="white", edgecolor="white")
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+@_one_at_a_time
+def regression_scatter_chart(
+    latest: tuple[np.ndarray, np.ndarray],
+    past: tuple[np.ndarray, np.ndarray],
+    fits: dict,
+    now: tuple[float, float],
+    *,
+    title: str,
+    x_title: str,
+    y_title: str,
+    labels: dict,
+    zero_lines: bool = False,
+) -> str:
+    """Target against feature: the latest window and its fit, an older stretch in grey with its own.
+
+    ``latest`` and ``past`` are (x, y) arrays (``past`` may be empty);
+    ``fits`` holds {"latest": fit, "past": fit} from ``stats.fit_lr``;
+    ``now`` is today's point; ``labels`` names the legend entries
+    ("latest", "latest_fit", "past", "past_fit", "now").
+    """
+    viz = _PngViz()
+    fig, ax = plt.subplots(figsize=(9, 6.2))
+    fig.patch.set_facecolor("white")
+    fig.subplots_adjust(left=0.04, right=0.92, top=0.90, bottom=0.22)
+
+    def fit_line(fit, xs, **style):
+        if xs.size and np.isfinite(fit["beta"]):
+            span = np.array([xs.min(), xs.max()])
+            ax.plot(span, fit["alpha"] + fit["beta"] * span, **style)
+
+    if zero_lines:
+        ax.axhline(0.0, color=DIM, linewidth=0.8, alpha=0.7)
+        ax.axvline(0.0, color=DIM, linewidth=0.8, alpha=0.7)
+    if past[0].size:
+        ax.scatter(*past, s=10, color="#BDBDBD", alpha=0.55, linewidths=0, label=labels["past"], zorder=2)
+        fit_line(fits["past"], past[0], color="#7F7F7F", linestyle="--", linewidth=1.4, label=labels["past_fit"],
+                 zorder=3)
+    ax.scatter(*latest, s=18, color=C2, alpha=0.8, linewidths=0, label=labels["latest"], zorder=4)
+    fit_line(fits["latest"], np.r_[latest[0], past[0]] if labels.get("extend_latest") else latest[0],
+             color=C2, linewidth=2.2, label=labels["latest_fit"], zorder=5)
+    ax.scatter([now[0]], [now[1]], s=80, marker="D", color=ORANGE, edgecolors="white", linewidths=1.2,
+               label=labels["now"], zorder=6)
+
+    viz._style_ax(ax, yaxis_title=y_title, xaxis_title=x_title)
+    ax.margins(0.04)  # _style_ax hugs the x edges for time series; points need room
+    ax.legend(loc="upper left", bbox_to_anchor=(0, -0.13), ncol=2, fontsize=9, frameon=False,
+              handletextpad=0.5, columnspacing=1.6)
+    fig.suptitle(title.upper(), fontsize=viz.TITLE_SIZE, fontweight="bold",
+                 color="#333", x=0.02, ha="left", y=0.98)
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight",
+                facecolor="white", edgecolor="white")
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode("ascii")

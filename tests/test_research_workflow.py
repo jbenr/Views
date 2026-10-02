@@ -191,7 +191,7 @@ def test_app_controls_fill_from_loaded_panel_and_hide_irrelevant_inputs():
     callbacks = {v["callback"].__wrapped__.__name__: v["callback"].__wrapped__ for v in app.callback_map.values()}
     assert callbacks["_weight_controls"]("10s30s", "fixed") == ({"display": "none"},)*3
     assert callbacks["_weight_controls"]("custom", "beta")[0].get("display") != "none"
-    opts, selected, *_ = callbacks["_fill"]({"target": "10s30s", "features": ["10y"], "rows": [{}]}, "oil")
+    opts, selected, *_ = callbacks["_fill"]({"target": "10s30s", "features": ["10y"], "rows": [{"ts": "2020-01-02"}]}, "oil")
     assert selected == "10y"
     assert [o["value"] for o in opts] == ["10y"]
     client = app.server.test_client()
@@ -230,10 +230,12 @@ def run_as_job(callbacks, name, *args, **kwargs):
     if record is None or (before and record["id"] == before["id"]):
         return info, None, None  # refused before a job started
     record = jobs.wait(record["id"])
-    other = jobs.latest("bt" if kind == "dis" else "dis")
-    shown = {kind: None, ("bt" if kind == "dis" else "dis"): other and other["id"]}
-    out = callbacks["_job_results"](1, shown["dis"], shown["bt"], 5)
-    return out[0:3] if kind == "dis" else out[4:7]
+    # The page's tick names the finished job; the area's own callback then draws it once.
+    status = callbacks["_job_status"](1, None, None, None, None, False, False)
+    ready = status[0] if kind == "dis" else status[1]
+    assert ready == record["id"]
+    out = (callbacks["_show_discovery_job"](ready, 5) if kind == "dis" else callbacks["_show_grid_job"](ready))
+    return out[0:3]
 
 
 def test_app_discovery_to_exit_inspection_callback_flow(tmp_path, monkeypatch, job_dir):
@@ -258,9 +260,11 @@ def test_app_discovery_to_exit_inspection_callback_flow(tmp_path, monkeypatch, j
     # Trades/equity/periods live on disk, not in the Store. The vectorised
     # grid saves exact Engine detail for its best cell; inspecting another
     # cell reruns it through Engine, checks parity and adds it to the run.
-    assert isinstance(saved, dict) and "runs" not in saved and len(saved["rows"]) == 2
+    # The page keeps where the grid is, not its rows (a big grid's rows froze the browser).
+    assert isinstance(saved, dict) and "rows" not in saved and saved["cells"] == 2
+    grid_rows = pl.read_parquet(Path(saved["run_path"]) / "results.parquet").to_dicts()
     run_path = Path(saved["run_path"])
-    best = str(max(saved["rows"], key=lambda r: r["earlier_sharpe"])["config_id"])
+    best = str(max(grid_rows, key=lambda r: r["earlier_sharpe"])["config_id"])
     other = ({"1", "2"} - {best}).pop()
     assert set(pl.read_parquet(run_path / "equity.parquet")["config_id"]) == {best}
     assert (run_path / "yearly.parquet").is_file()
@@ -282,7 +286,7 @@ def test_app_discovery_to_exit_inspection_callback_flow(tmp_path, monkeypatch, j
     historical_candidate = dict(frozen, archive_id=run_id, panel_id=archived['panel_id'])
     _, _, archived_exits = run_as_job(callbacks, '_run_backtest_grid', 1, historical_candidate, None, 'ignored', None,
         [.5], ['time'], [5], [0], [.5], [15], .1, [2], 1, 'session')
-    assert len(archived_exits['rows']) == 1
+    assert archived_exits['cells'] == 1
     json.dumps([summary, opened, opened_status], cls=PlotlyJSONEncoder)
 
 
@@ -325,6 +329,18 @@ def test_backtest_discovery_validation_pick_and_legacy_ic_runs(tmp_path, monkeyp
     reopened, _, archived = callbacks["_open_saved"](1, run_id, 5, "session")
     assert "SELECTION CHECKS" in json.dumps(reopened, cls=PlotlyJSONEncoder)
     assert archived["rows"] == board["rows"] and archived["cost_bps"] == 0.25
+
+    # Every rankable column saved its own board; a header click on one shows it, best first.
+    assert ui.board_rules(run_id) == set(ui.RANK_RULES)
+    resorted_view, resorted = callbacks["_sort_board"]({"rule": "pnl", "at": 1}, archived, 5, None)
+    pnls = [r["pnl_bps"] for r in resorted["rows"]]
+    assert pnls == sorted(pnls, reverse=True) and resorted["run_path"] == archived["run_path"]
+    text = json.dumps(resorted_view, cls=PlotlyJSONEncoder)
+    assert '"data-board-rule": "pnl"' in text and '"data-sort-dir": "desc"' in text
+    assert "PLACEBO" in text  # the placebo test still compares the selection rule's top score
+    # A candidate frozen from this run stays frozen when its board is re-sorted.
+    frozen_here = ui.freeze_candidate(archived, 0)[0]
+    assert callbacks["_invalidate_candidate_for_board"](resorted, None, frozen_here) == (no_update_marker(),) * 2
 
     # A discovery run saved before backtest scoring still opens, on the IC board.
     frame, results = dislocation_scan(panel(), target="y", feature="x", beta_lookbacks=[30], residual_lookbacks=[10],
@@ -379,3 +395,29 @@ def test_trade_mechanics_select_all_fills_entries_exits_and_stops_only():
         [0.5, 1.0], ["time", "band"], [5, 10], [0.0], [0.5], [1.0, 2.0], [0.0, 15.0]]
     outputs = next(k for k, v in app.callback_map.items() if v["callback"].__wrapped__.__name__ == "_select_all_mechanics")
     assert "bt-cost" not in outputs and "bt-lag" not in outputs
+
+
+def test_single_series_targets_load_with_fixed_weighting_and_disable_beta(monkeypatch):
+    from research import app as ui
+    from plotly.utils import PlotlyJSONEncoder
+    app = ui.build_app()
+    callbacks = {v["callback"].__wrapped__.__name__: v["callback"].__wrapped__ for v in app.callback_map.values()}
+    options, value = callbacks["_beta_only_for_packages"]("10y", "beta")  # an outright: nothing to hedge
+    assert value == "fixed" and next(o for o in options if o["value"] == "beta")["disabled"] is True
+    options, value = callbacks["_beta_only_for_packages"]("swsp10", "beta")  # swap vs Treasury legs
+    beta = next(o for o in options if o["value"] == "beta")
+    assert value is no_update_marker() and not beta["disabled"] and "sofr10" in beta["label"]
+    options, value = callbacks["_beta_only_for_packages"]("10s30s", "beta")
+    assert value is no_update_marker() and not next(o for o in options if o["value"] == "beta")["disabled"]
+
+    seen = {}
+    def fake_panel(trade, features, **kwargs):
+        seen.update(kwargs)
+        raise RuntimeError("stop after the weighting decision")
+    monkeypatch.setattr(ui, "build_panel", fake_panel)
+    view, _, _ = callbacks["_load"](1, 0, "10y", None, "beta", 126, None, ["2y"], "2000-01-01", [], None, "6M", "s")
+    assert seen["weighting"] == "fixed"
+    trades = []
+    monkeypatch.setattr(ui, "build_panel", lambda trade, features, **kw: trades.append((trade, kw)) or (_ for _ in ()).throw(RuntimeError("stop")))
+    callbacks["_load"](1, 0, "swsp10", None, "beta", 126, None, ["10y"], "2000-01-01", [], None, "6M", "s")
+    assert trades[0][0].legs == {"sofr10": 1.0, "10y": -1.0} and trades[0][1]["weighting"] == "beta"

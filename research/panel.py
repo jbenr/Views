@@ -57,7 +57,9 @@ EXO: dict[str, tuple[str, bool]] = {
     "be10":    ("USGGBE10 Index", True),
     "be30":    ("USGGBE30 Index", True),
     "sofr2":   ("USOSFR2 Curncy", True),
+    "sofr5":   ("USOSFR5 Curncy", True),
     "sofr10":  ("USOSFR10 Curncy", True),
+    "sofr20":  ("USOSFR20 Curncy", True),
     "sofr30":  ("USOSFR30 Curncy", True),
     "swsp2":   ("USSFCT02 Curncy", False),  # swap spreads: already bps
     "swsp5":   ("USSFCT05 Curncy", False),
@@ -78,9 +80,31 @@ SWAP_SPREADS = {
     if name.startswith("swsp")
 }
 
+# SOFR OIS swaps are executable too. As separate legs they let a swap spread
+# be built and hedged as swap vs Treasury: sofr10:1, 10y:-1 matches swsp10
+# (swap minus Treasury) to ~0.2bp, and can be beta-weighted.
+SOFR_SWAPS = {name: ticker for name, (ticker, _percent) in EXO.items() if name.startswith("sofr")}
+
+# Each ready-made swap spread (swap minus Treasury) and its two executable legs.
+SWAP_SPREAD_LEGS = {name: (f"sofr{name[4:]}", f"{name[4:]}y") for name in SWAP_SPREADS}
+
+
+def beta_package(trade: TradeDef) -> TradeDef:
+    """The two-leg form of a ready-made swap spread, which beta weighting can hedge.
+
+    Bloomberg's swap spread is one series; beta weighting needs the swap and
+    the Treasury as separate legs (swap is the dependent leg, hedged with
+    beta x Treasury). Anything else is returned unchanged.
+    """
+    if len(trade.legs) == 1 and trade.name in SWAP_SPREAD_LEGS:
+        swap, treasury = SWAP_SPREAD_LEGS[trade.name]
+        return TradeDef(f"{trade.name}_legs", {swap: 1.0, treasury: -1.0})
+    return trade
+
+
 # A custom target may use only legs with a clear executable expression.  Macro,
 # vol, and other explanatory inputs intentionally stay out of this set.
-TRADEABLE_LEGS = {**YIELDS, **SWAP_SPREADS}
+TRADEABLE_LEGS = {**YIELDS, **SWAP_SPREADS, **SOFR_SWAPS}
 
 # the ATM swaption grid, as (expiry, tenor) -> "vol_1Mo_30" style aliases
 SWAPTION_EXPIRIES = ("1Mo", "3Mo", "6Mo", "1Y", "2Y", "5Y")
@@ -177,7 +201,8 @@ class Panel:
 
     @property
     def columns(self) -> list[str]:
-        return [self.target.name, *self.features]
+        # A target can also be picked as a feature; list its column once.
+        return list(dict.fromkeys([self.target.name, *self.features]))
 
     @property
     def weight_cols(self) -> list[str]:
@@ -242,21 +267,29 @@ def beta_weighted(
     Fixed weights assume the wings hedge the belly in a constant ratio -- for
     a fly, half each. That is an assumption, not a measurement, and it decays
     as the curve reprices. Here the ratio is fitted on daily changes over a
-    trailing window instead:
+    trailing window instead, and each day's move is the hedged position held
+    from yesterday:
 
-        level = w_dep * ( dep - SUM_i beta_i * hedge_i )
+        d level_t = w_dep * ( d dep_t - SUM_i beta_i,t-1 * d hedge_i,t )
 
-    Scaling by the dependent leg's fixed weight makes the two constructions
-    directly comparable: a fly whose fitted betas are both 0.5 reproduces
-    2*belly - wing1 - wing2 exactly, and a curve with beta 1.0 reproduces
-    long - short. So the fixed target is the special case where the
-    regression finds textbook weights.
+    The level is NOT re-marked at today's betas (dep - beta_t * hedge).
+    Differencing a re-marked level adds -d beta * hedge level to every day;
+    with a 500bp hedge leg a 0.01 beta update is a 5bp phantom move that no
+    position earns, and a signal reads it as a dislocation. The held series
+    moves only when a hedged position would make or lose money.
+
+    The level starts at the re-marked value on the first day betas exist, so
+    it sits in a familiar range, but only its changes and windowed levels are
+    meaningful. Scaling by the dependent leg's fixed weight keeps it
+    comparable to fixed weights: with constant betas of 0.5 a fly reproduces
+    2*belly - wing1 - wing2 exactly.
 
     Betas come from changes, not levels, because only a changes beta is a
     hedge ratio -- a levels beta absorbs whatever trend the legs share.
 
-    Returns ts, the weighted level under the target's name, and one w_<leg>
-    column per hedge leg. Rows before the regression warms up are null.
+    Returns ts, the held level under the target's name, and one w_<leg>
+    column per hedge leg (the beta fitted through that day). Rows before the
+    regression warms up are null.
     """
     dep = dependent_leg(trade, dependent)
     hedges = hedge_legs(trade, dep)
@@ -267,24 +300,41 @@ def beta_weighted(
         )
 
     frame = align_columns(data, [dep, *hedges], date_col=ts_col).sort(ts_col)
-    reg = roll_mlr_diff(frame.select(hedges), frame[dep], lookback=lookback)
+    betas, move = _held_moves(frame, dep, hedges, lookback)
+    level = np.full(len(frame), np.nan)
+    valid = np.flatnonzero(np.isfinite(move))
+    if len(valid):
+        first = int(valid[0])
+        anchor = frame[dep][first - 1] - sum(betas[leg][first - 1] * frame[leg][first - 1] for leg in hedges)
+        level[first - 1:] = anchor + np.r_[0.0, np.nancumsum(move[first:])]
+        # An ill-conditioned fit day is missing, not a zero move for the level.
+        level[first:][~np.isfinite(move[first:])] = np.nan
 
-    # roll_mlr_diff drops the first differencing row; align_columns already
-    # guarantees no interior nulls, so the shortfall is exactly that warmup.
-    pad = len(frame) - len(reg)
-    def padded(name: str) -> pl.Series:
-        return pl.concat([pl.Series(name, [None] * pad, dtype=pl.Float64), reg[name]])
-
-    betas = {leg: padded(f"beta_{leg}") for leg in hedges}
     scale = float(trade.legs[dep])
-    level = frame[dep].cast(pl.Float64)
-    for leg, beta in betas.items():
-        level = level - beta * frame[leg].cast(pl.Float64)
-
     return frame.select(ts_col).with_columns(
-        (level * scale).alias(trade.name),
-        *[series.alias(f"w_{leg}") for leg, series in betas.items()],
+        pl.Series(trade.name, level * scale, nan_to_null=True),
+        *[pl.Series(f"w_{leg}", beta, nan_to_null=True) for leg, beta in betas.items()],
     )
+
+
+def _held_moves(
+    frame: pl.DataFrame, dep: str, hedges, lookback: int
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Rolling changes betas, and each day's dep move net of yesterday's beta hedge.
+
+    ``frame`` is aligned and sorted. Betas are padded to the frame's length:
+    roll_mlr_diff drops the first differencing row, and align_columns
+    guarantees no interior nulls, so the shortfall is exactly that warmup.
+    """
+    reg = roll_mlr_diff(frame.select(list(hedges)), frame[dep], lookback=lookback)
+    pad = len(frame) - len(reg)
+    betas = {leg: np.r_[np.full(pad, np.nan), reg[f"beta_{leg}"].to_numpy().astype(float)]
+             for leg in hedges}
+    move = np.diff(frame[dep].to_numpy().astype(float), prepend=np.nan)
+    for leg in hedges:
+        hedge_move = np.diff(frame[leg].to_numpy().astype(float), prepend=np.nan)
+        move = move - np.r_[np.nan, betas[leg][:-1]] * hedge_move
+    return betas, move
 
 
 @dataclass(frozen=True)
@@ -338,25 +388,15 @@ def held_residual(
 
         feature_t = SUM_s ( d dep_s - SUM_i beta_i,s-1 * d hedge_i,s )
 
-    This deliberately differs from ``beta_weighted``, which re-marks the whole
-    level at today's betas. Differencing that level adds -d beta * hedge level
-    to every daily change; with a 400bp hedge leg a 0.01 beta update is a 4bp
-    phantom move, which a changes regression would read as signal.
+    This is the same held construction as a beta-weighted target (see
+    ``beta_weighted``), never a level re-marked at today's betas.
 
     The level is anchored at zero when the betas warm up; only its changes and
     windowed levels are meaningful. Returns ``ts`` and the feature column.
     """
     names = [feature.dependent, *feature.hedges]
     frame = align_columns(data, names, date_col=ts_col).sort(ts_col)
-    reg = roll_mlr_diff(frame.select(feature.hedges), frame[feature.dependent],
-                        lookback=feature.lookback)
-    pad = len(frame) - len(reg)
-    dep = frame[feature.dependent].to_numpy().astype(float)
-    move = np.diff(dep, prepend=np.nan)
-    for hedge in feature.hedges:
-        beta = np.r_[np.full(pad, np.nan), reg[f"beta_{hedge}"].to_numpy().astype(float)]
-        hedge_move = np.diff(frame[hedge].to_numpy().astype(float), prepend=np.nan)
-        move = move - np.r_[np.nan, beta[:-1]] * hedge_move
+    _betas, move = _held_moves(frame, feature.dependent, feature.hedges, feature.lookback)
     level = np.full(len(frame), np.nan)
     valid = np.flatnonzero(np.isfinite(move))
     if len(valid):
@@ -419,6 +459,11 @@ def build_panel(
     (align_columns), and `diagnostics` reports what that would cost.
     """
     features = list(features or [])
+    if weighting == "beta":
+        target = beta_package(target)  # a ready-made swap spread becomes swap vs Treasury
+    if weighting == "beta" and len(target.legs) < 2:
+        raise ValueError(f"{target.name} is a single series with no second leg, so there is nothing to "
+                         "beta-hedge; choose fixed leg weighting.")
     yields, exo, vols, composites = _needed_sources(target, features)
 
     tickers = {a: YIELDS[a] for a in yields}
@@ -579,17 +624,13 @@ def stale_report(data: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
 
 
 def remark_report(panel: Panel, horizons: tuple[int, ...] = (5, 20, 60)) -> pl.DataFrame:
-    """How much of a beta-weighted target's move is the hedge being rewritten.
+    """How far a beta-weighted target's move is from a position held h days.
 
-    A beta-weighted level is marked with today's betas. A position opened h
-    days ago holds the betas it was opened with, so part of the level's change
-    is the hedge ratio moving, not P&L. Auditing PairRVStudy put that at 61%
-    of scored variance on a 10s30s package -- large enough that a scorecard
-    reading the level's forward change is not measuring a tradeable return.
-
-    Reported here so the cost of beta weighting is visible when you choose it,
-    rather than discovered in a backtest later. `held` freezes the entry
-    betas; `remark` is the remainder.
+    The target rebalances to yesterday's betas every day; a position opened h
+    days ago keeps the betas it was opened with. `held` freezes the entry
+    betas; `remark` is the remainder -- rebalancing drift, which should be a
+    small share. (A level re-marked at today's betas put this at 61-88% of
+    variance, which is why the target is built as a held series.)
     """
     if panel.weighting != "beta":
         return pl.DataFrame()

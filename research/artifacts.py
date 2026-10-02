@@ -11,13 +11,24 @@ import polars as pl
 RUNS = Path(__file__).parent / "data" / "runs"
 
 
-def save_run(kind: str, data: pl.DataFrame, results: pl.DataFrame,
-             metadata: dict, details: dict | None = None) -> str:
+def save_run(kind: str, data: pl.DataFrame, results: pl.DataFrame | None,
+             metadata: dict, details: dict | None = None, boards: dict | None = None) -> str:
+    """Save a run's input snapshot, metadata and either its full results or its ranked boards.
+
+    Discovery saves ``boards`` -- ``{(rank rule, min trades): top rows}`` --
+    instead of every cell, so a 100M-cell run is a few MB on disk and opens
+    without loading anything large.
+    """
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = RUNS / f"{stamp}_{kind}_{uuid4().hex[:8]}"
     path.mkdir(parents=True)
     data.write_parquet(path / "data.parquet")
-    results.write_parquet(path / "results.parquet")
+    if results is not None:
+        results.write_parquet(path / "results.parquet")
+    if boards:
+        (path / "boards").mkdir()
+        for (rule, min_trades), board in boards.items():
+            board.write_parquet(path / "boards" / board_file(rule, min_trades))
     root = Path(__file__).parent.parent
     files = ["research/app.py", "research/dislocation.py", "research/dislocation_backtest.py",
              "research/panel.py", "backtest/engine.py", "backtest/lab.py", "backtest/vector.py",
@@ -30,6 +41,10 @@ def save_run(kind: str, data: pl.DataFrame, results: pl.DataFrame,
     if details:
         append_details(path, details)
     return str(path.resolve())
+
+
+def board_file(rank_by: str, min_trades: int) -> str:
+    return f"board_{rank_by}_min{int(min_trades)}.parquet"
 
 
 def append_details(path: str | Path, details: dict) -> None:

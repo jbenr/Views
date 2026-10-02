@@ -8,7 +8,7 @@ import pytest
 
 from backtest.engine import TradeDef
 from backtest.validation import cv_fold_labels, cv_scores, pooled_sharpe, selection_checks
-from research.dislocation import backtest_scan, placebo_scan, rank_board
+from research.dislocation import RANK_RULES, backtest_scan, placebo_scan, rank_board
 from research.dislocation_backtest import run_grid
 
 
@@ -158,3 +158,112 @@ def test_placebo_progress_counts_models_across_every_placebo():
     assert totals == {2 * 4}  # 2 placebos x 4 models
     assert [d for d, _, _ in seen] == sorted(d for d, _, _ in seen)
     assert seen[-1][0] == 8 and "Placebo 2/2" in seen[-1][2] and "model" in seen[1][2]
+
+
+@pytest.mark.parametrize("rank_by", ["family", "sharpe", "cv_mean", "cv_worst"])
+def test_ranking_from_disk_matches_ranking_in_memory(tmp_path, rank_by):
+    from polars.testing import assert_frame_equal
+    from research.dislocation import rank_board_file
+    _, results, _ = backtest_scan(market(), **dict(SCAN, legs={"left": -1.0, "right": 1.0}, cv_folds=3))
+    path = tmp_path / "results.parquet"
+    results.write_parquet(path)
+    expected = rank_board(results, rank_by, min_trades=5)
+    board, cells, eligible = rank_board_file(path, rank_by, min_trades=5, top=25)
+    assert (cells, eligible) == (len(results), len(expected))
+    assert_frame_equal(board, expected.head(25), check_dtypes=False)
+
+
+def test_ranking_from_disk_reads_runs_saved_before_exits_joined_discovery(tmp_path):
+    from research.dislocation import rank_board_file
+    _, results, _ = backtest_scan(market(), **dict(SCAN, legs={"left": -1.0, "right": 1.0},
+                                                    exit_params={"time": [5, 15]}, half_life_caps=[None],
+                                                    signal_stops=[None], stop_losses=[None]))
+    old = results.drop("exit_style", "half_life_cap", "signal_stop", "stop_loss_bps").rename({"exit_param": "horizon"})
+    old.with_columns(pl.col("horizon").cast(pl.Int64)).write_parquet(tmp_path / "old.parquet")
+    board, cells, _ = rank_board_file(tmp_path / "old.parquet", "sharpe", min_trades=5, top=10)
+    assert cells == len(old) and set(board["exit_style"]) == {"time"}
+    assert board["exit_param"].to_list() == rank_board(results, "sharpe", 5).head(10)["exit_param"].to_list()
+
+
+def test_compact_discovery_boards_equal_full_ranking_row_for_row():
+    from polars.testing import assert_frame_equal
+    from research.dislocation import discovery_compact
+    kwargs = dict(SCAN, legs={"left": -1.0, "right": 1.0}, cv_folds=3)
+    _, results, extras = backtest_scan(market(), **kwargs)
+    out = discovery_compact(market(), min_trade_levels=(5, 20), top=30, selection_rule="cv_mean",
+                            selection_min_trades=5, **kwargs)
+    assert out["cells"] == len(results)
+    assert {rule for rule, _ in out["boards"]} == set(RANK_RULES)  # every angle has its own board
+    for rule in RANK_RULES:
+        for m in (5, 20):
+            expected = rank_board(results, rule, m)
+            assert out["eligible"][m] == len(expected)
+            assert_frame_equal(out["boards"][(rule, m)], expected.head(30), check_dtypes=False,
+                               check_column_order=False)
+    expected_checks = selection_checks(extras["cv_days"], extras["cv_sums"], extras["cv_sumsq"], "mean",
+                                       eligible=(results["n_trades"] >= 5).to_numpy())
+    assert out["checks"] == expected_checks
+
+
+def test_old_results_files_rank_to_the_same_boards_when_streamed(tmp_path):
+    import pyarrow.parquet as pq
+    from polars.testing import assert_frame_equal
+    from research.dislocation import rank_results_file
+    _, results, _ = backtest_scan(market(), **dict(SCAN, legs={"left": -1.0, "right": 1.0}, cv_folds=3))
+    path = tmp_path / "results.parquet"
+    pq.write_table(results.to_arrow(), path, row_group_size=700)  # many row groups, models spanning them
+    out = rank_results_file(path, min_trade_levels=(5, 20), top=30)
+    assert out["cells"] == len(results)
+    for rule in ("family", "sharpe", "cv_mean", "cv_worst"):
+        for m in (5, 20):
+            expected = rank_board(results, rule, m)
+            assert out["eligible"][m] == len(expected)
+            assert_frame_equal(out["boards"][(rule, m)], expected.head(30), check_dtypes=False,
+                               check_column_order=False)
+
+
+def test_an_interrupted_discovery_resumes_from_its_checkpoint(tmp_path, monkeypatch):
+    from polars.testing import assert_frame_equal
+    import research.dislocation as dis
+    kwargs = dict(SCAN, legs={"left": -1.0, "right": 1.0}, cv_folds=3)
+    reference = dis.discovery_compact(market(), min_trade_levels=(5,), top=20, **kwargs)
+    # Crash partway: the third model blows up after two were checkpointed.
+    original, calls = dis._ScanPlan.model_rows, []
+    def flaky(self, i, cells=None):
+        if cells is None:
+            calls.append(i)
+            if len(calls) == 3:
+                raise RuntimeError("worker died")
+        return original(self, i, cells)
+    monkeypatch.setattr(dis._ScanPlan, "model_rows", flaky)
+    with pytest.raises(RuntimeError, match="worker died"):
+        dis.discovery_compact(market(), min_trade_levels=(5,), top=20, checkpoints=tmp_path, **kwargs)
+    saved = list(tmp_path.glob("*/model_*.npz"))
+    assert len(saved) == 2 and not list(tmp_path.glob("*/*.partial.npz"))
+    # The rerun loads the two saved models and only backtests the rest.
+    monkeypatch.setattr(dis._ScanPlan, "model_rows", original)
+    rerun_models = []
+    monkeypatch.setattr(dis._ScanPlan, "model_rows",
+                        lambda self, i, cells=None: (rerun_models.append(i) if cells is None else None) or original(self, i, cells))
+    resumed = dis.discovery_compact(market(), min_trade_levels=(5,), top=20, checkpoints=tmp_path, **kwargs)
+    assert sorted(rerun_models) == [2, 3]
+    for key in reference["boards"]:
+        assert_frame_equal(resumed["boards"][key], reference["boards"][key])
+    assert resumed["checks"] == reference["checks"]
+    assert not any(tmp_path.iterdir())  # finished runs leave no checkpoint behind
+
+
+def test_backtest_loops_pause_the_garbage_collector_and_restore_it():
+    import gc
+    import research.dislocation as dis
+    seen = []
+    original = dis._ScanPlan.model_rows
+    def spy(self, i, cells=None):
+        seen.append(gc.isenabled())
+        return original(self, i, cells)
+    try:
+        dis._ScanPlan.model_rows = spy
+        dis.discovery_compact(market(), min_trade_levels=(5,), top=5, **dict(SCAN, legs={"left": -1.0, "right": 1.0}))
+    finally:
+        dis._ScanPlan.model_rows = original
+    assert seen and not any(seen[:4]) and gc.isenabled()

@@ -319,3 +319,23 @@ def roll_beta(x, y, lookback=100):
 
 def roll_resid(x, y, lookback=100):
     return roll_lr(x, y, lookback)["resid"]
+
+
+def fit_lr(x, y) -> dict:
+    """One OLS fit of y on x over the whole sample: alpha, beta, r2, n, resid_std.
+
+    Rows where either side is missing are dropped. For a single window (a
+    chart's latest regression); use ``roll_lr`` for a rolling fit.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    keep = np.isfinite(x) & np.isfinite(y)
+    x, y = x[keep], y[keep]
+    if len(x) < 3 or np.var(x) == 0:
+        return {"alpha": np.nan, "beta": np.nan, "r2": np.nan, "n": int(len(x)), "resid_std": np.nan}
+    beta = np.cov(x, y, ddof=0)[0, 1] / np.var(x)
+    alpha = y.mean() - beta * x.mean()
+    resid = y - alpha - beta * x
+    total = np.sum((y - y.mean()) ** 2)
+    return {"alpha": float(alpha), "beta": float(beta), "r2": float(1 - np.sum(resid ** 2) / total) if total > 0 else np.nan,
+            "n": int(len(x)), "resid_std": float(resid.std())}

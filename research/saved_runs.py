@@ -80,7 +80,8 @@ def list_runs(target=None, feature=None):
     for path in sorted(artifacts.RUNS.glob('*_discovery_*'), reverse=True):
         try:
             meta = json.loads((path / 'metadata.json').read_text(encoding='utf-8'))
-            if not all((path / f'{name}.parquet').is_file() for name in ('data', 'results')):
+            if not (path / 'data.parquet').is_file() or not ((path / 'results.parquet').is_file()
+                                                            or (path / 'boards').is_dir()):
                 continue
             if target and meta.get('target') != target:
                 continue
@@ -169,4 +170,45 @@ def compare_run(meta, requested, current_hash):
 def load_run(run_id, include_results=True):
     path = run_path(run_id)
     meta = json.loads((path/'metadata.json').read_text(encoding='utf-8'))
-    return meta, pl.read_parquet(path/'data.parquet'), (pl.read_parquet(path/'results.parquet') if include_results else None)
+    results = path / 'results.parquet'
+    return meta, pl.read_parquet(path/'data.parquet'), (pl.read_parquet(results) if include_results and results.is_file() else None)
+
+
+def board_rules(run_id):
+    """Rank rules with a saved board for this run (runs saved earlier have fewer)."""
+    boards = run_path(run_id) / 'boards'
+    return {p.stem[len('board_'):].rsplit('_min', 1)[0] for p in boards.glob('board_*_min*.parquet')} \
+        if boards.is_dir() else set()
+
+
+def load_board(run_id, rank_by, min_trades, top=None):
+    """The ranked board of a saved backtest discovery run, without loading its full grid.
+
+    Returns (board, min trades actually used, cells, eligible cells). Runs that
+    saved boards use the saved one for the closest minimum-trades level; older
+    runs rank their results file from disk once and keep that board.
+    """
+    from research.artifacts import board_file
+    from research.dislocation import rank_board_file
+
+    path = run_path(run_id)
+    meta = json.loads((path/'metadata.json').read_text(encoding='utf-8'))
+    boards = path / 'boards'
+    levels = sorted(int(p.stem.rsplit('_min', 1)[1]) for p in boards.glob(f'board_{rank_by}_min*.parquet')) \
+        if boards.is_dir() else []
+    if levels:
+        level = min(levels, key=lambda m: (abs(m - int(min_trades)), m))
+        board = pl.read_parquet(boards / board_file(rank_by, level))
+        counts = meta.get('board_counts', {})
+        return (board if top is None else board.head(top)), level, counts.get('cells'), \
+            counts.get('eligible', {}).get(str(level))
+    if not (path / 'results.parquet').is_file():
+        raise ValueError(f"run {run_id} has no board for {rank_by}")
+    cached = boards / board_file(rank_by, min_trades)
+    board, cells, eligible = rank_board_file(path / 'results.parquet', rank_by, int(min_trades), 200)
+    boards.mkdir(exist_ok=True)
+    board.write_parquet(cached)
+    counts = meta.setdefault('board_counts', {'cells': cells, 'eligible': {}})
+    counts['eligible'][str(int(min_trades))] = eligible
+    (path/'metadata.json').write_text(json.dumps(meta, default=str, indent=2), encoding='utf-8')
+    return (board if top is None else board.head(top)), int(min_trades), cells, eligible

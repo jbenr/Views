@@ -60,34 +60,41 @@ def test_a_new_page_reattaches_to_running_and_finished_jobs():
     from research import app as ui
     app = ui.build_app()
     callbacks = {v["callback"].__wrapped__.__name__: v["callback"].__wrapped__ for v in app.callback_map.values()}
-    poll = callbacks["_job_results"]
+    status = callbacks["_job_status"]
 
     release = threading.Event()
     running = jobs.submit("bt", "slow grid", lambda: release.wait(10) and {})
     try:
-        out = poll(1, None, None, 30)
-        assert out[10] is True and "Running" in out[11]  # Run backtest grid disabled while it runs
-        assert out[4] is no_update  # nothing to show yet
+        out = status(1, None, None, None, None, False, False)
+        assert out[4] is True and "Running" in out[5]  # Run backtest grid disabled while it runs
+        assert out[1] is no_update  # nothing to show yet
+        assert status(2, None, None, None, None, False, True)[4] is no_update  # unchanged: no update
     finally:
         release.set()
     jobs.wait(running)
 
     failed = jobs.wait(jobs.submit("dis", "broken", lambda: (_ for _ in ()).throw(RuntimeError("no data"))))
-    out = poll(1, None, running, 30)  # a fresh page: nothing rendered yet
-    assert out[3] == failed["id"] and "no data" in json.dumps(out[0].to_plotly_json(), default=str)
-    assert out[8] is False and out[9] == "Run discovery"
-    again = poll(2, failed["id"], running, 30)  # already shown: not re-rendered every tick
-    assert again[0] is no_update and again[3] is no_update
+    out = status(1, None, running, None, None, False, False)  # a fresh page: nothing rendered yet
+    assert out[0] == failed["id"]
+    shown = callbacks["_show_discovery_job"](out[0], 30)
+    assert shown[3] == failed["id"] and "no data" in json.dumps(shown[0].to_plotly_json(), default=str)
+    again = status(2, failed["id"], running, failed["id"], None, False, False)  # shown: nothing new
+    assert again[0] is no_update and again[1] is no_update
 
 
 def test_results_from_saved_runs_survive_loading_a_panel():
     from research import app as ui
     app = ui.build_app()
     callbacks = {v["callback"].__wrapped__.__name__: v["callback"].__wrapped__ for v in app.callback_map.values()}
+    stored = {"target": "10s30s", "weighting": "fixed", "legs": {"10y": -1.0, "30y": 1.0}, "features": ["10y"]}
+    same = {"target_definition": {"target": "10s30s", "weighting": "fixed", "legs": {"10y": -1.0, "30y": 1.0},
+                                  "weight_columns": {}}, "feature": "10y"}
+    other = dict(same, feature="swsp10")
+    assert callbacks["_invalidate_panel"](stored, same, same) == (no_update,) * 7  # same setup: results stay
+    cleared = json.dumps(callbacks["_invalidate_panel"](stored, other, other)[:7], default=str)
+    assert "The board shown was for" in cleared and "The grid shown was for" in cleared
     archived = {"archive_id": "run", "run_path": "/runs/run"}
-    assert callbacks["_invalidate_panel"]({"rows": []}, archived) == (no_update,) * 6
-    assert callbacks["_invalidate_panel"]({"rows": []}, {"run_path": "x"})[0] == ""
-    assert callbacks["_invalidate_candidate_for_board"](archived, {"discovery_run": "/runs/run"}) == (no_update,) * 4
+    assert callbacks["_invalidate_candidate_for_board"](archived, {"discovery_run": "/runs/run"}) == (no_update,) * 2
     assert callbacks["_invalidate_candidate_for_board"](archived, {"discovery_run": "/runs/other"})[0] is None
 
 
@@ -137,3 +144,78 @@ def test_native_crashes_are_logged_with_every_threads_stack(tmp_path):
     finally:
         faulthandler.disable()
         log.close()
+
+
+
+def test_the_per_tick_job_check_never_writes_to_the_result_areas():
+    # Writing there every 0.75s made Dash dim them as 'loading' each tick: the page flashed.
+    from research import app as ui
+    app = ui.build_app()
+    tick = next(k for k, v in app.callback_map.items() if v["callback"].__wrapped__.__name__ == "_job_status")
+    assert "dis-out" not in tick and "bt-out" not in tick and "dis-board" not in tick and "bt-grid" not in tick
+    for name, kind in (("_show_discovery_job", "dis"), ("_show_grid_job", "bt")):
+        spec = next(v for v in app.callback_map.values() if v["callback"].__wrapped__.__name__ == name)
+        assert [i["id"] for i in spec["inputs"]] == [f"{kind}-ready"]
+
+
+def test_concurrent_renders_of_one_result_share_a_single_render():
+    from research import app as ui
+    calls, started = [], threading.Event()
+
+    def slow():
+        calls.append(1)
+        started.set()
+        threading.Event().wait(0.2)
+        return "board"
+    results = []
+    first = threading.Thread(target=lambda: results.append(ui.render_once(("t", "job"), slow)))
+    first.start()
+    started.wait(5)
+    results.append(ui.render_once(("t", "job"), slow))
+    first.join()
+    assert results == ["board", "board"] and len(calls) == 1
+
+
+def test_a_damaged_record_is_repaired_on_read_not_raised():
+    # Exactly the record that broke the page: a stub with no status.
+    jobs.JOBS.mkdir(parents=True)
+    job_id = "20261002T055445432827Z_dis_a3ba3beb"
+    (jobs.JOBS / f"{job_id}.json").write_text(json.dumps({"id": job_id, "kind": "dis", "pid": 42340, "attempt": 2}))
+    record = jobs.latest("dis")
+    assert record["status"] == "failed" and "incomplete" in record["error"]
+    assert jobs.progress_of("dis") == {} and not jobs.running("dis")
+    assert json.loads((jobs.JOBS / f"{job_id}.json").read_text())["status"] == "failed"
+
+
+def test_worker_processes_finish_back_to_back_and_report_progress():
+    first = jobs.wait(jobs.submit("dis", "first", "json:loads", '{"n": 1}'), timeout=120)
+    # Started the instant the first record says done: must not be refused as still running.
+    second = jobs.wait(jobs.submit("dis", "second", "json:loads", '{"n": 2}'), timeout=120)
+    assert (first["status"], first["result"], second["status"], second["result"]) == ("done", {"n": 1}, "done", {"n": 2})
+    reported = jobs.wait(jobs.submit("bt", "progress", "research.progress:update", "jobs", "bt", "hello from a worker", 1, 2),
+                         timeout=120)
+    assert reported["status"] == "done"
+    progress = jobs.progress_of("bt")
+    assert progress["message"] == "hello from a worker" and (progress["done"], progress["total"]) == (1, 2)
+
+
+def test_a_crashing_worker_is_relaunched_then_marked_failed(monkeypatch):
+    monkeypatch.setattr(jobs, "MAX_ATTEMPTS", 2)
+    record = jobs.wait(jobs.submit("dis", "crashes", "os:_exit", 7), timeout=120)
+    assert record["status"] == "failed" and record["attempt"] == 2
+    assert "exit code 7" in record["error"] and "relaunched" in record["note"]
+    assert not jobs.running("dis")
+
+
+def test_a_locked_progress_file_never_breaks_the_job(tmp_path, monkeypatch):
+    # Windows refuses to replace a file the app is reading; progress must skip, not raise.
+    from research import progress
+    sink = tmp_path / "job.progress.json"
+    monkeypatch.setattr(progress, "_sink", sink)
+    real = progress.os.replace
+    monkeypatch.setattr(progress.os, "replace", lambda *a: (_ for _ in ()).throw(PermissionError(5, "Access is denied")))
+    progress.update("s", "dis", "Backtesting model 1/10", 1, 10)  # does not raise
+    assert not sink.exists()
+    monkeypatch.setattr(progress.os, "replace", real)
+    progress.update("s", "dis", "Completed · done", 1, 1)  # the next write lands
+    assert progress.read(sink)["message"] == "Completed · done"

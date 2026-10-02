@@ -1,11 +1,17 @@
 """Session-scoped progress for the local, threaded research server."""
 
+import json
+import os
+from pathlib import Path
 from threading import Lock
-from time import monotonic
+from time import monotonic, sleep, time
 
 _lock = Lock()
 _tasks: dict[tuple[str, str], dict] = {}
 MAX_LOG_LINES = 200
+# Set in a worker process: every update is also written here for the app to read.
+_sink: Path | None = None
+_last_write = 0.0
 
 
 def update(session: str, task: str, message: str, done=0, total=0) -> None:
@@ -27,7 +33,59 @@ def update(session: str, task: str, message: str, done=0, total=0) -> None:
                                           if old.get("total") == total and done >= old.get("done", 0)
                                           else now),
                            started=old.get("started", now), updated=now,
-                           history=history)
+                           history=history,
+                           wall_started=old.get("wall_started", time()),
+                           wall_phase_started=(old.get("wall_phase_started", time())
+                                               if old.get("total") == total and done >= old.get("done", 0)
+                                               else time()))
+        if _sink is not None:
+            _persist(_tasks[key])
+
+
+def persist_to(path) -> None:
+    """In a worker process: also write progress to ``path`` (read back with ``read``)."""
+    global _sink
+    _sink = Path(path)
+
+
+def _persist(state: dict) -> None:
+    """Write progress for the app to read. Never raises: progress is a display, not the job.
+
+    On Windows a file cannot be replaced while another process has it open,
+    and the app reads this file every poll. So the swap is retried briefly;
+    if the app still holds it, this update is skipped and the next one
+    rewrites it (a final message retries for longer).
+    """
+    global _last_write
+    finished = state["message"].startswith(("Completed ·", "Failed:"))
+    if not finished and time() - _last_write < 0.25:
+        return
+    payload = {k: state[k] for k in ("message", "done", "total", "message_count", "history",
+                                     "wall_started", "wall_phase_started")}
+    payload["wall_updated"] = time()
+    partial = _sink.with_name(_sink.name + ".partial")
+    pauses = (0.0, 0.02, 0.05, 0.1, 0.2, 0.4, 0.8) if finished else (0.0, 0.02, 0.05)
+    for pause in pauses:
+        sleep(pause)
+        try:
+            partial.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(partial, _sink)
+        except OSError:
+            continue
+        _last_write = time()
+        return
+
+
+def read(path) -> dict:
+    """A worker's persisted progress, in ``snapshot``'s shape; {} if none yet."""
+    try:
+        state = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    finished = state["message"].startswith(("Completed ·", "Failed:"))
+    end = state["wall_updated"] if finished else time()
+    return dict(state, started=state["wall_started"], elapsed=end - state["wall_started"],
+                phase_elapsed=end - state["wall_phase_started"])
 
 
 def start(session: str, task: str, message: str) -> None:

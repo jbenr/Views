@@ -136,6 +136,17 @@
     if (!th) return;
     const table = th.closest(".viz-table--sortable");
     if (!table) return;
+    /* A header with data-board-rule (and data-board-store, the Store to write)
+       has its own saved top rows on the server: the first click asks for those
+       rows, best first, instead of reordering the rows already shown. Clicks
+       on the column once it is the server's descending order toggle locally. */
+    const rule = th.dataset.boardRule;
+    if (rule && th.dataset.sortDir !== "desc" && window.dash_clientside && window.dash_clientside.set_props) {
+      const arrow = th.querySelector(".viz-sort-arrow");
+      if (arrow) arrow.textContent = " …";
+      window.dash_clientside.set_props(th.dataset.boardStore, { data: { rule: rule, at: Date.now() } });
+      return;
+    }
     const headerRow = th.parentElement;
     const colIndex = Array.prototype.indexOf.call(headerRow.children, th);
     const tbody = table.querySelector("tbody");

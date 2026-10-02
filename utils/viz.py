@@ -1462,6 +1462,8 @@ def table_div(
     col_widths=None,
     table_style=None,
     sortable=False,
+    header_props=None,
+    sorted_by=None,
 ):
     """Render a DataFrame as a plain HTML table -- the house table style.
 
@@ -1490,6 +1492,11 @@ def table_div(
     (toggling ascending/descending), entirely client-side -- see
     utils/assets/research_app.js. Off by default so existing tables are
     unaffected; opt in per call.
+
+    header_props {column: {attribute: value}} adds attributes to a header cell
+    (e.g. data-* hooks for page scripts). sorted_by (column, "asc" | "desc")
+    marks the order the rows already arrive in, so the arrow shows it and the
+    next click toggles from it.
     """
     from dash import html as dhtml
 
@@ -1530,11 +1537,16 @@ def table_div(
         return {**base, "width": width} if width else base
 
     if sortable:
+        sort_col, sort_dir = sorted_by or (None, None)
         header = dhtml.Tr([
             dhtml.Th(
-                [str(labels[col]), dhtml.Span("", className="viz-sort-arrow")],
+                [str(labels[col]), dhtml.Span(
+                    (" ▲" if sort_dir == "asc" else " ▼") if col == sort_col else "",
+                    className="viz-sort-arrow")],
                 className="viz-th-sortable",
                 style={**_with_width(th_style, col), "cursor": "pointer"},
+                **(header_props or {}).get(col, {}),
+                **({"data-sort-dir": sort_dir} if col == sort_col else {}),
             )
             for col in render_cols
         ])
