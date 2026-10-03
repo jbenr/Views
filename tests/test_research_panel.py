@@ -253,3 +253,30 @@ def test_regression_scatter_fits_latest_window_and_deeper_past_separately():
     assert "data:image/png;base64," in view and "β moved 1.000 → 3.000" in view
     alone = json.dumps(regression_scatter(data, "y", "x", "changes", 50, "none"), cls=PlotlyJSONEncoder, ensure_ascii=False)
     assert "β moved" not in alone
+
+
+def test_custom_structures_are_named_definitions():
+    from research.panel import structure_definition
+    assert structure_definition("fly", ["5y", "7y", "10y"]) == "5s7s10s = 5y:-1, 7y:2, 10y:-1"
+    assert structure_definition("spread", ["10y", "sofr10"]) == "10y-sofr10 = 10y:-1, sofr10:1"
+    fly = parse_weights(structure_definition("fly", ["5y", "7y", "10y"]))
+    assert fly.name == "5s7s10s" and fly.legs == {"5y": -1.0, "7y": 2.0, "10y": -1.0}
+    assert dependent_leg(fly) == "7y"  # the belly is hedged with betas on the wings
+    assert parse_weights("20y:2, 10y:-1, 30y:-1").name == "custom"  # unnamed still works
+    with pytest.raises(ValueError, match="different legs"):
+        structure_definition("fly", ["5y", "5y", "10y"])
+    with pytest.raises(ValueError, match="already a series name"):
+        parse_weights("10y = 10y:1, 30y:-1")
+
+
+def test_breakevens_and_tips_are_targets_and_breakevens_beta_weight_as_nominal_vs_tips():
+    from research.panel import beta_package
+    for tenor in (5, 10, 30):
+        assert CATALOG[f"be{tenor}"].legs == {f"be{tenor}": 1.0}
+        assert CATALOG[f"real{tenor}y"].legs == {f"real{tenor}y": 1.0}
+    package = beta_package(CATALOG["be10"])
+    assert package.name == "be10_legs" and package.legs == {"10y": 1.0, "real10y": -1.0}
+    assert dependent_leg(package) == "10y"  # nominal hedged with beta x TIPS
+    # usable as custom legs too: a breakeven curve, a real-yield spread
+    assert parse_weights("be5:-1, be10:1").legs == {"be5": -1.0, "be10": 1.0}
+    assert parse_weights("real5y:-1, real30y:1").legs == {"real5y": -1.0, "real30y": 1.0}

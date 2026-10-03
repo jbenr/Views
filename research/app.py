@@ -10,6 +10,7 @@ import argparse
 import faulthandler
 import json
 import os
+import re
 import threading
 import time
 import traceback
@@ -24,18 +25,22 @@ from dash import ALL, Input, Output, State, ctx, dcc, html, no_update
 from dashboard.charts import (
     WINDOW_PRESETS,
     coverage_chart,
+    curve_fit_chart,
     hedge_weights_chart,
     level_chart,
     regression_scatter_chart,
+    residual_bars_chart,
 )
+from research.curve_pca import PCA_TENORS, PCA_WINDOWS, pca_curve
 
 from research.panel import (
     BETA_LOOKBACK,
     CATALOG,
     START,
-    SWAP_SPREADS,
-    SWAP_SPREAD_LEGS,
+    PACKAGE_LEGS,
+    TRADEABLE_LEGS,
     beta_package,
+    structure_definition,
     VOLS,
     YIELDS,
     build_panel,
@@ -146,10 +151,29 @@ FEATURE_LABELS = {
     },
 }
 
-TARGET_LABELS = {
-    **{name: name for name in CATALOG if name not in SWAP_SPREADS},
-    **{name: FEATURE_LABELS[name] for name in SWAP_SPREADS},
-}
+# Treasury curves read best by their names; single non-Treasury series by their labels.
+TARGET_LABELS = {name: FEATURE_LABELS[name] if name in FEATURE_LABELS and name not in YIELDS else name
+                 for name in CATALOG}
+
+
+def _target_group(name: str) -> tuple[int, str]:
+    """(order, group) of a catalog target, so the list reads Treasuries, curves, flies, then the rest."""
+    legs = CATALOG[name].legs
+    if name.startswith("swsp"):
+        return 3, "Swap spread"
+    if name.startswith("be"):
+        return 4, "Breakeven"
+    if name.startswith("real"):
+        return 5, "TIPS"
+    return {1: (0, "Treasury"), 2: (1, "Curve"), 3: (2, "Fly")}[len(legs)]
+
+
+# Grouped, then by tenor (every number in the name, so 2s10s comes before 10s30s).
+TARGET_OPTIONS = [
+    {"label": f"{_target_group(n)[1]} · {TARGET_LABELS[n]}", "value": n}
+    for n in sorted(CATALOG, key=lambda n: (_target_group(n)[0],
+                                            [int(x) for x in re.findall(r"\d+", n)]))
+]
 
 TAB_STYLE = {
     "padding": "10px 18px", "fontSize": 12, "fontWeight": "bold",
@@ -186,6 +210,12 @@ def btn_style(primary: bool = False) -> dict:
 
 
 def field(label: str, control) -> html.Div:
+    if isinstance(control, dcc.Dropdown):
+        if getattr(control, "multi", False):
+            control.clearable = True
+        options = getattr(control, "options", [])
+        if options and all(isinstance(o.get("value"), (int, float)) for o in options):
+            control.options = sorted(options, key=lambda o: o["value"])
     control.style = {"fontFamily": "Arial, Helvetica, sans-serif", "fontSize": 12,
                      **(getattr(control, "style", None) or {})}
     return html.Div([html.Span(label, style=LABEL), control],
@@ -440,7 +470,7 @@ def dislocation_tab() -> html.Div:
                  "its behaviour but breaks any link to the target. If the real top score does not beat the "
                  "placebos' top scores, the search is finding noise. Each placebo costs one full discovery run."),
         ]),
-        html.Div(style={"display": "flex", "gap": 8, "alignItems": "center", "margin": "4px 0 6px"}, children=[
+        html.Div(style={"display": "flex", "flexWrap": "wrap", "gap": 8, "alignItems": "center", "margin": "4px 0 6px"}, children=[
             html.Button("Select all sweep options", id="dis-select-all", n_clicks=0, className="ref-btn", style=btn_style()),
         ]),
         info("What Select all does",
@@ -501,6 +531,8 @@ REMEMBERED = [
     "dis-lag", "dis-train", "dis-cv", "dis-rank", "dis-placebo",
     "bt-entry-zs", "bt-exit-styles", "bt-time-stops", "bt-bands", "bt-revert-fracs", "bt-half-lives", "bt-caps",
     "bt-signal-stops", "bt-stop", "bt-cost", "bt-lag",
+    "weighting", "beta-lb", "custom-kind", "custom-leg-1", "custom-leg-2", "custom-leg-3",
+    "fv-pca-tenors", "fv-pca-start", "fv-pca-window", "fv-pca-factors",
 ]
 
 
@@ -580,6 +612,29 @@ def _valid_derived(name: str) -> bool:
         return False
 
 
+CUSTOM_LEG_ROLES = {"spread": ["short leg (−1)", "long leg (+1)"],
+                    "fly": ["wing (−1)", "belly (+2)", "wing (−1)"]}
+
+
+def custom_builder() -> html.Div:
+    """Pick a structure and its legs; the custom definition below is written from them."""
+    legs = [{"label": f"{leg} · {FEATURE_LABELS.get(leg, leg)}", "value": leg} for leg in TRADEABLE_LEGS]
+    return html.Div([
+        field("custom structure", dcc.RadioItems(
+            id="custom-kind", value="fly", inline=True,
+            options=[{"label": " spread", "value": "spread"}, {"label": " fly", "value": "fly"},
+                     {"label": " free basket (type below)", "value": "basket"}],
+            labelStyle={"marginRight": 14, "fontSize": 12, "color": TEXT}, inputStyle={"marginRight": 4})),
+        *[html.Div([html.Span(role, id=f"custom-leg-{i}-label", style=LABEL),
+                    dcc.Dropdown(id=f"custom-leg-{i}", value=default, clearable=False, options=legs,
+                                 style={"fontFamily": "Arial, Helvetica, sans-serif", "fontSize": 12})],
+                   id=f"custom-leg-{i}-box", className="research-field", style={"marginBottom": 12})
+          for i, (role, default) in enumerate(zip(CUSTOM_LEG_ROLES["fly"], ["5y", "7y", "10y"]), start=1)],
+        html.Div(note("Treasuries, SOFR swaps and swap spreads can all be legs. Beta weighting hedges the belly "
+                      "(or the long leg) with fitted betas on the others.", "dim"), style={"marginBottom": 12}),
+    ], id="custom-builder", style={"display": "none"})
+
+
 def controls() -> html.Div:
     preferences = load_preferences(CATALOG, {name for names in FEATURE_GROUPS.values() for name in names},
                                    DEFAULT_TARGET, DEFAULT_FEATURES, extra_feature=_valid_derived)
@@ -588,12 +643,14 @@ def controls() -> html.Div:
     return html.Div(children=[
         field("target", dcc.Dropdown(
             id="target", value=preferences['target'], clearable=False,
-            options=[{"label": TARGET_LABELS[n], "value": n} for n in sorted(CATALOG)]
-                    + [{"label": "custom weights...", "value": "custom"}],
+            options=TARGET_OPTIONS
+                    + [{"label": "custom spread / fly / basket...", "value": "custom"}],
             style={"fontSize": 12})),
-        field("custom weights", dcc.Input(
-            id="custom", type="text", value=preferences['custom'], placeholder="20y:2, 10y:-1, 30y:-1",
+        custom_builder(),
+        field("custom definition (name = leg:weight, ...)", dcc.Input(
+            id="custom", type="text", value=preferences['custom'], placeholder="5s7s10s = 5y:-1, 7y:2, 10y:-1",
             debounce=True, style=INPUT)),
+        html.Div(id="custom-error"),
         field("leg weighting", dcc.RadioItems(
             id="weighting", value="fixed",
             options=[
@@ -646,7 +703,7 @@ def controls() -> html.Div:
 
 
 def setup_tab() -> html.Div:
-    return html.Div(style={"padding": "18px 24px"}, children=[
+    return remember_controls(html.Div(style={"padding": "18px 24px"}, children=[
         heading("panel setup"),
         html.Div(style={"display": "grid",
                         "gridTemplateColumns": "300px minmax(0, 1fr)",
@@ -656,7 +713,7 @@ def setup_tab() -> html.Div:
         ]),
         dcc.Store(id="research-level-data"),
         dcc.Store(id="research-level-window", data=DEFAULT_CHART_WINDOW),
-    ])
+    ]), load_controls())
 
 
 def level_window_nav(current: str) -> html.Div:
@@ -741,7 +798,7 @@ def scatter_section() -> html.Div:
                 {"label": "Daily changes (Δ target vs Δ feature)", "value": "changes"}], 260),
             choice("scatter-window", "latest regression window", 126,
                    [{"label": f"{w} days", "value": w} for w in SCATTER_WINDOWS], 170),
-            choice("scatter-past", "deeper past", "previous", [
+            choice("scatter-past", "past", "previous", [
                 {"label": "Previous window (same length)", "value": "previous"},
                 {"label": "All earlier history", "value": "all"},
                 {"label": "None", "value": "none"}], 230),
@@ -780,23 +837,27 @@ def regression_scatter(data: pl.DataFrame, target: str, feature: str, basis: str
     name = FEATURE_LABELS.get(feature, feature)
 
     def fit_label(which, fit):
-        return f"{which} fit · β {fit['beta']:.3f} · R² {fit['r2']:.2f} · n {fit['n']}"
+        return f"{which} fit: β {fit['beta']:.3f}, R² {fit['r2']:.2f}"
     png = regression_scatter_chart(
         (latest[feature].to_numpy(), latest[target].to_numpy()),
         (deeper[feature].to_numpy(), deeper[target].to_numpy()), fits, (now[feature], now[target]),
         title=f"{target} vs {name} · {units}s", x_title=f"{name} ({units})", y_title=f"{target} ({units})",
         zero_lines=basis == "changes",
-        labels={"latest": f"latest {window}d · {latest['ts'].min()} to {latest['ts'].max()}",
-                "latest_fit": fit_label(f"latest {window}d", fits["latest"]),
-                "past": f"deeper past · {deeper['ts'].min()} to {deeper['ts'].max()}" if len(deeper) else "",
-                "past_fit": fit_label("deeper past", fits["past"]),
-                "now": f"latest point · {now['ts']}", "extend_latest": past == "previous"})
+        labels={"latest": f"latest {window}d",
+                "latest_fit": fit_label("latest", fits["latest"]),
+                "past": "past" if len(deeper) else "",
+                "past_fit": fit_label("past", fits["past"]),
+                "now": "latest point", "extend_latest": past == "previous"})
+    periods = f"Latest: {latest['ts'].min()} to {latest['ts'].max()} (n={fits['latest']['n']})."
+    if len(deeper):
+        periods += f" Past: {deeper['ts'].min()} to {deeper['ts'].max()} (n={fits['past']['n']})."
     summary = (f"Latest point is {s['residual']:+.2f} {'bp ' if units == 'level' else ''}"
                f"{'above' if s['residual'] >= 0 else 'below'} the latest {window}d line ({s['z']:+.1f} residual std).")
     if np.isfinite(fits["past"]["beta"]):
-        summary += f" β moved {fits['past']['beta']:.3f} → {fits['latest']['beta']:.3f} from the deeper past to the latest window."
+        summary += f" β moved {fits['past']['beta']:.3f} → {fits['latest']['beta']:.3f} from the past to the latest window."
     return html.Div([
         html.Img(src=f"data:image/png;base64,{png}", style={"width": "100%", "border": f"1px solid {BORDER}"}),
+        note(periods, "dim"),
         note(summary, "dim"),
     ])
 
@@ -804,8 +865,22 @@ def regression_scatter(data: pl.DataFrame, target: str, feature: str, basis: str
 # ---- the load callback's output ---------------------------------------------
 
 
+def latest_hedge(panel, trade) -> dict[str, float] | None:
+    """Latest held weights of a beta-weighted target, per leg (dependent leg keeps its weight)."""
+    if panel.weighting != "beta" or not panel.weight_cols:
+        return None
+    dependent = dependent_leg(trade, panel.beta_dependent)
+    scale = float(trade.legs[dependent])
+    last = panel.data.select(panel.weight_cols).drop_nulls()
+    if not len(last):
+        return None
+    row = last.row(-1, named=True)
+    return {leg: scale if leg == dependent else -scale * row[f"w_{leg}"] for leg in trade.legs}
+
+
 def summary_bar(panel, trade, aligned_n: int, diag: dict) -> html.Div:
-    legs = "  ".join(f"{w:+g}·{leg}" for leg, w in trade.legs.items())
+    hedge = latest_hedge(panel, trade)
+    legs = "  ".join(f"{w:+.2f}·{leg}" if hedge else f"{w:+g}·{leg}" for leg, w in (hedge or trade.legs).items())
     level = panel.data[trade.name].drop_nulls()
 
     def move_block(bars: int) -> html.Div:
@@ -826,7 +901,7 @@ def summary_bar(panel, trade, aligned_n: int, diag: dict) -> html.Div:
 
     blocks = [
         stat_block("target", trade.name),
-        stat_block("legs", legs if panel.weighting == "fixed" else "fitted"),
+        stat_block("legs · latest β" if hedge else "legs", legs),
         stat_block("weighting", panel.weighting
                    + (f" · {panel.beta_lookback}d" if panel.weighting == "beta" else "")),
         stat_block("loaded bars", f"{len(panel.data):,}"),
@@ -1158,6 +1233,12 @@ def construction(stored: dict) -> str:
     """How the loaded target is built from its legs, in one line."""
     legs = stored.get("legs") or {}
     if stored.get("weighting") == "beta":
+        held = stored.get("weight_columns") or {}
+        last = next((row for row in reversed(stored.get("rows") or [])
+                     if held and all(row.get(col) is not None for col in held.values())), None)
+        if last:
+            weights = "  ".join(f"{last[col]:+.2f}·{leg}" for leg, col in held.items())
+            return f"beta-weighted · {weights} (latest β) · {stored.get('beta_lookback', '?')}d, held daily"
         dependent = stored.get("beta_dependent") or next((leg for leg, w in legs.items() if w > 0), "?")
         hedges = " + ".join(f"β×{leg}" for leg in legs if leg != dependent)
         return f"beta-weighted · {dependent} vs {hedges} · {stored.get('beta_lookback', '?')}d β, held daily"
@@ -1214,6 +1295,41 @@ def pnl_heatmap(equity: pl.DataFrame, periods: pl.DataFrame) -> html.Div:
     return table(shown.to_pandas(), title="P&L by month and year (bp) · blue gains, red losses; full year on its own scale",
                  columns=["year", *MONTHS, "full_year", "active_days"], cell_style=colour,
                  headers={"full_year": "full year", "active_days": "active days"})
+
+
+def _png_img(png: str) -> html.Img:
+    return html.Img(src=f"data:image/png;base64,{png}", style={"width": "100%", "border": f"1px solid {BORDER}",
+                                                              "marginBottom": 14})
+
+
+def pca_view(result: dict, window: int, n_components: int) -> html.Div:
+    """Today's curve against the curve its factors imply, and each tenor's gap in bp and in z-score."""
+    table, curve = result["table"], result["curve"]
+    explained = "  ·  ".join(f"PC{i + 1} {v:.1%}" for i, v in enumerate(result["explained"]))
+    tenors = table["tenor"].to_list()
+    as_of = result["as_of"]
+    return html.Div([
+        html.Div([
+            stat_block("as of", str(as_of)),
+            stat_block("fit", f"{window}d trailing, point-in-time" if window else "whole sample (in-sample)"),
+            stat_block("history", f"{curve['ts'][0]} → {curve['ts'][-1]} · {len(curve):,} days"),
+            stat_block(f"variance explained · {n_components} factors", explained),
+        ], style={"display": "flex", "gap": 28, "flexWrap": "wrap", "marginBottom": 14, "paddingBottom": 12,
+                  "borderBottom": f"1px solid {BORDER}"}),
+        _png_img(curve_fit_chart(table["years"].to_list(), table["actual_bp"].to_list(), table["fair_bp"].to_list(),
+                                 f"Treasury curve vs PCA-implied curve · {as_of}")),
+        html.Div([
+            html.Div(_png_img(residual_bars_chart(tenors, table["residual_bp"].to_list(),
+                                                  "residual · actual − PCA-implied (bp)", "bp")),
+                     style={"flex": "1 1 380px", "minWidth": 0}),
+            html.Div(_png_img(residual_bars_chart(tenors, table["z"].to_list(),
+                                                  "residual z-score (vs its own history)", "z", bands=(1.0, 2.0))),
+                     style={"flex": "1 1 380px", "minWidth": 0}),
+        ], style={"display": "flex", "gap": 18, "flexWrap": "wrap"}),
+        note("Blue: the yield is above the PCA-implied curve (cheap against the rest of the curve). Red: below it "
+             "(rich). z divides today's gap by that tenor's residual standard deviation over the history shown; "
+             "dotted and dashed lines mark ±1 and ±2.", "dim"),
+    ])
 
 
 def trade_distribution(pnl: np.ndarray) -> dcc.Graph:
@@ -1312,18 +1428,115 @@ def tabs() -> html.Div:
                         "and needs the same fix.",
                     ])),
         dcc.Tab(label="Fair Value", value="fv", style=TAB_STYLE,
-                selected_style=SELECTED_TAB_STYLE, children=stub_tab(
-                    "Fair Value", [
-                        "Audited clean for lookahead and alignment, and it fades "
-                        "against the target level, so its scorecard is tradeable.",
-                        "Do not gate on roll_lr's r2: it accumulates each bar's own "
-                        "residual rather than refitting the window, and its max gap "
-                        "to true in-window R2 is 0.114 on relationships whose R2 is "
-                        "about 0.05.",
-                        "Surface factor_condition_number prominently -- multi-factor "
-                        "levels regressions on collinear rates go unstable quietly.",
-                    ])),
+                selected_style=SELECTED_TAB_STYLE, children=fair_value_tab()),
     ])], className="research-bench")
+
+
+SUB_TAB_STYLE = {**TAB_STYLE, "padding": "7px 14px", "fontSize": 11}
+SUB_TAB_SELECTED = {**SUB_TAB_STYLE, "background": "#FFFFFF", "color": TEXT, "borderTop": f"2px solid {ORANGE}"}
+
+
+def fv_placeholder(title: str, what: str, plan: list[str], data: list[str]) -> html.Div:
+    """A Fair Value sub-tab that is planned but not built: what it will answer and what it needs."""
+    return html.Div([
+        html.Div([html.Div(title.upper(), style=HEADING), note(what, "dim")], className="research-banner",
+                 style={"display": "block"}),
+        html.Div([
+            html.Div([html.Span("plan", style=LABEL),
+                      html.Ul([html.Li(p, style={"fontSize": 12, "color": TEXT, "marginBottom": 6}) for p in plan])]),
+            html.Div([html.Span("data", style=LABEL),
+                      html.Ul([html.Li(d, style={"fontSize": 12, "color": TEXT, "marginBottom": 6}) for d in data])]),
+        ], style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": 32, "maxWidth": 1100}),
+    ])
+
+
+def pca_controls() -> html.Div:
+    return html.Div([
+        field("tenors", dcc.Checklist(
+            id="fv-pca-tenors", value=PCA_TENORS,
+            options=[{"label": f" {t}" + (" (from 2020)" if t == "20y" else " (from 2009)" if t == "7y" else ""),
+                      "value": t} for t in sorted(YIELDS, key=lambda t: int(t[:-1]))],
+            labelStyle={"display": "block", "fontSize": 12, "marginBottom": 3, "color": TEXT},
+            inputStyle={"marginRight": 5})),
+        field("history from", dcc.Dropdown(id="fv-pca-start", value="2010-01-01", clearable=False, options=[
+            {"label": "2000", "value": "2000-01-01"}, {"label": "2010", "value": "2010-01-01"},
+            {"label": "2015", "value": "2015-01-01"}, {"label": "2020", "value": "2020-01-01"}])),
+        field("fit window (point-in-time)", dcc.Dropdown(id="fv-pca-window", value=504, clearable=False, options=[
+            *[{"label": f"{w} days, trailing", "value": w} for w in PCA_WINDOWS],
+            {"label": "whole sample (in-sample, uses the future)", "value": 0}])),
+        field("factors kept", dcc.Dropdown(id="fv-pca-factors", value=3, clearable=False, options=[
+            {"label": "2 (level, slope)", "value": 2}, {"label": "3 (level, slope, curvature)", "value": 3},
+            {"label": "4", "value": 4}])),
+        html.Button("Run PCA", id="fv-pca-run", n_clicks=0, className="ref-btn",
+                    style={**btn_style(primary=True), "width": "100%", "marginTop": 4, "marginBottom": 14}),
+        info("How the fair value is built",
+             "Each day, PCA is fitted on the trailing window of curve levels (only data known that day), and the day's "
+             "curve is rebuilt from the kept factors. That rebuilt curve is the PCA-implied curve; the residual is "
+             "actual minus implied.",
+             "z is today's residual over the standard deviation of that tenor's residual history.",
+             "The 20y only exists from 2020 and the 7y from 2009; including them shortens the history. Untick the "
+             "20y for a longer one."),
+    ], className="research-controls")
+
+
+def pca_tab() -> html.Div:
+    return html.Div([
+        html.Div([html.Div("PCA · CURVE FAIR VALUE", style=HEADING), note(
+            "Level, slope and curvature explain almost all of the curve. Each tenor's gap to the curve they "
+            "imply is where it is rich or cheap against the rest of the curve.",
+            "dim")], className="research-banner", style={"display": "block"}),
+        html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)", "gap": 26,
+                        "alignItems": "start"}, children=[
+            pca_controls(),
+            dcc.Loading(html.Div(id="fv-pca-out"), type="dot"),
+        ]),
+        dcc.Store(id="fv-pca-settings"),
+    ])
+
+
+def fair_value_tab() -> html.Div:
+    return html.Div(style={"padding": "14px 24px"}, children=[
+        html.Div(id="fair-value-context", style={"display": "none"}),  # Setup's Fill tabs still writes here
+        dcc.Tabs(id="fv-tabs", value="pca", children=[
+            dcc.Tab(label="PCA", value="pca", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
+                    children=html.Div(pca_tab(), style={"paddingTop": 14})),
+            dcc.Tab(label="Term Premium", value="tp", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
+                    children=html.Div(fv_placeholder(
+                        "term premium",
+                        "How much of the long end is compensation for duration risk rather than the expected path "
+                        "of rates, built from our own curve rather than a published model.",
+                        ["A structural model: the 2s10s30s fly regressed on the residual of 2s vs 10s (the part of "
+                         "10s the front end does not explain), to be specified together.",
+                         "Rolling multi-factor fit with stationarity, error-correction speed and coefficient "
+                         "stability (FairValueStudy), so the residual is a tradeable fair-value gap."],
+                        ["Generic yields 2y–30y and on-the-run bonds: in the database.",
+                         "No published term premium (ACM / Kim-Wright) stored; not needed for our own model."]),
+                        style={"paddingTop": 14})),
+            dcc.Tab(label="Inflation", value="infl", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
+                    children=html.Div(fv_placeholder(
+                        "inflation",
+                        "Are breakevens rich or cheap against what usually drives them: oil, the dollar and "
+                        "nominal yields?",
+                        ["Breakeven fair value from oil, the dollar and nominals (FairValueStudy), per tenor.",
+                         "Breakeven curve (5s10s, 10s30s) and TIPS vs inflation-swap basis."],
+                        ["Breakevens and TIPS 5/10/30y (generics and by CUSIP), inflation swaps 1–30y from 2004, "
+                         "oil, gasoline, metals, the dollar: in the database.",
+                         "Missing: CPI and other economic releases, so no 'vs CPI trend' yet."]),
+                        style={"paddingTop": 14})),
+            dcc.Tab(label="Positioning", value="pos", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
+                    children=html.Div(fv_placeholder(
+                        "positioning",
+                        "Who is long or short Treasury futures (dealers, asset managers, leveraged funds), and how "
+                        "extreme that is against history.",
+                        ["Net positions by trader type and tenor (TU, FV, TY, UXY, US, WN), in contracts and DV01, "
+                         "as z-scores and percentiles; crowding against curve and level moves."],
+                        ["md.cftc (CFTC Traders in Financial Futures) has Treasury futures only for Jul 2010 – Dec "
+                         "2012 and Feb 2026 onward; nothing in 2013–2025. Needs a backfill from the CFTC's "
+                         "historical files before z-scores mean anything.",
+                         "Contract code 020604 is the old long bond in 2010–12 but the Ultra bond in 2026."]),
+                        style={"paddingTop": 14})),
+        ]),
+    ])
 
 
 MECHANICS_EXITS = ["bt-exit-styles", "bt-time-stops", "bt-bands", "bt-revert-fracs",
@@ -1712,20 +1925,56 @@ def register_callbacks(app) -> None:
         return {"marginBottom": 12} if 'raw' in (signals or []) else {"display": "none"}
 
     @app.callback(Output("custom-field", "style"), Output("beta-lb-field", "style"),
-                  Output("beta-advanced", "style"), Input("target", "value"), Input("weighting", "value"))
+                  Output("beta-advanced", "style"), Output("custom-builder", "style"),
+                  Input("target", "value"), Input("weighting", "value"))
     def _weight_controls(target, weighting):
         show, hide = {"marginBottom": 12}, {"display": "none"}
-        return show if target == "custom" else hide, show if weighting == "beta" else hide, show if weighting == "beta" else hide
+        return (show if target == "custom" else hide, show if weighting == "beta" else hide,
+                show if weighting == "beta" else hide, {} if target == "custom" else hide)
+
+    @app.callback(*[Output(f"custom-leg-{i}-box", "style") for i in (1, 2, 3)],
+                  *[Output(f"custom-leg-{i}-label", "children") for i in (1, 2, 3)],
+                  Input("custom-kind", "value"))
+    def _custom_roles(kind):
+        # A spread uses two legs, a fly three; a free basket is typed, so no pickers.
+        roles = CUSTOM_LEG_ROLES.get(kind, [])
+        return (*[{"marginBottom": 12} if i < len(roles) else {"display": "none"} for i in range(3)],
+                *[roles[i] if i < len(roles) else "" for i in range(3)])
+
+    @app.callback(Output("custom", "value"), Output("custom-error", "children"),
+                  Input("custom-kind", "value"), *[Input(f"custom-leg-{i}", "value") for i in (1, 2, 3)],
+                  prevent_initial_call=True)
+    def _custom_definition(kind, *legs):
+        # The builder writes the definition; a free basket is typed by hand instead.
+        if kind not in CUSTOM_LEG_ROLES:
+            return no_update, ""
+        try:
+            return structure_definition(kind, list(legs[:len(CUSTOM_LEG_ROLES[kind])])), ""
+        except ValueError as exc:
+            return no_update, note(str(exc), "warn")
+
+    @app.callback(Output("custom", "value", allow_duplicate=True), Input("target", "value"),
+                  State("custom", "value"), State("custom-kind", "value"),
+                  *[State(f"custom-leg-{i}", "value") for i in (1, 2, 3)], prevent_initial_call=True)
+    def _custom_on_select(target, current, kind, *legs):
+        # Choosing custom fills an empty definition from the builder; one already typed is kept.
+        if target != "custom" or (current or "").strip() or kind not in CUSTOM_LEG_ROLES:
+            return no_update
+        try:
+            return structure_definition(kind, list(legs[:len(CUSTOM_LEG_ROLES[kind])]))
+        except ValueError:
+            return no_update
 
     @app.callback(Output("weighting", "options"), Output("weighting", "value", allow_duplicate=True),
                   Input("target", "value"), State("weighting", "value"), prevent_initial_call="initial_duplicate")
     def _beta_only_for_packages(target, weighting):
-        # Beta weighting needs a second leg. Swap spreads get theirs (swap vs
-        # Treasury); an outright yield has none, so the option is disabled.
-        swap = target in SWAP_SPREAD_LEGS
-        single = target in CATALOG and len(CATALOG[target].legs) < 2 and not swap
-        label = (f" beta-weighted (swap {SWAP_SPREAD_LEGS[target][0]} vs β × {SWAP_SPREAD_LEGS[target][1]} Treasury)"
-                 if swap else " beta-weighted" + (" (needs 2+ legs)" if single else ""))
+        # Beta weighting needs a second leg. Swap spreads and breakevens get
+        # theirs (swap vs Treasury, nominal vs TIPS); an outright has none, so
+        # the option is disabled.
+        package = PACKAGE_LEGS.get(target)
+        single = target in CATALOG and len(CATALOG[target].legs) < 2 and not package
+        label = (f" beta-weighted ({package[0]} vs β × {package[1]})"
+                 if package else " beta-weighted" + (" (needs 2+ legs)" if single else ""))
         options = [{"label": " fixed", "value": "fixed"},
                    {"label": label, "value": "beta", "disabled": single}]
         return options, "fixed" if single and weighting == "beta" else no_update
@@ -1741,6 +1990,24 @@ def register_callbacks(app) -> None:
             styles = styles or []
             return [*[show if style in styles else hide for style in ("time", "band", "revert_frac", "half_life_frac")],
                     show if {"band", "revert_frac"} & set(styles) else hide]
+
+    @app.callback(Output("fv-pca-out", "children"), Output("fv-pca-settings", "data"),
+                  Input("fv-pca-run", "n_clicks"), Input("bench-tabs", "value"),
+                  State("fv-pca-tenors", "value"), State("fv-pca-start", "value"), State("fv-pca-window", "value"),
+                  State("fv-pca-factors", "value"), State("fv-pca-settings", "data"))
+    def _run_pca(clicks, tab, tenors, start, window, factors, shown):
+        # Runs on the button, and once when the Fair Value tab is first opened.
+        if not clicks and (tab != "fv" or shown):
+            return no_update, no_update
+        tenors = [t for t in (tenors or []) if t in YIELDS]
+        if len(tenors) < 3:
+            return note("Choose at least three tenors.", "warn"), None
+        settings = dict(tenors=tenors, start=start, window=int(window or 0), factors=int(factors or 3))
+        try:
+            result = pca_curve(tenors, start, settings["window"] or None, settings["factors"])
+        except Exception as exc:
+            return note(f"PCA failed: {type(exc).__name__}: {exc}", "bad"), None
+        return pca_view(result, settings["window"], settings["factors"]), settings
 
     @app.callback(Output("scatter-feature", "options"), Output("scatter-feature", "value"),
                   Input("research-level-data", "data"), State("scatter-feature", "value"))

@@ -88,23 +88,33 @@ SOFR_SWAPS = {name: ticker for name, (ticker, _percent) in EXO.items() if name.s
 # Each ready-made swap spread (swap minus Treasury) and its two executable legs.
 SWAP_SPREAD_LEGS = {name: (f"sofr{name[4:]}", f"{name[4:]}y") for name in SWAP_SPREADS}
 
+# TIPS real yields are executable; a breakeven is nominal minus TIPS of the
+# same tenor (be10 = 10y - real10y), so it is a target too.
+REAL_YIELDS = {name: ticker for name, (ticker, _percent) in EXO.items() if name.startswith("real")}
+BREAKEVENS = {name: ticker for name, (ticker, _percent) in EXO.items() if name.startswith("be")}
+BREAKEVEN_LEGS = {name: (f"{name[2:]}y", f"real{name[2:]}y") for name in BREAKEVENS}
+
+# Ready-made two-leg series and their legs (positive leg first).
+PACKAGE_LEGS = {**SWAP_SPREAD_LEGS, **BREAKEVEN_LEGS}
+
 
 def beta_package(trade: TradeDef) -> TradeDef:
-    """The two-leg form of a ready-made swap spread, which beta weighting can hedge.
+    """The two-leg form of a ready-made spread series, which beta weighting can hedge.
 
-    Bloomberg's swap spread is one series; beta weighting needs the swap and
-    the Treasury as separate legs (swap is the dependent leg, hedged with
-    beta x Treasury). Anything else is returned unchanged.
+    Bloomberg's swap spread or breakeven is one series; beta weighting needs
+    its legs separately: the first leg is the dependent one, hedged with
+    beta x the second (swap vs Treasury; nominal vs TIPS). Anything else is
+    returned unchanged.
     """
-    if len(trade.legs) == 1 and trade.name in SWAP_SPREAD_LEGS:
-        swap, treasury = SWAP_SPREAD_LEGS[trade.name]
-        return TradeDef(f"{trade.name}_legs", {swap: 1.0, treasury: -1.0})
+    if len(trade.legs) == 1 and trade.name in PACKAGE_LEGS:
+        dependent, hedge = PACKAGE_LEGS[trade.name]
+        return TradeDef(f"{trade.name}_legs", {dependent: 1.0, hedge: -1.0})
     return trade
 
 
 # A custom target may use only legs with a clear executable expression.  Macro,
 # vol, and other explanatory inputs intentionally stay out of this set.
-TRADEABLE_LEGS = {**YIELDS, **SWAP_SPREADS, **SOFR_SWAPS}
+TRADEABLE_LEGS = {**YIELDS, **SWAP_SPREADS, **SOFR_SWAPS, **REAL_YIELDS, **BREAKEVENS}
 
 # the ATM swaption grid, as (expiry, tenor) -> "vol_1Mo_30" style aliases
 SWAPTION_EXPIRIES = ("1Mo", "3Mo", "6Mo", "1Y", "2Y", "5Y")
@@ -120,7 +130,7 @@ VOLS = {
 
 
 def catalog() -> dict[str, TradeDef]:
-    """Every prebuilt target: Treasury outrights/curves/flies and swap spreads."""
+    """Every prebuilt target: Treasury outrights/curves/flies, swap spreads, TIPS and breakevens."""
     out: dict[str, TradeDef] = {}
     for n in HEADLINE:
         out[f"{n}y"] = TradeDef.outright(f"{n}y", f"{n}y")
@@ -138,7 +148,7 @@ def catalog() -> dict[str, TradeDef]:
                         f"{a}s{b}s{c}s", f"{a}y", f"{b}y", f"{c}y",
                         weights=(-1.0, 2.0, -1.0),  # positive = belly cheap
                     )
-    for name in SWAP_SPREADS:
+    for name in [*SWAP_SPREADS, *REAL_YIELDS, *BREAKEVENS]:
         out[name] = TradeDef.outright(name, name)
     return out
 
@@ -149,9 +159,18 @@ CATALOG = catalog()
 def parse_weights(text: str, name: str = "custom") -> TradeDef:
     """Build a TradeDef from a free-form '20y:2, 10y:-1, 30y:-1' string.
 
-    Legs must be executable aliases (Treasury yields or Treasury swap spreads);
-    anything else is a typo, not a silently-dropped leg.
+    An optional 'name = ' prefix names the target ('5s7s10s = 5y:-1, 7y:2,
+    10y:-1'); the name becomes the target's column, so it may not be a
+    series name. Legs must be executable aliases (Treasury yields, SOFR
+    swaps or Treasury swap spreads); anything else is a typo, not a
+    silently-dropped leg.
     """
+    if "=" in text:
+        name, text = (part.strip() for part in text.split("=", 1))
+        if not name or not all(c.isalnum() or c in "_-." for c in name):
+            raise ValueError(f"target name {name!r} may use letters, digits, '_', '-' and '.' only")
+        if name in TRADEABLE_LEGS or name in EXO or name in VOLS:
+            raise ValueError(f"target name {name!r} is already a series name; choose another")
     legs: dict[str, float] = {}
     for part in text.replace(";", ",").split(","):
         part = part.strip()
@@ -172,6 +191,28 @@ def parse_weights(text: str, name: str = "custom") -> TradeDef:
     if not legs:
         raise ValueError("no legs given")
     return TradeDef(name=name, legs=legs)
+
+
+STRUCTURE_WEIGHTS = {"spread": (-1.0, 1.0), "fly": (-1.0, 2.0, -1.0)}  # catalog conventions
+
+
+def structure_definition(kind: str, legs: list[str]) -> str:
+    """A custom spread or fly as a named weights string, e.g. '5s7s10s = 5y:-1, 7y:2, 10y:-1'.
+
+    Legs are given in order: short then long leg for a spread (long minus
+    short), wing, belly, wing for a fly (positive = belly cheap). Treasury
+    legs get catalog-style names; anything else is joined with '-'.
+    """
+    weights = STRUCTURE_WEIGHTS[kind]
+    if len(legs) != len(weights) or any(not leg for leg in legs):
+        raise ValueError(f"a {kind} needs {len(weights)} legs")
+    if len(set(legs)) != len(legs):
+        raise ValueError(f"a {kind} needs {len(weights)} different legs")
+    if all(leg in YIELDS for leg in legs):
+        name = "".join(f"{leg[:-1]}s" for leg in legs)
+    else:
+        name = "-".join(legs) + ("-fly" if kind == "fly" else "")
+    return f"{name} = " + ", ".join(f"{leg}:{weight:g}" for leg, weight in zip(legs, weights))
 
 
 def resolve_target(selection: str, custom: str | None = None) -> TradeDef:

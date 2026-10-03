@@ -565,7 +565,7 @@ def regression_scatter_chart(
     viz = _PngViz()
     fig, ax = plt.subplots(figsize=(9, 6.2))
     fig.patch.set_facecolor("white")
-    fig.subplots_adjust(left=0.04, right=0.92, top=0.90, bottom=0.22)
+    fig.subplots_adjust(left=0.04, right=0.92, top=0.90, bottom=0.16)
 
     def fit_line(fit, xs, **style):
         if xs.size and np.isfinite(fit["beta"]):
@@ -587,8 +587,8 @@ def regression_scatter_chart(
 
     viz._style_ax(ax, yaxis_title=y_title, xaxis_title=x_title)
     ax.margins(0.04)  # _style_ax hugs the x edges for time series; points need room
-    ax.legend(loc="upper left", bbox_to_anchor=(0, -0.13), ncol=2, fontsize=9, frameon=False,
-              handletextpad=0.5, columnspacing=1.6)
+    ax.legend(loc="upper left", bbox_to_anchor=(0, -0.13), ncol=5, fontsize=8, frameon=False,
+              handlelength=1.6, handletextpad=0.4, columnspacing=1.0)
     fig.suptitle(title.upper(), fontsize=viz.TITLE_SIZE, fontweight="bold",
                  color="#333", x=0.02, ha="left", y=0.98)
     buf = BytesIO()
@@ -596,3 +596,52 @@ def regression_scatter_chart(
                 facecolor="white", edgecolor="white")
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _png(fig) -> str:
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight", facecolor="white", edgecolor="white")
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+@_one_at_a_time
+def curve_fit_chart(years: list[int], actual: list[float], fair: list[float], title: str) -> str:
+    """Today's Treasury curve and the curve the PCA factors imply, by tenor."""
+    viz = _PngViz()
+    fig, ax = plt.subplots(figsize=(12, 4.8))
+    fig.patch.set_facecolor("white")
+    ax.plot(years, actual, color=ORANGE, linewidth=2.2, marker="o", markersize=7, label="actual", zorder=3)
+    ax.plot(years, fair, color=C2, linewidth=1.8, linestyle="--", marker="o", markersize=5,
+            markerfacecolor="white", label="PCA-implied", zorder=4)
+    for x, y in zip(years, actual):
+        ax.annotate(f"{y:.1f}", (x, y), textcoords="offset points", xytext=(0, 9), ha="center", fontsize=8,
+                    color="#333")
+    viz._style_ax(ax, yaxis_title="yield (bp)", xaxis_title="tenor (years)")
+    ax.set_xticks(years)
+    ax.margins(x=0.04, y=0.12)
+    ax.legend(loc="upper left", bbox_to_anchor=(0, -0.16), ncol=2, fontsize=9, frameon=False)
+    fig.suptitle(title.upper(), fontsize=viz.TITLE_SIZE, fontweight="bold", color="#333", x=0.02, ha="left", y=0.98)
+    return _png(fig)
+
+
+@_one_at_a_time
+def residual_bars_chart(tenors: list[str], values: list[float], title: str, unit: str,
+                        bands: tuple[float, ...] = ()) -> str:
+    """One bar per tenor, blue above zero and red below, labelled; optional ± reference lines."""
+    viz = _PngViz()
+    fig, ax = plt.subplots(figsize=(6.4, 4.2))
+    fig.patch.set_facecolor("white")
+    clean = [0.0 if v is None or not np.isfinite(v) else float(v) for v in values]
+    bars = ax.bar(tenors, clean, color=[C2 if v >= 0 else C0 for v in clean], alpha=0.85, width=0.62, zorder=3)
+    for bar, v in zip(bars, clean):
+        ax.annotate(f"{v:+.2f}", (bar.get_x() + bar.get_width() / 2, v), textcoords="offset points",
+                    xytext=(0, 4 if v >= 0 else -11), ha="center", fontsize=8, color="#333")
+    ax.axhline(0.0, color="#333", linewidth=0.9)
+    for band in bands:
+        for sign in (1, -1):
+            ax.axhline(sign * band, color=DIM, linestyle="--" if band >= 2 else ":", linewidth=0.9)
+    viz._style_ax(ax, yaxis_title=unit)
+    ax.margins(x=0.03, y=0.18)
+    fig.suptitle(title.upper(), fontsize=viz.TITLE_SIZE, fontweight="bold", color="#333", x=0.02, ha="left", y=0.98)
+    return _png(fig)

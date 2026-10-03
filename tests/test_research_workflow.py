@@ -189,8 +189,24 @@ def test_app_controls_fill_from_loaded_panel_and_hide_irrelevant_inputs():
     from research.app import build_app
     app = build_app()
     callbacks = {v["callback"].__wrapped__.__name__: v["callback"].__wrapped__ for v in app.callback_map.values()}
-    assert callbacks["_weight_controls"]("10s30s", "fixed") == ({"display": "none"},)*3
-    assert callbacks["_weight_controls"]("custom", "beta")[0].get("display") != "none"
+    assert callbacks["_weight_controls"]("10s30s", "fixed") == ({"display": "none"},)*4
+    # a breakeven offers beta weighting as nominal vs TIPS; a TIPS outright cannot be hedged
+    be_options, _ = callbacks["_beta_only_for_packages"]("be10", "fixed")
+    assert be_options[1]["label"] == " beta-weighted (10y vs β × real10y)" and not be_options[1]["disabled"]
+    assert callbacks["_beta_only_for_packages"]("real10y", "beta")[0][1]["disabled"]
+    import research.app as ui_labels
+    assert ui_labels.TARGET_LABELS["be10"] == "10Y breakeven inflation" and ui_labels.TARGET_LABELS["10s30s"] == "10s30s"
+    assert all(style.get("display") != "none" for style in callbacks["_weight_controls"]("custom", "beta"))
+    # The builder writes a named definition; a spread hides the third leg; a free basket is left alone.
+    assert callbacks["_custom_definition"]("fly", "5y", "7y", "10y")[0] == "5s7s10s = 5y:-1, 7y:2, 10y:-1"
+    assert callbacks["_custom_definition"]("spread", "2y", "10y", "30y")[0] == "2s10s = 2y:-1, 10y:1"
+    assert callbacks["_custom_roles"]("spread")[2] == {"display": "none"}
+    assert callbacks["_custom_definition"]("basket", "5y", "7y", "10y")[0] is no_update_marker()
+    assert callbacks["_custom_on_select"]("custom", "", "fly", "5y", "7y", "10y") == "5s7s10s = 5y:-1, 7y:2, 10y:-1"
+    assert callbacks["_custom_on_select"]("custom", "mine = 2y:1, 5y:-1", "fly", "5y", "7y", "10y") is no_update_marker()
+    # The weighting and the builder are remembered like the discovery controls.
+    import research.app as ui
+    assert {"weighting", "beta-lb", "custom-kind", "custom-leg-1"} <= set(ui.REMEMBERED)
     opts, selected, *_ = callbacks["_fill"]({"target": "10s30s", "features": ["10y"], "rows": [{"ts": "2020-01-02"}]}, "oil")
     assert selected == "10y"
     assert [o["value"] for o in opts] == ["10y"]

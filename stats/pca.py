@@ -331,3 +331,60 @@ def explain(result: dict) -> pl.DataFrame:
             "cumulative_pct": result["cumulative_variance"] * 100,
         }
     )
+
+
+def roll_pca_fair_value(
+    df: Union[pl.DataFrame, pd.DataFrame],
+    lookback: Optional[int] = 252,
+    n_components: int = 3,
+) -> dict:
+    """Point-in-time PCA fair value of every column, fitted on levels.
+
+    At each bar t, PCA is fitted on the trailing ``lookback`` rows ending at
+    t (so only data known at t), and the bar's observation is rebuilt from
+    the first ``n_components`` factors:
+
+        fair_t = mean + (x_t - mean) @ V @ V.T     (V = top-k loadings)
+
+    ``resid`` = actual - fair: what the factors (level, slope, curvature for
+    k = 3) do not explain, in the data's units. Reconstruction does not
+    depend on the factors' signs. ``lookback=None`` fits once on the whole
+    sample -- in-sample, so its residuals use the future; for display only.
+
+    Returns {"fair": frame, "resid": frame}, each with the input's columns
+    and length; warmup rows are null. Rows with a missing value are null.
+    """
+    frame = to_pl_df(df)
+    cols = frame.columns
+    mat = frame.to_numpy().astype(float)
+    n, k = mat.shape
+    n_components = min(n_components, k)
+    fair = np.full((n, k), np.nan)
+
+    def fit(window):
+        mean = window.mean(axis=0)
+        centered = window - mean
+        cov = centered.T @ centered / (len(centered) - 1)
+        _, evecs = np.linalg.eigh(cov)
+        top = evecs[:, ::-1][:, :n_components]  # eigh sorts ascending
+        return mean, top @ top.T
+
+    complete = ~np.isnan(mat).any(axis=1)
+    if lookback is None:
+        rows = np.flatnonzero(complete)
+        if len(rows) > k:
+            mean, project = fit(mat[rows])
+            fair[rows] = mean + (mat[rows] - mean) @ project
+    else:
+        for i in range(lookback - 1, n):
+            window = mat[i - lookback + 1: i + 1]
+            if not complete[i] or np.isnan(window).any():
+                continue
+            mean, project = fit(window)
+            fair[i] = mean + (mat[i] - mean) @ project
+
+    resid = mat - fair
+    return {
+        "fair": pl.DataFrame({c: pl.Series(fair[:, j]).fill_nan(None) for j, c in enumerate(cols)}),
+        "resid": pl.DataFrame({c: pl.Series(resid[:, j]).fill_nan(None) for j, c in enumerate(cols)}),
+    }

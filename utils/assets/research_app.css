@@ -3,6 +3,54 @@
    cubic-bezier tail goes past 1) so the button reads as sprung rather than
    as sliding back into place. Matches the .viz-ref-btn press in viz.py. */
 
+/* Viz dropdowns (Dash 4). Theme the popover too: it is portalled outside
+   the control's wrapper. Keep search, keyboard focus and multi-select intact. */
+body .dash-dropdown,
+body .dash-dropdown-content {
+    --Dash-Fill-Inverse-Strong: #fff;
+    --Dash-Fill-Interactive-Strong: #B7950B;
+    --Dash-Fill-Interactive-Weak: #FFF8D6;
+    --Dash-Fill-Disabled: #EBEBEB;
+    --Dash-Stroke-Strong: #DCDCDC;
+    --Dash-Text-Strong: #333;
+    --Dash-Text-Weak: #666;
+    --Dash-Text-Disabled: #888;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 12px;
+    color: #333;
+    border-radius: 2px;
+    border-color: #DCDCDC;
+}
+
+body .dash-dropdown { background: #F5F5F5; }
+body .dash-dropdown-trigger { min-height: 30px; padding: 0 8px; }
+body .dash-dropdown:hover:not(:disabled) { border-color: #AAA; }
+body .dash-dropdown:focus-visible,
+body .dash-dropdown[data-state='open'] {
+    border-color: #B7950B;
+    outline: 1px solid #B7950B;
+}
+body .dash-dropdown-content {
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.10);
+    background: #fff;
+}
+body .dash-dropdown-search-container { border-radius: 2px; }
+body .dash-dropdown-option { padding: 6px 8px; }
+body .dash-dropdown-options.viz-numeric-options { display: flex; flex-direction: column; }
+body .viz-numeric-options > .dash-dropdown-option { flex-shrink: 0; }
+body .dash-dropdown-option:hover { background: #F3F3F3; }
+body .dash-dropdown-option:has(input:checked) {
+    background: #FFF8D6;
+    font-weight: bold;
+}
+body .dash-dropdown-option:has(input:disabled) { color: #888; }
+body .dash-dropdown-value-count {
+    border-radius: 2px;
+    padding: 1px 5px;
+    color: #333;
+    background: #FFF8D6;
+}
+
 .ref-btn {
     transition: transform 130ms cubic-bezier(0.34, 1.6, 0.64, 1),
                 box-shadow 130ms ease-out,
