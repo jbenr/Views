@@ -210,6 +210,7 @@ def test_app_controls_fill_from_loaded_panel_and_hide_irrelevant_inputs():
     opts, selected, *_ = callbacks["_fill"]({"target": "10s30s", "features": ["10y"], "rows": [{"ts": "2020-01-02"}]}, "oil")
     assert selected == "10y"
     assert [o["value"] for o in opts] == ["10y"]
+    assert app.config.update_title is None  # the tab title no longer flips to "Updating..." on every poll
     client = app.server.test_client()
     assert client.get("/_dash-layout").status_code == 200
     assert client.get("/_dash-dependencies").status_code == 200
@@ -284,6 +285,12 @@ def test_app_discovery_to_exit_inspection_callback_flow(tmp_path, monkeypatch, j
     other = ({"1", "2"} - {best}).pop()
     assert set(pl.read_parquet(run_path / "equity.parquet")["config_id"]) == {best}
     assert (run_path / "yearly.parquet").is_file()
+    # A metric header click ranks the whole saved grid by that metric.
+    by_pnl = json.dumps(callbacks["_sort_grid"]({"rule": "total_pnl_bps", "at": 1}, saved), cls=PlotlyJSONEncoder)
+    top = max(grid_rows, key=lambda r: r["total_pnl_bps"])["config_id"]
+    assert "by total_pnl_bps" in by_pnl and '"data-board-store": "bt-sort"' in by_pnl
+    assert by_pnl.index(f'"data-sort": "{top}"') < min(by_pnl.index(f'"data-sort": "{r["config_id"]}"')
+                                                      for r in grid_rows if r["config_id"] != top)
     detail = callbacks["_inspect"](other, saved)
     assert "matches the vectorised grid" in json.dumps(detail, cls=PlotlyJSONEncoder)
     assert set(pl.read_parquet(run_path / "equity.parquet")["config_id"]) == {"1", "2"}
@@ -391,10 +398,10 @@ def test_pnl_heatmap_sums_months_colours_by_sign_and_blanks_missing_months():
     assert cells["2020"]["Nov"].children == "29.0" and cells["2020"]["Dec"].children == "-62.0"
     assert cells["2020"]["Jan"].children == "" and "background" not in cells["2020"]["Jan"].style
     assert cells["2021"]["Jan"].children == "15.0"
-    blue, red = cells["2020"]["Nov"].style["background"], cells["2020"]["Dec"].style["background"]
-    assert blue.startswith("rgb(") and red.startswith("rgb(")
-    r, g, b = map(int, blue[4:-1].split(","))
-    assert b > r  # gains lean blue
+    green, red = cells["2020"]["Nov"].style["background"], cells["2020"]["Dec"].style["background"]
+    assert green.startswith("rgb(") and red.startswith("rgb(")
+    r, g, b = map(int, green[4:-1].split(","))
+    assert g > r and g > b  # gains lean green
     r, g, b = map(int, red[4:-1].split(","))
     assert r > b  # losses lean red; the largest loss is full strength with white ink
     assert cells["2020"]["Dec"].style["color"] == "#FFFFFF"

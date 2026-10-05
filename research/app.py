@@ -25,12 +25,17 @@ from dash import ALL, Input, Output, State, ctx, dcc, html, no_update
 from dashboard.charts import (
     WINDOW_PRESETS,
     coverage_chart,
+    gate_chart,
+    regime_gate_chart,
     curve_fit_chart,
     hedge_weights_chart,
     level_chart,
+    regime_timeline_chart,
     regression_scatter_chart,
     residual_bars_chart,
 )
+from dataclasses import asdict
+from research.regimes import REGIMES, STATES, RegimeParams, regime_column, regimes, with_regimes
 from research.curve_pca import PCA_TENORS, PCA_WINDOWS, pca_curve
 
 from research.panel import (
@@ -50,8 +55,9 @@ from research.panel import (
     parse_derived,
     resolve_target,
 )
-from research.dislocation import BOARD_ROWS_SAVED, RANK_COLUMNS, RANK_RULES, discovery_compact, placebo_scan
-from backtest.lab import REGIME_GATE_BUCKETS
+from research.dislocation import (BOARD_ROWS_SAVED, RANK_COLUMNS, RANK_RULES, REGIME_SCOPE, discovery_compact,
+                                  placebo_scan)
+from backtest.lab import REGIME_GATE_BUCKETS, gate_percentile_rank
 from research.dislocation_backtest import detail_for, exit_cells, run_vector_grid, signal_frame, _entry_gate
 from backtest.validation import event_overlap_diagnostics
 from research.artifacts import append_details, save_run
@@ -330,6 +336,7 @@ EXIT_CHOICES = {
     "caps": ([0.0], [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0]),
     "signal-stops": ([0.0], [0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 20.0]),
     "stops": ([15.0], [0.0, 10.0, 15.0, 25.0, 40.0, 60.0]),
+    "max-half-lives": ([0.0], [0.0, 5.0, 10.0, 20.0, 40.0, 60.0, 100.0]),
 }
 
 
@@ -347,7 +354,8 @@ def exit_controls(prefix: str, styles: list, overrides: dict | None = None) -> l
         return field(label, dcc.Dropdown(
             id={("dis", "time-stops"): "dis-horizons", ("bt", "stops"): "bt-stop"}.get((prefix, key), f"{prefix}-{key}"),
             value=value, multi=True, clearable=False,
-            options=[{"label": "none" if v == 0 and key in ("caps", "signal-stops", "stops") else str(v), "value": v}
+            options=[{"label": "none" if v == 0 and key in ("caps", "signal-stops", "stops", "max-half-lives")
+                      else str(v), "value": v}
                      for v in choices]))
 
     return [
@@ -368,13 +376,17 @@ def exit_controls(prefix: str, styles: list, overrides: dict | None = None) -> l
         multi("half-life cap on band / reversion exits (× entry half-life)", "caps"),
         multi("signal stop (signal units beyond entry)", "signal-stops"),
         multi("hard stops (bp)", "stops"),
+        multi("max entry half-life (days): enter only if the residual reverts this fast", "max-half-lives"),
         info("About the exits",
              "Time exits hold a fixed number of bars. Band exits leave when the signal comes back inside the band "
              "(0 = back to equilibrium). Reversion fraction leaves once that share of the entry dislocation has "
              "reverted. Half-life multiple holds for that multiple of the half-life estimated at entry.",
              "The half-life cap bounds band and reversion exits at that multiple of the entry half-life, so a trade "
              "that never reverts cannot sit forever. The signal stop leaves when the dislocation extends that far "
-             "beyond where it was entered (the relationship breaking); hard stops are a P&L loss in bp."),
+             "beyond where it was entered (the relationship breaking); hard stops are a P&L loss in bp.",
+             "Max entry half-life skips entries where the residual's fitted half-life at the signal is longer than "
+             "that (or it is not mean-reverting at all): a residual that takes 100 days to halve, or trends, is not "
+             "a dislocation, and a half-life exit on it would hold for years."),
     ]
 
 
@@ -437,10 +449,23 @@ def dislocation_tab() -> html.Div:
             field("gate percentile lookbacks", dcc.Dropdown(
                 id="dis-gate-windows", value=[126, 252, 504], multi=True, clearable=False,
                 options=[{"label": str(v), "value": v} for v in [126, 252, 504, 756, 1260, 1764]])),
+            field("macro regime gates", dcc.Checklist(
+                id="dis-regimes", value=[],
+                options=[{"label": f" {spec['title']} ({' / '.join(STATES[name])})", "value": name}
+                         for name, spec in REGIMES.items()],
+                labelStyle={"display": "block", "fontSize": 12, "marginBottom": 4, "color": TEXT},
+                inputStyle={"marginRight": 5})),
+            field("minimum regime episodes (discovery period)", dcc.Dropdown(
+                id="dis-min-episodes", value=3, clearable=False,
+                options=[{"label": str(v), "value": v} for v in (1, 2, 3, 5, 8)])),
             info("About gates",
                  "Each checked condition is ranked against its own trailing history (causal percentiles) and "
                  "adds 12 regime buckets per lookback. Ungated cells are always included. Percentile gates need "
-                 "126 valid observations, so lookbacks must be at least 126."),
+                 "126 valid observations, so lookbacks must be at least 126.",
+                 "Macro regime gates add one gate per regime state (e.g. policy cycle: hiking), defined exactly as "
+                 "on the Regimes tab with its current settings. A state seen in fewer separate episodes than the "
+                 "minimum during the discovery period gets no gate: one era cannot tell a lasting edge from luck. "
+                 "The board's episodes column says how many episodes each regime gate rests on."),
         ], open=False),
         section("Costs & execution", [
             field("round-trip cost (bp)", dcc.Dropdown(id="dis-cost", value=0.1, clearable=False,
@@ -458,8 +483,12 @@ def dislocation_tab() -> html.Div:
                 options=[{"label": "Off", "value": 0}, *[{"label": f"{k} blocks", "value": k} for k in (3, 5, 8, 10)]])),
             field("rank by", dcc.Dropdown(id="dis-rank", value="family", clearable=False,
                 options=[{"label": label, "value": value} for value, label in RANK_RULES.items()])),
-            field("placebo runs", dcc.Dropdown(id="dis-placebo", value=0, clearable=False,
+            field("placebo runs (feature scrambled; each reruns the whole grid)", dcc.Dropdown(
+                id="dis-placebo", value=0, clearable=False,
                 options=[{"label": "Off", "value": 0}, *[{"label": str(k), "value": k} for k in (5, 10, 25, 50)]])),
+            field("regime placebo runs (regime calendar shifted; reruns only its gates)", dcc.Dropdown(
+                id="dis-regime-placebo", value=10, clearable=False,
+                options=[{"label": "Off", "value": 0}, *[{"label": str(k), "value": k} for k in (5, 10, 25)]])),
             info("About validation",
                  "Ranking only ever uses the discovery period; the held-out later period is reported, never ranked on.",
                  "Cross-validation splits the discovery period into blocks, dropping the first longest-holding-period "
@@ -468,7 +497,11 @@ def dislocation_tab() -> html.Div:
                  "good cell on a block it never saw (out-of-fold, and walk-forward using earlier blocks only).",
                  "Placebo runs rerun the whole grid with the feature's daily changes circularly shifted, which keeps "
                  "its behaviour but breaks any link to the target. If the real top score does not beat the "
-                 "placebos' top scores, the search is finding noise. Each placebo costs one full discovery run."),
+                 "placebos' top scores, the search is finding noise. Each placebo costs one full discovery run, "
+                 "and when the cross-validation checks already pass it rarely changes the verdict.",
+                 "Regime placebo runs test the macro regime gates: each regime's daily states are rotated in time "
+                 "(same episodes and lengths, wrong dates) and only that regime's gates are rerun, so they are "
+                 "cheap. A regime gate is worth trusting when its best score beats its shifted calendars."),
         ]),
         html.Div(style={"display": "flex", "flexWrap": "wrap", "gap": 8, "alignItems": "center", "margin": "4px 0 6px"}, children=[
             html.Button("Select all sweep options", id="dis-select-all", n_clicks=0, className="ref-btn", style=btn_style()),
@@ -516,6 +549,7 @@ def dislocation_tab() -> html.Div:
         dcc.Store(id="dis-sort"),
         dcc.Store(id="dis-candidate"),
         dcc.Store(id="bt-grid"),
+        dcc.Store(id="bt-sort"),
         dcc.Store(id="controls-saved"),
         dcc.Store(id="dis-rendered"),
         dcc.Store(id="bt-rendered"),
@@ -527,12 +561,16 @@ def dislocation_tab() -> html.Div:
 REMEMBERED = [
     "dis-signal", "dis-fit-on", "dis-beta-lbs", "dis-residual-lbs", "dis-norm-lbs", "dis-thresholds",
     "dis-raw-thresholds", "dis-min-events", "dis-exit-styles", "dis-horizons", "dis-bands", "dis-revert-fracs",
-    "dis-half-lives", "dis-caps", "dis-signal-stops", "dis-stops", "dis-gates", "dis-gate-windows", "dis-cost",
+    "dis-half-lives", "dis-caps", "dis-signal-stops", "dis-stops", "dis-max-half-lives", "dis-gates",
+    "dis-gate-windows", "dis-cost",
     "dis-lag", "dis-train", "dis-cv", "dis-rank", "dis-placebo",
     "bt-entry-zs", "bt-exit-styles", "bt-time-stops", "bt-bands", "bt-revert-fracs", "bt-half-lives", "bt-caps",
-    "bt-signal-stops", "bt-stop", "bt-cost", "bt-lag",
+    "bt-signal-stops", "bt-stop", "bt-max-half-lives", "bt-cost", "bt-lag",
     "weighting", "beta-lb", "custom-kind", "custom-leg-1", "custom-leg-2", "custom-leg-3",
     "fv-pca-tenors", "fv-pca-start", "fv-pca-window", "fv-pca-factors",
+    "reg-start", "reg-pricing", "reg-vol-window", "reg-vol-rank", "reg-vol-bands", "reg-oil-window", "reg-oil-bands",
+    "reg-infl-bands", "dis-regimes", "dis-min-episodes", "dis-regime-placebo",
+    "reg-confirm",
 ]
 
 
@@ -675,8 +713,6 @@ def controls() -> html.Div:
         field("derived features (residual / beta-weighted)", dcc.Input(
             id="derived-features", type="text", value="; ".join(derived), debounce=True, style=INPUT,
             placeholder="10y ~ 2y; swsp10 ~ 10y; 20y ~ 10y + 30y @ 63")),
-        note("Each is the dependent series' move left over after a rolling changes-beta hedge (default 126d), "
-             "using yesterday's betas and accumulated into a level. '10y ~ 2y' is beta-weighted 2s10s.", "dim"),
         dcc.Checklist(
             id="invert-feature", value=[],
             options=[{"label": " Invert feature in chart", "value": "invert"}],
@@ -716,7 +752,7 @@ def setup_tab() -> html.Div:
     ]), load_controls())
 
 
-def level_window_nav(current: str) -> html.Div:
+def level_window_nav(current: str, prefix: str = "research-level-window") -> html.Div:
     """The live dashboard's exact chart-window control, reused for research."""
     return html.Div(
         style={"display": "flex", "gap": 8, "marginBottom": 8,
@@ -728,7 +764,7 @@ def level_window_nav(current: str) -> html.Div:
             }),
             *[
                 html.Button(
-                    key, id=f"research-level-window-{key}", n_clicks=0,
+                    key, id=f"{prefix}-{key}", n_clicks=0,
                     className="ref-btn", style=btn_style(primary=(key == current)),
                 )
                 for key in WINDOW_PRESETS
@@ -973,10 +1009,33 @@ SORT_RULES = {**{column: rule for rule, column in RANK_COLUMNS.items()}, "trades
 def exit_label(row: dict) -> str:
     """One discovery or grid row's exit, compactly: 'band 0 cap 2xHL sig 1 stop 15'."""
     text = f"{row.get('exit_style', 'time')} {row.get('exit_param', row.get('horizon'))}"
-    for key, name in (("half_life_cap", "cap {}xHL"), ("signal_stop", "sig {}"), ("stop_loss_bps", "stop {}")):
+    for key, name in (("half_life_cap", "cap {}xHL"), ("signal_stop", "sig {}"), ("stop_loss_bps", "stop {}"),
+                      ("max_entry_half_life", "maxHL {}")):
         if row.get(key):
             text += " " + name.format(row[key])
     return text
+
+
+def scope_switch(scope: str) -> html.Div:
+    """'All cells' / 'Macro regime gates only' buttons over a discovery board (handled in research_app.js)."""
+    def button(label, value):
+        return html.Button(label, className="ref-btn", style=btn_style(primary=scope == value),
+                           **{"data-board-scope": value, "data-board-store": "dis-sort"})
+    return html.Div([html.Span("Show", style={**LABEL, "marginBottom": 0, "alignSelf": "center"}),
+                     button("All cells", "all"), button("Macro regime gates only", "regimes")],
+                    style={"display": "flex", "gap": 8, "marginBottom": 8})
+
+
+def gate_label(row: dict) -> str:
+    """A row's gate in words: 'ungated', 'r2:high_90 w=252', or 'regime policy = hiking (6 episodes)'."""
+    gate = row.get("gate") or "(none)"
+    if gate == "(none)":
+        return "ungated"
+    if gate.startswith("regime:"):
+        episodes = row.get("regime_episodes")
+        return f"regime {gate.removeprefix('regime:')} = {row['gate_bucket']}" + (
+            f" ({episodes} episodes)" if episodes is not None else "")
+    return f"{gate}:{row['gate_bucket']} w={row['gate_window']}"
 
 
 def board_row_picker(records: list[dict], enabled: bool = True) -> html.Div:
@@ -988,10 +1047,7 @@ def board_row_picker(records: list[dict], enabled: bool = True) -> html.Div:
         return html.Div()
     lines = []
     for i, row in enumerate(records):
-        gate_desc = (
-            f"{row['gate']}:{row['gate_bucket']} w={row['gate_window']}"
-            if row["gate"] != "(none)" else "ungated"
-        )
+        gate_desc = gate_label(row)
         score = ("ic", row.get("ic")) if "ic" in row else ("sharpe", row.get("sharpe"))
         score_label = f"{score[1]:.3f}" if score[1] is not None else "n/a"
         label = (
@@ -1033,9 +1089,25 @@ def run_stats(run_info: dict, feature: str, extra: list) -> html.Div:
                                   "paddingBottom": 12, "borderBottom": f"1px solid {BORDER}"})
 
 
-def validation_view(checks: list[dict], placebo: list[dict], real_score: float | None, rank_by: str) -> html.Div:
+def validation_view(checks: list[dict], placebo: list[dict], real_score: float | None, rank_by: str,
+                    regime_placebo: list[dict] | None = None) -> html.Div:
     """Whether picking the top of this board is likely to mean anything."""
     parts = []
+    if regime_placebo:
+        lines = []
+        for r in regime_placebo:
+            scores = np.array([s for s in r["placebo_scores"] if s is not None and np.isfinite(s)])
+            title = REGIMES.get(r["regime"], {}).get("title", r["regime"])
+            if not np.isfinite(r["real_score"]) or not len(scores):
+                lines.append(note(f"{title}: no regime cell met the minimum trades, so nothing to test.", "dim"))
+                continue
+            beaten = int(np.sum(scores >= r["real_score"]))
+            lines.append(note(
+                f"{title} ({' / '.join(r['states'])}): best regime-gated score {r['real_score']:.3f} vs shifted "
+                f"calendars median {np.median(scores):.3f}, max {scores.max():.3f}. {beaten} of {len(scores)} "
+                f"shifted calendars matched or beat it (p ≈ {r['p_value']:.2f}).",
+                "good" if r["p_value"] <= 0.1 else "warn"))
+        parts += [html.Div("REGIME PLACEBO", style={"fontWeight": "bold", "fontSize": 11, "color": "#333"}), *lines]
     if checks:
         frame = pl.DataFrame(checks)
         lines = []
@@ -1072,6 +1144,8 @@ def validation_view(checks: list[dict], placebo: list[dict], real_score: float |
 
 def _with_exit_columns(results: pl.DataFrame) -> pl.DataFrame:
     """Backtest runs saved before exits joined discovery held for ``horizon`` bars."""
+    if "max_entry_half_life" not in results.columns and "exit_style" in results.columns:
+        results = results.with_columns(pl.lit(None, dtype=pl.Float64).alias("max_entry_half_life"))
     if "exit_style" in results.columns:
         return results
     return results.with_columns(
@@ -1083,7 +1157,7 @@ def backtest_discovery_view(
     board: pl.DataFrame, feature: str, run_info: dict, min_trades: int = 30,
     rank_by: str = "family", checks: list | None = None, placebo: list | None = None,
     cells: int | None = None, eligible: int | None = None, sort_by: str | None = None,
-    available=(), real_score: float | None = None,
+    available=(), real_score: float | None = None, scope: str = "all", regime_boards: bool = False,
 ) -> tuple[html.Div, list[dict]]:
     """Discovery board of real backtests, ranked on the discovery period only.
 
@@ -1092,27 +1166,41 @@ def backtest_discovery_view(
     saved top rows exist, so no full grid is ever needed here. Columns whose
     rule is in ``available`` load their own board when their header is clicked.
     ``real_score`` is the selection rule's top score, for the placebo test.
+    ``scope`` "regimes" shows the board ranked over macro-regime-gated cells
+    only (``regime_boards``: the run saved such boards, so offer the switch).
     """
     shown = sort_by or rank_by
+    if board.is_empty():
+        # e.g. no regime-gated cell reached the minimum trades
+        return html.Div([
+            scope_switch(scope) if regime_boards else None,
+            note(f"No {'macro-regime-gated ' if scope == 'regimes' else ''}cell has at least {min_trades} discovery-"
+                 "period trades. Lower the minimum trades to see more cells.", "warn"),
+        ]), []
     board = _with_exit_columns(board).head(BOARD_ROWS)
-    if real_score is None and shown == rank_by and len(board):
+    if real_score is None and shown == rank_by and scope == "all" and len(board):
         real_score = float(board["rank_score"][0])
+    if "regime_episodes" in board.columns:
+        # how many separate spells of a regime gate's state the discovery period had; blank, not nan, off regime
+        board = board.with_columns(pl.col("regime_episodes").cast(pl.Utf8).fill_null("").alias("episodes"))
     cols = ["#", "signal_kind", "fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "exit_style", "exit_param",
-            "half_life_cap", "signal_stop", "stop_loss_bps", "gate", "gate_bucket", "gate_window",
+            "half_life_cap", "signal_stop", "stop_loss_bps", "max_entry_half_life", "gate", "gate_bucket",
+            "gate_window", "episodes",
             "family_median_sharpe", "sharpe", "cv_mean_sharpe", "cv_worst_sharpe", "cv_positive_share", "n_trades",
             "trades_per_year", "avg_holding_days", "win_rate", "pnl_bps", "later_sharpe", "later_pnl_bps", "later_trades"]
-    display = _display_board(board, cols).rename({"entry_z": "entry", "half_life_cap": "hl_cap"})
+    display = _display_board(board, cols).rename({"entry_z": "entry", "half_life_cap": "hl_cap",
+                                                  "max_entry_half_life": "max_entry_hl"}, strict=False)
     records = board.to_dicts()
     view = html.Div([
         run_stats(run_info, feature, [
             stat_block("cells backtested", f"{cells:,}" if cells is not None else "not recorded"),
             stat_block(f"cells with ≥{min_trades} trades", f"{eligible:,}" if eligible is not None else "not recorded"),
-            stat_block("sorted by", RANK_RULES[shown]),
+            stat_block("sorted by", RANK_RULES[shown] + (" · macro regime gates only" if scope == "regimes" else "")),
             *([stat_block("selection rule", RANK_RULES[rank_by])] if shown != rank_by else []),
             stat_block("cost · execution", f"{run_info.get('cost_bps', 0)} bp · "
                        f"{'next bar' if run_info.get('execution_lag', 1) else 'same bar'}"),
         ]),
-        validation_view(checks or [], placebo or [], real_score, rank_by),
+        validation_view(checks or [], placebo or [], real_score, rank_by, run_info.get("regime_placebo")),
         info("How to read this board",
              "Each row is a real backtest of one model, gate, entry and holding period. Sharpe, trades, win rate and "
              "P&L are for the discovery period. Blank caps and stops mean none. Family median is the median Sharpe "
@@ -1121,8 +1209,14 @@ def backtest_discovery_view(
              "Clicking one of those column headers loads that column's own top cells, best first; clicking it again "
              "flips the order. Other columns only reorder the rows shown.",
              "Later columns are the held-out period: they are never ranked on, and choosing rows by them turns that "
-             "period into research data."),
-        table(display.to_pandas(), title=f"backtest discovery board · top {len(board)} by {RANK_RULES[shown]}",
+             "period into research data.",
+             "A macro regime gate reads gate = regime:policy, gate_bucket = hiking; episodes is how many separate "
+             "spells of that state (not days) the discovery period had. Regime-gated cells rarely reach "
+             "the top of a grid of millions, so the run also saved each ranking over regime gates only: switch to "
+             "it above the board."),
+        scope_switch(scope) if regime_boards else None,
+        table(display.to_pandas(), title=f"backtest discovery board · top {len(board)} by {RANK_RULES[shown]}"
+                                         + (" · macro regime gates only" if scope == "regimes" else ""),
               max_rows=BOARD_ROWS, float_fmt=",.3f", sortable=True,
               header_props={column: {"data-board-rule": rule, "data-board-store": "dis-sort"}
                             for column, rule in SORT_RULES.items() if rule in available},
@@ -1245,7 +1339,7 @@ def construction(stored: dict) -> str:
     return "fixed · " + ", ".join(f"{leg} {weight:+g}" for leg, weight in legs.items())
 
 
-GAIN, LOSS, FLAT = (42, 120, 214), (227, 73, 72), (240, 239, 236)  # diverging blue / red, gray midpoint
+GAIN, LOSS, FLAT = (39, 174, 96), (227, 73, 72), (240, 239, 236)  # diverging green / red, gray midpoint
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
@@ -1292,7 +1386,7 @@ def pnl_heatmap(equity: pl.DataFrame, periods: pl.DataFrame) -> html.Div:
             return {**(_diverging(row["raw_full_year"], year_scale) or {}), "fontWeight": "bold"}
         return None
 
-    return table(shown.to_pandas(), title="P&L by month and year (bp) · blue gains, red losses; full year on its own scale",
+    return table(shown.to_pandas(), title="P&L by month and year (bp) · green gains, red losses; full year on its own scale",
                  columns=["year", *MONTHS, "full_year", "active_days"], cell_style=colour,
                  headers={"full_year": "full year", "active_days": "active days"})
 
@@ -1333,17 +1427,20 @@ def pca_view(result: dict, window: int, n_components: int) -> html.Div:
 
 
 def trade_distribution(pnl: np.ndarray) -> dcc.Graph:
-    """Histogram of closed-trade P&L; bins below zero red, above blue."""
+    """Histogram of closed-trade P&L; bins below zero red, above green."""
     pnl = pnl[np.isfinite(pnl)]
     # zero is always a bin edge, so no bar mixes winners and losers
-    width = max(float(pnl.max() - pnl.min()), 1e-9) / min(40, max(10, len(pnl) // 4))
+    width = max(float(pnl.max() - pnl.min()), 1e-9) / min(100, max(20, len(pnl) // 2))  # ~1 bucket per 2 trades
     edges = np.arange(np.floor(pnl.min() / width), np.ceil(pnl.max() / width) + 1) * width
     counts, edges = np.histogram(pnl, bins=edges if len(edges) > 1 else 1)
     centres = (edges[:-1] + edges[1:]) / 2
     colours = [f"rgb{LOSS}" if c < 0 else f"rgb{GAIN}" for c in centres]
     return dcc.Graph(figure={
         "data": [{"type": "bar", "x": centres.tolist(), "y": counts.tolist(), "width": float(edges[1] - edges[0]) * 0.92,
-                  "marker": {"color": colours}, "hovertemplate": "%{x:.1f} bp: %{y} trades<extra></extra>"}],
+                  "marker": {"color": colours},
+                  # each bar is a bucket: say its range, not its midpoint
+                  "customdata": np.column_stack([edges[:-1], edges[1:]]).tolist(),
+                  "hovertemplate": "%{customdata[0]:.1f} to %{customdata[1]:.1f} bp: %{y} trades<extra></extra>"}],
         "layout": {"title": {"text": f"Trade return distribution · {len(pnl)} closed trades · mean {pnl.mean():.1f} bp, "
                                      f"median {np.median(pnl):.1f} bp", "font": {"size": 13}},
                    "xaxis": {"title": {"text": "trade P&L (bp)"}, "zeroline": True},
@@ -1352,17 +1449,87 @@ def trade_distribution(pnl: np.ndarray) -> dcc.Graph:
     }, config={"displayModeBar": False})
 
 
+def safe_view(build, what: str):
+    """``build()``, or a short note if it fails, so one chart cannot take down the view around it."""
+    try:
+        return build()
+    except Exception as exc:
+        return note(f"Could not draw the {what}: {type(exc).__name__}: {exc}", "warn")
+
+
+GATE_WINDOW = "All"  # the gate chart opens on the whole history
+
+
+def gate_state(saved_dir: Path) -> dict | None:
+    """A saved grid's frozen candidate, its signal frame, and the days its gate allows entries."""
+    meta = json.loads((saved_dir / "metadata.json").read_text(encoding="utf-8"))
+    candidate = meta.get("candidate") or {}
+    if not candidate or not (saved_dir / "data.parquet").is_file():
+        return None
+    state = signal_frame(pl.read_parquet(saved_dir / "data.parquet"), target=candidate["target"],
+                         feature=candidate["feature"], fit_on=candidate["fit_on"], beta_lb=int(candidate["beta_lb"]),
+                         residual_lb=None if candidate.get("residual_lb") is None else int(candidate["residual_lb"]),
+                         norm_lb=int(candidate["norm_lb"]), signal_kind=candidate.get("signal_kind", "normalized"))
+    return {"candidate": candidate, "state": state, "allowed": _entry_gate(state, candidate)}
+
+
+def gate_png(saved_dir: Path, window: str = GATE_WINDOW) -> tuple[str | None, str]:
+    """(chart PNG or None when ungated, one-line summary) of when the candidate's gate is open."""
+    gate = gate_state(saved_dir)
+    if gate is None or (gate["candidate"].get("gate") or "(none)") == "(none)":
+        return None, "ungated"
+    candidate, state, allowed = gate["candidate"], gate["state"], gate["allowed"]
+    spells = int(np.sum(allowed[1:] & ~allowed[:-1]) + (1 if len(allowed) and allowed[0] else 0))
+    summary = f"{gate_label(candidate)} · open {allowed.mean():.0%} of days, {spells} spells"
+    bars = WINDOW_PRESETS.get(window)
+    if candidate["gate"].startswith("regime:"):
+        png = regime_gate_chart(state.select("ts").with_columns(pl.Series("gate_allow", allowed)),
+                                f"gate: {summary}", window_bars=bars)
+    else:
+        ranks = gate_percentile_rank(state[f"gate_{candidate['gate']}"].cast(pl.Float64).to_numpy(), min_history=126,
+                                     window=int(candidate["gate_window"]))
+        png = gate_chart(state.select("ts"), pl.DataFrame({"gate_percentile": ranks, "gate_allow": allowed}),
+                         (candidate["gate"], candidate["gate_bucket"]), window_bars=bars,
+                         gate_window=int(candidate["gate_window"]))
+    return png, summary
+
+
+def gate_section(saved_dir: Path, window: str = GATE_WINDOW) -> html.Div:
+    """The candidate's gate through time, with the time-frame buttons."""
+    png, summary = gate_png(saved_dir, window)
+    if png is None:
+        return note("Ungated candidate: entries are allowed on every day.", "dim")
+    return html.Div([
+        level_window_nav(window, prefix="bt-gate-window"),
+        html.Img(id="bt-gate-img", src=f"data:image/png;base64,{png}",
+                 style={"width": "100%", "border": f"1px solid {BORDER}"}),
+        note(f"When the frozen candidate may enter: {summary}.", "dim"),
+    ], style={"marginBottom": 14, "maxWidth": RESEARCH_CHART_MAX_WIDTH})
+
+
 INSPECT_CHOICES = 500
 
 
-def backtest_grid_view(grid: pl.DataFrame, selected: dict) -> html.Div:
+GRID_ROWS = 200  # rows of the trade-mechanics grid shown; the whole grid is on disk
+# Grid metrics a header click ranks the whole grid by (parameters and labels only reorder the rows shown).
+GRID_SORT_COLUMNS = [
+    "sharpe", "total_pnl_bps", "n_trades", "trade_win_rate", "avg_pnl_per_trade_bps", "median_pnl_bps",
+    "avg_holding_days", "time_in_market_pct", "max_drawdown_bps", "open_trades", "earlier_sharpe", "later_sharpe",
+    "earlier_pnl_bps", "later_pnl_bps", "closed_pnl_bps",
+]
+
+
+def backtest_grid_view(grid: pl.DataFrame, selected: dict, sort_by: str | None = None) -> html.Div:
     """Every requested entry/exit cell for the frozen candidate.
 
     No refitting happens here -- the relationship and gate are frozen from
     the discovery candidate; only trade mechanics vary across the grid.
+    ``sort_by`` shows the whole grid's top rows by that metric (default: the
+    run's rank metric).
     """
     best = selected["metrics"]
     rank_metric = selected.get("rank_metric", "sharpe")
+    shown = sort_by if sort_by in grid.columns else rank_metric
     stats = [
         stat_block("cells run", f"{len(grid):,}"),
         stat_block(f"selected {rank_metric}", f"{best[rank_metric]:.2f}"),
@@ -1374,13 +1541,16 @@ def backtest_grid_view(grid: pl.DataFrame, selected: dict) -> html.Div:
     ]
     cols = [
         "config_id", "signal_kind", "signal_units", "entry_z", "exit_style", "exit_param", "half_life_cap", "signal_stop",
-        "stop_loss_bps", "sharpe", "total_pnl_bps",
+        "stop_loss_bps", "max_entry_half_life", "sharpe", "total_pnl_bps",
         "n_trades", "trade_win_rate", "avg_pnl_per_trade_bps", "median_pnl_bps",
         "avg_holding_days", "time_in_market_pct", "max_drawdown_bps", "open_trades",
         "earlier_sharpe", "later_sharpe", "earlier_pnl_bps", "later_pnl_bps",
         "closed_pnl_bps",
     ]
-    ordered = grid.sort(rank_metric, descending=True)
+    ordered = grid.sort(shown, descending=True, nulls_last=True)
+    choices = ordered.head(INSPECT_CHOICES)
+    if str(best["config_id"]) not in set(choices["config_id"].cast(pl.Utf8).to_list()):
+        choices = pl.concat([grid.filter(pl.col("config_id") == best["config_id"]), choices], how="diagonal_relaxed")
     return html.Div([
         html.Div(stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
                                "marginBottom": 14, "paddingBottom": 12,
@@ -1391,15 +1561,22 @@ def backtest_grid_view(grid: pl.DataFrame, selected: dict) -> html.Div:
              "with its median trade P&L. Legs are re-marked and transaction cost applied. Stops are evaluated on "
              "observations, not intraday fills. Ranking uses the earlier period when a split is selected. Later "
              "daily P&L includes positions carried across the split. This is a chronological diagnostic, not a "
-             "complete walk-forward validation."),
-        table(ordered.select([c for c in cols if c in ordered.columns]).to_pandas(),
-              title="backtest grid", max_rows=60, float_fmt=",.2f", sortable=True),
+             "complete walk-forward validation.",
+             f"Clicking a metric's header shows the top {GRID_ROWS} cells of the whole grid by that metric; clicking "
+             "it again flips the order. Picking cells by the later columns turns the held-out period into research "
+             "data."),
+        table(ordered.head(GRID_ROWS).select([c for c in cols if c in ordered.columns]).to_pandas(),
+              title=f"backtest grid · top {min(GRID_ROWS, len(ordered)):,} of {len(ordered):,} by {shown}",
+              max_rows=GRID_ROWS, float_fmt=",.2f", sortable=True,
+              header_props={c: {"data-board-rule": c, "data-board-store": "bt-sort"}
+                            for c in GRID_SORT_COLUMNS if c in ordered.columns},
+              sorted_by=(shown, "desc")),
         # A select-all grid has 100k+ configurations; listing them all sent tens
         # of MB to the browser and froze the page. Offer the best few hundred.
-        field(f"inspect configuration (top {min(INSPECT_CHOICES, len(ordered)):,} of {len(ordered):,} by {rank_metric})",
+        field(f"inspect configuration (top {min(INSPECT_CHOICES, len(ordered)):,} of {len(ordered):,} by {shown})",
               dcc.Dropdown(id="bt-inspect", value=str(best["config_id"]), options=[
                   {"label": f"#{r['config_id']} · entry {r['entry_z']} · {exit_label(r)}", "value": str(r["config_id"])}
-                  for r in ordered.head(INSPECT_CHOICES).iter_rows(named=True)])),
+                  for r in choices.iter_rows(named=True)])),
     ])
 
 
@@ -1414,6 +1591,8 @@ def tabs() -> html.Div:
                 selected_style=SELECTED_TAB_STYLE, children=setup_tab()),
         dcc.Tab(label="Dislocation", value="dis", style=TAB_STYLE,
                 selected_style=SELECTED_TAB_STYLE, children=dislocation_tab()),
+        dcc.Tab(label="Regimes", value="reg", style=TAB_STYLE,
+                selected_style=SELECTED_TAB_STYLE, children=regimes_tab()),
         dcc.Tab(label="Relative Value", value="rv", style=TAB_STYLE,
                 selected_style=SELECTED_TAB_STYLE, children=stub_tab(
                     "Relative Value", [
@@ -1494,8 +1673,130 @@ def pca_tab() -> html.Div:
     ])
 
 
+def regimes_controls() -> html.Div:
+    def choice(id_, label, value, options):
+        return field(label, dcc.Dropdown(id=id_, value=value, clearable=False,
+                                         options=[{"label": text, "value": v} for v, text in options]))
+    return html.Div([
+        choice("reg-start", "history from", "2000-01-01",
+               [("2000-01-01", "2000"), ("2007-01-01", "2007 (SOFR OIS history)"), ("2015-01-01", "2015")]),
+        choice("reg-confirm", "confirm a new state after", 5,
+               [(1, "1 day (no confirmation)"), (5, "5 days"), (10, "10 days"), (20, "20 days")]),
+        section("Policy cycle", [
+            choice("reg-pricing", "hiking / cutting beyond (realized + priced)", 25.0,
+                   [(10.0, "±10bp"), (25.0, "±25bp"), (50.0, "±50bp")]),
+        ]),
+        section("Rate vol · realized and 1m10y implied", [
+            choice("reg-vol-window", "realized-vol window", 20, [(10, "10 days"), (20, "20 days"), (60, "60 days")]),
+            choice("reg-vol-rank", "ranked against the trailing", 756,
+                   [(504, "2 years"), (756, "3 years"), (1260, "5 years")]),
+            choice("reg-vol-bands", "low / high vol", "25-75",
+                   [("25-75", "bottom 25% / top 25%"), ("10-90", "bottom 10% / top 10%")]),
+        ]),
+        section("Oil sensitivity", [
+            choice("reg-oil-window", "correlation window", 126, [(63, "63 days"), (126, "126 days"), (252, "252 days")]),
+            choice("reg-oil-bands", "trades with oil at / none below", "0.3-0",
+                   [("0.2-0", "≥ 0.2 / < 0"), ("0.3-0", "≥ 0.3 / < 0"), ("0.4-0.1", "≥ 0.4 / < 0.1")]),
+        ]),
+        section("Inflation", [
+            choice("reg-infl-bands", "5y inflation swap: low below / high at", "225-275",
+                   [("200-250", "2.00% / 2.50%"), ("225-275", "2.25% / 2.75%"), ("225-300", "2.25% / 3.00%")]),
+        ]),
+        html.Button("Update regimes", id="reg-run", n_clicks=0, className="ref-btn",
+                    style={**btn_style(primary=True), "width": "100%", "marginTop": 4, "marginBottom": 14}),
+        info("How the regimes are built",
+             "Every regime uses only data known that day. The policy cycle comes from fed funds futures (history "
+             "from 2000): the front-month rate's change over the last six months (moves made) plus the change "
+             "priced over the next six (front month vs the contract six months out). Together they span the year "
+             "around today, so a cycle shows up as soon as it is priced and stays on while it is delivered.",
+             "Inflation is the 5y zero-coupon inflation swap against fixed bands. The 1y swap has bad prints, so "
+             "it is not used.",
+             "Rate vol is the realized volatility of daily 10y changes, ranked against its own trailing history, "
+             "so 'high vol' means high for its recent era. Implied rate vol is the 1m10y ATM swaption normal vol, "
+             "ranked the same way; its data starts in September 2021. Oil sensitivity is the rolling correlation of daily 10y "
+             "changes with daily changes in front-month WTI, in dollars (percent changes break when WTI went "
+             "negative in April 2020).",
+             "A new state counts only after it has held for the confirmation period, so a value sitting on a "
+             "threshold does not flicker. An episode is one unbroken run of a state: regimes are long and few, so "
+             "the episode count is how much independent history a gate really has."),
+    ], className="research-controls")
+
+
+REGIME_WINDOW = "All"  # regimes are about eras, so the charts open on the whole history
+
+
+def regimes_tab() -> html.Div:
+    return remember_controls(html.Div(style={"padding": "18px 24px"}, children=[
+        html.Div([html.Div("REGIMES", style=HEADING), note(
+            "Causal states of the world: whether the Fed is hiking or cutting, whether realized and implied rate "
+            "vol are high or low for their era, whether rates are trading off oil, and where inflation expectations "
+            "sit. Check each definition by eye here; discovery can then "
+            "use them as gates.", "dim")], className="research-banner", style={"display": "block"}),
+        html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)", "gap": 26,
+                        "alignItems": "start"}, children=[
+            regimes_controls(),
+            html.Div([level_window_nav(REGIME_WINDOW, prefix="reg-window"),
+                      dcc.Loading(html.Div(id="reg-out"), type="dot")]),
+        ]),
+        dcc.Store(id="reg-shown"),
+        dcc.Store(id="reg-window", data=REGIME_WINDOW),
+    ]), load_controls())
+
+
+def regime_params(confirm, pricing, vol_window, vol_rank, vol_bands, oil_window, oil_bands,
+                  infl_bands=None) -> RegimeParams:
+    """The tab's choices as RegimeParams ('25-75' style bands are low-high)."""
+    vol_low, vol_high = (float(x) / 100 for x in str(vol_bands or "25-75").split("-"))
+    oil_high, oil_low = (float(x) for x in str(oil_bands or "0.3-0").split("-"))
+    infl_low, infl_high = (float(x) for x in str(infl_bands or "225-275").split("-"))
+    return RegimeParams(cycle_threshold_bp=float(pricing or 25), vol_window=int(vol_window or 20),
+                        inflation_low_bp=infl_low, inflation_high_bp=infl_high,
+                        vol_rank_window=int(vol_rank or 756), vol_low=vol_low, vol_high=vol_high,
+                        oil_window=int(oil_window or 126), oil_high=oil_high, oil_low=oil_low,
+                        confirm=int(confirm or 5))
+
+
+def regime_parts(series: pl.DataFrame) -> list:
+    """Today's components, for regimes built from more than one piece (the policy cycle)."""
+    labels = {"policy_rate": "fed funds now", "realized": "moved, last 6m", "priced": "priced, next 6m"}
+    last = series.drop_nulls("value")
+    if not len(last):
+        return []
+    row = last.row(-1, named=True)
+    return [stat_block(label, f"{row[col]:+.0f} bp" if col != "policy_rate" else f"{row[col]:.0f} bp")
+            for col, label in labels.items() if col in series.columns and row.get(col) is not None]
+
+
+def regimes_view(result: dict, params: RegimeParams, window: str = REGIME_WINDOW) -> html.Div:
+    """One card per regime: today's state, its timeline (zoomed to ``window``), and its full-history episodes."""
+    thresholds = {"policy": (-params.cycle_threshold_bp, params.cycle_threshold_bp), "vol": (), "implied": (),
+                  "inflation": (params.inflation_low_bp, params.inflation_high_bp),
+                  "oil": (params.oil_low, params.oil_high)}
+    cards = []
+    for name, r in result.items():
+        now = r["current"]
+        value = now.get("value")
+        shown = "—" if value is None else f"{value:.2f}" if r["units"] == "correlation" else f"{value:.0f} {r['units']}"
+        cards.append(html.Div([
+            html.Div([
+                stat_block(r["title"], now.get("state", "—")),
+                stat_block("value", shown),
+                *regime_parts(r["series"]),
+                stat_block("since", str(now.get("since", "—"))),
+                stat_block("as of", str(now.get("as_of", "—"))),
+            ], style={"display": "flex", "gap": 28, "flexWrap": "wrap", "marginBottom": 8}),
+            note(r["what"], "dim"),
+            _png_img(regime_timeline_chart(r["series"], STATES[name], f"{r['title']} · {r['units']}", r["units"],
+                                           thresholds[name], WINDOW_PRESETS.get(window))),
+            table(r["episodes"].to_pandas(), title=f"{r['title']} · episodes (full history)", float_fmt=",.2f",
+                  headers={"share_of_days": "share of days", "median_days": "median length (d)",
+                           "longest_days": "longest (d)", "last_started": "last began"}),
+        ], style={"marginBottom": 22, "paddingBottom": 14, "borderBottom": f"1px solid {BORDER}"}))
+    return html.Div(cards)
+
+
 def fair_value_tab() -> html.Div:
-    return html.Div(style={"padding": "14px 24px"}, children=[
+    return remember_controls(html.Div(style={"padding": "14px 24px"}, children=[
         html.Div(id="fair-value-context", style={"display": "none"}),  # Setup's Fill tabs still writes here
         dcc.Tabs(id="fv-tabs", value="pca", children=[
             dcc.Tab(label="PCA", value="pca", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
@@ -1536,11 +1837,11 @@ def fair_value_tab() -> html.Div:
                          "Contract code 020604 is the old long bond in 2010–12 but the Ultra bond in 2026."]),
                         style={"paddingTop": 14})),
         ]),
-    ])
+    ]), load_controls())
 
 
 MECHANICS_EXITS = ["bt-exit-styles", "bt-time-stops", "bt-bands", "bt-revert-fracs",
-                   "bt-half-lives", "bt-caps", "bt-signal-stops", "bt-stop"]
+                   "bt-half-lives", "bt-caps", "bt-signal-stops", "bt-stop", "bt-max-half-lives"]
 
 
 def freeze_candidate(board: dict, idx: int, entry_zs=None, current: dict | None = None) -> tuple:
@@ -1567,12 +1868,9 @@ def freeze_candidate(board: dict, idx: int, entry_zs=None, current: dict | None 
         "archive_id": board.get("archive_id"),
         "target_definition": board.get("target_definition", {}),
         "weight_columns": board.get("weight_columns", {}),
+        "regime_params": board.get("regime_params"),
     }
-    gate_desc = (
-        f"{candidate['gate']}:{candidate['gate_bucket']} "
-        f"(window={candidate['gate_window']})"
-        if candidate["gate"] != "(none)" else "ungated"
-    )
+    gate_desc = gate_label({**candidate, "regime_episodes": row.get("regime_episodes")})
     label = (
         f"{target_label(candidate.get('target_definition') or {'target': candidate['target']})} vs "
         f"{FEATURE_LABELS.get(candidate['feature'], candidate['feature'])} · "
@@ -1587,7 +1885,8 @@ def freeze_candidate(board: dict, idx: int, entry_zs=None, current: dict | None 
     control = {"time": "bt-time-stops", "band": "bt-bands", "revert_frac": "bt-revert-fracs",
                "half_life_frac": "bt-half-lives"}[style]
     for key, value in ((control, param), ("bt-caps", row.get("half_life_cap") or 0.0),
-                       ("bt-signal-stops", row.get("signal_stop") or 0.0), ("bt-stop", row.get("stop_loss_bps") or 0.0)):
+                       ("bt-signal-stops", row.get("signal_stop") or 0.0), ("bt-stop", row.get("stop_loss_bps") or 0.0),
+                       ("bt-max-half-lives", row.get("max_entry_half_life") or 0.0)):
         values[key] = sorted({*values[key], int(value) if key == "bt-time-stops" else float(value)})
     cost, lag = board.get("cost_bps"), board.get("execution_lag")
     return (candidate, note(f"Frozen: {label}", "good"),
@@ -1625,20 +1924,26 @@ def discovery_job(stored: dict, feature: str, settings: dict) -> dict:
             **{col: pl.Series([row[col] for row in rows], dtype=pl.Float64)
                for col in dict.fromkeys([target, feature, *stored['legs'], *stored.get('weight_columns', {}).values()])},
         }).with_columns(pl.col("ts").str.to_date())
+        if s.get("regimes"):
+            progress(0, 0, f"Adding macro regime states: {', '.join(REGIMES[r]['title'] for r in s['regimes'])}")
+            frame = with_regimes(frame, s["regimes"], RegimeParams(**s["regime_params"]))
         scan = dict(
             target=target, legs=stored["legs"], weight_columns=stored.get("weight_columns") or None,
             fit_on=s["fit_on"], beta_lookbacks=s["beta_lbs"], residual_lookbacks=s["residual_lbs"],
             normalization_lookbacks=s["norm_lbs"], thresholds=s["thresholds"], raw_thresholds=s["raw_entries"],
             exit_params=s["exit_params"], stop_losses=s["stops"] or [None], half_life_caps=s["caps"] or [None],
-            signal_stops=s["signal_stops"] or [None], gate_names=s["gates"], gate_windows=s["gate_windows"],
+            signal_stops=s["signal_stops"] or [None], max_half_lives=s.get("max_half_lives") or [None],
+            gate_names=s["gates"], gate_windows=s["gate_windows"],
             signal_kind=s["signal_kind"], train_fraction=float(s["train_fraction"]),
             cost_bps=float(s["cost"] or 0.0), execution_lag=int(s["lag"]), cv_folds=int(s["cv"] or 0),
+            regime_gates=s.get("regimes") or [], min_regime_episodes=int(s.get("min_regime_episodes", 3)),
         )
         started = time.perf_counter()
         # Only each cell's ranking numbers are kept while backtesting; every rank
         # rule's top rows are rebuilt in full at the end and saved as boards.
         found = discovery_compact(frame, feature=feature, progress=progress, selection_rule=s["rank_by"],
-                                  selection_min_trades=s["min_trades"], checkpoints=jobs.JOBS / "checkpoints", **scan)
+                                  selection_min_trades=s["min_trades"], checkpoints=jobs.JOBS / "checkpoints",
+                                  regime_placebos=int(s.get("regime_placebos") or 0), **scan)
         frame, checks, cells = found["frame"], found["checks"], found["cells"]
         scan_s = time.perf_counter() - started
         placebo = []
@@ -1664,11 +1969,15 @@ def discovery_job(stored: dict, feature: str, settings: dict) -> dict:
             grid=grid_spec(s["fit_on"], s["beta_lbs"], s["residual_lbs"], s["norm_lbs"], s["thresholds"],
                            s["horizons"], s["gates"], s["gate_windows"], s["signal_kind"], s["train_fraction"],
                            s["raw_entries"], scoring="backtest", cost=s["cost"], lag=s["lag"], cv_folds=s["cv"],
-                           exits=s["exits"]),
+                           exits=s["exits"], regimes=s.get("regimes"), min_regime_episodes=s.get("min_regime_episodes"),
+                           regime_params=s.get("regime_params")),
             input_sha256=input_hash(stored, feature),
             signal_kind=s["signal_kind"], min_events=s["min_trades"], scoring="backtest", rank_by=s["rank_by"],
             cv_folds=int(s["cv"] or 0), selection_checks=checks, placebo=placebo,
             panel_id=stored["panel_id"], gate_min_history=126,
+            regime_gates=s.get("regimes") or [], regime_params=s.get("regime_params"),
+            min_regime_episodes=s.get("min_regime_episodes"), regime_placebo=found.get("regime_placebo") or [],
+            skipped_regime_gates=found.get("skipped_regime_gates") or [],
             board_counts={"cells": cells, "eligible": {str(k): v for k, v in found["eligible"].items()}},
             **info), boards=found["boards"])
     except Exception as exc:
@@ -1681,7 +1990,7 @@ def discovery_job(stored: dict, feature: str, settings: dict) -> dict:
 
 
 def render_discovery(run_id: str, min_events=None, fresh: bool = False, query: dict | None = None,
-                     sort_by: str | None = None):
+                     sort_by: str | None = None, scope: str = "all"):
     """A saved discovery run as (view, status note, board), for fresh jobs and reopened runs alike.
 
     The board is built from the run's own snapshot, so picking a row and
@@ -1698,16 +2007,21 @@ def render_discovery(run_id: str, min_events=None, fresh: bool = False, query: d
     if meta.get('scoring') == 'backtest':
         wanted = int(min_events or meta.get('min_events') or 30)
         rank_by = meta.get('rank_by', 'family')
-        available = board_rules(run_id)
-        shown = sort_by if sort_by in available else rank_by
-        board, used, cells, eligible = load_board(run_id, shown, wanted)
+        saved = board_rules(run_id)
+        regime_rules = {r.removeprefix(REGIME_SCOPE) for r in saved if r.startswith(REGIME_SCOPE)}
+        available = (regime_rules if scope == 'regimes' and regime_rules
+                     else {r for r in saved if not r.startswith(REGIME_SCOPE)})
+        scope = 'regimes' if scope == 'regimes' and regime_rules else 'all'
+        shown = sort_by if sort_by in available else (rank_by if rank_by in available else next(iter(sorted(available)), rank_by))
+        board, used, cells, eligible = load_board(run_id, (REGIME_SCOPE if scope == 'regimes' else '') + shown, wanted)
         real_score = None
-        if shown != rank_by and meta.get('placebo') and rank_by in available:
+        if (shown != rank_by or scope == 'regimes') and meta.get('placebo') and rank_by in saved:
             top = load_board(run_id, rank_by, wanted, 1)[0]
             real_score = float(top['rank_score'][0]) if len(top) else None
         view, records = backtest_discovery_view(
             board, meta['feature'], info, used, rank_by, meta.get('selection_checks'), meta.get('placebo'),
-            cells=cells, eligible=eligible, sort_by=shown, available=available, real_score=real_score)
+            cells=cells, eligible=eligible, sort_by=shown, available=available, real_score=real_score,
+            scope=scope, regime_boards=bool(regime_rules))
         if used != wanted:
             view = html.Div([note(f"This run saved boards for set minimum-trade levels; showing ≥{used} trades "
                                   f"(closest to the {wanted} requested).", "warn"), view])
@@ -1720,7 +2034,8 @@ def render_discovery(run_id: str, min_events=None, fresh: bool = False, query: d
         panel_id='archive:'+run_id, split_date=split, run_path=str(run_path(run_id)),
         archive_id=run_id, weight_columns=meta.get('weight_columns', {}),
         target_definition=target_definition(meta),
-        cost_bps=meta.get('cost_bps'), execution_lag=meta.get('execution_lag'), fresh=fresh)
+        cost_bps=meta.get('cost_bps'), execution_lag=meta.get('execution_lag'), fresh=fresh,
+        regime_params=meta.get('regime_params'), sort_by=sort_by, scope=scope)
     if fresh:
         text = f"Completed · {meta.get('board_counts', {}).get('cells', 0):,} backtested cells in {info['elapsed_s']:.1f}s · saved as {run_id}"
     else:
@@ -1748,12 +2063,22 @@ def mechanics_job(stored: dict, candidate: dict, settings: dict) -> dict:
         columns = {"ts": pl.Series([row["ts"] for row in rows], dtype=pl.Utf8)}
         columns.update({col: pl.Series([row[col] for row in rows], dtype=pl.Float64) for col in needed})
         data = pl.DataFrame(columns).with_columns(pl.col("ts").str.to_date())
+        gate = candidate.get("gate") or "(none)"
+        if gate.startswith("regime:"):
+            # The discovery run's own regime states when its snapshot has them; otherwise rebuilt with its settings.
+            column = regime_column(gate.removeprefix("regime:"))
+            if rows and column in rows[0]:
+                data = data.with_columns(pl.Series(column, [row.get(column) for row in rows], dtype=pl.Utf8))
+            else:
+                data = with_regimes(data, [gate.removeprefix("regime:")],
+                                    RegimeParams(**(candidate.get("regime_params") or {})))
         started = time.perf_counter()
         work.update(JOB_SESSION, "bt", "Running every cell through the vectorised engine; exact Engine detail for the best")
         grid, selected, yearly, _ = run_vector_grid(
             data, trade, candidate, entry_zs=s["entry_zs"], exit_params=s["exit_params"],
             round_trip_cost_bps=s["cost"] or 0.0, stop_losses=s["stops"] or [None], execution_lag=int(s["lag"]),
             half_life_caps=s["caps"] or [None], signal_stops=s["signal_stops"] or [None],
+            max_half_lives=s.get("max_half_lives") or [None],
         )
         elapsed_s = time.perf_counter() - started
         work.update(JOB_SESSION, "bt", "Saving every configuration's results and yearly P&L, and the best one's trades")
@@ -1762,6 +2087,7 @@ def mechanics_job(stored: dict, candidate: dict, settings: dict) -> dict:
             beta_lookback=stored.get('beta_lookback'), beta_dependent=stored.get('beta_dependent'),
             weight_columns=stored.get('weight_columns', {}), execution_lag=s["lag"],
             cost_bps=s["cost"], stop_losses=s["stops"], half_life_caps=s["caps"], signal_stops=s["signal_stops"],
+            max_half_lives=s.get("max_half_lives"),
             engine="vector", rank_metric=selected["rank_metric"], best_config_id=selected["metrics"]["config_id"],
             elapsed_s=elapsed_s), selected["runs"])
         yearly.write_parquet(Path(saved) / "yearly.parquet")
@@ -1773,8 +2099,8 @@ def mechanics_job(stored: dict, candidate: dict, settings: dict) -> dict:
     return {"run_path": saved, "summary": summary}
 
 
-def render_mechanics(saved: str | Path):
-    """A saved trade-mechanics grid as (view, status note, grid store)."""
+def render_mechanics(saved: str | Path, sort_by: str | None = None):
+    """A saved trade-mechanics grid as (view, status note, grid store), ranked by ``sort_by`` if given."""
     path = Path(saved)
     meta = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
     grid = pl.read_parquet(path / "results.parquet")
@@ -1785,7 +2111,7 @@ def render_mechanics(saved: str | Path):
     text = (f"Completed · {len(grid):,} cells"
             + (f" in {meta['elapsed_s']:.2f}s" if meta.get("elapsed_s") is not None else "")
             + f" · {candidate.get('target', '')} vs {candidate.get('feature', '')} · saved as {path.name}")
-    return (backtest_grid_view(grid, {"metrics": best, "rank_metric": rank_metric}), note(text, "good"),
+    return (backtest_grid_view(grid, {"metrics": best, "rank_metric": rank_metric}, sort_by), note(text, "good"),
             # The browser gets where the grid is, not its rows: inspect reads one row from disk.
             {"run_path": str(path), "discovery_run": candidate.get("discovery_run"), "cells": len(grid),
              "target_definition": candidate.get("target_definition"), "feature": candidate.get("feature")})
@@ -1850,9 +2176,9 @@ def job_failure(record: dict) -> html.Div:
 
 def register_callbacks(app) -> None:
     sweep_controls = ["dis-signal", "dis-fit-on", "dis-beta-lbs", "dis-residual-lbs",
-        "dis-norm-lbs", "dis-thresholds", "dis-horizons", "dis-gates", "dis-gate-windows", "dis-raw-thresholds",
+        "dis-norm-lbs", "dis-thresholds", "dis-horizons", "dis-gates", "dis-gate-windows", "dis-regimes", "dis-raw-thresholds",
         "dis-exit-styles", "dis-bands", "dis-revert-fracs", "dis-half-lives", "dis-caps", "dis-signal-stops", "dis-stops",
-        "bt-entry-zs", *MECHANICS_EXITS]
+        "dis-max-half-lives", "bt-entry-zs", *MECHANICS_EXITS]
 
     @app.callback(*[Output(control, "value", allow_duplicate=True) for control in sweep_controls],
         Input("dis-select-all", "n_clicks"),
@@ -1872,7 +2198,8 @@ def register_callbacks(app) -> None:
 
     grid_inputs = ["dis-signal", "dis-fit-on", "dis-beta-lbs", "dis-residual-lbs", "dis-norm-lbs", "dis-thresholds",
                    "dis-raw-thresholds", "dis-gates", "dis-gate-windows", "dis-exit-styles", "dis-horizons", "dis-bands",
-                   "dis-revert-fracs", "dis-half-lives", "dis-caps", "dis-signal-stops", "dis-stops", "dis-cv", "dis-placebo"]
+                   "dis-revert-fracs", "dis-half-lives", "dis-caps", "dis-signal-stops", "dis-stops", "dis-cv", "dis-placebo", "dis-regimes",
+                   "dis-max-half-lives"]
 
     @app.callback(Output("controls-saved", "data"), *[Input(control, "value") for control in REMEMBERED],
                   prevent_initial_call=True)
@@ -1886,16 +2213,19 @@ def register_callbacks(app) -> None:
 
     @app.callback(Output("dis-grid-size", "children"), *[Input(control, "value") for control in grid_inputs])
     def _grid_size(signals, bases, beta, residual, norm, entries, raw_entries, gates, windows, styles, times,
-                   bands, reverts, half_lives, caps, signal_stops, stops, cv, placebos):
+                   bands, reverts, half_lives, caps, signal_stops, stops, cv, placebos, regime_gates=None,
+                   max_half_lives=None):
         signals = [signals] if isinstance(signals, str) else signals or []
         per_kind = len(beta or [])*len(norm or [])*(
             (len(residual or []) if 'changes' in (bases or []) else 0)
             + (1 if 'levels' in (bases or []) else 0))
-        gate_cells = 1 + len(gates or [])*len(windows or [])*len(REGIME_GATE_BUCKETS)
+        gate_cells = (1 + len(gates or [])*len(windows or [])*len(REGIME_GATE_BUCKETS)
+                      + sum(len(STATES[r]) for r in (regime_gates or []) if r in STATES))  # at most; thin states are dropped
         params = {"time": times, "band": bands, "revert_frac": reverts, "half_life_frac": half_lives}
         exits = {s: v for s, v in params.items() if s in (styles or []) and v}
         per_model = sum(len(exit_cells((raw_entries if s == 'raw' else entries) or [], exits, stops or [None],
-                                       caps or [None], signal_stops or [None])) for s in signals)
+                                       caps or [None], signal_stops or [None], max_half_lives or [None]))
+                        for s in signals)
         cells = per_kind*per_model*gate_cells
         # ~200k backtests/s and ~200 bytes per saved cell (plus CV block sums) on this machine
         seconds = cells / 200_000
@@ -1990,6 +2320,32 @@ def register_callbacks(app) -> None:
             styles = styles or []
             return [*[show if style in styles else hide for style in ("time", "band", "revert_frac", "half_life_frac")],
                     show if {"band", "revert_frac"} & set(styles) else hide]
+
+    @app.callback(Output("reg-window", "data"), *[Output(f"reg-window-{key}", "style") for key in WINDOW_PRESETS],
+                  *[Input(f"reg-window-{key}", "n_clicks") for key in WINDOW_PRESETS], prevent_initial_call=True)
+    def _regime_window(*clicks):
+        if not any(clicks):
+            return (no_update,) * (1 + len(WINDOW_PRESETS))
+        selected = ctx.triggered_id.removeprefix("reg-window-")
+        return (selected, *[btn_style(primary=(key == selected)) for key in WINDOW_PRESETS])
+
+    @app.callback(Output("reg-out", "children"), Output("reg-shown", "data"),
+                  Input("reg-run", "n_clicks"), Input("bench-tabs", "value"), Input("reg-window", "data"),
+                  State("reg-start", "value"), State("reg-confirm", "value"), State("reg-pricing", "value"),
+                  State("reg-vol-window", "value"), State("reg-vol-rank", "value"), State("reg-vol-bands", "value"),
+                  State("reg-oil-window", "value"), State("reg-oil-bands", "value"), State("reg-shown", "data"),
+                  State("reg-infl-bands", "value"))
+    def _regimes(clicks, tab, window, start, confirm, pricing, vol_window, vol_rank, vol_bands, oil_window, oil_bands,
+                 shown, infl_bands=None):
+        # Runs on the button, when the Regimes tab is first opened, and when the chart window changes.
+        window = window if window in WINDOW_PRESETS else REGIME_WINDOW
+        if not clicks and (tab != "reg" or shown == window):
+            return no_update, no_update
+        params = regime_params(confirm, pricing, vol_window, vol_rank, vol_bands, oil_window, oil_bands, infl_bands)
+        try:
+            return regimes_view(regimes(start or "2000-01-01", params), params, window), window
+        except Exception as exc:
+            return note(f"Regimes failed: {type(exc).__name__}: {exc}", "bad"), no_update
 
     @app.callback(Output("fv-pca-out", "children"), Output("fv-pca-settings", "data"),
                   Input("fv-pca-run", "n_clicks"), Input("bench-tabs", "value"),
@@ -2122,6 +2478,19 @@ def register_callbacks(app) -> None:
         return [progress_view(work.snapshot(session, name) if name == "load" else jobs.progress_of(name), caption)
                 for name, caption in (("load", "loading"), ("dis", "searching"), ("bt", "backtesting"))]
 
+    @app.callback(Output("bt-gate-img", "src"), *[Output(f"bt-gate-window-{key}", "style") for key in WINDOW_PRESETS],
+                  *[Input(f"bt-gate-window-{key}", "n_clicks") for key in WINDOW_PRESETS], State("bt-grid", "data"),
+                  prevent_initial_call=True)
+    def _gate_window(*args):
+        # The gate chart's time-frame buttons redraw it over the chosen window.
+        *clicks, grid = args
+        if not any(clicks) or not grid or not grid.get("run_path"):
+            return (no_update,) * (1 + len(WINDOW_PRESETS))
+        selected = ctx.triggered_id.removeprefix("bt-gate-window-")
+        png, _ = gate_png(Path(grid["run_path"]), selected)
+        return (f"data:image/png;base64,{png}" if png else no_update,
+                *[btn_style(primary=(key == selected)) for key in WINDOW_PRESETS])
+
     @app.callback(Output("bt-detail", "children"), Input("bt-inspect", "value"), State("bt-grid", "data"))
     def _inspect(config_id, stored):
         # The grid's run saves exact Engine detail for its best cell only. Any
@@ -2151,6 +2520,7 @@ def register_callbacks(app) -> None:
                     exit_param=row["exit_param"], stop_loss_bps=row["stop_loss_bps"],
                     round_trip_cost_bps=meta.get("cost_bps") or 0.0, execution_lag=int(meta["execution_lag"]),
                     half_life_cap=row.get("half_life_cap"), signal_stop=row.get("signal_stop"),
+                    max_entry_half_life=row.get("max_entry_half_life"),
                 )
                 append_details(saved_dir, {cid: detail})
             except Exception as exc:
@@ -2180,6 +2550,7 @@ def register_callbacks(app) -> None:
                               "layout": {"title": {"text": "Selected configuration · cumulative P&L", "font": {"size": 13}},
                                          "yaxis": {"title": {"text": "bp"}},
                                          "height": 320, "margin": {"l": 55, "r": 20, "t": 45, "b": 40}}}),
+            safe_view(lambda: gate_section(saved_dir), "gate chart"),
             pnl_heatmap(equity, periods),
             html.Div([
                 html.Div(trade_distribution(trades["pnl_bps"].to_numpy()), style={"flex": "2 1 420px", "minWidth": 0}),
@@ -2187,7 +2558,7 @@ def register_callbacks(app) -> None:
                     pl.len().alias("trades"), pl.col("pnl_bps").mean().alias("mean_pnl_bps")).to_pandas(),
                     title="Exit reasons"), style={"flex": "1 1 260px", "minWidth": 0}),
             ], style={"display": "flex", "gap": 24, "flexWrap": "wrap", "alignItems": "flex-start"}) if len(trades) else None,
-            table(trades.to_pandas(), title="Closed trades · MAE/MFE measured on observations · P&L blue gains, red losses",
+            table(trades.to_pandas(), title="Closed trades · MAE/MFE measured on observations · P&L green gains, red losses",
                   cell_style=lambda column, value, _row: _diverging(value, scale) if column == "pnl_bps" else None)
             if len(trades) else note("No closed trades for this configuration."),
         ])
@@ -2205,17 +2576,23 @@ def register_callbacks(app) -> None:
         Input("dis-raw-thresholds", "value"),
         Input("dis-saved-other", "value"),
         Input("dis-cost", "value"), Input("dis-lag", "value"), Input("dis-cv", "value"),
+        Input("dis-regimes", "value"), Input("dis-min-episodes", "value"),
+        State("reg-confirm", "value"), State("reg-pricing", "value"), State("reg-vol-window", "value"),
+        State("reg-vol-rank", "value"), State("reg-vol-bands", "value"), State("reg-oil-window", "value"),
+        State("reg-oil-bands", "value"), State("reg-infl-bands", "value"),
     )
     def _find_saved(stored, feature, bases, beta, residual, norm, entries, horizons,
                     gates, windows, signal, train, _board, selected, raw_entries=None, show_other=None,
-                    cost=0.1, lag=1, cv=0):
+                    cost=0.1, lag=1, cv=0, regime_gates=None, min_episodes=3, *regime_settings):
         if not stored or feature not in stored.get('features', []):
             return [], None, None
         request = grid_spec(bases or ['changes'], beta or DISLOCATION_BETA_LBS,
             residual or DISLOCATION_RESIDUAL_LBS, norm or DISLOCATION_NORM_LBS,
             entries or DISLOCATION_THRESHOLDS, horizons or DISLOCATION_HORIZONS,
             gates or [], windows or [126, 252, 504], signal, train, raw_entries or RAW_THRESHOLDS,
-            scoring="backtest", cost=cost, lag=lag, cv_folds=cv)
+            scoring="backtest", cost=cost, lag=lag, cv_folds=cv,
+            regimes=[r for r in (regime_gates or []) if r in REGIMES], min_regime_episodes=int(min_episodes or 3),
+            regime_params=asdict(regime_params(*regime_settings)) if len(regime_settings) == 8 else asdict(RegimeParams()))
         fingerprint = input_hash(stored, feature)
         runs = list_runs(stored['target'], feature)
         definition = target_definition(stored)
@@ -2282,12 +2659,14 @@ def register_callbacks(app) -> None:
         prevent_initial_call=True,
     )
     def _sort_board(sort, board, min_events, query):
-        # A header click on a column with its own saved board shows that board.
+        # A header click (a rule) or the scope switch (all cells / regime gates only) shows that saved board;
+        # whichever of the two was not just chosen stays as it was.
         if not sort or not board or not board.get("archive_id"):
             return no_update, no_update
         try:
-            view, _status, new_board = render_discovery(board["archive_id"], min_events, fresh=board.get("fresh", False),
-                                                        query=query, sort_by=sort.get("rule"))
+            view, _status, new_board = render_discovery(
+                board["archive_id"], min_events, fresh=board.get("fresh", False), query=query,
+                sort_by=sort.get("rule") or board.get("sort_by"), scope=sort.get("scope") or board.get("scope", "all"))
         except Exception as exc:
             return note(f"Cannot load that board: {exc}", "bad"), no_update
         return view, new_board
@@ -2309,14 +2688,20 @@ def register_callbacks(app) -> None:
         State("dis-rank", "value"), State("dis-placebo", "value"),
         State("dis-exit-styles", "value"), State("dis-bands", "value"), State("dis-revert-fracs", "value"),
         State("dis-half-lives", "value"), State("dis-caps", "value"), State("dis-signal-stops", "value"),
-        State("dis-stops", "value"),
+        State("dis-stops", "value"), State("dis-max-half-lives", "value"),
+        State("dis-regimes", "value"), State("dis-min-episodes", "value"), State("dis-regime-placebo", "value"),
+        State("reg-confirm", "value"), State("reg-pricing", "value"), State("reg-vol-window", "value"),
+        State("reg-vol-rank", "value"), State("reg-vol-bands", "value"), State("reg-oil-window", "value"),
+        State("reg-oil-bands", "value"), State("reg-infl-bands", "value"),
         prevent_initial_call=True,
     )
     def _run_dislocation(
         _n, stored, feature, fit_on, beta_lbs, residual_lbs, norm_lbs, thresholds,
         horizons, gates, gate_windows, signal_kind, train_fraction, min_events, session, raw_entries=None,
         cost=0.1, lag=1, cv=0, rank_by="family", placebos=0, exit_styles=None, bands=None, revert_fracs=None,
-        half_lives=None, caps=None, signal_stops=None, stops=None,
+        half_lives=None, caps=None, signal_stops=None, stops=None, max_half_lives=None, regime_gates=None,
+        min_episodes=3,
+        regime_placebos=0, *regime_settings,
     ):
         if jobs.running("dis"):
             return note("A discovery job is already running; its progress is shown on the right.", "warn")
@@ -2338,7 +2723,7 @@ def register_callbacks(app) -> None:
             return note("Choose at least one exit style with at least one parameter under Exits.", "warn")
         exits = dict(styles=sorted(exit_params), **{style: sorted(v) for style, v in exit_params.items()},
                      half_life_caps=sorted(caps or [0.0]), signal_stops=sorted(signal_stops or [0.0]),
-                     stops=sorted(stops or [0.0]))
+                     stops=sorted(stops or [0.0]), max_entry_half_lives=sorted(max_half_lives or [0.0]))
         settings = dict(
             fit_on=fit_on or ["changes"], beta_lbs=beta_lbs or DISLOCATION_BETA_LBS,
             residual_lbs=residual_lbs or DISLOCATION_RESIDUAL_LBS, norm_lbs=norm_lbs or DISLOCATION_NORM_LBS,
@@ -2346,7 +2731,10 @@ def register_callbacks(app) -> None:
             horizons=horizons or DISLOCATION_HORIZONS, gates=gates or [], gate_windows=gate_windows or [126, 252, 504],
             signal_kind=signal_kind, train_fraction=train_fraction, min_trades=min_trades, cost=cost, lag=lag,
             cv=cv, rank_by=rank_by, placebos=placebos, exit_params=exit_params, exits=exits, caps=caps,
-            signal_stops=signal_stops, stops=stops)
+            signal_stops=signal_stops, stops=stops, max_half_lives=max_half_lives,
+            regimes=[r for r in (regime_gates or []) if r in REGIMES], min_regime_episodes=int(min_episodes or 3),
+            regime_placebos=int(regime_placebos or 0),
+            regime_params=asdict(regime_params(*regime_settings)) if len(regime_settings) == 8 else asdict(RegimeParams()))
         try:
             # A worker process: a native crash can only end the job, and it is relaunched to resume.
             jobs.submit("dis", f"{stored['target']} vs {feature} discovery", "research.app:discovery_job",
@@ -2392,12 +2780,13 @@ def register_callbacks(app) -> None:
         State("bt-revert-fracs", "value"), State("bt-stop", "value"),
         State("bt-cost", "value"),
         State("bt-half-lives", "value"), State("bt-lag", "value"), State("research-session", "data"),
-        State("bt-caps", "value"), State("bt-signal-stops", "value"),
+        State("bt-caps", "value"), State("bt-signal-stops", "value"), State("bt-max-half-lives", "value"),
         prevent_initial_call=True,
     )
     def _run_backtest_grid(
         _n, candidate, stored, target, custom, entry_zs, exit_styles,
         time_stops, bands, revert_fracs, stop_bp, cost_bp, half_lives, lag, session, caps=None, signal_stops=None,
+        max_half_lives=None,
     ):
         if jobs.running("bt"):
             return note("A backtest grid is already running; its progress is shown on the right.", "warn")
@@ -2442,7 +2831,7 @@ def register_callbacks(app) -> None:
                 "Choose at least one entry threshold and one exit style.", "warn",
             )
         settings = dict(entry_zs=entry_zs, exit_params=exit_params, cost=cost_bp, stops=stop_bp, lag=lag,
-                        caps=caps, signal_stops=signal_stops)
+                        caps=caps, signal_stops=signal_stops, max_half_lives=max_half_lives)
         try:
             jobs.submit("bt", f"{candidate['target']} vs {candidate['feature']} trade mechanics",
                         "research.app:mechanics_job", stored, candidate, dict(settings, runs_dir=str(artifacts.RUNS)))
@@ -2524,6 +2913,17 @@ def register_callbacks(app) -> None:
             return render_mechanics(saved)
         except Exception as exc:
             return no_update, note(f"Cannot open saved grid: {exc}", "bad"), no_update
+
+    @app.callback(Output("bt-out", "children", allow_duplicate=True), Input("bt-sort", "data"),
+                  State("bt-grid", "data"), prevent_initial_call=True)
+    def _sort_grid(sort, grid):
+        # A metric header click shows the whole saved grid's top rows by that metric.
+        if not sort or not grid or not grid.get("run_path"):
+            return no_update
+        try:
+            return render_mechanics(grid["run_path"], sort.get("rule"))[0]
+        except Exception as exc:
+            return note(f"Cannot sort the grid: {exc}", "bad")
 
     @app.callback(
         Output("panel-out", "children"),

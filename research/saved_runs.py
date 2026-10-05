@@ -9,7 +9,8 @@ from research import artifacts
 
 
 def grid_spec(bases, beta, residual, norm, entries, horizons, gates, windows, signal, train,
-              raw_entries=(1., 2., 3., 5., 10., 15.), scoring='ic', cost=None, lag=None, cv_folds=0, exits=None):
+              raw_entries=(1., 2., 3., 5., 10., 15.), scoring='ic', cost=None, lag=None, cv_folds=0, exits=None,
+              regimes=None, min_regime_episodes=None, regime_params=None):
     spec = dict(fit_on=sorted(bases), beta_lb=sorted(beta), residual_lb=sorted(residual),
                 norm_lb=sorted(norm), entry_z=sorted(entries), horizon=sorted(horizons),
                 gates=sorted(gates), gate_windows=sorted(windows) if gates else [],
@@ -19,6 +20,10 @@ def grid_spec(bases, beta, residual, norm, entries, horizons, gates, windows, si
         # Backtest discovery results depend on trading costs, fill timing and CV blocks.
         spec.update(scoring='backtest', cost_bps=float(cost or 0.0), execution_lag=int(lag if lag is not None else 1),
                     cv_folds=int(cv_folds or 0), exits=exits)
+        # Macro regime gates: which regimes, how many episodes a state needs, and how the regimes were defined.
+        spec.update(regime_gates=sorted(regimes or []),
+                    min_regime_episodes=int(min_regime_episodes) if regimes else None,
+                    regime_params=dict(regime_params) if regimes and regime_params else None)
     return spec
 
 
@@ -149,6 +154,14 @@ def compare_run(meta, requested, current_hash):
         for key in ('train_fraction', 'cost_bps', 'execution_lag', 'cv_folds', 'exits'):
             if saved.get(key) != requested.get(key):
                 missing.append(f'{key}: requested {requested.get(key)}, saved {saved.get(key)} (rerun required)')
+        extra = sorted(set(requested.get('regime_gates') or []) - set(saved.get('regime_gates') or []))
+        if extra:
+            missing.append(f'regime_gates: {extra}')
+        if requested.get('regime_gates') and set(requested['regime_gates']) & set(saved.get('regime_gates') or []):
+            for key in ('min_regime_episodes', 'regime_params'):
+                if saved.get(key) != requested.get(key):
+                    missing.append(f'{key}: requested {requested.get(key)}, saved {saved.get(key)} '
+                                   '(regime definitions differ; rerun required)')
         messages.append('Missing requested settings: ' + '; '.join(missing) if missing
                         else 'Saved grid covers all requested settings. Opening shows the entire saved grid.')
     if meta.get('input_sha256') == current_hash:

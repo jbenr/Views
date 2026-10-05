@@ -131,6 +131,14 @@
      Each <td> carries a data-sort attribute (see table_div's _sort_value)
      holding either a numeric literal or a plain string; empty string means
      "missing" and always sorts to the bottom regardless of direction. */
+  /* A board-scope button (data-board-scope + data-board-store) asks the server
+     for the same board over a different set of cells, e.g. regime gates only. */
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-board-scope]");
+    if (!button || !window.dash_clientside || !window.dash_clientside.set_props) return;
+    window.dash_clientside.set_props(button.dataset.boardStore, { data: { scope: button.dataset.boardScope, at: Date.now() } });
+  });
+
   document.addEventListener("click", (event) => {
     const th = event.target.closest(".viz-th-sortable");
     if (!th) return;

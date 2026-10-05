@@ -207,6 +207,9 @@ def make_app(
         __name__,
         suppress_callback_exceptions=True,
         assets_folder=str(_assets),
+        # Dash retitles the tab "Updating..." during every callback; with a
+        # progress poll firing every second the tab title flickered constantly.
+        update_title=None,
     )
     app.title = title
 

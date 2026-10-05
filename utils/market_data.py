@@ -171,6 +171,37 @@ def load_wide(
     return long_to_wide(long_df, tickers, bps_cols=bps_cols, to_pandas=to_pandas)
 
 
+def load_futures_wide(
+    generics: Union[Mapping[str, str], Iterable[str]],
+    start: str,
+    end: str | None = None,
+    to_pandas: bool = False,
+) -> Union[pl.DataFrame, pd.DataFrame]:
+    """Load generic futures prices (e.g. "FF1", "SFR3") from md.fut_eod, one column per generic.
+
+    Prices are as quoted (a rate future's implied rate is 100 - price).
+    Generics roll, so a price change on a roll day is partly the roll.
+
+    Args:
+        generics: {alias: generic} to rename columns, or an iterable of generics.
+        start: Inclusive start date.
+        end: Optional inclusive end date.
+        to_pandas: Return pandas (indexed by ts) instead of polars.
+    """
+    generic_list = list(generics.values()) if isinstance(generics, Mapping) else list(generics)
+    sql = """
+        SELECT ts, generic_ticker AS ticker, px_last::float AS px
+        FROM md.fut_eod
+        WHERE generic_ticker = ANY(%s) AND ts >= %s
+    """
+    params: list = [generic_list, start]
+    if end is not None:
+        sql += " AND ts <= %s"
+        params.append(end)
+    sql += " ORDER BY ts"
+    return long_to_wide(query_db(sql, params=params), generics, to_pandas=to_pandas)
+
+
 def swaption_point(expiry: str, tenor: int, strike: int = 0) -> str:
     """Canonical column alias for one point on the swaption surface."""
     suffix = "" if strike == 0 else f"_{strike:+d}"

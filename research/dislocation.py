@@ -43,6 +43,8 @@ import numpy as np
 import polars as pl
 
 from backtest.lab import REGIME_GATE_BUCKETS, gate_allow_from_ranks, gate_percentile_rank, predict_scan
+from research.regimes import STATES as REGIME_STATES, count_episodes, regime_column
+from utils.market_data import align_columns
 from backtest.validation import cv_fold_labels, cv_scores
 from backtest.vector import run_vector
 from stats.diagnostics import beta_cv, quality_weight
@@ -471,7 +473,7 @@ RANK_COLUMNS = {"family": "family_median_sharpe", "sharpe": "sharpe",
 _COMPACT_EXTRAS = ("pnl_bps", "win_rate", "avg_holding_days")
 
 
-EXIT_COLUMNS = ["exit_style", "exit_param", "half_life_cap", "signal_stop", "stop_loss_bps"]
+EXIT_COLUMNS = ["exit_style", "exit_param", "half_life_cap", "signal_stop", "stop_loss_bps", "max_entry_half_life"]
 OPEN_ENDED_EMBARGO = 63  # CV buffer (bars) for exits without a fixed length
 
 
@@ -485,10 +487,11 @@ class _ScanPlan:
 
     def __init__(self, data, *, target, feature, legs, beta_lookbacks, residual_lookbacks,
                  normalization_lookbacks, thresholds, exit_params, stop_losses=(None,),
-                 half_life_caps=(None,), signal_stops=(None,), weight_columns=None, fit_on=("changes",),
+                 half_life_caps=(None,), signal_stops=(None,), max_half_lives=(None,), weight_columns=None,
+                 fit_on=("changes",),
                  signal_kind="normalized", raw_thresholds=(1.0, 2.0, 3.0, 5.0, 10.0, 15.0), gate_names=(),
                  gate_windows=(126, 252, 504), min_gate_history=126, cost_bps=0.0, execution_lag=1,
-                 train_fraction=0.7, cv_folds=0):
+                 train_fraction=0.7, cv_folds=0, regime_gates=(), min_regime_episodes=3):
         from research.dislocation_backtest import exit_cells
 
         signal_kinds = list(dict.fromkeys([signal_kind] if isinstance(signal_kind, str) else signal_kind))
@@ -513,7 +516,14 @@ class _ScanPlan:
         self.target, self.feature, self.cost, self.lag = target, feature, cost_bps, execution_lag
         self.min_gate_history = min_gate_history
         weight_columns = weight_columns or {}
-        self.frame = aligned_panel(data, list(dict.fromkeys([target, feature, *legs, *weight_columns.values()])))
+        regime_gates = list(dict.fromkeys(regime_gates))
+        missing = [n for n in regime_gates if regime_column(n) not in data.columns]
+        if missing:
+            raise ValueError(f"regime state columns missing from the data: {missing} (see research.regimes.with_regimes)")
+        # Regime states ride along without trimming the sample: a regime that starts late (implied vol
+        # in 2022) simply has no state, so its gates are closed, before then.
+        self.frame = align_columns(data, list(dict.fromkeys([target, feature, *legs, *weight_columns.values()])),
+                                   optional=[regime_column(n) for n in regime_gates]).sort("ts")
         n = len(self.frame)
         self.cut = int(n * train_fraction)
         self.folds = int(cv_folds) if cv_folds and cv_folds >= 2 else 1
@@ -525,7 +535,8 @@ class _ScanPlan:
         self.entry_weights = (self.frame.select([weight_columns[leg] for leg in legs]).to_numpy()
                               if weight_columns else None)
         self.exits = {kind: exit_cells(raw_thresholds if kind == "raw" else thresholds, exit_params,
-                                       stop_losses, half_life_caps, signal_stops) for kind in signal_kinds}
+                                       stop_losses, half_life_caps, signal_stops, max_half_lives)
+                      for kind in signal_kinds}
         self.models = [
             (kind, basis, int(beta), None if basis == "levels" else int(resid), int(norm))
             for kind in signal_kinds for basis in bases for beta in beta_lookbacks
@@ -534,6 +545,18 @@ class _ScanPlan:
         self.gates = [("(none)", "all", None)] + [
             (name, bucket[0], int(window))
             for name in gate_names for window in gate_windows for bucket in REGIME_GATE_BUCKETS]
+        # Macro regime gates: one per state, kept only with enough separate episodes in the discovery
+        # period, since a regime seen once cannot tell a lasting edge from one lucky era.
+        self.regime_episodes, self.skipped_regime_gates = {}, []
+        for name in regime_gates:
+            states = self.frame[regime_column(name)].head(self.cut).to_list()
+            for state in REGIME_STATES[name]:
+                count = count_episodes(states, state)
+                self.regime_episodes[(name, state)] = count
+                if count >= min_regime_episodes:
+                    self.gates.append((f"regime:{name}", state, None))
+                else:
+                    self.skipped_regime_gates.append((name, state, count))
         sizes = [len(self.gates) * len(self.exits[m[0]]) for m in self.models]
         self.offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
         # Feature/target conditions are identical for every model: rank them once.
@@ -547,15 +570,25 @@ class _ScanPlan:
     def n_cells(self) -> int:
         return int(self.offsets[-1])
 
-    def model_rows(self, i: int, cells=None):
-        """Backtest model ``i`` (all its cells, or just ``cells``): rows, CV block sums, block sum squares."""
+    def model_state(self, i: int) -> pl.DataFrame:
+        """Model ``i``'s signal and gate-condition frame (one row per row of ``self.frame``)."""
         from research.dislocation_backtest import signal_frame
 
         kind, basis, beta, resid, norm = self.models[i]
+        return signal_frame(self.frame, target=self.target, feature=self.feature, fit_on=basis, beta_lb=beta,
+                            residual_lb=resid, norm_lb=norm, signal_kind=kind)
+
+    def model_rows(self, i: int, cells=None, state: pl.DataFrame | None = None):
+        """Backtest model ``i`` (all its cells, or just ``cells``): rows, CV block sums, block sum squares.
+
+        ``state`` reuses a model frame already built by ``model_state`` (the
+        regime placebo swaps shifted regime columns into one).
+        """
+        kind, basis, beta, resid, norm = self.models[i]
         if (kind, basis, beta) != self._group:
             self._group, self._group_ranks = (kind, basis, beta), {}
-        state = signal_frame(self.frame, target=self.target, feature=self.feature, fit_on=basis, beta_lb=beta,
-                             residual_lb=resid, norm_lb=norm, signal_kind=kind)
+        if state is None:
+            state = self.model_state(i)
         spec = self.exits[kind]
         index = (np.arange(len(self.gates) * len(spec)) if cells is None
                  else np.asarray(cells, dtype=np.int64))
@@ -570,6 +603,7 @@ class _ScanPlan:
             "exit_param": [spec[e][2] for e in exit_of], "stop": [float(spec[e][3] or 0.0) for e in exit_of],
             "cap": [float(spec[e][4] or 0.0) for e in exit_of],
             "signal_stop": [float(spec[e][5] or 0.0) for e in exit_of],
+            "max_hl": [float(spec[e][6] or 0.0) for e in exit_of],
         })
         result = run_vector(self.leg_matrix, self.leg_weights, state["signal"].to_numpy()[None, :], configs,
                             half_life=state["half_life"].to_numpy()[None, :],
@@ -588,8 +622,10 @@ class _ScanPlan:
             "half_life_cap": pl.Series([spec[e][4] for e in exit_of], dtype=pl.Float64),
             "signal_stop": pl.Series([spec[e][5] for e in exit_of], dtype=pl.Float64),
             "stop_loss_bps": pl.Series([spec[e][3] for e in exit_of], dtype=pl.Float64),
+            "max_entry_half_life": pl.Series([spec[e][6] for e in exit_of], dtype=pl.Float64),
             "gate": [self.gates[g][0] for g in gate_of], "gate_bucket": [self.gates[g][1] for g in gate_of],
             "gate_window": pl.Series([self.gates[g][2] for g in gate_of], dtype=pl.Int64),
+            "regime_episodes": pl.Series([self._episodes(g) for g in gate_of], dtype=pl.Int64),
             "n_trades": trades,
             "trades_per_year": trades / max(self.cut / 252, 1e-9),
             "sharpe": result.sharpe(discovery),
@@ -610,8 +646,15 @@ class _ScanPlan:
                            cv_positive_share=scores["positive_share"])
         return pl.DataFrame(columns), sums, sumsq
 
+    def _episodes(self, g):
+        """Episodes of a regime gate's state in the discovery period; None for other gates."""
+        name, bucket, _ = self.gates[g]
+        return self.regime_episodes.get((name.removeprefix("regime:"), bucket)) if name.startswith("regime:") else None
+
     def _mask(self, state, g):
         name, bucket, window = self.gates[g]
+        if name.startswith("regime:"):
+            return (state[f"gate_{name}"] == bucket).fill_null(False).to_numpy()
         values = state[f"gate_{name}"].to_numpy().astype(float)
         cache = self._shared_ranks if name.startswith(("feature_", "target_")) else self._group_ranks
         key = (name, window, hash(values.tobytes()))
@@ -634,6 +677,7 @@ def backtest_scan(
     stop_losses: Iterable[float | None] = (None,),
     half_life_caps: Iterable[float | None] = (None,),
     signal_stops: Iterable[float | None] = (None,),
+    max_half_lives: Iterable[float | None] = (None,),
     weight_columns: dict[str, str] | None = None,
     fit_on: Iterable[str] = ("changes",),
     signal_kind: str | Iterable[str] = "normalized",
@@ -645,6 +689,8 @@ def backtest_scan(
     execution_lag: int = 1,
     train_fraction: float = 0.7,
     cv_folds: int = 0,
+    regime_gates: Iterable[str] = (),
+    min_regime_episodes: int = 3,
     progress: Callable[[int, int, str], None] | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
     """Discovery by real trades: every model x gate x entry x exit, backtested.
@@ -667,10 +713,12 @@ def backtest_scan(
         data, target=target, feature=feature, legs=legs, beta_lookbacks=beta_lookbacks,
         residual_lookbacks=residual_lookbacks, normalization_lookbacks=normalization_lookbacks,
         thresholds=thresholds, exit_params=exit_params, stop_losses=stop_losses, half_life_caps=half_life_caps,
-        signal_stops=signal_stops, weight_columns=weight_columns, fit_on=fit_on, signal_kind=signal_kind,
+        signal_stops=signal_stops, max_half_lives=max_half_lives, weight_columns=weight_columns, fit_on=fit_on,
+        signal_kind=signal_kind,
         raw_thresholds=raw_thresholds, gate_names=gate_names, gate_windows=gate_windows,
         min_gate_history=min_gate_history, cost_bps=cost_bps, execution_lag=execution_lag,
-        train_fraction=train_fraction, cv_folds=cv_folds)
+        train_fraction=train_fraction, cv_folds=cv_folds, regime_gates=regime_gates,
+        min_regime_episodes=min_regime_episodes)
     parts, cv_sums, cv_sumsq = [], [], []
     with _gc_paused():
         for i, model in enumerate(plan.models):
@@ -740,6 +788,8 @@ def rank_board_file(path, rank_by: str = "family", min_trades: int = 30, top: in
         scan = scan.with_columns(
             pl.lit("time").alias("exit_style"), pl.col("horizon").cast(pl.Float64).alias("exit_param"),
             *[pl.lit(None, dtype=pl.Float64).alias(c) for c in ("half_life_cap", "signal_stop", "stop_loss_bps")])
+    if "max_entry_half_life" not in scan.collect_schema().names():  # saved before the entry half-life filter
+        scan = scan.with_columns(pl.lit(None, dtype=pl.Float64).alias("max_entry_half_life"))
     family = ["signal_kind", "fit_on", "entry_z", *EXIT_COLUMNS, "gate", "gate_bucket", "gate_window"]
     keys = [column, "sharpe"] if column != "sharpe" else ["sharpe"]
     eligible = scan.with_row_index("board_index").filter(pl.col("n_trades") >= min_trades)
@@ -913,12 +963,16 @@ def _top_cells(score: np.ndarray, sharpe: np.ndarray, eligible: np.ndarray, top:
     return index[order][:top]
 
 
-def _rank_compact(plan, compact, rank_by: str, min_trades: int, top: int, family=None):
+REGIME_SCOPE = "regime-"  # a board ranked over macro-regime-gated cells only is saved as rule "regime-<rule>"
+
+
+def _rank_compact(plan, compact, rank_by: str, min_trades: int, top: int, family=None, restrict=None):
     """(top global indices, their rank scores, their family medians, eligible count) for one rule.
 
     ``family`` takes the family medians already computed for this minimum
     (they depend only on which cells are eligible), so ranking many rules at
-    one level computes them once.
+    one level computes them once. ``restrict`` (a per-cell bool mask) ranks
+    only those cells, e.g. the macro-regime-gated ones.
     """
     if rank_by not in RANK_RULES:
         raise ValueError(f"rank_by must be one of {list(RANK_RULES)}")
@@ -928,9 +982,107 @@ def _rank_compact(plan, compact, rank_by: str, min_trades: int, top: int, family
     eligible = compact["n_trades"] >= min_trades
     if family is None:
         family = _family_medians(plan, compact, eligible)
+    if restrict is not None:  # after the family medians: a family is one gate, so its median is unchanged
+        eligible &= restrict
     score = family if rank_by == "family" else compact[RANK_COLUMNS[rank_by]]
     best = _top_cells(score, compact["sharpe"], eligible, top)
     return best, score[best], family[best], int(eligible.sum())
+
+
+def _shift_regime(frame: pl.DataFrame, column: str, offset: int) -> pl.DataFrame:
+    """The regime's states rotated ``offset`` days within its own history (leading days without a state stay so)."""
+    values = frame[column].to_list()
+    first = next((i for i, v in enumerate(values) if v is not None), len(values))
+    known = values[first:]
+    if known:
+        k = offset % len(known)
+        known = known[-k:] + known[:-k] if k else known
+    return frame.with_columns(pl.Series(column, values[:first] + known, dtype=pl.Utf8))
+
+
+def _regime_gated(plan) -> np.ndarray | None:
+    """Per-cell mask of every macro-regime-gated cell, or None when the plan has no regime gates."""
+    gates = [g for g, (gate, _, _) in enumerate(plan.gates) if gate.startswith("regime:")]
+    if not gates:
+        return None
+    mask = np.zeros(plan.n_cells, dtype=bool)
+    for i, model in enumerate(plan.models):
+        start, stop = plan.offsets[i], plan.offsets[i + 1]
+        mask[start:stop] = np.isin(np.arange(stop - start) // len(plan.exits[model[0]]), gates)
+    return mask
+
+
+def _regime_subset(plan, name: str):
+    """One regime's gated cells, model by model: (local cell indices per model, a plan-like view for ranking).
+
+    Every model has the same cells for one regime (its states x the model's
+    exits), so the subset keeps the plan's model-by-model layout and the
+    family ranking works on it unchanged.
+    """
+    import types
+    gates = [g for g, (gate, _, _) in enumerate(plan.gates) if gate == f"regime:{name}"]
+    local = [np.concatenate([g * len(plan.exits[m[0]]) + np.arange(len(plan.exits[m[0]])) for g in gates])
+             if gates else np.array([], dtype=np.int64) for m in plan.models]
+    offsets = np.concatenate([[0], np.cumsum([len(c) for c in local])]).astype(np.int64)
+    return local, types.SimpleNamespace(models=plan.models, offsets=offsets, n_cells=int(offsets[-1]))
+
+
+def regime_placebo(plan, compact, *, shifts: int, rank_by: str, min_trades: int, progress=None, **_unused) -> list[dict]:
+    """Does each regime gate beat the same regime with its calendar shifted?
+
+    For every regime with gates, the real score is the best of its gated
+    cells (same rank rule and minimum trades as the board). Each placebo
+    rotates that regime's daily states in time -- same episodes and lengths,
+    wrong dates. Each model's signal is built once and every shifted calendar
+    is swapped into it, so only the regime's gated cells are backtested again.
+    """
+    regimes = list(dict.fromkeys(gate.removeprefix("regime:") for gate, _, _ in plan.gates
+                                 if gate.startswith("regime:")))
+    if not regimes:
+        return []
+    metric = RANK_COLUMNS[rank_by] if rank_by != "family" else "sharpe"
+    keys = list(dict.fromkeys(["sharpe", "n_trades", metric]))
+    subsets = {name: _regime_subset(plan, name) for name in regimes}
+    calendars, results = {}, {}
+    for name in regimes:
+        known = int(plan.frame[regime_column(name)].is_not_null().sum())
+        offsets = [int(f * known) for f in (np.linspace(0.2, 0.8, shifts) if shifts > 1 else [0.5])]
+        calendars[name] = [(offset, _shift_regime(plan.frame, regime_column(name), offset)[regime_column(name)])
+                           for offset in offsets]
+        n_sub = subsets[name][1].n_cells
+        results[name] = [{k: np.zeros(n_sub, dtype=np.int32 if k == "n_trades" else float) for k in keys}
+                         for _ in offsets]
+    for i in range(len(plan.models)):
+        if progress:
+            progress(i, len(plan.models), f"Regime placebo · model {i + 1}/{len(plan.models)} · "
+                                          f"{shifts} shifted calendars for {', '.join(regimes)}")
+        state = plan.model_state(i)
+        for name in regimes:
+            local, view = subsets[name]
+            part = slice(view.offsets[i], view.offsets[i + 1])
+            for s, (_, calendar) in enumerate(calendars[name]):
+                rows, _, _ = plan.model_rows(i, local[i], state=state.with_columns(calendar.alias(f"gate_regime:{name}")))
+                for k in keys:
+                    results[name][s][k][part] = rows[k].fill_nan(None).fill_null(np.nan).to_numpy() \
+                        if k != "n_trades" else rows[k].to_numpy()
+    out = []
+    for name in regimes:
+        local, view = subsets[name]
+        real_cells = np.concatenate([plan.offsets[i] + local[i] for i in range(len(plan.models))])
+        real = {k: compact[k][real_cells] for k in keys}
+        best, scores, _, _ = _rank_compact(view, real, rank_by, min_trades, 1)
+        real_score = float(scores[0]) if len(best) else float("nan")
+        found = []
+        for result in results[name]:
+            pick, sub_scores, _, _ = _rank_compact(view, result, rank_by, min_trades, 1)
+            found.append(float(sub_scores[0]) if len(pick) else float("nan"))
+        valid = [x for x in found if np.isfinite(x)]
+        beaten = sum(x >= real_score for x in valid) if np.isfinite(real_score) else len(valid)
+        out.append({"regime": name, "states": [b for gate, b, _ in plan.gates if gate == f"regime:{name}"],
+                    "real_score": real_score, "placebo_scores": found,
+                    "shift_days": [offset for offset, _ in calendars[name]],
+                    "p_value": (1 + beaten) / (1 + len(valid))})
+    return out
 
 
 def _board_rows(plan, picks: dict) -> dict:
@@ -958,6 +1110,7 @@ def discovery_compact(
     selection_min_trades: int = 30,
     progress: Callable[[int, int, str], None] | None = None,
     checkpoints: Path | None = None,
+    regime_placebos: int = 0,
     **scan_kwargs,
 ) -> dict:
     """``backtest_scan`` + ``rank_board`` for big grids, in a few GB instead of tens.
@@ -974,19 +1127,27 @@ def discovery_compact(
     rules = [r for r in rank_rules if not r.startswith("cv") or plan.folds >= 2]
     levels = sorted(set(int(m) for m in min_trade_levels) | {int(selection_min_trades)})
     ranked = {}
+    # Regime-gated cells rarely reach the top of a grid of millions, so their own boards are saved too.
+    regime_mask = _regime_gated(plan)
     for m in levels:
         family = _family_medians(plan, compact, compact["n_trades"] >= m)
         for rule in rules:
             ranked[(rule, m)] = _rank_compact(plan, compact, rule, m, top, family)
+            if regime_mask is not None:
+                ranked[(REGIME_SCOPE + rule, m)] = _rank_compact(plan, compact, rule, m, top, family,
+                                                                 restrict=regime_mask)
         del family
+    del regime_mask
     if progress:
         progress(0, 0, f"Rebuilding full detail for the top {top} cells of {len(ranked)} boards")
     rows = _board_rows(plan, {key: value[0] for key, value in ranked.items()})
     boards, eligible = {}, {}
     for key, (best, scores, families, n_eligible) in ranked.items():
-        eligible[key[1]] = n_eligible
+        if not key[0].startswith(REGIME_SCOPE):  # cells with enough trades, counted over the whole grid
+            eligible[key[1]] = n_eligible
         # rank_score from the full row: some scores are ranked in float32 to save memory
-        exact = None if key[0] == "family" else RANK_COLUMNS[key[0]]
+        rule = key[0].removeprefix(REGIME_SCOPE)
+        exact = None if rule == "family" else RANK_COLUMNS[rule]
         records = [{"board_index": int(c), **rows[int(c)], "family_median_sharpe": float(f),
                     "rank_score": float(rows[int(c)][exact] if exact else s)}
                    for c, s, f in zip(best, scores, families)]
@@ -997,10 +1158,16 @@ def discovery_compact(
         checks = selection_checks(plan.cv_days, compact["cv_sums"], compact["cv_sumsq"],
                                   {"cv_mean": "mean", "cv_worst": "worst"}.get(selection_rule, "sharpe"),
                                   eligible=compact["n_trades"] >= selection_min_trades)
+    regimes_tested = []
+    if regime_placebos and any(gate.startswith("regime:") for gate, _, _ in plan.gates):
+        regimes_tested = regime_placebo(plan, compact, shifts=int(regime_placebos),
+                                        rank_by=selection_rule or "family", min_trades=selection_min_trades,
+                                        progress=progress)
     if checkpoint is not None:
         shutil.rmtree(checkpoint, ignore_errors=True)  # the run is complete; nothing to resume
     return {"frame": plan.frame, "boards": boards, "cells": plan.n_cells, "eligible": eligible,
-            "checks": checks, "folds": plan.folds}
+            "checks": checks, "folds": plan.folds, "regime_placebo": regimes_tested,
+            "skipped_regime_gates": plan.skipped_regime_gates}
 
 
 def rank_results_file(path, rank_rules=("family", "sharpe", "cv_mean", "cv_worst"),
@@ -1081,8 +1248,9 @@ def placebo_scan(
     are what this search finds from noise alone. Progress counts models
     across all placebos, so a long run shows where it is and how long is left.
     """
-    frame = aligned_panel(data, list(dict.fromkeys([scan_kwargs["target"], feature, *scan_kwargs["legs"],
-                                                    *(scan_kwargs.get("weight_columns") or {}).values()])))
+    frame = align_columns(data, list(dict.fromkeys([scan_kwargs["target"], feature, *scan_kwargs["legs"],
+                                                    *(scan_kwargs.get("weight_columns") or {}).values()])),
+                          optional=[regime_column(n) for n in scan_kwargs.get("regime_gates", ())]).sort("ts")
     values = frame[feature].to_numpy().astype(float)
     moves = np.diff(values, prepend=values[0])
     offsets = np.linspace(0.2, 0.8, placebos) * len(values) if placebos > 1 else [0.5 * len(values)]

@@ -80,7 +80,7 @@ def _sharpe(n: int, total: np.ndarray, total_sq: np.ndarray) -> np.ndarray:
 
 @njit(parallel=True, cache=True)
 def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
-            model, gate, entry, style, param, stop, sig_stop, cap, cost, lag, fold, n_fold,
+            model, gate, entry, style, param, stop, sig_stop, cap, max_hl, cost, lag, fold, n_fold,
             keep, pnl_out, fold_sum, fold_sumsq, fold_trades, fold_wins,
             total, closed_pnl, n_trades, n_wins, max_dd, days_held,
             gross_profit, gross_loss, closed_bars, open_end, summary_dd, held_w):
@@ -94,7 +94,7 @@ def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
 
     for k in prange(model.shape[0]):
         m, g, e, st, p, sl = model[k], gate[k], entry[k], style[k], param[k], stop[k]
-        ss, cp = sig_stop[k], cap[k]
+        ss, cp, mh = sig_stop[k], cap[k], max_hl[k]
         time_stop = int(np.round(p)) if st == 0 else 0
         # Frozen entry weights live in this config's row of held_w, indexed in
         # place. Allocating (or slicing) an array here makes numba hoist one
@@ -162,6 +162,9 @@ def _kernel(legs, fixed_w, signals, half_life, gates, entry_w, use_entry_w,
                     if st == 3:
                         hl = half_life[m, j]
                         allowed = allowed and np.isfinite(hl) and hl > 0
+                    if mh > 0:  # only a residual reverting fast enough is a dislocation worth entering
+                        hl = half_life[m, j]
+                        allowed = allowed and np.isfinite(hl) and hl > 0 and hl <= mh
                     direction = 0
                     if allowed:
                         if now <= -e and not (before <= -e):
@@ -247,8 +250,10 @@ def run_vector(
                   (exit once the signal moves this far beyond its entry value,
                   away from zero, in signal units; 0/null = none) and ``cap``
                   (band/revert_frac only: exit after ceil(entry half-life x
-                  cap) bars when that half-life is positive; 0/null = none).
-    half_life     (models, bars), required by half_life_frac configs.
+                  cap) bars when that half-life is positive; 0/null = none) and
+                  ``max_hl`` (enter only when the half-life at the signal is
+                  positive and at most this many bars; 0/null = none).
+    half_life     (models, bars), required by half_life_frac configs, caps and max_hl.
     gates         (gate masks, bars) boolean entry-allow masks, unshifted.
     entry_weights (bars, legs) weights frozen at entry, replacing
                   ``leg_weights``; unshifted like the signal.
@@ -288,9 +293,11 @@ def run_vector(
                 if "signal_stop" in configs.columns else np.zeros(len(configs)))
     cap = (configs["cap"].fill_null(0.0).cast(pl.Float64).to_numpy()
            if "cap" in configs.columns else np.zeros(len(configs)))
+    max_hl = (configs["max_hl"].fill_null(0.0).cast(pl.Float64).to_numpy()
+              if "max_hl" in configs.columns else np.zeros(len(configs)))
     if half_life is None:
-        if (style == EXIT_STYLES["half_life_frac"]).any() or (cap > 0).any():
-            raise ValueError("half_life_frac configs and half-life caps need half_life")
+        if (style == EXIT_STYLES["half_life_frac"]).any() or (cap > 0).any() or (max_hl > 0).any():
+            raise ValueError("half_life_frac configs, half-life caps and max_hl need half_life")
         half_life = np.full((1, 1), np.nan)
     half_life = np.ascontiguousarray(np.atleast_2d(half_life), dtype=np.float64)
     use_w = entry_weights is not None
@@ -318,7 +325,7 @@ def run_vector(
 
     _kernel(legs, np.asarray(leg_weights, dtype=np.float64), signals, half_life, gates, entry_w, use_w,
             model, gate, configs["entry"].cast(pl.Float64).to_numpy(), style,
-            configs["exit_param"].cast(pl.Float64).to_numpy(), stop, sig_stop, cap, float(cost), int(lag),
+            configs["exit_param"].cast(pl.Float64).to_numpy(), stop, sig_stop, cap, max_hl, float(cost), int(lag),
             fold, n_fold, keep_idx, pnl, fold_sum, fold_sumsq, fold_trades, fold_wins,
             total, closed, n_trades, n_wins, max_dd, days_held,
             gross_profit, gross_loss, closed_bars, open_end, summary_dd, held_w)

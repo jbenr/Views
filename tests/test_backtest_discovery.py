@@ -267,3 +267,34 @@ def test_backtest_loops_pause_the_garbage_collector_and_restore_it():
     finally:
         dis._ScanPlan.model_rows = original
     assert seen and not any(seen[:4]) and gc.isenabled()
+
+
+def test_max_entry_half_life_only_enters_reverting_residuals_and_matches_the_engine():
+    data = market()
+    legs = {"left": -1.0, "right": 1.0}
+    scan = dict(SCAN, gate_names=[], max_half_lives=[None, 6.0])
+    frame, results, _ = backtest_scan(data, legs=legs, **scan)
+    keys = ["signal_kind", "fit_on", "beta_lb", "residual_lb", "norm_lb", "entry_z", "exit_style", "exit_param",
+            "half_life_cap", "signal_stop", "stop_loss_bps", "gate", "gate_bucket"]
+    pairs = (results.filter(pl.col("max_entry_half_life").is_null())
+             .join(results.filter(pl.col("max_entry_half_life") == 6.0), on=keys, suffix="_capped", nulls_equal=True))
+    # Skipping a slow-reverting entry can free the book for a later one, so counts can move either way;
+    # what must hold is that the filter changes trading, and (below) every entry it takes is reverting.
+    assert len(pairs) and (pairs["n_trades_capped"] != pairs["n_trades"]).any()
+    split = str(frame["ts"][int(len(frame) * 0.7)])
+    capped = results.filter((pl.col("max_entry_half_life") == 6.0) & (pl.col("n_trades") > 0))
+    rng = np.random.default_rng(5)
+    for i in rng.choice(len(capped), 8, replace=False):
+        row = capped.row(int(i), named=True)
+        cand = {k: row[k] for k in ("fit_on", "beta_lb", "residual_lb", "norm_lb", "signal_kind",
+                                    "gate", "gate_bucket", "gate_window")}
+        cand.update(target="y", feature="x", split_date=split)
+        exact, selected = run_grid(data, TradeDef("y", legs), cand, entry_zs=[row["entry_z"]],
+                                   exit_params={row["exit_style"]: [row["exit_param"]]},
+                                   stop_losses=[row["stop_loss_bps"]], half_life_caps=[row["half_life_cap"]],
+                                   signal_stops=[row["signal_stop"]], max_half_lives=[6.0],
+                                   round_trip_cost_bps=0.25, execution_lag=1)
+        e = exact.row(0, named=True)
+        assert row["pnl_bps"] == pytest.approx(e["earlier_pnl_bps"], abs=1e-9), row
+        assert row["n_trades"] == len([t for t in selected["trades"] if str(t["exit_date"]) < split]), row
+        assert all(0 < t["entry_half_life"] <= 6.0 for t in selected["trades"])  # every entry was reverting

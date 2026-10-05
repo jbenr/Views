@@ -22,6 +22,7 @@ from backtest.engine import (
     trade_log,
 )
 from backtest.lab import gate_allow_mask
+from research.regimes import REGIME_PREFIX
 from backtest.vector import run_vector
 from stats import roll_lr, roll_lr_diff, roll_ou_features
 from stats.diagnostics import beta_cv, quality_weight
@@ -77,7 +78,9 @@ def signal_frame(
     """
     if fit_on not in {"changes", "levels"}:
         raise ValueError("fit_on must be 'changes' or 'levels'")
-    frame = align_columns(data, [target, feature]).sort("ts")
+    # macro regime states (see research.regimes.with_regimes) ride along as gates without trimming the sample
+    regimes = [c for c in data.columns if c.startswith(REGIME_PREFIX)]
+    frame = align_columns(data, [target, feature], optional=regimes).sort("ts")
     x, y = frame[feature].cast(pl.Float64), frame[target].cast(pl.Float64)
     if fit_on == "changes":
         if residual_lb is None:
@@ -125,6 +128,7 @@ def signal_frame(
         signal.alias("signal"), resid.alias("resid"), beta.alias("beta"), r2.alias("r2"),
         ou["half_life"].alias("half_life"),
         *[value.alias(f"gate_{name}") for name, value in conditions.items()],
+        *[frame[c].alias(f"gate_regime:{c.removeprefix(REGIME_PREFIX)}") for c in regimes],
     )
 
 
@@ -135,6 +139,8 @@ def _entry_gate(state: pl.DataFrame, candidate: dict) -> np.ndarray:
     column = f"gate_{gate}"
     if column not in state.columns:
         raise ValueError(f"unknown candidate gate: {gate!r}")
+    if gate.startswith("regime:"):  # a macro regime state: open exactly on the days the regime is in it
+        return (state[column] == candidate["gate_bucket"]).fill_null(False).to_numpy()
     return gate_allow_mask(
         state[column],
         (gate, candidate["gate_bucket"]),
@@ -156,9 +162,13 @@ def make_pipeline(
     execution_lag: int = 0,
     half_life_cap: float | None = None,
     signal_stop: float | None = None,
+    max_entry_half_life: float | None = None,
 ) -> BooleanSignalPipeline:
     """Build one exact Engine pipeline with same-day first-crossing entries.
 
+    ``max_entry_half_life`` enters only when the residual's half-life at the
+    signal is positive and at most that many bars: a residual that barely
+    reverts (or trends) is not a dislocation.
     ``signal_stop`` exits once the signal moves that far beyond its entry
     value, away from zero (the dislocation extending, not reverting).
     ``half_life_cap`` caps a band or reversion-fraction trade at
@@ -182,6 +192,11 @@ def make_pipeline(
     allowed = _entry_gate(state, candidate)
     enter_long = (signal <= -entry_z) & ~(previous <= -entry_z) & allowed
     enter_short = (signal >= entry_z) & ~(previous >= entry_z) & allowed
+    if max_entry_half_life:
+        hl = state["half_life"].to_numpy().astype(float)
+        reverting = np.isfinite(hl) & (hl > 0) & (hl <= max_entry_half_life)
+        enter_long &= reverting
+        enter_short &= reverting
 
     exit_long = np.zeros(len(state), dtype=bool)
     exit_short = np.zeros(len(state), dtype=bool)
@@ -277,8 +292,9 @@ def exit_cells(
     stop_losses: Iterable[float | None] = (None,),
     half_life_caps: Iterable[float | None] = (None,),
     signal_stops: Iterable[float | None] = (None,),
+    max_half_lives: Iterable[float | None] = (None,),
 ) -> list[tuple]:
-    """Every (entry, exit style, exit param, P&L stop, half-life cap, signal stop) cell.
+    """Every (entry, exit style, exit param, P&L stop, half-life cap, signal stop, max entry half-life) cell.
 
     Bands at or above the entry are skipped (they would exit immediately), and
     half-life caps only multiply band and reversion-fraction exits. 0 and None
@@ -286,8 +302,9 @@ def exit_cells(
     """
     none = lambda values: sorted({float(v) if v else None for v in values}, key=lambda v: -1 if v is None else v)
     caps, sstops, stops = none(half_life_caps or [None]), none(signal_stops or [None]), none(stop_losses or [None])
+    mhls = none(max_half_lives or [None])
     return [
-        (float(entry), style, float(param), stop, cap, sstop)
+        (float(entry), style, float(param), stop, cap, sstop, mhl)
         for entry in entry_zs
         for style, params in exit_params.items()
         for param in params
@@ -295,12 +312,13 @@ def exit_cells(
         for cap in (caps if style in ("band", "revert_frac") else [None])
         for sstop in sstops
         for stop in stops
+        for mhl in mhls
     ]
 
 
 def _grid_inputs(data, trade, candidate, entry_zs, exit_params, stop_losses,
                  stop_loss_bps, execution_lag, half_life_caps=(None,),
-                 signal_stops=(None,)) -> tuple[pl.DataFrame, pl.DataFrame, list[tuple]]:
+                 signal_stops=(None,), max_half_lives=(None,)) -> tuple[pl.DataFrame, pl.DataFrame, list[tuple]]:
     """Aligned data, the frozen candidate's signal frame and the valid grid cells."""
     # Engine and signal frame must share precisely the same bar index.  The
     # feature can have a shorter history than the executable target legs, so
@@ -309,7 +327,8 @@ def _grid_inputs(data, trade, candidate, entry_zs, exit_params, stop_losses,
     # sees the same column requested twice and polars refuses the projection.
     data = align_columns(
         data, list(dict.fromkeys([candidate["target"], candidate["feature"], *trade.legs,
-                                 *candidate.get("weight_columns", {}).values()]))
+                                 *candidate.get("weight_columns", {}).values()])),
+        optional=[c for c in data.columns if c.startswith(REGIME_PREFIX)],  # macro regime gates
     ).sort("ts")
     if execution_lag not in (0, 1):
         raise ValueError("execution_lag must be 0 or 1")
@@ -329,7 +348,7 @@ def _grid_inputs(data, trade, candidate, entry_zs, exit_params, stop_losses,
     )
     cells = exit_cells(entry_zs, exit_params,
                        list(stop_losses) if stop_losses is not None else [stop_loss_bps],
-                       half_life_caps, signal_stops)
+                       half_life_caps, signal_stops, max_half_lives)
     return data, state, cells
 
 
@@ -348,6 +367,7 @@ def run_detail(
     execution_lag: int,
     half_life_cap: float | None = None,
     signal_stop: float | None = None,
+    max_entry_half_life: float | None = None,
 ) -> dict:
     """One cell through the exact Engine: metrics row, trades with MAE/MFE, equity, years.
 
@@ -357,7 +377,7 @@ def run_detail(
         data, trade, candidate, entry_z=entry_z, exit_style=exit_style,
         exit_param=exit_param, stop_loss_bps=stop_loss_bps or None,
         state=state, execution_lag=execution_lag,
-        half_life_cap=half_life_cap, signal_stop=signal_stop,
+        half_life_cap=half_life_cap, signal_stop=signal_stop, max_entry_half_life=max_entry_half_life,
     )
     result = Engine(BacktestConfig(
         transaction_cost_bps=round_trip_cost_bps,
@@ -370,6 +390,7 @@ def run_detail(
         "signal_units": "target units" if candidate.get("signal_kind") == "raw" else "standard deviations",
         "entry_z": entry_z, "exit_style": exit_style,
         "exit_param": exit_param, "half_life_cap": half_life_cap, "signal_stop": signal_stop,
+        "max_entry_half_life": max_entry_half_life,
         **_metrics(result),
     }
     if candidate.get("split_date"):
@@ -410,6 +431,7 @@ def detail_for(
     execution_lag: int,
     half_life_cap: float | None = None,
     signal_stop: float | None = None,
+    max_entry_half_life: float | None = None,
 ) -> dict:
     """Exact Engine detail for one grid cell, on the same alignment as the grid."""
     data, state, _ = _grid_inputs(data, trade, candidate, [], {}, None, None, execution_lag)
@@ -417,7 +439,7 @@ def detail_for(
         data, trade, candidate, state=state, config_id=config_id, entry_z=entry_z,
         exit_style=exit_style, exit_param=exit_param, stop_loss_bps=stop_loss_bps,
         round_trip_cost_bps=round_trip_cost_bps, execution_lag=execution_lag,
-        half_life_cap=half_life_cap, signal_stop=signal_stop,
+        half_life_cap=half_life_cap, signal_stop=signal_stop, max_entry_half_life=max_entry_half_life,
     )
 
 
@@ -435,23 +457,24 @@ def run_grid(
     execution_lag: int = 0,
     half_life_caps: Iterable[float | None] = (None,),
     signal_stops: Iterable[float | None] = (None,),
+    max_half_lives: Iterable[float | None] = (None,),
 ) -> tuple[pl.DataFrame, dict]:
     """Run every requested entry/exit cell through the exact Engine."""
     data, state, cells = _grid_inputs(data, trade, candidate, entry_zs, exit_params,
                                       stop_losses, stop_loss_bps, execution_lag,
-                                      half_life_caps, signal_stops)
+                                      half_life_caps, signal_stops, max_half_lives)
     rows: list[dict] = []
     selected: dict = {}
     runs: dict = {}
     rank_metric = "earlier_sharpe" if candidate.get("split_date") else "sharpe"
     if not cells:
         raise ValueError("No valid exit combinations: exit bands must be below entry thresholds")
-    for done, (entry_z, style, exit_param, stop, cap, sstop) in enumerate(cells, 1):
+    for done, (entry_z, style, exit_param, stop, cap, sstop, mhl) in enumerate(cells, 1):
         run = run_detail(
             data, trade, candidate, state=state, config_id=str(done), entry_z=entry_z,
             exit_style=style, exit_param=exit_param, stop_loss_bps=stop,
             round_trip_cost_bps=round_trip_cost_bps, execution_lag=execution_lag,
-            half_life_cap=cap, signal_stop=sstop,
+            half_life_cap=cap, signal_stop=sstop, max_entry_half_life=mhl,
         )
         row = run["metrics"]
         rows.append(row)
@@ -479,6 +502,7 @@ def run_vector_grid(
     execution_lag: int = 0,
     half_life_caps: Iterable[float | None] = (None,),
     signal_stops: Iterable[float | None] = (None,),
+    max_half_lives: Iterable[float | None] = (None,),
 ) -> tuple[pl.DataFrame, dict, pl.DataFrame, pl.DataFrame]:
     """``run_grid``'s table from the vectorised engine; exact detail for the best cell only.
 
@@ -489,7 +513,8 @@ def run_vector_grid(
     per-config yearly P&L and the aligned data the grid was run on.
     """
     data, state, cells = _grid_inputs(data, trade, candidate, entry_zs, exit_params,
-                                      stop_losses, None, execution_lag, half_life_caps, signal_stops)
+                                      stop_losses, None, execution_lag, half_life_caps, signal_stops,
+                                      max_half_lives)
     if not cells:
         raise ValueError("No valid exit combinations: exit bands must be below entry thresholds")
     gated = candidate.get("gate", "(none)") not in (None, "(none)")
@@ -498,6 +523,7 @@ def run_vector_grid(
         "entry": [c[0] for c in cells], "exit_style": [c[1] for c in cells],
         "exit_param": [c[2] for c in cells], "stop": [float(c[3] or 0.0) for c in cells],
         "cap": [float(c[4] or 0.0) for c in cells], "signal_stop": [float(c[5] or 0.0) for c in cells],
+        "max_hl": [float(c[6] or 0.0) for c in cells],
     })
     weights = candidate.get("weight_columns")
     split = candidate.get("split_date")
@@ -522,6 +548,7 @@ def run_vector_grid(
         "entry_z": m["entry"], "exit_style": m["exit_style"], "exit_param": m["exit_param"],
         "half_life_cap": pl.Series([c[4] for c in cells], dtype=pl.Float64),
         "signal_stop": pl.Series([c[5] for c in cells], dtype=pl.Float64),
+        "max_entry_half_life": pl.Series([c[6] for c in cells], dtype=pl.Float64),
     }).with_columns(m.select(
         "total_pnl_bps", "n_trades", "trade_win_rate", "sharpe", "max_drawdown_bps", "avg_holding_days",
         "avg_pnl_per_trade_bps", "closed_pnl_bps", "time_in_market_pct", "open_trades",
@@ -554,5 +581,6 @@ def run_vector_grid(
         exit_style=best["exit_style"], exit_param=best["exit_param"], stop_loss_bps=best["stop_loss_bps"],
         round_trip_cost_bps=round_trip_cost_bps, execution_lag=execution_lag,
         half_life_cap=best["half_life_cap"], signal_stop=best["signal_stop"],
+        max_entry_half_life=best["max_entry_half_life"],
     )
     return grid, {**detail, "runs": {best["config_id"]: detail}, "rank_metric": rank_metric}, yearly, data

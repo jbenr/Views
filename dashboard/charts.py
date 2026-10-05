@@ -645,3 +645,62 @@ def residual_bars_chart(tenors: list[str], values: list[float], title: str, unit
     ax.margins(x=0.03, y=0.18)
     fig.suptitle(title.upper(), fontsize=viz.TITLE_SIZE, fontweight="bold", color="#333", x=0.02, ha="left", y=0.98)
     return _png(fig)
+
+
+REGIME_COLOURS = (C2, "#BDBDBD", ORANGE)  # low side, middle, high side
+
+
+@_one_at_a_time
+def regime_timeline_chart(series: pl.DataFrame, states: list[str], title: str, units: str,
+                          thresholds: tuple[float, ...] = (), window_bars: int | str | None = None) -> str:
+    """A regime's value through time, with the background shaded by its confirmed state.
+
+    ``window_bars`` zooms the chart (a bar count, "YTD" or None for all); the
+    regime itself is always computed on its full history.
+    """
+    viz = _PngViz()
+    frame = series.to_pandas().set_index("ts")
+    frame.index = pd.to_datetime(frame.index)
+    frame = _slice_window(frame, window_bars, None)
+    fig, ax = plt.subplots(figsize=(12, 3.8))
+    fig.patch.set_facecolor("white")
+    for state, colour in zip(states, REGIME_COLOURS):
+        ax.fill_between(frame.index, 0, 1, where=(frame["state"] == state).to_numpy(), color=colour, alpha=0.22,
+                        linewidth=0, transform=ax.get_xaxis_transform(), label=state, step="mid")
+    ax.plot(frame.index, frame["value"], color="#333", linewidth=1.0)
+    for level in thresholds:
+        ax.axhline(level, color=DIM, linestyle="--", linewidth=0.9)
+    viz._style_ax(ax, yaxis_title=units)
+    viz._format_dates(ax, frame.index.min(), frame.index.max())
+    ax.legend(loc="upper left", bbox_to_anchor=(0, -0.12), ncol=len(states), fontsize=9, frameon=False)
+    fig.suptitle(title.upper(), fontsize=viz.TITLE_SIZE, fontweight="bold", color="#333", x=0.02, ha="left", y=0.98)
+    return _png(fig)
+
+
+@_one_at_a_time
+def regime_gate_chart(series: pl.DataFrame, title: str, window_bars: int | str | None = None,
+                      fig_height: float = 2.8) -> str:
+    """When a macro regime gate is open: days the regime is in the gate's state, shaded, through time.
+
+    ``series`` holds ``ts`` and a boolean ``gate_allow``. Same window
+    handling as ``gate_chart`` (a bar count, "YTD", or None for all).
+    """
+    frame = _pandas_indexed(series.select("ts", pl.col("gate_allow").cast(pl.Float64)), ["gate_allow"])
+    frame = _slice_window(frame, window_bars, None)
+    viz = _PngViz(fig_height=fig_height)
+
+    def render(fig, ax, start, end):
+        subset = frame.loc[start:end, "gate_allow"].fillna(0.0)
+        ax.fill_between(subset.index, 0.0, subset.to_numpy(), step="post", color=C1, alpha=0.55,
+                        linewidth=0, label="gate open (regime in this state)")
+        ax.fill_between(subset.index, 0.0, 1.0 - subset.to_numpy(), step="post", color=C0, alpha=0.12,
+                        linewidth=0, label="gate closed")
+        ax.set_ylim(0.0, 1.0)
+        viz._style_ax(ax)
+        ax.set_yticks([])
+        viz._format_dates(ax, start, end)
+        viz._legend(ax)
+        ax.set_xlim(start, end)
+        fig.subplots_adjust(bottom=0.3)
+
+    return viz._make_time_nav(frame, render, title=title)
