@@ -15,7 +15,9 @@ yields ×100 so everything downstream is natively in bps. That lives here now.
 
 from __future__ import annotations
 
+import io
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import Union
 
 import pandas as pd
@@ -365,3 +367,60 @@ def pick_ticker(candidates: list[str], start: str) -> str | None:
     if out.empty:
         return None
     return str(out.loc[0, "ticker"])
+
+
+# ---- NY Fed ACM term premium -------------------------------------------------
+
+ACM_DAILY_URL = "https://www.newyorkfed.org/medialibrary/media/research/data_indicators/ACMTermPremium.xls"
+ACM_MONTHLY_URL = "https://www.newyorkfed.org/medialibrary/media/research/data_indicators/acmPlot_data.csv"
+ACM_CACHE = Path(__file__).resolve().parent.parent / "research" / "data" / "acm_term_premium.parquet"
+
+
+def _acm_daily(content: bytes) -> pl.DataFrame:
+    """The daily sheet of ACMTermPremium.xls: DATE plus ACMY/ACMTP/ACMRNY 01-10 (percent)."""
+    book = pd.read_excel(io.BytesIO(content), sheet_name=None)  # needs xlrd for the .xls format
+    sheet = max(book.values(), key=lambda f: len(f) if "DATE" in [str(c).upper() for c in f.columns] else 0)
+    sheet = sheet.rename(columns={c: str(c).upper() for c in sheet.columns})
+    out = pl.from_pandas(sheet).with_columns(pl.col("DATE").cast(pl.Utf8).str.to_date(strict=False, format=None))
+    columns = {"DATE": "ts", **{f"ACMTP{t:02d}": f"tp{t}" for t in range(1, 11)},
+               **{f"ACMY{t:02d}": f"fitted{t}" for t in range(1, 11)},
+               **{f"ACMRNY{t:02d}": f"expected{t}" for t in range(1, 11)}}
+    out = out.select([pl.col(c).alias(a) for c, a in columns.items() if c in out.columns])
+    return out.with_columns(pl.exclude("ts").cast(pl.Float64) * 100.0).drop_nulls("ts").sort("ts")
+
+
+def _acm_monthly(text: str) -> pl.DataFrame:
+    """The NY Fed's chart feed: month-end 10y term premium, ACM-fitted and actual (GSW) 10y yields (percent)."""
+    frame = pl.read_csv(io.StringIO(text))
+    return frame.select(
+        pl.col("RunDates").str.to_date("%d-%b-%Y").alias("ts"),
+        (pl.col("TERMYld").cast(pl.Float64) * 100.0).alias("tp10"),
+        (pl.col("ACMFITYld").cast(pl.Float64) * 100.0).alias("fitted10"),
+    ).with_columns((pl.col("fitted10") - pl.col("tp10")).alias("expected10")).sort("ts")
+
+
+def load_acm_term_premium(refresh: bool = False, max_age_hours: float = 24.0) -> tuple[pl.DataFrame, str]:
+    """The NY Fed's ACM term premium (Adrian, Crump & Moench), in bp, and which frequency it is.
+
+    Columns: ts, tp<N> (term premium), fitted<N> (model yield) and
+    expected<N> (risk-neutral, expected-path yield = fitted - term premium)
+    for N = 1..10 years when the daily .xls can be read (needs the xlrd
+    package), otherwise month-end 10y only from the NY Fed's chart feed.
+    Cached to research/data for ``max_age_hours``; the NY Fed updates daily.
+    """
+    import time
+    import requests
+
+    if ACM_CACHE.is_file() and not refresh and time.time() - ACM_CACHE.stat().st_mtime < max_age_hours * 3600:
+        frame = pl.read_parquet(ACM_CACHE)
+        return frame, "daily" if "tp2" in frame.columns else "monthly"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        frame = _acm_daily(requests.get(ACM_DAILY_URL, timeout=60, headers=headers).content)
+        frequency = "daily"
+    except ImportError:
+        frame = _acm_monthly(requests.get(ACM_MONTHLY_URL, timeout=60, headers=headers).text)
+        frequency = "monthly"
+    ACM_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    frame.write_parquet(ACM_CACHE)
+    return frame, frequency

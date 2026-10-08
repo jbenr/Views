@@ -704,3 +704,19 @@ def regime_gate_chart(series: pl.DataFrame, title: str, window_bars: int | str |
         fig.subplots_adjust(bottom=0.3)
 
     return viz._make_time_nav(frame, render, title=title)
+
+
+@_one_at_a_time
+def series_chart(data: pl.DataFrame, cols: list[str], title: str, yaxis_title: str = "bp",
+                 left: list[str] | None = None, yaxis_right_title: str | None = None, hlines=None,
+                 window_bars: int | str | None = None, line_colors: dict | None = None,
+                 fig_height: float | None = None) -> str:
+    """Any ``ts`` + columns frame as a house line chart, zoomed to ``window_bars`` ("YTD", a bar count, None = all).
+
+    ``left`` columns go on the left axis, the rest on the right; missing values
+    (e.g. a monthly series on a daily frame) are skipped, not drawn as zero.
+    """
+    frame = _slice_window(_pandas_indexed(data, cols), window_bars, None)
+    return _PngViz(fig_height=fig_height).line(
+        frame, cols=cols, title=title, yaxis_title=yaxis_title, yaxis_right_title=yaxis_right_title,
+        left=left or [], hlines=hlines, line_colors=line_colors or {})

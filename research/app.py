@@ -31,12 +31,14 @@ from dashboard.charts import (
     hedge_weights_chart,
     level_chart,
     regime_timeline_chart,
+    series_chart,
     regression_scatter_chart,
     residual_bars_chart,
 )
 from dataclasses import asdict
 from research.regimes import REGIMES, STATES, RegimeParams, regime_column, regimes, with_regimes
 from research.curve_pca import PCA_TENORS, PCA_WINDOWS, pca_curve
+from research.term_premium import CURVE as TP_CURVE, FLY as TP_FLY, TP_WINDOWS, term_premium
 
 from research.panel import (
     BETA_LOOKBACK,
@@ -68,7 +70,7 @@ from research import artifacts, jobs, progress as work
 from research.preferences import load_controls, load_preferences, save_controls, save_preferences
 from backtest.engine import TradeDef
 from utils.research_app import (
-    BORDER, C0, C1, DIM, ORANGE, PANEL, TEXT, make_app, run,
+    BORDER, C0, C1, C2, DIM, ORANGE, PANEL, TEXT, make_app, run,
     shimmer_loader, stat_block,
 )
 from utils.viz import table_div
@@ -567,7 +569,7 @@ REMEMBERED = [
     "bt-entry-zs", "bt-exit-styles", "bt-time-stops", "bt-bands", "bt-revert-fracs", "bt-half-lives", "bt-caps",
     "bt-signal-stops", "bt-stop", "bt-max-half-lives", "bt-cost", "bt-lag",
     "weighting", "beta-lb", "custom-kind", "custom-leg-1", "custom-leg-2", "custom-leg-3",
-    "fv-pca-tenors", "fv-pca-start", "fv-pca-window", "fv-pca-factors",
+    "fv-pca-tenors", "fv-pca-start", "fv-pca-window", "fv-pca-factors", "tp-start", "tp-lookback",
     "reg-start", "reg-pricing", "reg-vol-window", "reg-vol-rank", "reg-vol-bands", "reg-oil-window", "reg-oil-bands",
     "reg-infl-bands", "dis-regimes", "dis-min-episodes", "dis-regime-placebo",
     "reg-confirm",
@@ -1795,6 +1797,116 @@ def regimes_view(result: dict, params: RegimeParams, window: str = REGIME_WINDOW
     return html.Div(cards)
 
 
+TP_WINDOW = "5Y"  # the term premium charts open on five years
+
+
+def term_premium_tab() -> html.Div:
+    controls = html.Div([
+        field("history from", dcc.Dropdown(id="tp-start", value="2000-01-01", clearable=False, options=[
+            {"label": "2000", "value": "2000-01-01"}, {"label": "2010", "value": "2010-01-01"},
+            {"label": "2015", "value": "2015-01-01"}])),
+        field("regression window (rolling, point-in-time)", dcc.Dropdown(
+            id="tp-lookback", value=504, clearable=False,
+            options=[{"label": f"{w} days", "value": w} for w in TP_WINDOWS])),
+        html.Button("Update", id="tp-run", n_clicks=0, className="ref-btn",
+                    style={**btn_style(primary=True), "width": "100%", "marginTop": 4, "marginBottom": 14}),
+        info("How this is built",
+             f"The {TP_FLY} fly (2 x 10y - 2y - 30y) is regressed on {TP_CURVE} over a rolling window using only data "
+             "known each day. Fair value is the fitted fly; the residual (fly - fair value) is how far the 10y sits "
+             "against its wings beyond what the curve's slope implies -- a structural, model-free read on long-end "
+             "compensation. z divides it by its own rolling standard deviation; R2 is the window's squared "
+             f"correlation of the fly with {TP_CURVE}.",
+             "The ACM term premium is the NY Fed's model estimate (Adrian, Crump & Moench), downloaded from the NY "
+             "Fed and cached for a day. Without the xlrd package only the month-end 10y series is available; "
+             "install it (mamba install -n 2s10s xlrd) for the daily series at every tenor."),
+    ], className="research-controls")
+    return html.Div([
+        html.Div([html.Div("TERM PREMIUM", style=HEADING), note(
+            f"The {TP_FLY} fly's residual against {TP_CURVE}, beside the NY Fed's ACM term premium: a model-free "
+            "proxy and the standard model estimate of the compensation for holding the long end.", "dim")],
+            className="research-banner", style={"display": "block"}),
+        html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)", "gap": 26,
+                        "alignItems": "start"}, children=[
+            controls,
+            html.Div([level_window_nav(TP_WINDOW, prefix="tp-window"),
+                      dcc.Loading(html.Div(id="tp-out"), type="dot")]),
+        ]),
+        dcc.Store(id="tp-shown"),
+        dcc.Store(id="tp-window", data=TP_WINDOW),
+    ])
+
+
+def term_premium_view(result: dict, lookback: int, window: str = TP_WINDOW) -> html.Div:
+    """Today's numbers, the fly against its fair value, the residual against ACM, beta and R2, and ACM's split."""
+    signals = result["signals"]
+    live = signals.drop_nulls("residual")
+    if live.is_empty():
+        return note("Not enough history for the regression window.", "warn")
+    now = live.row(-1, named=True)
+    acm, tenor, freq = result["acm"], result["tenor"], result["acm_frequency"]
+    tp = f"tp{tenor}"
+    acm_live = acm.drop_nulls(tp)
+    acm_now = acm_live.row(-1, named=True) if len(acm_live) else None
+    year_ago = acm_live.filter(pl.col("ts") <= pl.lit(acm_now["ts"]).dt.offset_by("-1y")) if acm_now else None
+    acm_change = (acm_now[tp] - year_ago[tp][-1]) if acm_now and year_ago is not None and len(year_ago) else None
+    comparison = result["comparison"]
+    # Window by date, from the daily data: a bar count on the monthly ACM series would span decades.
+    bars, last = WINDOW_PRESETS.get(window), signals["ts"][-1]
+    since = (None if bars is None else
+             last.replace(month=1, day=1) if bars == "YTD" else signals["ts"][max(0, len(signals) - int(bars))])
+    if since is not None:
+        signals, acm = signals.filter(pl.col("ts") >= since), acm.filter(pl.col("ts") >= since)
+    bars = None
+    std = float(live["residual"].std())
+    beta_col = f"beta_{TP_CURVE}"
+    joined = signals.select("ts", pl.col(TP_FLY).alias("2s10s30s fly"), pl.col("fair_value").alias("fair value from 2s10s"),
+                            pl.col("residual").alias("fly residual"), pl.col(beta_col).alias("beta to 2s10s"),
+                            pl.col("r2").alias("R2"))
+    with_acm = joined.join(acm.select("ts", pl.col(tp).alias(f"ACM {tenor}y term premium")), on="ts", how="full",
+                           coalesce=True).sort("ts")
+    stats = html.Div([
+        stat_block("as of", str(now["ts"])),
+        stat_block(f"{TP_FLY} fly", f"{now[TP_FLY]:.1f} bp"),
+        stat_block("fair value", f"{now['fair_value']:.1f} bp"),
+        stat_block("residual", f"{now['residual']:+.1f} bp"),
+        stat_block("z", f"{now['z']:+.2f}" if now.get("z") is not None else "—"),
+        stat_block(f"beta · R2 ({lookback}d)", f"{now[beta_col]:.2f} · {now['r2']:.2f}"),
+        stat_block("residual half-life", f"{result['half_life']:.0f} d" if result.get("half_life") else "—"),
+        stat_block(f"ACM {tenor}y term premium", f"{acm_now[tp]:+.0f} bp ({acm_now['ts']})" if acm_now else "—"),
+        stat_block("ACM 1y change", f"{acm_change:+.0f} bp" if acm_change is not None else "—"),
+    ], style={"display": "flex", "gap": 28, "flexWrap": "wrap", "marginBottom": 14, "paddingBottom": 12,
+              "borderBottom": f"1px solid {BORDER}"})
+    corr = (f"Fly residual vs ACM {tenor}y on ACM's {'dates' if freq == 'daily' else 'month-ends'}: correlation "
+            f"{comparison['level_corr']:+.2f} in levels, {comparison['change_corr']:+.2f} in changes."
+            if comparison.get("level_corr") is not None and comparison.get("change_corr") is not None else "")
+    return html.Div([
+        stats,
+        _png_img(series_chart(with_acm, ["fly residual", f"ACM {tenor}y term premium"],
+                              f"fly residual vs ACM {tenor}y term premium", yaxis_title="residual bp",
+                              left=[f"ACM {tenor}y term premium"], yaxis_right_title="ACM bp",
+                              hlines=[{"value": k * std, "style": "dotted", "color": DIM, "alpha": 0.7}
+                                      for k in (-2, -1, 1, 2)] + [{"value": 0.0, "style": "solid", "color": DIM}],
+                              window_bars=bars, line_colors={"fly residual": ORANGE,
+                                                             f"ACM {tenor}y term premium": C2})),
+        note(corr + (" ACM here is month-end only; install xlrd for the daily series." if freq != "daily" else ""),
+             "dim"),
+        _png_img(series_chart(joined, ["2s10s30s fly", "fair value from 2s10s"],
+                              f"{TP_FLY} vs its fair value from {TP_CURVE} ({lookback}d rolling)", window_bars=bars,
+                              line_colors={"2s10s30s fly": ORANGE, "fair value from 2s10s": C2})),
+        _png_img(series_chart(joined, ["beta to 2s10s", "R2"], f"rolling beta to {TP_CURVE} and R2", yaxis_title="beta",
+                              left=["R2"], yaxis_right_title="R2", window_bars=bars,
+                              line_colors={"beta to 2s10s": ORANGE, "R2": DIM}, fig_height=3.6)),
+        _png_img(series_chart(acm.select("ts", pl.col(f"fitted{tenor}").alias(f"ACM fitted {tenor}y yield"),
+                                         pl.col(f"expected{tenor}").alias("expected path (risk-neutral)"),
+                                         pl.col(tp).alias("term premium")),
+                              [f"ACM fitted {tenor}y yield", "expected path (risk-neutral)", "term premium"],
+                              f"ACM {tenor}y: yield = expected path + term premium", window_bars=bars,
+                              left=["term premium"], yaxis_right_title="term premium bp",
+                              line_colors={f"ACM fitted {tenor}y yield": "#333", "expected path (risk-neutral)": C2,
+                                           "term premium": ORANGE})),
+    ])
+
+
 def fair_value_tab() -> html.Div:
     return remember_controls(html.Div(style={"padding": "14px 24px"}, children=[
         html.Div(id="fair-value-context", style={"display": "none"}),  # Setup's Fill tabs still writes here
@@ -1802,17 +1914,7 @@ def fair_value_tab() -> html.Div:
             dcc.Tab(label="PCA", value="pca", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
                     children=html.Div(pca_tab(), style={"paddingTop": 14})),
             dcc.Tab(label="Term Premium", value="tp", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
-                    children=html.Div(fv_placeholder(
-                        "term premium",
-                        "How much of the long end is compensation for duration risk rather than the expected path "
-                        "of rates, built from our own curve rather than a published model.",
-                        ["A structural model: the 2s10s30s fly regressed on the residual of 2s vs 10s (the part of "
-                         "10s the front end does not explain), to be specified together.",
-                         "Rolling multi-factor fit with stationarity, error-correction speed and coefficient "
-                         "stability (FairValueStudy), so the residual is a tradeable fair-value gap."],
-                        ["Generic yields 2y–30y and on-the-run bonds: in the database.",
-                         "No published term premium (ACM / Kim-Wright) stored; not needed for our own model."]),
-                        style={"paddingTop": 14})),
+                    children=html.Div(term_premium_tab(), style={"paddingTop": 14})),
             dcc.Tab(label="Inflation", value="infl", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
                     children=html.Div(fv_placeholder(
                         "inflation",
@@ -2346,6 +2448,29 @@ def register_callbacks(app) -> None:
             return regimes_view(regimes(start or "2000-01-01", params), params, window), window
         except Exception as exc:
             return note(f"Regimes failed: {type(exc).__name__}: {exc}", "bad"), no_update
+
+    @app.callback(Output("tp-window", "data"), *[Output(f"tp-window-{key}", "style") for key in WINDOW_PRESETS],
+                  *[Input(f"tp-window-{key}", "n_clicks") for key in WINDOW_PRESETS], prevent_initial_call=True)
+    def _tp_window(*clicks):
+        if not any(clicks):
+            return (no_update,) * (1 + len(WINDOW_PRESETS))
+        selected = ctx.triggered_id.removeprefix("tp-window-")
+        return (selected, *[btn_style(primary=(key == selected)) for key in WINDOW_PRESETS])
+
+    @app.callback(Output("tp-out", "children"), Output("tp-shown", "data"),
+                  Input("tp-run", "n_clicks"), Input("bench-tabs", "value"), Input("fv-tabs", "value"),
+                  Input("tp-window", "data"), State("tp-start", "value"), State("tp-lookback", "value"),
+                  State("tp-shown", "data"))
+    def _term_premium(clicks, tab, fv_tab, window, start, lookback, shown):
+        # Runs on Update, when the Term Premium tab is first opened, and when the chart window changes.
+        window = window if window in WINDOW_PRESETS else TP_WINDOW
+        if not clicks and (tab != "fv" or fv_tab != "tp" or shown == window):
+            return no_update, no_update
+        try:
+            result = term_premium(start or "2000-01-01", int(lookback or 504))
+            return term_premium_view(result, int(lookback or 504), window), window
+        except Exception as exc:
+            return note(f"Term premium failed: {type(exc).__name__}: {exc}", "bad"), no_update
 
     @app.callback(Output("fv-pca-out", "children"), Output("fv-pca-settings", "data"),
                   Input("fv-pca-run", "n_clicks"), Input("bench-tabs", "value"),
