@@ -39,6 +39,7 @@ from dataclasses import asdict
 from research.regimes import REGIMES, STATES, RegimeParams, regime_column, regimes, with_regimes
 from research.curve_pca import PCA_TENORS, PCA_WINDOWS, pca_curve
 from research.term_premium import CURVE as TP_CURVE, FLY as TP_FLY, TP_WINDOWS, term_premium
+from research.inflation_carry import BREAKEVENS, HORIZONS, carry, carry_table, load_inflation
 
 from research.panel import (
     BETA_LOOKBACK,
@@ -570,6 +571,7 @@ REMEMBERED = [
     "bt-signal-stops", "bt-stop", "bt-max-half-lives", "bt-cost", "bt-lag",
     "weighting", "beta-lb", "custom-kind", "custom-leg-1", "custom-leg-2", "custom-leg-3",
     "fv-pca-tenors", "fv-pca-start", "fv-pca-window", "fv-pca-factors", "tp-start", "tp-lookback",
+    "infl-horizon", "infl-start",
     "reg-start", "reg-pricing", "reg-vol-window", "reg-vol-rank", "reg-vol-bands", "reg-oil-window", "reg-oil-bands",
     "reg-infl-bands", "dis-regimes", "dis-min-episodes", "dis-regime-placebo",
     "reg-confirm",
@@ -1797,6 +1799,16 @@ def regimes_view(result: dict, params: RegimeParams, window: str = REGIME_WINDOW
     return html.Div(cards)
 
 
+def window_start(dates: pl.Series, window: str):
+    """The first date a chart window shows, counted in bars of a daily ``dates`` series (None = all history)."""
+    bars = WINDOW_PRESETS.get(window)
+    if bars is None or not len(dates):
+        return None
+    if bars == "YTD":
+        return dates[-1].replace(month=1, day=1)
+    return dates[max(0, len(dates) - int(bars))]
+
+
 TP_WINDOW = "5Y"  # the term premium charts open on five years
 
 
@@ -1851,9 +1863,7 @@ def term_premium_view(result: dict, lookback: int, window: str = TP_WINDOW) -> h
     acm_change = (acm_now[tp] - year_ago[tp][-1]) if acm_now and year_ago is not None and len(year_ago) else None
     comparison = result["comparison"]
     # Window by date, from the daily data: a bar count on the monthly ACM series would span decades.
-    bars, last = WINDOW_PRESETS.get(window), signals["ts"][-1]
-    since = (None if bars is None else
-             last.replace(month=1, day=1) if bars == "YTD" else signals["ts"][max(0, len(signals) - int(bars))])
+    since = window_start(signals["ts"], window)
     if since is not None:
         signals, acm = signals.filter(pl.col("ts") >= since), acm.filter(pl.col("ts") >= since)
     bars = None
@@ -1907,6 +1917,87 @@ def term_premium_view(result: dict, lookback: int, window: str = TP_WINDOW) -> h
     ])
 
 
+INFL_WINDOW = "5Y"
+
+
+def inflation_tab() -> html.Div:
+    controls = html.Div([
+        field("carry horizon", dcc.Dropdown(id="infl-horizon", value="3m", clearable=False,
+                                            options=[{"label": k, "value": k} for k in HORIZONS])),
+        field("history from", dcc.Dropdown(id="infl-start", value="2004-01-01", clearable=False, options=[
+            {"label": "2004 (inflation swaps start)", "value": "2004-01-01"}, {"label": "2010", "value": "2010-01-01"},
+            {"label": "2015", "value": "2015-01-01"}])),
+        html.Button("Update", id="infl-run", n_clicks=0, className="ref-btn",
+                    style={**btn_style(primary=True), "width": "100%", "marginTop": 4, "marginBottom": 14}),
+        info("How carry is measured",
+             "A long breakeven (long TIPS, short nominals) earns realized inflation on the TIPS and pays the "
+             "breakeven on the nominal. Over the horizon h that is (near-term inflation - breakeven) x h; divided by "
+             "the tenor as a duration proxy it is in breakeven bp. Near-term inflation is the 1y zero-coupon "
+             "inflation swap (no CPI fixings are in the database).",
+             "Roll-down is the breakeven sliding along the curve as an N-year becomes an (N-h)-year, read off the "
+             "inflation swap curve (the breakeven curve has only 5/10/30y points). Carry = accrual + roll-down: how "
+             "many bp the breakeven can fall over the horizon before a long loses money. Carry / vol divides it by "
+             "the breakeven's realized vol over the same horizon (last 63 days).",
+             "Isolated one-day inflation-swap spikes -- a print that jumps more than 40bp (1y) or 20bp (longer "
+             "tenors) away from both neighbours, which agree -- are treated as bad prints (e.g. Good Friday 2024's "
+             "sign flip) and replaced by the previous print. Real moves, like late 2008's collapse, stay."),
+    ], className="research-controls")
+    return html.Div([
+        html.Div([html.Div("INFLATION · BREAKEVEN CARRY", style=HEADING), note(
+            "What a long breakeven earns if nothing moves: near-term inflation accrued against the breakeven paid, "
+            "plus the roll down the inflation curve, for 5, 10 and 30y breakevens.", "dim")],
+            className="research-banner", style={"display": "block"}),
+        html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)", "gap": 26,
+                        "alignItems": "start"}, children=[
+            controls,
+            html.Div([level_window_nav(INFL_WINDOW, prefix="infl-window"),
+                      dcc.Loading(html.Div(id="infl-out"), type="dot")]),
+        ]),
+        dcc.Store(id="infl-shown"),
+        dcc.Store(id="infl-window", data=INFL_WINDOW),
+    ])
+
+
+def inflation_view(series: pl.DataFrame, horizon: str, window: str = INFL_WINDOW) -> html.Div:
+    """Today's carry by tenor, the carry history, the 10y's components, and breakevens vs the 1y swap."""
+    live = series.drop_nulls("carry10")
+    if live.is_empty():
+        return note("Not enough inflation data for the chosen history.", "warn")
+    today = carry_table(series)
+    scale = max(float(today["carry_bp"].abs().max() or 0), 0.5)
+    since = window_start(series["ts"], window)
+    shown = series.filter(pl.col("ts") >= since) if since is not None else series
+    tenors = list(BREAKEVENS)
+    zero = [{"value": 0.0, "style": "solid", "color": DIM}]
+    return html.Div([
+        html.Div([stat_block("as of", str(live["ts"][-1])), stat_block("horizon", horizon),
+                  stat_block("1y inflation swap", f"{live['is1'][-1]:.0f} bp")],
+                 style={"display": "flex", "gap": 28, "flexWrap": "wrap", "marginBottom": 14, "paddingBottom": 12,
+                        "borderBottom": f"1px solid {BORDER}"}),
+        table(today.to_pandas(), title=f"breakeven carry over {horizon} · in breakeven bp", float_fmt=",.2f",
+              headers={"level_bp": "breakeven", "1y_infl_swap_bp": "1y infl swap", "accrual_bp": "accrual",
+                       "roll_bp": "roll-down", "carry_bp": "carry", "vol_bp": f"{horizon} vol",
+                       "carry_per_vol": "carry / vol"},
+              cell_style=lambda column, value, _row: _diverging(value, scale) if column == "carry_bp" else None),
+        _png_img(series_chart(shown.select("ts", *[pl.col(f"carry{n}").alias(f"{n}y") for n in tenors]),
+                              [f"{n}y" for n in tenors], f"breakeven carry over {horizon} (bp)", hlines=zero,
+                              line_colors={"5y": ORANGE, "10y": C2, "30y": DIM})),
+        _png_img(series_chart(shown.select("ts", pl.col("accrual10").alias("accrual"), pl.col("roll10").alias("roll-down"),
+                                           pl.col("carry10").alias("carry")),
+                              ["carry", "accrual", "roll-down"], f"10y breakeven carry over {horizon}: accrual + roll-down",
+                              hlines=zero, line_colors={"carry": "#333", "accrual": ORANGE, "roll-down": C2},
+                              fig_height=3.8)),
+        _png_img(series_chart(shown.select("ts", pl.col("is1").alias("1y inflation swap"),
+                                           *[pl.col(f"be{n}").alias(f"{n}y breakeven") for n in tenors]),
+                              ["1y inflation swap", *[f"{n}y breakeven" for n in tenors]],
+                              "breakevens vs near-term inflation (1y inflation swap)",
+                              line_colors={"1y inflation swap": "#333", "5y breakeven": ORANGE, "10y breakeven": C2,
+                                           "30y breakeven": DIM})),
+        note("Carry is positive while near-term inflation runs above the breakeven, and when the inflation curve "
+             "slopes up enough to roll down. Long-dated carry is small next to the breakeven's own volatility.", "dim"),
+    ])
+
+
 def fair_value_tab() -> html.Div:
     return remember_controls(html.Div(style={"padding": "14px 24px"}, children=[
         html.Div(id="fair-value-context", style={"display": "none"}),  # Setup's Fill tabs still writes here
@@ -1916,16 +2007,7 @@ def fair_value_tab() -> html.Div:
             dcc.Tab(label="Term Premium", value="tp", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
                     children=html.Div(term_premium_tab(), style={"paddingTop": 14})),
             dcc.Tab(label="Inflation", value="infl", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
-                    children=html.Div(fv_placeholder(
-                        "inflation",
-                        "Are breakevens rich or cheap against what usually drives them: oil, the dollar and "
-                        "nominal yields?",
-                        ["Breakeven fair value from oil, the dollar and nominals (FairValueStudy), per tenor.",
-                         "Breakeven curve (5s10s, 10s30s) and TIPS vs inflation-swap basis."],
-                        ["Breakevens and TIPS 5/10/30y (generics and by CUSIP), inflation swaps 1–30y from 2004, "
-                         "oil, gasoline, metals, the dollar: in the database.",
-                         "Missing: CPI and other economic releases, so no 'vs CPI trend' yet."]),
-                        style={"paddingTop": 14})),
+                    children=html.Div(inflation_tab(), style={"paddingTop": 14})),
             dcc.Tab(label="Positioning", value="pos", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
                     children=html.Div(fv_placeholder(
                         "positioning",
@@ -2448,6 +2530,29 @@ def register_callbacks(app) -> None:
             return regimes_view(regimes(start or "2000-01-01", params), params, window), window
         except Exception as exc:
             return note(f"Regimes failed: {type(exc).__name__}: {exc}", "bad"), no_update
+
+    @app.callback(Output("infl-window", "data"), *[Output(f"infl-window-{key}", "style") for key in WINDOW_PRESETS],
+                  *[Input(f"infl-window-{key}", "n_clicks") for key in WINDOW_PRESETS], prevent_initial_call=True)
+    def _infl_window(*clicks):
+        if not any(clicks):
+            return (no_update,) * (1 + len(WINDOW_PRESETS))
+        selected = ctx.triggered_id.removeprefix("infl-window-")
+        return (selected, *[btn_style(primary=(key == selected)) for key in WINDOW_PRESETS])
+
+    @app.callback(Output("infl-out", "children"), Output("infl-shown", "data"),
+                  Input("infl-run", "n_clicks"), Input("bench-tabs", "value"), Input("fv-tabs", "value"),
+                  Input("infl-window", "data"), State("infl-horizon", "value"), State("infl-start", "value"),
+                  State("infl-shown", "data"))
+    def _inflation(clicks, tab, fv_tab, window, horizon, start, shown):
+        # Runs on Update, when the Inflation tab is first opened, and when the chart window changes.
+        window = window if window in WINDOW_PRESETS else INFL_WINDOW
+        if not clicks and (tab != "fv" or fv_tab != "infl" or shown == window):
+            return no_update, no_update
+        try:
+            horizon = horizon if horizon in HORIZONS else "3m"
+            return inflation_view(carry(load_inflation(start or "2004-01-01"), horizon), horizon, window), window
+        except Exception as exc:
+            return note(f"Inflation carry failed: {type(exc).__name__}: {exc}", "bad"), no_update
 
     @app.callback(Output("tp-window", "data"), *[Output(f"tp-window-{key}", "style") for key in WINDOW_PRESETS],
                   *[Input(f"tp-window-{key}", "n_clicks") for key in WINDOW_PRESETS], prevent_initial_call=True)
