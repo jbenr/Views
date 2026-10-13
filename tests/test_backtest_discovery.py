@@ -202,7 +202,15 @@ def test_compact_discovery_boards_equal_full_ranking_row_for_row():
                                check_column_order=False)
     expected_checks = selection_checks(extras["cv_days"], extras["cv_sums"], extras["cv_sumsq"], "mean",
                                        eligible=(results["n_trades"] >= 5).to_numpy())
-    assert out["checks"] == expected_checks
+    # Discovery keeps the block sums as float32 (they are most of its memory), so the checks agree to
+    # ~7 digits: the same config chosen, the same percentile, Sharpes equal to rounding.
+    assert len(out["checks"]) == len(expected_checks)
+    for got, want in zip(out["checks"], expected_checks):
+        assert {k: got[k] for k in ("method", "held_out_block", "chosen_on_blocks", "config_index")} == {
+            k: want[k] for k in ("method", "held_out_block", "chosen_on_blocks", "config_index")}
+        for key in ("chosen_selection_score", "chosen_held_out_sharpe", "median_config_held_out_sharpe",
+                    "chosen_held_out_percentile"):
+            assert got[key] == pytest.approx(want[key], rel=1e-5, abs=1e-6), key
 
 
 def test_old_results_files_rank_to_the_same_boards_when_streamed(tmp_path):
@@ -298,3 +306,37 @@ def test_max_entry_half_life_only_enters_reverting_residuals_and_matches_the_eng
         assert row["pnl_bps"] == pytest.approx(e["earlier_pnl_bps"], abs=1e-9), row
         assert row["n_trades"] == len([t for t in selected["trades"] if str(t["exit_date"]) < split]), row
         assert all(0 < t["entry_half_life"] <= 6.0 for t in selected["trades"])  # every entry was reverting
+
+
+def _whole_grid_checks(days, sums, sumsq, score, eligible):
+    """The selection checks computed on the whole grid at once: the reference the streaming version must match."""
+    from backtest.validation import _selection_score
+    idx = np.flatnonzero(eligible)
+    days, sums, sumsq = np.asarray(days, dtype=float), sums[idx], sumsq[idx]
+    held_out = pooled_sharpe(days[None, :], sums, sumsq)
+    rows, folds = [], sums.shape[1]
+    for method in ("out-of-fold", "walk-forward"):
+        for k in range(1 if method == "walk-forward" else 0, folds):
+            chosen_from = [j for j in range(folds) if (j != k if method == "out-of-fold" else j < k)]
+            pick = int(np.argmax(_selection_score(days, sums, sumsq, chosen_from, score)))
+            others = held_out[:, k]
+            rows.append({"method": method, "held_out_block": k + 1, "config_index": int(idx[pick]),
+                         "chosen_held_out_sharpe": float(others[pick]),
+                         "median_config_held_out_sharpe": float(np.median(others)),
+                         "chosen_held_out_percentile": float((others < others[pick]).mean())})
+    return rows
+
+
+@pytest.mark.parametrize("score", ["sharpe", "mean", "worst"])
+def test_streamed_selection_checks_match_the_whole_grid(score):
+    rng = np.random.default_rng(8)
+    pnl = rng.normal(0.02, 1, size=(1000, 800))
+    days, sums, sumsq = _fold_stats(pnl, 4)
+    eligible = rng.random(1000) > 0.3
+    expected = _whole_grid_checks(days, sums, sumsq, score, eligible)
+    for chunk in (37, 250, 10_000):  # chunk edges anywhere, including one chunk for everything
+        got = selection_checks(days, sums, sumsq, score, eligible=eligible, chunk=chunk)
+        assert [r["config_index"] for r in got] == [r["config_index"] for r in expected]
+        for g, e in zip(got, expected):
+            for key in ("chosen_held_out_sharpe", "median_config_held_out_sharpe", "chosen_held_out_percentile"):
+                assert g[key] == pytest.approx(e[key], rel=1e-12, abs=1e-12), (chunk, key)

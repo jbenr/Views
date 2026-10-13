@@ -873,12 +873,30 @@ def run_key(plan: "_ScanPlan", settings: dict) -> str:
     return digest.hexdigest()[:20]
 
 
+def discovery_memory_gb(cells: int, cv_folds: int = 0) -> float:
+    """Peak memory (GB) a discovery run of ``cells`` needs: what ``_compact_pass`` keeps, plus ranking.
+
+    Per cell: 24 bytes kept (Sharpe, trades, P&L, win rate, holding days),
+    20 + 8 per block with cross-validation, and about 12 while ranking (the
+    family medians, eligibility and regime masks). About 2.5GB on top for the
+    process, the panel and each model's working tables. Measured on real
+    10s30s grids of 3.2M and 12.8M cells with 5 blocks: 84 bytes per extra
+    cell while backtesting, 88 at the ranking peak, 44 after the block sums
+    are freed.
+    """
+    folds = int(cv_folds) if cv_folds and cv_folds >= 2 else 0
+    per_cell = 24 + 12 + ((20 + 8 * folds) if folds else 0)
+    return cells * per_cell / 1e9 + 2.5
+
+
 def _compact_pass(plan: "_ScanPlan", progress=None, message=_model_message, checkpoint: Path | None = None) -> dict:
     """Backtest every cell, keeping only what ranking and the selection checks need.
 
     About 24 bytes per cell (Sharpe, trades, P&L, win rate, holding days),
-    plus 20 for CV scores and 16 per CV block for the block sums when
-    cross-validating, instead of a ~180-byte results row per cell. With ``checkpoint`` (a directory), each finished
+    plus 20 for CV scores and 8 per CV block for the block sums when
+    cross-validating, instead of a ~180-byte results row per cell. The block
+    sums are float32: at hundreds of millions of cells they are most of the
+    memory, and seven digits is ample for a block's P&L sum. With ``checkpoint`` (a directory), each finished
     model's numbers are saved there, and models already saved are loaded
     instead of rerun, so an interrupted pass resumes where it stopped.
     """
@@ -888,7 +906,8 @@ def _compact_pass(plan: "_ScanPlan", progress=None, message=_model_message, chec
     if plan.folds >= 2:
         out.update(cv_mean_sharpe=np.empty(total), cv_worst_sharpe=np.empty(total),
                    cv_positive_share=np.empty(total, dtype=np.float32),
-                   cv_sums=np.empty((total, plan.folds)), cv_sumsq=np.empty((total, plan.folds)))
+                   cv_sums=np.empty((total, plan.folds), dtype=np.float32),
+                   cv_sumsq=np.empty((total, plan.folds), dtype=np.float32))
     if checkpoint is not None:
         checkpoint.mkdir(parents=True, exist_ok=True)
     resumed = 0
@@ -941,23 +960,56 @@ def _family_medians(plan: "_ScanPlan", compact: dict, eligible: np.ndarray) -> n
     for members in groups.values():
         start, stop = plan.offsets[members[0]], plan.offsets[members[-1] + 1]
         width = (stop - start) // len(members)
-        values = np.where(eligible[start:stop], compact["sharpe"][start:stop], np.nan).reshape(len(members), width)
-        with np.errstate(all="ignore"), warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            family = np.nanmedian(values, axis=0)
-        medians[start:stop] = np.where(eligible[start:stop], np.tile(family, len(members)), np.nan)
+        # Views, worked a slice of cell positions at a time: whole-group temporaries
+        # (several GB each on a grid of hundreds of millions) exhausted the machine.
+        sharpe = compact["sharpe"][start:stop].reshape(len(members), width)
+        allowed = eligible[start:stop].reshape(len(members), width)
+        target = medians[start:stop].reshape(len(members), width)
+        step = max(1, _RANK_CHUNK // len(members))
+        for a in range(0, width, step):
+            keep = allowed[:, a:a + step]
+            values = np.where(keep, sharpe[:, a:a + step], np.nan)
+            with np.errstate(all="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                family = np.nanmedian(values, axis=0)
+            target[:, a:a + step] = np.where(keep, family[None, :], np.nan)
     return medians
 
 
+_RANK_CHUNK = 8_000_000  # cells ranked at a time, so ranking never copies the whole grid
+
+
 def _top_cells(score: np.ndarray, sharpe: np.ndarray, eligible: np.ndarray, top: int) -> np.ndarray:
-    """Global indices of the best ``top`` eligible cells: score, then Sharpe, descending; then index."""
-    index = np.flatnonzero(eligible)
-    if len(index) == 0:
-        return index
-    primary = np.where(np.isnan(score[index]), -np.inf, score[index])
-    if len(index) > top:
-        kth = np.partition(primary, len(primary) - top)[len(primary) - top]
-        index, primary = index[primary >= kth], primary[primary >= kth]
+    """Global indices of the best ``top`` eligible cells: score, then Sharpe, descending; then index.
+
+    Two passes over the grid in chunks: the first keeps a running top-``top``
+    of scores to find the cut-off, the second collects every cell at or above
+    it. Same answer as ranking the whole grid at once, without its copies.
+    """
+    n = len(score)
+
+    def chunk(a):
+        part = np.asarray(score[a:a + _RANK_CHUNK], dtype=np.float64)
+        return np.where(np.isnan(part), -np.inf, part), eligible[a:a + _RANK_CHUNK]
+
+    best, count = np.empty(0), 0
+    for a in range(0, n, _RANK_CHUNK):
+        primary, keep = chunk(a)
+        values = primary[keep]
+        count += len(values)
+        best = np.concatenate([best, values])
+        if len(best) > top:
+            best = np.partition(best, len(best) - top)[len(best) - top:]
+    if count == 0:
+        return np.empty(0, dtype=np.int64)
+    kth = best.min() if count > top else -np.inf
+    found, scores = [], []
+    for a in range(0, n, _RANK_CHUNK):
+        primary, keep = chunk(a)
+        hit = np.flatnonzero(keep & (primary >= kth))
+        found.append(hit + a)
+        scores.append(primary[hit])
+    index, primary = np.concatenate(found), np.concatenate(scores)
     secondary = np.where(np.isnan(sharpe[index]), -np.inf, sharpe[index])
     order = np.lexsort((index, -secondary, -primary))
     return index[order][:top]
@@ -1138,6 +1190,16 @@ def discovery_compact(
                                                                  restrict=regime_mask)
         del family
     del regime_mask
+    checks = []
+    if plan.folds >= 2 and selection_rule:
+        from backtest.validation import selection_checks
+        checks = selection_checks(plan.cv_days, compact["cv_sums"], compact["cv_sumsq"],
+                                  {"cv_mean": "mean", "cv_worst": "worst"}.get(selection_rule, "sharpe"),
+                                  eligible=compact["n_trades"] >= selection_min_trades)
+    # The block sums are the bulk of the memory and nothing after this needs them.
+    compact.pop("cv_sums", None)
+    compact.pop("cv_sumsq", None)
+    gc.collect()
     if progress:
         progress(0, 0, f"Rebuilding full detail for the top {top} cells of {len(ranked)} boards")
     rows = _board_rows(plan, {key: value[0] for key, value in ranked.items()})
@@ -1152,12 +1214,6 @@ def discovery_compact(
                     "rank_score": float(rows[int(c)][exact] if exact else s)}
                    for c, s, f in zip(best, scores, families)]
         boards[key] = pl.DataFrame(records, infer_schema_length=None) if records else pl.DataFrame()
-    checks = []
-    if plan.folds >= 2 and selection_rule:
-        from backtest.validation import selection_checks
-        checks = selection_checks(plan.cv_days, compact["cv_sums"], compact["cv_sumsq"],
-                                  {"cv_mean": "mean", "cv_worst": "worst"}.get(selection_rule, "sharpe"),
-                                  eligible=compact["n_trades"] >= selection_min_trades)
     regimes_tested = []
     if regime_placebos and any(gate.startswith("regime:") for gate, _, _ in plan.gates):
         regimes_tested = regime_placebo(plan, compact, shifts=int(regime_placebos),

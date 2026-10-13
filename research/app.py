@@ -12,6 +12,8 @@ import json
 import os
 import re
 import threading
+
+import psutil
 import time
 import traceback
 from pathlib import Path
@@ -59,7 +61,7 @@ from research.panel import (
     resolve_target,
 )
 from research.dislocation import (BOARD_ROWS_SAVED, RANK_COLUMNS, RANK_RULES, REGIME_SCOPE, discovery_compact,
-                                  placebo_scan)
+                                  discovery_memory_gb, placebo_scan)
 from backtest.lab import REGIME_GATE_BUCKETS, gate_percentile_rank
 from research.dislocation_backtest import detail_for, exit_cells, run_vector_grid, signal_frame, _entry_gate
 from backtest.validation import event_overlap_diagnostics
@@ -2088,6 +2090,12 @@ def _job_paths(settings: dict) -> None:
         artifacts.RUNS = Path(settings["runs_dir"])
 
 
+def leave_cores_for_the_app(spare: int = 2) -> None:
+    """In a job's process: keep ``spare`` cores out of the backtest so the app and browser stay responsive."""
+    import numba
+    numba.set_num_threads(max(1, numba.config.NUMBA_NUM_THREADS - spare))
+
+
 def discovery_job(stored: dict, feature: str, settings: dict) -> dict:
     """One discovery run, start to saved result. Runs as a background job.
 
@@ -2099,6 +2107,7 @@ def discovery_job(stored: dict, feature: str, settings: dict) -> dict:
 
     s = settings
     _job_paths(s)
+    leave_cores_for_the_app()
     work.start(JOB_SESSION, "dis", "Preparing loaded panel and discovery grid")
     try:
         target = stored["target"]
@@ -2239,6 +2248,7 @@ def mechanics_job(stored: dict, candidate: dict, settings: dict) -> dict:
     """One trade-mechanics grid, start to saved result. Runs as a background job."""
     s = settings
     _job_paths(s)
+    leave_cores_for_the_app()
     work.start(JOB_SESSION, "bt", "Building the frozen candidate signal and all exit combinations")
     try:
         trade = TradeDef(stored["target"], stored["legs"])
@@ -2411,19 +2421,23 @@ def register_callbacks(app) -> None:
                                        caps or [None], signal_stops or [None], max_half_lives or [None]))
                         for s in signals)
         cells = per_kind*per_model*gate_cells
-        # ~200k backtests/s and ~200 bytes per saved cell (plus CV block sums) on this machine
+        # ~200k backtests/s on this machine; memory is what discovery keeps per cell plus ranking
         seconds = cells / 200_000
-        gigabytes = cells * (200 + 16 * (cv or 0)) / 1e9
+        gigabytes = discovery_memory_gb(cells, cv or 0)
+        machine = psutil.virtual_memory().total / 1e9
 
         def span(sec):
             return f"{sec / 3600:.1f} h" if sec >= 3600 else f"{sec / 60:.0f} min" if sec >= 60 else f"{sec:.0f} s"
         text = (f"{per_kind*len(signals):,} models · {cells:,} backtested discovery cells · "
-                f"about {span(seconds)} and {gigabytes:.1f} GB")
+                f"about {span(seconds)} and {gigabytes:.0f} GB of this machine's {machine:.0f} GB")
         if placebos:
             text += f" · {placebos} placebos rerun the whole grid: about {span(seconds * (1 + placebos))} in total"
-        warning = gigabytes > 8
-        return note(text + (" · Very large: narrow the selections before running." if warning else "."),
-                    'warn' if warning else 'dim')
+        # Past ~70% of RAM the machine starts paging and everything, the app included, stops responding.
+        if gigabytes > 0.7 * machine:
+            fits = int(0.7 * machine / max(gigabytes / max(cells, 1), 1e-12))
+            return note(text + f" · Too large for this machine: it will run out of memory. Narrow the selections to "
+                               f"about {fits:,} cells or fewer" + (", or turn cross-validation off." if cv else "."), 'bad')
+        return note(text + ".", 'warn' if gigabytes > 0.4 * machine else 'dim')
 
     @app.callback(
         Output("dis-gates", "value"),
