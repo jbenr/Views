@@ -35,6 +35,7 @@ import psycopg
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from berg import Bbg
 from utils import tickers as tkr
+from utils import format_tsy_price
 
 DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets")
 TODAY  = dt.date.today()
@@ -55,6 +56,9 @@ FUT_TICKERS = [
     for root, ranks in FUT_GENERIC_RANKS.items()
     for rank in ranks
 ]
+
+# front-month tsy futures shown in the summary, with min tick in 32nds
+TSY_TICKS = {"TU": 0.125, "FV": 0.25, "TY": 0.5, "UXY": 0.5, "US": 1, "WN": 1}
 
 INDEX_TICKERS = (
     tkr.ust + tkr.crv + tkr.fly +
@@ -97,11 +101,13 @@ def _fmt_et(d: dt.datetime) -> str:
 
 def pull_fut(bbg: Bbg) -> pd.DataFrame:
     print(f"  {_DIM}fut ({len(FUT_TICKERS)}){_RESET}", flush=True)
-    raw = bbg.bdp(FUT_TICKERS, ['PX_LAST', 'VOLUME', 'FUT_CUR_GEN_TICKER'])
+    raw = bbg.bdp(FUT_TICKERS, ['PX_LAST', 'VOLUME', 'FUT_CUR_GEN_TICKER', 'BID', 'ASK'])
     df = (
         raw
         .rename(columns={
             'PX_LAST':            'px_last',
+            'BID':                'bid',
+            'ASK':                'ask',
             'VOLUME':             'volume',
             'FUT_CUR_GEN_TICKER': 'contract',
         })
@@ -322,6 +328,14 @@ def main():
         rows_str = f"  {_DIM}{total} rows written{_RESET}" if total is not None else f"  {_DIM}dry run{_RESET}"
         print(f"\n  {_BOLD}{_fmt_et(now_et)}{_RESET}")
         print(f"  {_CYAN}10Y{_RESET}  {_BOLD}{ten_yr:.3f}{_RESET}    {_CYAN}SPX{_RESET}  {_BOLD}{spx:,.0f}{_RESET}")
+        fut_q = fut_df.set_index('generic_ticker')
+        for root, tick in TSY_TICKS.items():
+            bid, ask = (fut_q[col].get(f"{root}1") for col in ('bid', 'ask'))
+            bid_str, ask_str = (
+                format_tsy_price(px, is_ticks=False, tick_32nds=tick) if pd.notna(px) else "n/a"
+                for px in (bid, ask)
+            )
+            print(f"  {_CYAN}{root:<3}{_RESET}  {_DIM}BID{_RESET} {_BOLD}{bid_str:>7} / {ask_str:<7}{_RESET} {_DIM}ASK{_RESET}")
         print(rows_str)
 
     finally:

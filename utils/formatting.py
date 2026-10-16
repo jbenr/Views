@@ -14,9 +14,12 @@ def pdf(df):
     print(tabulate(df, headers="keys", tablefmt="simple"))
 
 
-def format_tsy_price(decimal_price, is_ticks=True):
+def format_tsy_price(decimal_price, is_ticks=True, tick_32nds=0.125):
     """
     Convert decimal price to Treasury futures notation.
+
+    tick_32nds is the contract's minimum tick in 32nds, used for rounding:
+    1/8 for TU, 1/4 for FV, 1/2 for TY/UXY, 1 for US/WN.
 
     Examples:
         112.64062500 -> 112-20+
@@ -37,8 +40,11 @@ def format_tsy_price(decimal_price, is_ticks=True):
         # Price already in 32nds (fractional part represents 32nds directly)
         thirty_seconds = frac * 32
 
-    # Round to nearest 1/8th of a 32nd
-    eighth_of_32nd = round(thirty_seconds * 8) / 8
+    # Round to the nearest tick (default 1/8th of a 32nd), carrying into the handle
+    eighth_of_32nd = round(thirty_seconds / tick_32nds) * tick_32nds
+    if eighth_of_32nd >= 32:
+        handles += 1
+        eighth_of_32nd -= 32
 
     # Split into whole 32nds and the fraction
     whole_32nds = int(eighth_of_32nd)

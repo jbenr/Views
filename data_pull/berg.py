@@ -757,7 +757,7 @@ class LiveFeed:
                                 v = el.getValueAsString()
                             elif dtp in (blpapi.DataType.FLOAT32, blpapi.DataType.FLOAT64):
                                 v = el.getValueAsFloat()
-                            elif dtp in (blpapi.DataType.INTEGER32, blpapi.DataType.INTEGER64):
+                            elif dtp in (blpapi.DataType.INT32, blpapi.DataType.INT64):
                                 v = el.getValueAsInteger()
                             elif dtp == blpapi.DataType.BOOL:
                                 v = el.getValueAsBool()
