@@ -1501,6 +1501,8 @@ def table_div(
     from dash import html as dhtml
 
     def _fmt(v):
+        if hasattr(v, "to_plotly_json"):  # a Dash component (e.g. a row's button) renders as itself
+            return v
         if isinstance(v, (float, np.floating)):
             return format(v, float_fmt)
         if isinstance(v, pd.Timestamp):
@@ -1508,7 +1510,7 @@ def table_div(
         return str(v)
 
     def _sort_value(v):
-        if v is None:
+        if v is None or hasattr(v, "to_plotly_json"):
             return ""
         if isinstance(v, (float, np.floating)):
             return "" if np.isnan(v) else repr(float(v))

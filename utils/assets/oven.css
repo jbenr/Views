@@ -1,0 +1,34 @@
+/* Oven only (the app root carries .oven-tight): denser house tables.
+   table_div sets cell padding and size inline, so these need !important. */
+.oven-tight .viz-table th,
+.oven-tight .viz-table td {
+    padding: 2px 7px !important;
+    font-size: 11px !important;
+    line-height: 1.35;
+}
+.oven-tight .viz-table th {
+    border-bottom-width: 1px !important;
+}
+/* size tables to their content instead of stretching every column across the page */
+.oven-tight .viz-table {
+    min-width: 0 !important;
+}
+/* table_div wraps each table in a div with a 16px bottom margin */
+.oven-tight div:has(> .viz-table) {
+    margin-bottom: 6px !important;
+}
+.oven-tight .oven-pager {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    margin: 4px 0 14px;
+}
+.oven-tight .oven-pager .ref-btn {
+    padding: 2px 8px !important;
+    font-size: 11px !important;
+}
+.oven-tight .oven-pager-status {
+    font-size: 11px;
+    color: #888888;
+    margin-left: 4px;
+}
