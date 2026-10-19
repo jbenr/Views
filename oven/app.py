@@ -65,8 +65,9 @@ GRID_CONTROLS = {
     "hl_mults": ("exit · time stop at × entry half-life (0 = off)", [0.0, 0.5, 1.0, 2.0, 3.0], engine.HL_MULTS),
     "max_holds": ("exit · max hold, the hard cap (bars)", [5, 10, 20, 40, 60, 120], engine.MAX_HOLDS),
     "stops": ("exit · stop, entry sigmas wider (0 = none)", [0.0, 0.5, 1.0, 2.0], engine.STOPS),
+    "hedge_lookbacks": ("hedge lookback · changes OLS (d)", [21, 63, 126, 252, 504], engine.HEDGE_LOOKBACKS),
 }
-SETUP_COLS = ["lookback", "basis", "scale", "entry", "revert", "max_hold", "stop", "hl_mult"]
+SETUP_COLS = ["lookback", "hedge_lb", "basis", "scale", "entry", "revert", "max_hold", "stop", "hl_mult"]
 BASIS_TEXT = {
     "levels": "levels-fit residual, target − (a + levels β × input)",
     "portfolio": "the traded portfolio's own deviation from its mean",
@@ -83,7 +84,11 @@ ET = ZoneInfo("America/New_York")
 STATS_ROW = {"display": "flex", "gap": 28, "flexWrap": "wrap", "padding": "8px 2px 8px"}
 TWO_UP = {"display": "grid", "gridTemplateColumns": "minmax(0, 1fr) minmax(0, 1fr)", "gap": 12,
           "alignItems": "start"}
-IMG = {"width": "100%", "border": f"1px solid {BORDER}"}
+# every chart cell the same shape: the PNGs come out at slightly different aspect
+# ratios (each chart type has its own figure size, then tight cropping), so each is
+# fitted inside an identical frame rather than setting its own row height
+IMG = {"width": "100%", "aspectRatio": "1.75", "objectFit": "contain", "background": "#FFFFFF", "display": "block",
+       "border": f"1px solid {BORDER}"}
 
 
 # ---- data --------------------------------------------------------------------
@@ -104,9 +109,12 @@ def run_options() -> list[dict]:
     return out
 
 
-def _with_basis(frame: pl.DataFrame) -> pl.DataFrame:
-    """Older bakes: before the portfolio basis everything was levels-basis, and before
-    half-life time stops no setup had one."""
+def _with_basis(frame: pl.DataFrame, hedge_lb: int) -> pl.DataFrame:
+    """Older bakes: before the portfolio basis everything was levels-basis, before
+    half-life time stops no setup had one, and before the hedge lookback was swept
+    every setup used the bake's single one."""
+    if "hedge_lb" not in frame.columns:
+        frame = frame.with_columns(pl.lit(hedge_lb, pl.Int64).alias("hedge_lb"))
     if "basis" not in frame.columns:
         frame = frame.with_columns(pl.lit("levels").alias("basis"))
     if "hl_mult" not in frame.columns:
@@ -118,20 +126,24 @@ def _with_basis(frame: pl.DataFrame) -> pl.DataFrame:
 def load_run(path: str) -> dict:
     """A run's meta and board: all the boards need. Trades load only when a setup is opened."""
     p = Path(path)
-    return dict(meta=json.loads((p / "meta.json").read_text(encoding="utf-8")),
-                board=_with_basis(pl.read_parquet(p / "board.parquet")))
+    meta = json.loads((p / "meta.json").read_text(encoding="utf-8"))
+    return dict(meta=meta, board=_with_basis(pl.read_parquet(p / "board.parquet"), _old_hedge_lb(meta)))
 
 
 @lru_cache(maxsize=2)
 def load_trades(path: str) -> pl.DataFrame:
-    return _with_basis(pl.read_parquet(Path(path) / "trades.parquet"))
+    return _with_basis(pl.read_parquet(Path(path) / "trades.parquet"), _old_hedge_lb(load_run(path)["meta"]))
+
+
+def _old_hedge_lb(meta: dict) -> int:
+    return int(meta["settings"].get("hedge_lookback", engine.HEDGE_LOOKBACK))
 
 
 def describe(setup: dict) -> str:
-    """A setup in one line: 'lb 252 · portfolio · raw > 5 · revert 1 · hl×1 · hold 120 · stop 2'."""
+    """A setup in one line: 'lb 252 · hedge 126 · portfolio · raw > 5 · revert 1 · hl×1 · hold 120 · stop 2'."""
     revert = f"revert {setup['revert']:g}" if setup["revert"] else "no revert"
     half_life = f" · hl×{setup['hl_mult']:g}" if setup["hl_mult"] else ""
-    return (f"lb {setup['lookback']} · {setup['basis']} · {setup['scale']} > {setup['entry']:g} · {revert}"
+    return (f"lb {setup['lookback']} · hedge {setup['hedge_lb']} · {setup['basis']} · {setup['scale']} > {setup['entry']:g} · {revert}"
             f"{half_life} · hold {setup['max_hold']} · stop {setup['stop']:g}")
 
 
@@ -174,8 +186,8 @@ def setup_id(row: dict) -> str:
 
 
 def setup_from_id(name: str, sid: str) -> dict:
-    lb, basis, scale, entry, revert, hold, stop, hl_mult = sid.split("|")
-    return dict(input=name, lookback=int(lb), basis=basis, scale=scale, entry=float(entry), revert=float(revert),
+    lb, hedge_lb, basis, scale, entry, revert, hold, stop, hl_mult = sid.split("|")
+    return dict(input=name, lookback=int(lb), hedge_lb=int(hedge_lb), basis=basis, scale=scale, entry=float(entry), revert=float(revert),
                 max_hold=int(hold), stop=float(stop), hl_mult=float(hl_mult))
 
 
@@ -216,8 +228,7 @@ def bundle(path: str, name: str, sid: str) -> dict:
     target = meta["target"]
     trades = matches(load_trades(path), setup).sort("entry_ts")
     row = matches(run["board"], setup).to_dicts()
-    frame = model_frame(target, name, setup["lookback"],
-                        int(meta["settings"].get("hedge_lookback", engine.HEDGE_LOOKBACK)))
+    frame = model_frame(target, name, setup["lookback"], setup["hedge_lb"])
     daily = daily_frame(frame, target, name, trades, float(meta["settings"].get("cost", engine.COST)))
     levels = frame.select("ts", pl.col(target).alias("y"), pl.col(name).alias("x"), "portfolio")
     at = lambda when: levels.rename({"ts": f"{when}_ts", "y": f"{when}_level", "x": f"{when}_input",
@@ -285,9 +296,45 @@ def feature_correlations(trades: pl.DataFrame) -> pl.DataFrame:
     return pl.DataFrame(rows)
 
 
+HORIZON_Z = 1.0  # |z| beyond which another horizon counts as saying something
+
+
+def multi_resolution(trades: pl.DataFrame, setup: dict) -> pl.DataFrame:
+    """This setup's trades split by what each OTHER signal horizon said at entry:
+    'agrees' (same sign, |z| > HORIZON_Z: also rich, or also cheap), 'disagrees'
+    (opposite sign beyond it) or 'neutral'. A state whose average trade beats the
+    setup's own is one where that horizon adds information."""
+    horizons = sorted((int(c[4:]), c) for c in trades.columns if c.startswith("z_lb"))
+    base = trades["pnl"].mean()
+    own = pl.col("entry_z").sign()
+    rows = []
+    for lb, col in horizons:
+        if lb == setup["lookback"]:
+            continue
+        z = pl.col(col)
+        state = (pl.when(z.is_null() | z.is_nan() | (z.abs() <= HORIZON_Z)).then(pl.lit("neutral"))
+                 .when(z.sign() == own).then(pl.lit("agrees")).otherwise(pl.lit("disagrees")))
+        both = trades.select("entry_z", col).drop_nulls().filter(pl.col(col).is_not_nan())
+        corr = both.select(pl.corr("entry_z", col, method="spearman")).item() if len(both) > 5 else None
+        split = (trades.with_columns(state.alias("state")).group_by("state").agg(
+            pl.len().alias("trades"), pl.col("pnl").mean().alias("avg_trade"), (pl.col("pnl") > 0).mean().alias("hit_rate"),
+            pl.col("pnl").sum().alias("total_pnl")))
+        for row in split.to_dicts():
+            rows.append(dict(other_horizon=f"lb {lb}", z_corr_at_entry=corr, state=row["state"], trades=row["trades"],
+                             share=row["trades"] / len(trades), avg_trade=row["avg_trade"],
+                             vs_setup_avg=row["avg_trade"] - base, hit_rate=row["hit_rate"],
+                             total_pnl=row["total_pnl"]))
+    if not rows:
+        return pl.DataFrame()
+    order = {"agrees": 0, "neutral": 1, "disagrees": 2}
+    return (pl.DataFrame(rows).with_columns(pl.col("state").replace_strict(order, default=3).alias("_o"),
+                                            pl.col("other_horizon").str.slice(3).cast(pl.Int64).alias("_lb"))
+            .sort("_lb", "_o").drop("_o", "_lb"))
+
+
 def lookback_grid(board: pl.DataFrame, setup: dict, by: str) -> pl.DataFrame:
     """``by`` over lookback x entry for this input, holding the setup's scale, exit and stop."""
-    fixed = {k: setup[k] for k in ("input", "basis", "scale", "revert", "max_hold", "stop", "hl_mult")}
+    fixed = {k: setup[k] for k in ("input", "hedge_lb", "basis", "scale", "revert", "max_hold", "stop", "hl_mult")}
     return (matches(board, fixed).select("lookback", pl.format("entry {}", pl.col("entry")).alias("entry"), by)
             .pivot(on="entry", index="lookback", values=by).sort("lookback"))
 
@@ -503,8 +550,9 @@ def signal_now(b: dict) -> float:
 
 
 def charts_view(b: dict, window: str | None, date_range=None) -> list:
-    """The Dig card's chart grid -- the traded portfolio and the target with trades,
-    the input, the signal, P&L, the return distribution -- then the Oven's own."""
+    """The Dig card's chart grid, two to a row: the traded portfolio | the target (both
+    with trades), the entry signal | the input, cumulative P&L | the return
+    distribution -- then the Oven's own (drawdown, P&L by year, betas, fit quality)."""
     setup, target, name, frame, daily = b["setup"], b["target"], b["setup"]["input"], b["frame"], b["daily"]
     bars = None if date_range is not None else WINDOW_PRESETS[window or DEFAULT_WINDOW]
     raw = setup["scale"] == "raw"
@@ -525,16 +573,20 @@ def charts_view(b: dict, window: str | None, date_range=None) -> list:
         # signal_chart draws "resid" for the label "residual" and "ou_z" for any other label
         signal_chart(frame, sig_frame, "residual" if raw else f"{setup['basis']} z-score", setup["entry"],
                      window_bars=bars, date_range=date_range, fired=fired),
-        pnl_chart(daily.select("ts", "cumulative_pnl"), window_bars=bars, date_range=date_range),
         input_chart(frame, name, window_bars=bars, date_range=date_range),
-        return_distribution_chart(b["trades"].select(pl.col("pnl").alias("pnl_bps"))),
+        pnl_chart(daily.select("ts", "cumulative_pnl"), window_bars=bars, date_range=date_range),
+        return_distribution_chart(b["trades"].select(pl.col("pnl").alias("pnl_bps")), bins=40, density=True),
         series_chart(d, ["drawdown"], "drawdown", "bps", window_bars=bars, line_colors={"drawdown": C0}),
         residual_bars_chart([str(y) for y in years["year"]], years["pnl"].to_list(), "P&L by year", "bps"),
+        # series_chart: yaxis_title names the right-hand axis, yaxis_right_title the left one (the `left` columns)
         series_chart(f, ["beta_levels", "beta_changes", "corr126"], "levels beta · changes beta (the hedge) · "
-                     "126d corr", "beta", left=["beta_levels", "beta_changes"], yaxis_right_title="corr",
+                     "126d corr", "corr", left=["beta_levels", "beta_changes"], yaxis_right_title="beta",
                      window_bars=bars),
-        series_chart(f, ["r2", "signal_half_life"], f"levels fit R² · {setup['basis']} residual half-life", "R²",
-                     left=["r2"], yaxis_right_title="half-life (bars)", window_bars=bars),
+        series_chart(f.with_columns(  # a residual that barely reverts has a near-infinite half-life: leave those out
+                         pl.when(pl.col("signal_half_life") <= 5 * setup["lookback"]).then(pl.col("signal_half_life"))
+                         .otherwise(None).alias("signal_half_life")),
+                     ["r2", "signal_half_life"], f"levels fit R² · {setup['basis']} residual half-life (≤ 5× lookback)",
+                     "half-life (bars)", left=["r2"], yaxis_right_title="R²", window_bars=bars),
     ]
     return [html.Img(src=f"data:image/png;base64,{png}", style=IMG) for png in pngs]
 
@@ -646,7 +698,34 @@ def detail_view(path: str, picked: dict, by: str, min_trades: int, window: str) 
               title="entry-state characteristics · terciles of each feature at entry", float_fmt=",.3f",
               sortable=True),
     ])
-    return html.Div([card, mechanics, diagnostics]), view
+    return html.Div([card, mechanics, resolution_view(trades, setup), diagnostics]), view
+
+
+def resolution_view(trades: pl.DataFrame, setup: dict) -> html.Div:
+    """The multi-resolution section: does another horizon change what this one's trades are worth?"""
+    table_rows = multi_resolution(trades, setup)
+    if table_rows.is_empty():
+        body = note("This bake has no other horizons recorded. Re-bake with more than one signal lookback to see "
+                    "what the other horizons said at each entry.", "dim")
+    else:
+        scale = float(np.nanmax(np.abs(table_rows["vs_setup_avg"].fill_null(0).to_numpy()))) or 1.0
+        body = table(show(table_rows), title=f"this setup's {len(trades)} trades, split by each other horizon's "
+                                             f"{setup['basis']} z at entry", float_fmt=",.2f",
+                     headers={"other_horizon": "other horizon", "z_corr_at_entry": "z corr at entry",
+                              "vs_setup_avg": "vs setup avg", "avg_trade": "avg trade", "hit_rate": "hit",
+                              "total_pnl": "total pnl"},
+                     cell_style=lambda col, value, _row: (_diverging(value, scale) if col == "vs_setup_avg" and
+                                                          value != "" else {"textAlign": "left"}
+                                                          if col in ("other_horizon", "state") else None))
+    return html.Div([
+        heading("multi-resolution"),
+        note(f"Same input, basis and hedge, read at the other signal lookbacks when this setup entered. 'agrees': "
+             f"that horizon was also beyond ±{HORIZON_Z:g} z the same way (it saw the same rich/cheap); 'disagrees': "
+             f"beyond it the other way. Green 'vs setup avg' means trades in that state beat the setup's average "
+             f"trade, so that horizon carries information; watch the trade counts, small states are noise. z corr "
+             f"near 1 means the horizons are the same signal measured twice.", "dim"),
+        body,
+    ], style={"marginBottom": 18})
 
 
 def snap_range(path: str, picked: dict, view: dict):
@@ -712,9 +791,7 @@ def bake_controls() -> html.Div:
                  "dim"),
             *[_multi(k) for k in ("reverts", "hl_mults", "max_holds", "stops")]]),
         section("Hedge & costs", [
-            field("hedge lookback · changes OLS (d)", dcc.Dropdown(
-                id="oven-hedge-lb", value=engine.HEDGE_LOOKBACK, clearable=False,
-                options=[{"label": str(v), "value": v} for v in (63, 126, 252)])),
+            _multi("hedge_lookbacks"),
             field("cost · bps per round trip", dcc.Input(id="oven-cost", type="number", value=engine.COST, min=0,
                                                          step=0.1, style=INPUT)),
         ], open=False),
@@ -803,14 +880,14 @@ def register(app) -> None:
 
     @app.callback(Output("oven-grid-size", "children"), Input("oven-target", "value"), Input("oven-inputs", "value"),
                   *[Input(f"oven-{k}", "value") for k in GRID_CONTROLS], Input("oven-bases", "value"))
-    def _grid_size(target, inputs, lookbacks, z, raw, reverts, hl_mults, holds, stops, bases):
+    def _grid_size(target, inputs, lookbacks, z, raw, reverts, hl_mults, holds, stops, hedge_lbs, bases):
         bases = bases or []
         # the portfolio basis only runs for inputs that can be held as a hedge
         models = sum(("levels" in bases) + ("portfolio" in bases and engine.hedgeable(i))
                      for i in dict.fromkeys(inputs or []) if i != target)
         per_model = ((len(z or []) + len(raw or [])) * len(reverts or []) * len(holds or [])
                      * max(len(stops or []), 1) * max(len(hl_mults or []), 1))
-        setups = models * len(lookbacks or []) * per_model
+        setups = models * len(lookbacks or []) * len(hedge_lbs or []) * per_model
         # measured on a select-everything 10s30s bake: 554,580 setups -> 39.2M trades, 18.8 GB peak, 23s
         trades = setups * 71
         ram_gb = trades / 1e6 * 0.48
@@ -825,12 +902,11 @@ def register(app) -> None:
     @app.callback(Output("oven-run-note", "children"), Input("oven-run", "n_clicks"),
                   State("oven-target", "value"), State("oven-inputs", "value"),
                   *[State(f"oven-{k}", "value") for k in GRID_CONTROLS],
-                  State("oven-hedge-lb", "value"), State("oven-cost", "value"), State("oven-bases", "value"),
+                  State("oven-cost", "value"), State("oven-bases", "value"),
                   prevent_initial_call=True)
     def _bake(_clicks, target, inputs, *grid):
-        *lists, hedge_lb, cost, bases = grid
-        settings = dict(zip(GRID_CONTROLS, [sorted(v or []) for v in lists]),
-                        hedge_lookback=int(hedge_lb), cost=float(cost or 0),
+        *lists, cost, bases = grid
+        settings = dict(zip(GRID_CONTROLS, [sorted(v or []) for v in lists]), cost=float(cost or 0),
                         bases=[b for b in engine.BASES if b in (bases or [])])
         settings["stops"] = settings["stops"] or [0.0]
         settings["hl_mults"] = settings["hl_mults"] or [0.0]
@@ -839,9 +915,10 @@ def register(app) -> None:
         inputs = [i for i in dict.fromkeys(inputs or []) if i != target]
         if not inputs:
             return note("Choose at least one input other than the target.", "warn")
-        if not (settings["lookbacks"] and (settings["z_entries"] or settings["raw_entries"])
+        if not (settings["lookbacks"] and settings["hedge_lookbacks"] and (settings["z_entries"] or settings["raw_entries"])
                 and settings["reverts"] and settings["max_holds"]):
-            return note("The grid needs a lookback, an entry, a revert share and a max hold.", "warn")
+            return note("The grid needs a signal lookback, a hedge lookback, an entry, a revert share and a max "
+                        "hold.", "warn")
         try:
             jobs.submit("oven", f"bake {target} vs {len(inputs)} inputs", "oven.engine:oven_job",
                         target, inputs, settings)

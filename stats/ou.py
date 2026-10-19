@@ -152,7 +152,7 @@ def roll_ou_zscore(
     with np.errstate(invalid="ignore", divide="ignore"):
         mu = np.where(np.abs(beta) > 1e-12, -alpha / beta, np.nan)
 
-    sigma = s.rolling_std(lookback, min_periods=min_p).to_numpy().astype(float)
+    sigma = s.rolling_std(lookback, min_samples=min_p).to_numpy().astype(float)
     s_np  = s.to_numpy().astype(float)
 
     with np.errstate(invalid="ignore", divide="ignore"):

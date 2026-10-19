@@ -1,7 +1,7 @@
 """Oven: bake signals for one target against a boatload of inputs.
 
 The question is which relationships produce the most profitable, most
-trustworthy TRADES. For every (input, lookback) the Oven fits two rolling
+trustworthy TRADES. For every (input, signal lookback, hedge lookback) it fits two rolling
 regressions of the target y on the input x, each with its own job:
 
   signal  levels OLS     y = a + bL * x      "is y rich/cheap vs where x says it should be?"
@@ -57,7 +57,8 @@ from stats import roll_half_life, roll_lr, roll_lr_diff
 OVEN_RUNS = Path(__file__).parent / "data"
 
 LOOKBACKS = [63, 126, 252, 504]
-HEDGE_LOOKBACK = 126
+HEDGE_LOOKBACK = 126  # the hedge lookback older bakes used, before it was swept
+HEDGE_LOOKBACKS = [63, 126, 252]  # changes-OLS lookbacks for the hedge ratio, swept like the signal's
 Z_ENTRIES = [1.5, 2.0, 2.5]
 RAW_ENTRIES = [5.0, 10.0, 15.0, 20.0]
 REVERTS = [0.0, 0.5, 1.0]  # share of the entry residual recovered; 1.0 = back to fair; 0 = no reversion exit
@@ -72,7 +73,7 @@ SCALES = ("z", "raw")
 EXIT_REASONS = ("revert", "stop", "time", "half_life")
 FEATURES = ("entry_z", "r2", "beta_levels", "beta_changes", "hedge_gap", "beta_drift20",
             "half_life", "resid_sigma", "input_vol60", "target_vol60")
-SETUP = ["input", "lookback", "basis", "scale", "entry", "revert", "max_hold", "stop", "hl_mult"]
+SETUP = ["input", "lookback", "hedge_lb", "basis", "scale", "entry", "revert", "max_hold", "stop", "hl_mult"]
 # What the entry signal measures (both trade the same hedged portfolio):
 #   levels     y - (a + bL x): rich/cheap vs where the levels fit says y should be
 #   portfolio  (y - bC x) - its rolling mean: the traded portfolio's own dislocation
@@ -323,9 +324,10 @@ def _sharpe(total, total_sq, days):
 # ---- bake: the whole search -------------------------------------------------
 
 
-def bake(panel, inputs: list[str], lookbacks=LOOKBACKS, hedge_lookback: int = HEDGE_LOOKBACK,
+def bake(panel, inputs: list[str], lookbacks=LOOKBACKS, hedge_lookbacks=HEDGE_LOOKBACKS,
          configs: pl.DataFrame | None = None, cost: float = COST, progress=None, bases=BASES) -> dict:
-    """Walk every (input, lookback, signal basis, config) for the panel's target.
+    """Walk every (input, signal lookback, hedge lookback, signal basis, config) for the
+    panel's target.
 
     Returns ``trades`` (one row per trade, with its entry-state features),
     ``board`` (one row per setup, with its strategy stats) and ``skipped``
@@ -336,53 +338,73 @@ def bake(panel, inputs: list[str], lookbacks=LOOKBACKS, hedge_lookback: int = HE
     target = panel.target.name
     data = panel.data
     trade_frames, stat_frames, skipped = [], [], []
-    models = [(i, lb) for i in dict.fromkeys(inputs) if i != target for lb in lookbacks]
-    for k, (name, lookback) in enumerate(models):
-        if progress:
-            progress(k, len(models), f"Baking {target} vs {name} · lookback {lookback}")
+    names = [i for i in dict.fromkeys(inputs) if i != target]
+    total, k = len(names) * len(lookbacks) * len(hedge_lookbacks), 0
+    for name, hedge_lookback in product(names, hedge_lookbacks):
         if name not in data.columns:
-            skipped.append(dict(input=name, lookback=lookback, reason="not in panel"))
+            skipped += [dict(input=name, lookback=lb, reason="not in panel") for lb in lookbacks]
+            k += len(lookbacks)
             continue
         aligned = data.select("ts", target, name).drop_nulls()
-        if len(aligned) < lookback + MIN_BARS:
-            skipped.append(dict(input=name, lookback=lookback, reason=f"only {len(aligned)} shared bars"))
-            continue
         y = aligned[target].to_numpy().astype(float)
         x = aligned[name].to_numpy().astype(float)
         ts = aligned["ts"]
-        arrays = model_arrays(y, x, lookback, hedge_lookback)
         hedge = 1.0 if hedgeable(name) else 0.0
-        usable = np.flatnonzero(np.isfinite(arrays["entry_z"]))
-        split = int(usable[0] + (len(y) - usable[0]) // 2) if len(usable) else len(y)
-        # with no hedge the "portfolio" is the target alone, the same for every input: skip it
-        for basis in [b for b in bases if hedge or b == "levels"]:
-            raw, stats = walk_model(y, x, arrays, configs, hedge, cost, split, basis)
-            stat_frames.append(pl.concat([
-                pl.DataFrame({"input": [name] * len(configs), "lookback": [lookback] * len(configs),
-                              "basis": [basis] * len(configs),
-                              "split_date": [ts[min(split, len(ts) - 1)]] * len(configs)}), configs,
-                pl.DataFrame(stats, schema=list(_STATS), orient="row")], how="horizontal"))
-            if not len(raw):
-                continue
-            decided = raw[:, 1].astype(np.int64)
-            filled = raw[:, 2].astype(np.int64)
-            cfg = configs[raw[:, 0].astype(np.int64)]
-            m = basis_arrays(arrays, basis)
-            entry_state = {**arrays, "entry_z": m["z"], "resid_sigma": m["sigma"], "half_life": m["half_life"]}
-            trade_frames.append(pl.DataFrame({
-                "input": name, "lookback": lookback, "basis": basis,
-                **{c: cfg[c] for c in configs.columns},
-                "entry_ts": ts.gather(decided + 1), "exit_ts": ts.gather(filled),
-                "bars": filled - decided - 1, "side": raw[:, 3],
-                "hedge_ratio": hedge * arrays["beta_changes"][decided], "pnl": raw[:, 4],
-                "reason": [EXIT_REASONS[int(r)] for r in raw[:, 5]],
-                **{f: entry_state[f][decided].astype(np.float32) for f in FEATURES},
-            }))
+        # every horizon's fit for this input first, so each trade can record what the other
+        # horizons said at its entry (z_lb<L>): the multi-resolution view
+        fits = {lb: model_arrays(y, x, lb, hedge_lookback) for lb in lookbacks if len(aligned) >= lb + MIN_BARS}
+        skipped += [dict(input=name, lookback=lb, reason=f"only {len(aligned)} shared bars")
+                    for lb in lookbacks if lb not in fits]
+        k += len(lookbacks) - len(fits)
+        for lookback, arrays in fits.items():
+            if progress:
+                progress(k, total, f"Baking {target} vs {name} · lookback {lookback} · hedge {hedge_lookback}")
+            k += 1
+            usable = np.flatnonzero(np.isfinite(arrays["entry_z"]))
+            split = int(usable[0] + (len(y) - usable[0]) // 2) if len(usable) else len(y)
+            # with no hedge the "portfolio" is the target alone, the same for every input: skip it
+            for basis in [b for b in bases if hedge or b == "levels"]:
+                _walk_basis(name, lookback, hedge_lookback, basis, y, x, ts, arrays, fits, lookbacks, configs, hedge,
+                            cost, split, stat_frames, trade_frames)
     if progress:
-        progress(len(models), len(models), f"Scoring {sum(len(f) for f in trade_frames):,} trades")
+        progress(total, total, f"Scoring {sum(len(f) for f in trade_frames):,} trades")
     trades = pl.concat(trade_frames) if trade_frames else pl.DataFrame()
     stats = pl.concat(stat_frames) if stat_frames else pl.DataFrame()
     return {"trades": trades, "board": board(trades, stats), "skipped": pl.DataFrame(skipped)}
+
+
+def _walk_basis(name, lookback, hedge_lookback, basis, y, x, ts, arrays, fits, lookbacks, configs, hedge, cost, split,
+                stat_frames, trade_frames) -> None:
+    """One model on one signal basis: its setups' stats and its trades, appended.
+
+    Each trade also records the same input's signal z, on the same basis and hedge,
+    at every signal lookback of the bake (``z_lb<L>``; null where that horizon had
+    too little history) -- what the other horizons said when this one fired."""
+    raw, stats = walk_model(y, x, arrays, configs, hedge, cost, split, basis)
+    stat_frames.append(pl.concat([
+        pl.DataFrame({"input": [name] * len(configs), "lookback": [lookback] * len(configs),
+                      "hedge_lb": [hedge_lookback] * len(configs), "basis": [basis] * len(configs),
+                      "split_date": [ts[min(split, len(ts) - 1)]] * len(configs)}), configs,
+        pl.DataFrame(stats, schema=list(_STATS), orient="row")], how="horizontal"))
+    if not len(raw):
+        return
+    decided = raw[:, 1].astype(np.int64)
+    filled = raw[:, 2].astype(np.int64)
+    cfg = configs[raw[:, 0].astype(np.int64)]
+    m = basis_arrays(arrays, basis)
+    entry_state = {**arrays, "entry_z": m["z"], "resid_sigma": m["sigma"], "half_life": m["half_life"]}
+    horizons = {f"z_lb{lb}": (basis_arrays(fits[lb], basis)["z"][decided].astype(np.float32) if lb in fits
+                              else np.full(len(decided), np.nan, dtype=np.float32)) for lb in lookbacks}
+    trade_frames.append(pl.DataFrame({
+        "input": name, "lookback": lookback, "hedge_lb": hedge_lookback, "basis": basis,
+        **{c: cfg[c] for c in configs.columns},
+        "entry_ts": ts.gather(decided + 1), "exit_ts": ts.gather(filled),
+        "bars": filled - decided - 1, "side": raw[:, 3],
+        "hedge_ratio": hedge * arrays["beta_changes"][decided], "pnl": raw[:, 4],
+        "reason": [EXIT_REASONS[int(r)] for r in raw[:, 5]],
+        **{f: entry_state[f][decided].astype(np.float32) for f in FEATURES},
+        **horizons,
+    }))
 
 
 def board(trades: pl.DataFrame, stats: pl.DataFrame) -> pl.DataFrame:
@@ -509,7 +531,8 @@ def oven_job(target: str, inputs: list[str], settings: dict) -> dict:
                           settings.get("reverts", REVERTS), settings.get("max_holds", MAX_HOLDS),
                           settings.get("stops", STOPS), settings.get("hl_mults", HL_MULTS))
     run = bake(panel, inputs, lookbacks=settings.get("lookbacks", LOOKBACKS),
-               hedge_lookback=int(settings.get("hedge_lookback", HEDGE_LOOKBACK)), configs=configs,
+               hedge_lookbacks=[int(h) for h in settings.get("hedge_lookbacks", HEDGE_LOOKBACKS)],
+               configs=configs,
                cost=float(settings.get("cost", COST)), progress=progress,
                bases=tuple(settings.get("bases", BASES)))
     path = save(run, target, inputs, settings, Path(settings.get("runs_dir", OVEN_RUNS)))

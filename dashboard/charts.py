@@ -476,12 +476,17 @@ def pnl_chart(
 
 
 @_one_at_a_time
-def return_distribution_chart(trades: pl.DataFrame | None) -> str:
+def return_distribution_chart(trades: pl.DataFrame | None, bins: int | None = None, density: bool = False) -> str:
     """Histogram of realized, net closed-trade returns in basis points.
 
     This is deliberately strategy-wide rather than windowed: the histogram is
     meant to show the shape of the strategy's realized return distribution,
     while the time-series panels above answer the recent-window question.
+
+    ``bins`` sets roughly how many buckets span the returns (zero is always a
+    bucket edge, so no bar mixes winners and losers); by default buckets are a
+    fixed 1 bp. ``density`` overlays a smoothed (Gaussian kernel) outline of
+    the distribution's shape, scaled to the bar counts.
     """
     values = np.array([], dtype=float)
     if trades is not None and not trades.is_empty() and "pnl_bps" in trades.columns:
@@ -496,17 +501,28 @@ def return_distribution_chart(trades: pl.DataFrame | None) -> str:
     if values.size:
         # Fixed one-basis-point buckets make the distribution directly
         # comparable across refreshes and strategies.
-        lower = float(np.floor(values.min()))
-        upper = float(np.ceil(values.max()))
+        width = 1.0
+        if bins:
+            width = max(float(values.max() - values.min()), 1e-9) / bins
+        lower = float(np.floor(values.min() / width)) * width
+        upper = float(np.ceil(values.max() / width)) * width
         if upper <= lower:
-            upper = lower + 1.0
-        bins = np.arange(lower, upper + 1.0, 1.0)
+            upper = lower + width
+        edges = np.arange(round(lower / width), round(upper / width) + 1) * width
         _counts, edges, patches = ax.hist(
             values,
-            bins=bins,
+            bins=edges,
             edgecolor="white",
             linewidth=0.7,
         )
+        if density and values.size > 2 and values.std() > 0:
+            bandwidth = 1.06 * values.std() * values.size ** -0.2  # Silverman's rule
+            grid = np.linspace(values.min() - 3 * bandwidth, values.max() + 3 * bandwidth, 400)
+            kde = np.exp(-0.5 * ((grid[:, None] - values[None, :]) / bandwidth) ** 2).sum(axis=1)
+            kde *= width / (bandwidth * np.sqrt(2 * np.pi))  # density x n x bucket width = counts
+            ax.plot(grid, kde, color="#333", linewidth=1.3, alpha=0.75, label="shape")
+            median = float(np.median(values))
+            ax.axvline(median, color=C2, linestyle=":", linewidth=1.3, label=f"median {median:+.1f} bps")
         for patch, left, right in zip(patches, edges[:-1], edges[1:]):
             patch.set_facecolor(C1 if (left + right) / 2 >= 0 else C0)
             patch.set_alpha(0.82)

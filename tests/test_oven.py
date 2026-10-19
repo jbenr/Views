@@ -72,7 +72,7 @@ def test_daily_marks_match_board_totals():
     y = 0.5 * x + ou
     panel = _panel(y, x)
     configs = config_grid(z_entries=[2.0], raw_entries=[], reverts=[1.0], max_holds=[20], stops=[0.0], hl_mults=[0.0])
-    run = bake(panel, ["10y"], lookbacks=[126], configs=configs, cost=0.5)
+    run = bake(panel, ["10y"], lookbacks=[126], hedge_lookbacks=[126], configs=configs, cost=0.5)
     for basis in ("levels", "portfolio"):
         trades = run["trades"].filter(pl.col("basis") == basis)
         marks = daily_marks(panel.data["ts"], y, x, trades, cost=0.5)
@@ -89,11 +89,11 @@ def test_reverting_residual_pays_and_random_walk_does_not():
         ou[i] = 0.9 * ou[i - 1] + rng.normal(0, 2)
     configs = config_grid(z_entries=[2.0], raw_entries=[], reverts=[1.0], max_holds=[20], stops=[0.0], hl_mults=[0.0])
 
-    reverting = bake(_panel(0.5 * x + ou, x), ["10y"], lookbacks=[252], configs=configs)["board"]
+    reverting = bake(_panel(0.5 * x + ou, x), ["10y"], lookbacks=[252], hedge_lookbacks=[126], configs=configs)["board"]
     assert reverting["sharpe"][0] > 1 and reverting["trade_t"][0] > 3
 
     walk = np.cumsum(rng.normal(0, 2, n))
-    placebo = bake(_panel(walk, x), ["10y"], lookbacks=[252], configs=configs)["board"]
+    placebo = bake(_panel(walk, x), ["10y"], lookbacks=[252], hedge_lookbacks=[126], configs=configs)["board"]
     assert abs(placebo["trade_t"][0]) < 3
 
 
@@ -105,10 +105,23 @@ def test_portfolio_basis_signal_is_the_traded_portfolio():
     for i in range(1, n):
         ou[i] = 0.9 * ou[i - 1] + rng.normal(0, 2)
     configs = config_grid(z_entries=[2.0], raw_entries=[], reverts=[1.0], max_holds=[20], stops=[0.0], hl_mults=[0.0])
-    run = bake(_panel(0.5 * x + ou, x), ["10y"], lookbacks=[252], configs=configs)
+    run = bake(_panel(0.5 * x + ou, x), ["10y"], lookbacks=[252], hedge_lookbacks=[126], configs=configs)
     board = run["board"].sort("basis")
     assert board["basis"].to_list() == ["levels", "portfolio"]
     assert board.filter(pl.col("basis") == "portfolio")["sharpe"][0] > 1
+
+
+def test_trades_record_every_horizon_at_entry():
+    rng = np.random.default_rng(5)
+    n = 2000
+    x = np.cumsum(rng.normal(0, 5, n))
+    y = 0.5 * x + np.cumsum(rng.normal(0, 1, n)) * 0.3
+    configs = config_grid(z_entries=[1.5], raw_entries=[], reverts=[1.0], max_holds=[20], stops=[0.0], hl_mults=[0.0])
+    trades = bake(_panel(y, x), ["10y"], lookbacks=[63, 252], hedge_lookbacks=[126], configs=configs)["trades"]
+    assert {"z_lb63", "z_lb252"} <= set(trades.columns)
+    for lb in (63, 252):  # a trade's own horizon is its entry z
+        own = trades.filter(pl.col("lookback") == lb)
+        assert np.allclose(own[f"z_lb{lb}"].to_numpy(), own["entry_z"].to_numpy(), equal_nan=True)
 
 
 def test_untradable_input_trades_the_target_alone():
@@ -116,7 +129,7 @@ def test_untradable_input_trades_the_target_alone():
     n = 1200
     x, y = np.cumsum(rng.normal(size=n)), np.cumsum(rng.normal(size=n))
     configs = config_grid(z_entries=[1.0], raw_entries=[], reverts=[1.0], max_holds=[20], stops=[0.0], hl_mults=[0.0])
-    run = bake(_panel(y, x, feature="oil"), ["oil"], lookbacks=[63], configs=configs)
+    run = bake(_panel(y, x, feature="oil"), ["oil"], lookbacks=[63], hedge_lookbacks=[126], configs=configs)
     assert (run["trades"]["hedge_ratio"] == 0).all()
     assert not run["board"]["hedged"][0]
     assert run["board"]["basis"].to_list() == ["levels"]  # no hedge, so no portfolio basis

@@ -34,12 +34,12 @@ def roll_lr(
 
     # Rolling moments
     df = df.with_columns(
-        pl.col("x").rolling_sum(lookback, min_periods=min_periods).alias("sum_x"),
-        pl.col("y").rolling_sum(lookback, min_periods=min_periods).alias("sum_y"),
-        (pl.col("x") * pl.col("x")).rolling_sum(lookback, min_periods=min_periods).alias("sum_xx"),
-        (pl.col("x") * pl.col("y")).rolling_sum(lookback, min_periods=min_periods).alias("sum_xy"),
-        (pl.col("y") * pl.col("y")).rolling_sum(lookback, min_periods=min_periods).alias("sum_yy"),
-        pl.col("x").is_not_null().cast(pl.Int32).rolling_sum(lookback, min_periods=min_periods).cast(pl.Float64).alias("n"),
+        pl.col("x").rolling_sum(lookback, min_samples=min_periods).alias("sum_x"),
+        pl.col("y").rolling_sum(lookback, min_samples=min_periods).alias("sum_y"),
+        (pl.col("x") * pl.col("x")).rolling_sum(lookback, min_samples=min_periods).alias("sum_xx"),
+        (pl.col("x") * pl.col("y")).rolling_sum(lookback, min_samples=min_periods).alias("sum_xy"),
+        (pl.col("y") * pl.col("y")).rolling_sum(lookback, min_samples=min_periods).alias("sum_yy"),
+        pl.col("x").is_not_null().cast(pl.Int32).rolling_sum(lookback, min_samples=min_periods).cast(pl.Float64).alias("n"),
     )
 
     # Beta and alpha from normal equations
@@ -65,7 +65,7 @@ def roll_lr(
     # SS_tot = sum_yy - sum_y^2 / n  (rolling variance of y * n)
     # SS_res = rolling sum of resid^2
     df = df.with_columns(
-        (pl.col("resid") ** 2).rolling_sum(lookback, min_periods=min_periods).alias("ss_res"),
+        (pl.col("resid") ** 2).rolling_sum(lookback, min_samples=min_periods).alias("ss_res"),
         (pl.col("sum_yy") - pl.col("sum_y") ** 2 / pl.col("n")).alias("ss_tot"),
     )
     df = df.with_columns(

@@ -1255,10 +1255,10 @@ def neighbor_ic_stats(
         ]
     )
     stats = (
-        # join_nulls: an extra key can be legitimately null for a whole class
+        # nulls_equal: an extra key can be legitimately null for a whole class
         # of rows (gate_window is null on every ungated row). Without it those
         # rows match nothing and are silently dropped for having no neighbours.
-        probes.join(cells.select([*key, "ic"]), on=key, how="inner", join_nulls=True)
+        probes.join(cells.select([*key, "ic"]), on=key, how="inner", nulls_equal=True)
         .group_by("cand")
         .agg(pl.col("ic").median().alias("nbr_ic"), pl.len().alias("n_nbr"))
     )
