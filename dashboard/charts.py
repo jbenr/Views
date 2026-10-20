@@ -643,8 +643,9 @@ def curve_fit_chart(years: list[int], actual: list[float], fair: list[float], ti
 
 @_one_at_a_time
 def residual_bars_chart(tenors: list[str], values: list[float], title: str, unit: str,
-                        bands: tuple[float, ...] = ()) -> str:
-    """One bar per tenor, blue above zero and red below, labelled; optional ± reference lines."""
+                        bands: tuple[float, ...] = (), rotate_labels: bool = False) -> str:
+    """One bar per tenor, blue above zero and red below, labelled; optional ± reference lines.
+    ``rotate_labels`` turns the x labels vertical, for long runs such as years."""
     viz = _PngViz()
     fig, ax = plt.subplots(figsize=(6.4, 4.2))
     fig.patch.set_facecolor("white")
@@ -658,6 +659,8 @@ def residual_bars_chart(tenors: list[str], values: list[float], title: str, unit
         for sign in (1, -1):
             ax.axhline(sign * band, color=DIM, linestyle="--" if band >= 2 else ":", linewidth=0.9)
     viz._style_ax(ax, yaxis_title=unit)
+    if rotate_labels:
+        ax.tick_params(axis="x", labelrotation=90)
     ax.margins(x=0.03, y=0.18)
     fig.suptitle(title.upper(), fontsize=viz.TITLE_SIZE, fontweight="bold", color="#333", x=0.02, ha="left", y=0.98)
     return _png(fig)

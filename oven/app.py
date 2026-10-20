@@ -453,7 +453,8 @@ def paged_table(name: str, rows: pl.DataFrame, view: dict, title: str) -> tuple[
                            f"of {pages} · sorted by {HEADERS.get(view['sort'], view['sort'])} "
                            f"{'high → low' if view['desc'] else 'low → high'}",
                            className="oven-pager-status"))
-    return html.Div(parts), view
+    # a new key per view makes React rebuild the table, clearing the " …" the sort click wrote
+    return html.Div(parts, key=f"{view['sort']}-{view['desc']}-{view['page']}"), view
 
 
 def pager(name: str, extra=()) -> html.Div:
@@ -577,7 +578,8 @@ def charts_view(b: dict, window: str | None, date_range=None) -> list:
         pnl_chart(daily.select("ts", "cumulative_pnl"), window_bars=bars, date_range=date_range),
         return_distribution_chart(b["trades"].select(pl.col("pnl").alias("pnl_bps")), bins=40, density=True),
         series_chart(d, ["drawdown"], "drawdown", "bps", window_bars=bars, line_colors={"drawdown": C0}),
-        residual_bars_chart([str(y) for y in years["year"]], years["pnl"].to_list(), "P&L by year", "bps"),
+        residual_bars_chart([str(y) for y in years["year"]], years["pnl"].to_list(), "P&L by year", "bps",
+                            rotate_labels=True),
         # series_chart: yaxis_title names the right-hand axis, yaxis_right_title the left one (the `left` columns)
         series_chart(f, ["beta_levels", "beta_changes", "corr126"], "levels beta · changes beta (the hedge) · "
                      "126d corr", "corr", left=["beta_levels", "beta_changes"], yaxis_right_title="beta",
