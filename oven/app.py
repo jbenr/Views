@@ -606,6 +606,37 @@ def window_row(window: str | None) -> list:
     ]
 
 
+# the scatter fit windows: the setup's own lookback, then the same presets as the chart window
+SCATTER_WINDOWS = ["lookback", *WINDOW_PRESETS]
+
+
+def scatter_pair(b: dict, window: str) -> list:
+    """The levels and changes scatters, fitted over ``window`` (a SCATTER_WINDOWS key)
+    with the stretch of the same length before it in grey; All fits every day, with no grey."""
+    target, name = b["target"], b["setup"]["input"]
+    ts = b["frame"].select("ts", target, name).drop_nulls()["ts"]
+    preset = WINDOW_PRESETS.get(window)
+    if window == "lookback":
+        days = b["setup"]["lookback"]
+    elif preset == "YTD":
+        days = int((ts.dt.year() == ts.max().year).sum())
+    elif preset is None:  # All: regression_scatter wants 3 rows beyond its window (4 once changes drop a day)
+        days = len(ts) - 4
+    else:
+        days = preset
+    past = "none" if window == "All" else "previous"
+    return [regression_scatter(b["frame"], target, name, basis, days, past) for basis in ("levels", "changes")]
+
+
+def scatter_window_row(lookback: int, window: str) -> list:
+    """The scatters' fit-window buttons."""
+    return [
+        html.Span("Fit window", style={"fontSize": 10, "color": DIM, "textTransform": "uppercase", "marginRight": 2}),
+        *[html.Button(f"{lookback}d · lookback" if k == "lookback" else k, id=f"oven-scatter-{k}", n_clicks=0,
+                      className="ref-btn", style=btn_style(primary=k == window)) for k in SCATTER_WINDOWS],
+    ]
+
+
 def detail_view(path: str, picked: dict, by: str, min_trades: int, window: str) -> tuple[html.Div, dict]:
     b = bundle(path, picked["input"], picked["sid"])
     setup, target, name, row, latest = b["setup"], b["target"], picked["input"], b["row"], b["latest"]
@@ -681,10 +712,9 @@ def detail_view(path: str, picked: dict, by: str, min_trades: int, window: str) 
     ], style={"marginBottom": 18})
     diagnostics = html.Div([
         heading("relationship diagnostics"),
-        html.Div(style=TWO_UP, children=[
-            regression_scatter(b["frame"], target, name, "levels", setup["lookback"], "previous"),
-            regression_scatter(b["frame"], target, name, "changes", setup["lookback"], "previous"),
-        ]),
+        html.Div(scatter_window_row(setup["lookback"], "lookback"),
+                 style={"display": "flex", "gap": 8, "marginBottom": 8, "alignItems": "center", "flexWrap": "wrap"}),
+        html.Div(scatter_pair(b, "lookback"), id="oven-scatters", style=TWO_UP),
         html.Div(style={**TWO_UP, "marginTop": 12}, children=[
             table(show(lookback_grid(load_run(path)["board"], setup, by)),
                   title=f"{engine.RANKS[by]} · lookback × entry ({setup['scale']}, same exit)", float_fmt=",.2f"),
@@ -1018,6 +1048,19 @@ def register(app) -> None:
                      Input(f"oven-{name}-sort", "data"), State(f"oven-{name}-view", "data"),
                      State("oven-run-pick", "value"), State("oven-rank", "value"), State("oven-min-trades", "value"),
                      State("oven-input", "data"), State("oven-setup", "data"), prevent_initial_call=True)(_page)
+
+    # the scatters' fit window redraws only the two scatters
+    @app.callback(Output("oven-scatters", "children"),
+                  *[Output(f"oven-scatter-{k}", "style") for k in SCATTER_WINDOWS],
+                  *[Input(f"oven-scatter-{k}", "n_clicks") for k in SCATTER_WINDOWS],
+                  State("oven-setup", "data"), State("oven-run-pick", "value"), prevent_initial_call=True)
+    def _scatter_window(*args):
+        *clicks, picked, path = args
+        if not any(clicks) or not picked or not path:
+            return (no_update,) * (1 + len(SCATTER_WINDOWS))
+        chosen = ctx.triggered_id.removeprefix("oven-scatter-")
+        return (scatter_pair(bundle(path, picked["input"], picked["sid"]), chosen),
+                *[btn_style(primary=(k == chosen)) for k in SCATTER_WINDOWS])
 
     # the Dig card's chart window and Snap chart to view redraw only the chart grid
     @app.callback(Output("card-charts-oven", "children", allow_duplicate=True), Output("oven-window", "data"),
