@@ -290,3 +290,11 @@ body .dash-dropdown-value-count {
 .research-banner .research-field {
     margin-bottom: 0 !important;
 }
+
+/* Live dashboard (dashboard.app): tighter table cells so the tables fit the
+   page without a horizontal scrollbar. table_div sets padding inline, so these
+   need !important. */
+.dashboard-tight .viz-table th,
+.dashboard-tight .viz-table td {
+    padding: 3px 6px !important;
+}

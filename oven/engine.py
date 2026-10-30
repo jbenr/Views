@@ -221,6 +221,45 @@ def config_grid(z_entries=Z_ENTRIES, raw_entries=RAW_ENTRIES, reverts=REVERTS,
 
 
 @njit(cache=True)
+def _horizon(hold, hl_mult, half_life):
+    """(bars to the time stop, its exit reason): max_hold, or sooner at hl_mult x the
+    half-life measured at entry."""
+    horizon, timeout = hold, 2
+    if hl_mult > 0:
+        by_half_life = max(1, int(np.ceil(hl_mult * half_life)))
+        if by_half_life < horizon:
+            horizon, timeout = by_half_life, 3
+    return horizon, timeout
+
+
+@njit(cache=True)
+def _expect(abs_r0, hl, revert, horizon, cost):
+    """(exp_return, exp_bars) the frozen model expects of an entry residual |r0| (module
+    docstring): OU recovery with half-life hl by the expected exit, net of cost."""
+    exp_bars = float(horizon)
+    exp_return = np.nan
+    if np.isfinite(hl) and hl > 0:
+        if 0.0 < revert < 1.0:  # revert 0.5: one half-life; 0.75: two
+            exp_bars = min(exp_bars, hl * np.log(1.0 / (1.0 - revert)) / np.log(2.0))
+        elif revert >= 1.0:  # all the way back never arrives: count 90% of it (3.3 half-lives)
+            exp_bars = min(exp_bars, hl * np.log(10.0) / np.log(2.0))
+        exp_bars = max(exp_bars, 1.0)
+        exp_return = abs_r0 * (1.0 - 2.0 ** (-exp_bars / hl)) - cost
+    return exp_return, exp_bars
+
+
+def expected_now(resid: float, half_life: float, port_vol: float, setup: dict, cost: float = COST) -> dict:
+    """What the frozen model would expect of an entry at residual ``resid`` today, with
+    the setup's exits: exp_return (bps, net of cost), exp_bars, bps_per_day and exp_risk
+    (the portfolio's daily vol over the expected hold). The walk's own arithmetic."""
+    hl = float(half_life) if half_life is not None else np.nan
+    horizon, _ = _horizon(int(setup["max_hold"]), float(setup["hl_mult"]), hl)
+    exp_return, exp_bars = _expect(abs(float(resid)), hl, float(setup["revert"]), horizon, float(cost))
+    return dict(exp_return=exp_return, exp_bars=exp_bars, bps_per_day=exp_return / exp_bars,
+                exp_risk=float(port_vol) * np.sqrt(exp_bars) if port_vol is not None else np.nan)
+
+
+@njit(cache=True)
 def _walk(y, x, alpha, beta_l, beta_c, sigma, half_life, port_vol, signals, hedge, scale, entry, revert, hold, stop,
           hl_mult, pnl_stop, sizing, cost, split, trades, stats):
     """Every config's trades and daily P&L statistics for one model.
@@ -266,23 +305,8 @@ def _walk(y, x, alpha, beta_l, beta_c, sigma, half_life, port_vol, signals, hedg
             sign0 = 1.0 if r0 > 0 else -1.0
             goal = (1.0 - revert[c]) * abs(r0)
             limit = abs(r0) + stop[c] * sigma[t]
-            # time out at max_hold, or sooner at hl_mult x the half-life measured at entry
-            horizon, timeout = hold[c], 2
-            if hl_mult[c] > 0:
-                by_half_life = max(1, int(np.ceil(hl_mult[c] * half_life[t])))
-                if by_half_life < horizon:
-                    horizon, timeout = by_half_life, 3
-            # what the frozen model expects (module docstring): OU recovery by the expected exit
-            hl = half_life[t]
-            exp_bars = float(horizon)
-            exp_return = np.nan
-            if np.isfinite(hl) and hl > 0:
-                if 0.0 < revert[c] < 1.0:  # revert 0.5: one half-life; 0.75: two
-                    exp_bars = min(exp_bars, hl * np.log(1.0 / (1.0 - revert[c])) / np.log(2.0))
-                elif revert[c] >= 1.0:  # all the way back never arrives: count 90% of it (3.3 half-lives)
-                    exp_bars = min(exp_bars, hl * np.log(10.0) / np.log(2.0))
-                exp_bars = max(exp_bars, 1.0)
-                exp_return = abs(r0) * (1.0 - 2.0 ** (-exp_bars / hl)) - cost
+            horizon, timeout = _horizon(hold[c], hl_mult[c], half_life[t])
+            exp_return, exp_bars = _expect(abs(r0), half_life[t], revert[c], horizon, cost)
             size = 1.0
             if sizing[c] == 1:
                 size = exp_return

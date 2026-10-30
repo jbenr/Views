@@ -275,13 +275,14 @@ def test_gate_column_states_the_rule_and_its_percentile_basis(
     same condition and bucket mean different gates on different lookbacks."""
     app = _load_app_module(monkeypatch, tmp_path)
 
+    # compact, so the overview fits without a scrollbar, but the basis is never dropped
     assert app._gate_rule({"gate": None}) == "none"
     assert app._gate_rule(
         {"gate": ("r2", "tails_25_75"), "gate_window": 1260}
-    ) == "r2 · tails_25_75 · roll 1260d"
+    ) == "r2 tails_25_75 /1260d"
     assert app._gate_rule(
         {"gate": ("resid_half_life", "below_50"), "gate_window": None}
-    ) == "resid_half_life · below_50 · expanding"
+    ) == "resid_half_life below_50 /exp"
 
 
 def test_registry_list_states_the_whole_frozen_configuration():

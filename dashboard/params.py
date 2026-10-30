@@ -13,6 +13,7 @@ the same in `registry --list` as it does on the app.
 from __future__ import annotations
 
 import ast
+import json
 
 PARAM_COLS = [
     "entry_signal", "beta_lb", "ou_lb", "entry_threshold",
@@ -63,7 +64,12 @@ def params_from_row(row: dict) -> dict:
 def auto_label(row: dict) -> str:
     """Params-derived label for a promotion with no curated variant name, in
     the same shorthand curated labels use: the lookback that defines the
-    signal plus its entry threshold."""
+    signal plus its entry threshold. An oven signal reads OVEN<lookback><basis>,
+    P for the portfolio basis and L for levels."""
+    if row.get("kind") == "oven":
+        setup = json.loads(row["oven_setup"])
+        units = "bps" if setup["scale"] == "raw" else "z"
+        return f"OVEN{setup['lookback']}{setup['basis'][0].upper()} · {float(setup['entry']):g}{units}"
     if row["entry_signal"] == "residual":
         return f"RES{int(row['beta_lb'])} · {float(row['entry_threshold']):g}bps"
     return f"OU{int(row['ou_lb'])} · {float(row['entry_threshold']):g}z"
@@ -76,7 +82,16 @@ def signal_label(row: dict) -> str:
     suffixed with a label: curated variants use their own, every other
     promotion gets one derived from its frozen params."""
     base = f"{row['feature']}_{row['target']}"
-    return f"{base} · {row.get('variant_label') or auto_label(row)}"
+    return f"{base} · {short_label(row)}"
+
+
+def short_label(row: dict) -> str:
+    """The part of a signal's name after `<input>_<target>`: its curated variant
+    label, else one derived from its params. Oven signals always derive theirs,
+    so a long stored label never widens a table."""
+    if row.get("kind") == "oven":
+        return auto_label(row)
+    return row.get("variant_label") or auto_label(row)
 
 
 def input_label(row: dict) -> str:

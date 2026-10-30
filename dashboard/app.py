@@ -47,7 +47,7 @@ from dashboard.charts import (
 )
 from dashboard.ledger import SignalLedger
 from dashboard.params import (
-    auto_label, exit_label, gate_label as _gate_rule, input_label,
+    exit_label, gate_short as _gate_rule, input_label, short_label,
     signal_label as _display_name,
 )
 from dashboard.registry import LiveRegistry
@@ -71,9 +71,9 @@ TRADE_TABLE_COLS = [
 TRADE_TABLE_HEADERS = {
     "entry_date": "Entry", "exit_date": "Exit", "direction": "Dir",
     "entry_level": "Entry Lvl", "exit_level": "Exit Lvl",
-    "target_lvl": "Target Lvl", "expected_return_bps": "Exp Ret (bps)",
-    "pnl_bps": "Net PnL (bps)", "entry_half_life": "Half-life (d)",
-    "bars_held": "Held (d)", "exit_reason": "Exit Reason",
+    "target_lvl": "Target Lvl", "expected_return_bps": "Exp Ret",
+    "pnl_bps": "PnL", "entry_half_life": "HL (d)",
+    "bars_held": "Held (d)", "exit_reason": "Reason",
 }
 TRADE_TABLE_ROUND = {
     "entry_level": 2, "exit_level": 2, "target_lvl": 2,
@@ -84,17 +84,19 @@ OVERVIEW_COLUMNS = [
     # Feature is dropped: the Signal name already leads with it. Position folds
     # in the old "Latest Reading", and Reading pairs the live value with the
     # threshold it is being judged against, so the four state columns become two.
+    # Headers and cells are kept short so the table fits the page without a
+    # scrollbar; units (bps, %) are the dashboard's defaults and go unstated.
     ("name", "Signal"),
     ("position", "Position"),
     ("reading", "Reading"),
     ("gate_rule", "Gate"),
-    ("gate_status", "Gate State"),
-    ("live_pnl_bps", "Net PnL (bps)"),
+    ("gate_status", "Gate Now"),
+    ("live_pnl_bps", "PnL"),
     ("sharpe", "Sharpe"),
     ("n_trades", "Trades"),
-    ("hit_rate", "Hit Rate (%)"),
-    ("max_drawdown_bps", "Max DD (bps)"),
-    ("data_asof", "Data As-Of"),
+    ("hit_rate", "Hit %"),
+    ("max_drawdown_bps", "Max DD"),
+    ("data_asof", "As Of"),
 ]
 
 
@@ -258,7 +260,7 @@ def _gate_status(state: dict) -> str:
     suffix = "th" if 10 <= pct % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(
         pct % 10, "th"
     )
-    return f"{status} · {pct}{suffix} pct"
+    return f"{status} {pct}{suffix}"
 
 
 CHANGE_WINDOWS = [("1D", 1), ("1W", 7), ("1M", 30)]
@@ -343,6 +345,15 @@ def _db_asof(signal_id: str, data_asof) -> tuple[str, str, bool]:
         stale = pd.Timestamp(fresh["last_written"]) > pd.Timestamp(pulled_at)
     written = f"db {_clock(fresh['last_written'], same_day_as=data_asof)}"
     return str(data_asof), written, stale
+
+
+def _short_asof(bar: str, written: str) -> str:
+    """'2026-10-29' + 'db 6:32:37pm EDT' as '10-29 · 6:32pm': the bar's month-day and
+    the DB write time to the minute. A write on another day keeps its own date."""
+    when = re.sub(r":\d\d(?=[ap]m)", "", written.removeprefix("db "))  # drop seconds
+    when = re.sub(r"\s+[A-Z]{2,5}$", "", when)  # drop the zone
+    when = re.sub(r"^\d{4}-(\d\d-\d\d)", r"\1", when)
+    return f"{str(bar)[5:]} · {'db down' if written == 'db unreachable' else when}"
 
 
 def _target_snapshot(target: str, rows: list[dict]) -> dict | None:
@@ -467,7 +478,8 @@ def _overview_snapshot(row: dict) -> dict:
         "gate_rule": _gate_rule(params),
         "gate_status": _gate_status(state).upper(),
         "live_pnl_bps": round(_live_pnl_bps(trades, open_entry), 1),
-        "data_asof": f"{asof_bar} · {asof_written}",
+        # compact for the table: the target header above it carries the full stamp
+        "data_asof": _short_asof(asof_bar, asof_written),
         # not a displayed column -- drives the stale conditional style below
         "data_stale": int(asof_stale),
     }
@@ -574,6 +586,7 @@ def _overview_content(rows: list[dict]) -> list:
         columns=OVERVIEW_KEYS,
         headers=dict(OVERVIEW_COLUMNS),
         float_fmt=OVERVIEW_FLOAT_FMT,
+        pad=1,  # the cells carry their own padding (see .dashboard-tight)
     )
     return [
         _overview_table(target, by_target[target], snapshots[target], widths)
@@ -823,7 +836,7 @@ def _dropdown_options(rows: list[dict]) -> list[dict]:
         options += [
             {
                 "label": f"{r['target']} · {input_label(r)} · "
-                         f"{r.get('variant_label') or auto_label(r)}",
+                         f"{short_label(r)}",
                 "value": _row_id(r),
             }
             for r in group
@@ -935,6 +948,10 @@ def build_app() -> dash.Dash:
         "background": PANEL,
         "border": f"1px solid {BORDER}",
         "color": DIM,
+        # sized to the label, not stretched across the page (dcc.Tab splits the width by default)
+        "width": "auto",
+        "flex": "0 0 auto",
+        "minWidth": 110,
     }
     selected_tab_style = {
         **tab_style,
@@ -1036,6 +1053,7 @@ def build_app() -> dash.Dash:
         rows = _registry_rows()
         return dcc.Tabs(
             id="dashboard-tabs",
+            className="dashboard-tight",
             value="live-overview",
             children=[
                 dcc.Tab(

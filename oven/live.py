@@ -54,7 +54,7 @@ def registry_entry(run_path: str | Path, name: str, sid: str, rationale: str | N
         "target": target,
         "feature": name,
         "variant": None,
-        "variant_label": f"oven · lb {setup['lookback']} · {setup['basis']} · {setup['scale']} {setup['entry']:g}",
+        "variant_label": None,  # named from the setup: dashboard.params.auto_label
         "rationale": rationale,
         "rank": None,
         "selection_source": f"oven bake {Path(run_path).name}",
