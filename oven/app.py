@@ -1344,8 +1344,8 @@ def register(app) -> None:
             entry = LiveRegistry().promote_oven(path, picked["input"], picked["sid"])
         except Exception as exc:  # shown on the card rather than lost in the server log
             return note(f"Not sent: {exc}", "warn")
-        return note(f"Sent · live on the dashboard as {entry['signal_id']} · Ref there pulls its data and "
-                    f"re-run logs it to the ledger", "dim")
+        return note(f"Sent · live as {entry['signal_id']} · refresh the dashboard to see it; Ref there pulls "
+                    f"its data", "dim")
 
     # the scatters' fit window redraws only the two scatters
     @app.callback(Output("oven-scatters", "children"),

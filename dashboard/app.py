@@ -31,7 +31,7 @@ import re
 import dash
 import pandas as pd
 import polars as pl
-from dash import Input, Output, State, ctx, dcc, html
+from dash import ALL, MATCH, Input, Output, State, ctx, dcc, html
 
 import utils.helpers
 from dashboard import runner
@@ -100,6 +100,12 @@ OVERVIEW_COLUMNS = [
 
 def _slug(signal_id: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", signal_id.lower()).strip("-")
+
+
+def _pid(kind: str, signal_id) -> dict:
+    """A card component's pattern-matching id. One set of MATCH callbacks then serves
+    every card, so a signal promoted after the server started works on a browser refresh."""
+    return {"type": kind, "sid": signal_id}
 
 
 def _row_id(row: dict) -> str:
@@ -605,7 +611,7 @@ def _trade_table_block(
 
 
 def _trade_table_section(
-    closed_rows: list[dict], page: int, open_row: dict | None, slug: str
+    closed_rows: list[dict], page: int, open_row: dict | None, signal_id: str
 ) -> html.Div:
     """A fixed control row around the table area that the pager replaces.
 
@@ -615,7 +621,7 @@ def _trade_table_section(
     """
     table = html.Div(
         _trade_table_block(closed_rows, page, open_row),
-        id=f"trade-table-{slug}",
+        id=_pid("trade-table", signal_id),
     )
     n = len(closed_rows)
     if n == 0 and open_row is None:
@@ -627,26 +633,26 @@ def _trade_table_section(
             html.Div(
                 style={"display": "flex", "gap": 8, "alignItems": "center", "marginTop": 8},
                 children=[
-                    html.Button("<<", id=f"trades-first-{slug}", n_clicks=0,
+                    html.Button("<<", id=_pid("trades-first", signal_id), n_clicks=0,
                                 className="ref-btn",
                                 title="First trade page",
                                 style={**_btn_style(), "padding": "3px 6px"}),
-                    html.Button("< prev", id=f"trades-prev-{slug}", n_clicks=0,
+                    html.Button("< prev", id=_pid("trades-prev", signal_id), n_clicks=0,
                                 className="ref-btn",
                                 style=_btn_style()),
-                    html.Button("next >", id=f"trades-next-{slug}", n_clicks=0,
+                    html.Button("next >", id=_pid("trades-next", signal_id), n_clicks=0,
                                 className="ref-btn",
                                 style=_btn_style()),
-                    html.Button(">>", id=f"trades-last-{slug}", n_clicks=0,
+                    html.Button(">>", id=_pid("trades-last", signal_id), n_clicks=0,
                                 className="ref-btn",
                                 title="Last trade page",
                                 style={**_btn_style(), "padding": "3px 6px"}),
-                    html.Button("Snap chart to view", id=f"snap-{slug}", n_clicks=0,
+                    html.Button("Snap chart to view", id=_pid("snap", signal_id), n_clicks=0,
                                 className="ref-btn",
                                 style=_btn_style()),
                     html.Span(
                         _trade_page_label(n, page),
-                        id=f"trades-status-{slug}",
+                        id=_pid("trades-status", signal_id),
                         style={"fontSize": 11, "color": DIM},
                     ),
                 ],
@@ -850,16 +856,16 @@ def _card(row: dict) -> html.Div:
                 style={"display": "flex", "gap": 8, "marginBottom": 4,
                        "alignItems": "center", "flexWrap": "wrap"},
                 children=[
-                    html.Button("Ref", id=f"ref-{slug}", n_clicks=0,
+                    html.Button("Ref", id=_pid("ref", signal_id), n_clicks=0,
                                 className="ref-btn",
                                 style=_btn_style(primary=True)),
-                    dcc.Store(id=f"window-{slug}", data=DEFAULT_WINDOW),
-                    dcc.Store(id=f"snap-range-{slug}", data=None),
-                    dcc.Store(id=f"trades-page-{slug}", data=0),
-                    dcc.Store(id=f"trades-data-{slug}", data=trade_data),
+                    dcc.Store(id=_pid("window", signal_id), data=DEFAULT_WINDOW),
+                    dcc.Store(id=_pid("snap-range", signal_id), data=None),
+                    dcc.Store(id=_pid("trades-page", signal_id), data=0),
+                    dcc.Store(id=_pid("trades-data", signal_id), data=trade_data),
                 ],
             ),
-            html.Div(id=f"card-summary-{slug}", children=summary),
+            html.Div(id=_pid("card-summary", signal_id), children=summary),
             html.Div(
                 style={
                     "display": "flex",
@@ -879,7 +885,7 @@ def _card(row: dict) -> html.Div:
                         },
                     ),
                     *[
-                        html.Button(key, id=f"window-{slug}-{key}", n_clicks=0,
+                        html.Button(key, id=_pid(f"window-{key}", signal_id), n_clicks=0,
                                     style=_btn_style(primary=(key == DEFAULT_WINDOW)))
                         for key in WINDOW_PRESETS
                     ],
@@ -900,9 +906,12 @@ def _card(row: dict) -> html.Div:
             html.Div(
                 id=f"card-analysis-{slug}",
                 children=[
-                    html.Div(id=f"card-charts-{slug}", children=chart_body),
+                    # the plain id is what research_app.js's Copy reads the images from;
+                    # the callbacks fill the pattern-id div inside it
+                    html.Div(id=f"card-charts-{slug}",
+                             children=html.Div(id=_pid("card-charts", signal_id), children=chart_body)),
                     _trade_table_section(
-                        trade_data["closed"], 0, trade_data["open"], slug,
+                        trade_data["closed"], 0, trade_data["open"], signal_id,
                     ) if trade_data is not None else html.Div(),
                 ],
             ),
@@ -910,14 +919,15 @@ def _card(row: dict) -> html.Div:
     )
 
 
-def build_app() -> dash.Dash:
+def _registry_rows() -> list[dict]:
+    """The promoted signals as they stand now. Read on every page load and every
+    overview Ref -- never once at startup -- so a signal promoted while the server
+    runs (the Oven's Send to dashboard, or registry --promote) shows on a refresh."""
     reg_df = REGISTRY.list()
-    rows = (
-        []
-        if reg_df.is_empty()
-        else reg_df.sort("target", "family", "name").to_dicts()
-    )
-    selected_signal = _row_id(rows[0]) if rows else None
+    return [] if reg_df.is_empty() else reg_df.sort("target", "family", "name").to_dicts()
+
+
+def build_app() -> dash.Dash:
     tab_style = {
         "padding": "10px 18px",
         "fontSize": 12,
@@ -933,7 +943,7 @@ def build_app() -> dash.Dash:
         "borderTop": f"3px solid {ORANGE}",
     }
 
-    def _overview_tab():
+    def _overview_tab(rows):
         return html.Div(
             style={"padding": "18px 24px"},
             children=[
@@ -969,7 +979,8 @@ def build_app() -> dash.Dash:
             ],
         )
 
-    def _deep_dive_tab():
+    def _deep_dive_tab(rows):
+        selected_signal = _row_id(rows[0]) if rows else None
         return html.Div(
             style={"padding": "18px 24px"},
             children=(
@@ -997,7 +1008,7 @@ def build_app() -> dash.Dash:
                     ),
                     *[
                         html.Div(
-                            id=f"deep-card-{_slug(_row_id(row))}",
+                            id=_pid("deep-card", _row_id(row)),
                             style={
                                 "display": "block"
                                 if _row_id(row) == selected_signal
@@ -1022,6 +1033,7 @@ def build_app() -> dash.Dash:
     def _tabs():
         """The real page. Costs one Engine.run() per promoted signal, so it is
         built in a callback rather than in the layout -- see _body."""
+        rows = _registry_rows()
         return dcc.Tabs(
             id="dashboard-tabs",
             value="live-overview",
@@ -1031,14 +1043,14 @@ def build_app() -> dash.Dash:
                     value="live-overview",
                     style=tab_style,
                     selected_style=selected_tab_style,
-                    children=_overview_tab(),
+                    children=_overview_tab(rows),
                 ),
                 dcc.Tab(
                     label="Dig",
                     value="signal-deep-dive",
                     style=tab_style,
                     selected_style=selected_tab_style,
-                    children=_deep_dive_tab(),
+                    children=_deep_dive_tab(rows),
                 ),
             ],
         )
@@ -1052,11 +1064,12 @@ def build_app() -> dash.Dash:
         indicator could be shown. Returning a shell first means the page is on
         screen immediately and the wait happens with the spinner visible.
 
-        Content is still rebuilt per page load (the boot callback runs each
-        time), and the component ids inside are identical every call, which is
-        what keeps the per-card callbacks below valid. Those callbacks
-        reference ids that do not exist until this fills, which is legal only
-        because make_app sets suppress_callback_exceptions.
+        Content is rebuilt per page load (the boot callback runs each time,
+        reading the registry afresh), and each card's components carry
+        pattern-matching ids keyed by signal id, which is what lets the MATCH
+        callbacks below serve cards for signals promoted after startup. Those
+        callbacks reference ids that do not exist until this fills, which is
+        legal only because make_app sets suppress_callback_exceptions.
         """
         return html.Div([
             dcc.Interval(id="page-boot", interval=60, max_intervals=1),
@@ -1077,165 +1090,144 @@ def build_app() -> dash.Dash:
 
     window_keys = list(WINDOW_PRESETS)
 
-    if rows:
-        app.callback(
-            *[
-                Output(f"deep-card-{_slug(_row_id(row))}", "style")
-                for row in rows
-            ],
-            Input("deep-dive-signal", "value"),
-        )(
-            lambda selected: [
-                {
-                    "display": "block"
-                    if _row_id(row) == selected
-                    else "none"
-                }
-                for row in rows
-            ]
-        )
+    # Every callback below is pattern-matched on the signal id rather than registered
+    # per promoted signal at startup, so cards built for signals promoted later work too.
+    app.callback(
+        Output(_pid("deep-card", ALL), "style"),
+        Input("deep-dive-signal", "value"),
+    )(
+        lambda selected: [
+            {"display": "block" if out["id"]["sid"] == selected else "none"}
+            for out in ctx.outputs_list
+        ]
+    )
 
-        def _refresh_overview(*_clicks):
-            _refresh_all_data(rows)
-            return _overview_content(rows)
+    def _refresh_overview(*_clicks):
+        rows = _registry_rows()
+        _refresh_all_data(rows)
+        return _overview_content(rows)
 
-        app.callback(
-            Output("overview-content", "children"),
-            Input("refresh-overview", "n_clicks"),
-            prevent_initial_call=True,
-        )(_refresh_overview)
+    app.callback(
+        Output("overview-content", "children"),
+        Input("refresh-overview", "n_clicks"),
+        prevent_initial_call=True,
+    )(_refresh_overview)
 
-    for row in rows:
-        signal_id = _row_id(row)
-        slug = _slug(signal_id)
-        window_prefix = f"window-{slug}-"
-
-        def _update(
-            _ref,
-            *rest,
-            signal_id=signal_id,
-            slug=slug,
-            window_prefix=window_prefix,
-        ):
-            *_window_clicks, _snap, window, snap_range, page = rest
-            trigger = ctx.triggered_id or ""
-            no_btn_styles = [dash.no_update] * len(window_keys)
-            try:
-                if trigger.startswith("ref-"):
-                    # one click = fresh data, then one logged analysis on it
-                    runner.pull_data(signal_id)
-                    runner.run_analysis(signal_id)
-                    page = 0
-                elif trigger.startswith(window_prefix):
-                    window = trigger[len(window_prefix):]
-                    snap_range = None
-                    page = 0
-                state = runner.compute_signal(signal_id)
-                trades, open_entry = runner.trade_history(signal_id, state)
-            except RuntimeError as exc:
-                err = html.Div(str(exc), style={"color": ORANGE, "padding": "12px 0"})
-                return (
-                    html.Div(), err, None,
-                    dash.no_update, dash.no_update, 0,
-                    window, snap_range, *no_btn_styles,
-                )
-
-            if trigger == f"snap-{slug}":
-                rng = _visible_trade_range(trades, open_entry, page, state["data_asof"])
-                if rng is not None:
-                    snap_range = [str(rng[0]), str(rng[1])]
-
-            date_range = None
-            if snap_range:
-                date_range = (pd.Timestamp(snap_range[0]), pd.Timestamp(snap_range[1]))
-
-            summary, chart_body, trade_data = _card_sections(
-                signal_id,
-                state=state,
-                trades=trades,
-                open_entry=open_entry,
-                window=window,
-                page=page,
-                date_range=date_range,
-            )
-            btn_styles = [_btn_style(primary=(k == window)) for k in window_keys]
-            if trigger == f"snap-{slug}":
-                # Snap changes the chart range only. Leaving the trade DOM and
-                # page store untouched keeps the viewer on the same rows.
-                return (
-                    summary, chart_body,
-                    dash.no_update, dash.no_update, dash.no_update, dash.no_update,
-                    window, snap_range, *btn_styles,
-                )
+    def _update(_ref, *rest):
+        *_window_clicks, _snap, window, snap_range, page = rest
+        trigger = ctx.triggered_id or {}
+        kind = trigger.get("type", "")
+        signal_id = ctx.outputs_list[0]["id"]["sid"]
+        no_btn_styles = [dash.no_update] * len(window_keys)
+        try:
+            if kind == "ref":
+                # one click = fresh data, then one logged analysis on it
+                runner.pull_data(signal_id)
+                runner.run_analysis(signal_id)
+                page = 0
+            elif kind.startswith("window-"):
+                window = kind[len("window-"):]
+                snap_range = None
+                page = 0
+            state = runner.compute_signal(signal_id)
+            trades, open_entry = runner.trade_history(signal_id, state)
+        except RuntimeError as exc:
+            err = html.Div(str(exc), style={"color": ORANGE, "padding": "12px 0"})
             return (
-                summary, chart_body, trade_data,
-                _trade_table_block(trade_data["closed"], page, trade_data["open"]),
-                _trade_page_label(len(trade_data["closed"]), page), page,
+                html.Div(), err, None,
+                dash.no_update, dash.no_update, 0,
+                window, snap_range, *no_btn_styles,
+            )
+
+        if kind == "snap":
+            rng = _visible_trade_range(trades, open_entry, page, state["data_asof"])
+            if rng is not None:
+                snap_range = [str(rng[0]), str(rng[1])]
+
+        date_range = None
+        if snap_range:
+            date_range = (pd.Timestamp(snap_range[0]), pd.Timestamp(snap_range[1]))
+
+        summary, chart_body, trade_data = _card_sections(
+            signal_id,
+            state=state,
+            trades=trades,
+            open_entry=open_entry,
+            window=window,
+            page=page,
+            date_range=date_range,
+        )
+        btn_styles = [_btn_style(primary=(k == window)) for k in window_keys]
+        if kind == "snap":
+            # Snap changes the chart range only. Leaving the trade DOM and
+            # page store untouched keeps the viewer on the same rows.
+            return (
+                summary, chart_body,
+                dash.no_update, dash.no_update, dash.no_update, dash.no_update,
                 window, snap_range, *btn_styles,
             )
+        return (
+            summary, chart_body, trade_data,
+            _trade_table_block(trade_data["closed"], page, trade_data["open"]),
+            _trade_page_label(len(trade_data["closed"]), page), page,
+            window, snap_range, *btn_styles,
+        )
 
-        app.callback(
-            Output(f"card-summary-{slug}", "children"),
-            Output(f"card-charts-{slug}", "children"),
-            Output(f"trades-data-{slug}", "data"),
-            Output(f"trade-table-{slug}", "children", allow_duplicate=True),
-            Output(f"trades-status-{slug}", "children", allow_duplicate=True),
-            Output(f"trades-page-{slug}", "data"),
-            Output(f"window-{slug}", "data"),
-            Output(f"snap-range-{slug}", "data"),
-            *[Output(f"window-{slug}-{k}", "style") for k in window_keys],
-            Input(f"ref-{slug}", "n_clicks"),
-            *[Input(f"window-{slug}-{k}", "n_clicks") for k in window_keys],
-            Input(f"snap-{slug}", "n_clicks"),
-            State(f"window-{slug}", "data"),
-            State(f"snap-range-{slug}", "data"),
-            State(f"trades-page-{slug}", "data"),
-            prevent_initial_call=True,
-        )(_update)
+    app.callback(
+        Output(_pid("card-summary", MATCH), "children"),
+        Output(_pid("card-charts", MATCH), "children"),
+        Output(_pid("trades-data", MATCH), "data"),
+        Output(_pid("trade-table", MATCH), "children", allow_duplicate=True),
+        Output(_pid("trades-status", MATCH), "children", allow_duplicate=True),
+        Output(_pid("trades-page", MATCH), "data"),
+        Output(_pid("window", MATCH), "data"),
+        Output(_pid("snap-range", MATCH), "data"),
+        *[Output(_pid(f"window-{k}", MATCH), "style") for k in window_keys],
+        Input(_pid("ref", MATCH), "n_clicks"),
+        *[Input(_pid(f"window-{k}", MATCH), "n_clicks") for k in window_keys],
+        Input(_pid("snap", MATCH), "n_clicks"),
+        State(_pid("window", MATCH), "data"),
+        State(_pid("snap-range", MATCH), "data"),
+        State(_pid("trades-page", MATCH), "data"),
+        prevent_initial_call=True,
+    )(_update)
 
-        def _page_trades(
-            _first,
-            _prev,
-            _next,
-            _last,
-            trade_data,
+    def _page_trades(_first, _prev, _next, _last, trade_data, page):
+        """Swap rows only -- chart and backtest work stays off this path."""
+        trade_data = trade_data or {"closed": [], "open": None}
+        closed_rows = trade_data.get("closed", [])
+        open_entry = trade_data.get("open")
+        n = len(closed_rows)
+        last_page = max(0, (n - 1) // TRADES_PER_PAGE * TRADES_PER_PAGE) if n else 0
+        page = page or 0
+        kind = (ctx.triggered_id or {}).get("type")
+        if kind == "trades-first":
+            page = 0
+        elif kind == "trades-prev":
+            page = max(0, page - TRADES_PER_PAGE)
+        elif kind == "trades-next":
+            page = min(page + TRADES_PER_PAGE, last_page)
+        elif kind == "trades-last":
+            page = last_page
+        page = min(page, last_page)
+        return (
+            _trade_table_block(closed_rows, page, open_entry),
+            _trade_page_label(n, page),
             page,
-            slug=slug,
-        ):
-            """Swap rows only -- chart and backtest work stays off this path."""
-            trade_data = trade_data or {"closed": [], "open": None}
-            closed_rows = trade_data.get("closed", [])
-            open_entry = trade_data.get("open")
-            n = len(closed_rows)
-            last_page = max(0, (n - 1) // TRADES_PER_PAGE * TRADES_PER_PAGE) if n else 0
-            page = page or 0
-            if ctx.triggered_id == f"trades-first-{slug}":
-                page = 0
-            elif ctx.triggered_id == f"trades-prev-{slug}":
-                page = max(0, page - TRADES_PER_PAGE)
-            elif ctx.triggered_id == f"trades-next-{slug}":
-                page = min(page + TRADES_PER_PAGE, last_page)
-            elif ctx.triggered_id == f"trades-last-{slug}":
-                page = last_page
-            page = min(page, last_page)
-            return (
-                _trade_table_block(closed_rows, page, open_entry),
-                _trade_page_label(n, page),
-                page,
-            )
+        )
 
-        app.callback(
-            Output(f"trade-table-{slug}", "children"),
-            Output(f"trades-status-{slug}", "children"),
-            Output(f"trades-page-{slug}", "data", allow_duplicate=True),
-            Input(f"trades-first-{slug}", "n_clicks"),
-            Input(f"trades-prev-{slug}", "n_clicks"),
-            Input(f"trades-next-{slug}", "n_clicks"),
-            Input(f"trades-last-{slug}", "n_clicks"),
-            State(f"trades-data-{slug}", "data"),
-            State(f"trades-page-{slug}", "data"),
-            prevent_initial_call=True,
-        )(_page_trades)
+    app.callback(
+        Output(_pid("trade-table", MATCH), "children"),
+        Output(_pid("trades-status", MATCH), "children"),
+        Output(_pid("trades-page", MATCH), "data", allow_duplicate=True),
+        Input(_pid("trades-first", MATCH), "n_clicks"),
+        Input(_pid("trades-prev", MATCH), "n_clicks"),
+        Input(_pid("trades-next", MATCH), "n_clicks"),
+        Input(_pid("trades-last", MATCH), "n_clicks"),
+        State(_pid("trades-data", MATCH), "data"),
+        State(_pid("trades-page", MATCH), "data"),
+        prevent_initial_call=True,
+    )(_page_trades)
 
     return app
 

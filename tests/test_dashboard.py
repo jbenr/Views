@@ -95,9 +95,44 @@ def test_dashboard_has_live_overview_and_selectable_deep_dive(monkeypatch, tmp_p
         "overview-content",
         "refresh-overview",
         "deep-dive-signal",
-        "deep-card-book-curve-twos-10s30s",
     ):
         assert component_id in page
+    # each card carries a pattern-matching id keyed by its signal id
+    assert '"type":"deep-card"' in page.replace(" ", "")
+    assert '"sid":"book.curve.twos_10s30s"' in page.replace(" ", "")
+
+
+def _boot_page(app_module) -> str:
+    """The page body as a browser load gets it: the boot callback's response."""
+    response = app_module.app.server.test_client().post(
+        "/_dash-update-component",
+        json={
+            "output": "page-body.children",
+            "outputs": {"id": "page-body", "property": "children"},
+            "inputs": [{"id": "page-boot", "property": "n_intervals", "value": 1}],
+            "changedPropIds": ["page-boot.n_intervals"],
+        },
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 200
+    return response.data.decode().replace(" ", "")
+
+
+def test_a_signal_promoted_after_startup_shows_on_the_next_page_load(monkeypatch, tmp_path):
+    app_module = _load_app_module(monkeypatch, tmp_path)  # started with nothing promoted
+    assert '"type":"deep-card"' not in _boot_page(app_module)
+
+    row = {"module": "book.curve.twos_10s30s", "name": "twos_10s30s", "family": "curve", "target": "10s30s",
+           "feature": "2y", "entry_signal": "ou_z", "beta_lb": 90, "ou_lb": 470, "entry_threshold": 0.9,
+           "exit_style": "revert_frac", "exit_param": 1.0, "gate": None, "stop_loss_bps": 25.0, "sharpe": 0.71,
+           "n_trades": 58, "hit_rate": 0.707, "max_drawdown_bps": -52.4}
+    pl.DataFrame([row]).write_parquet(tmp_path / "live_signals.parquet")
+
+    page = _boot_page(app_module)  # same server, no restart: a browser refresh
+    assert '"sid":"book.curve.twos_10s30s"' in page
+    # its card's controls are served by the pattern-matched callbacks registered at startup
+    patterns = [k for k in app_module.app.callback_map if '"sid":["MATCH"]' in k.replace(" ", "")]
+    assert patterns
 
 
 def test_overview_snapshot_uses_exact_open_position(monkeypatch, tmp_path):
