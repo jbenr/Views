@@ -44,8 +44,13 @@ def _f(value):
 
 
 def _resolve(signal_id: str):
-    """Return (registry row, strategy), accepting a base module for legacy use."""
+    """Return (registry row, strategy), accepting a base module for legacy use. An oven
+    signal (kind "oven") is served by oven.live.OvenStrategy, oven's own engine."""
     row = LiveRegistry().get(signal_id)
+    if row is not None and row.get("kind") == "oven":
+        from oven.live import OvenStrategy
+
+        return row, OvenStrategy(row)
     module = row["module"] if row is not None else signal_id
     return row, load_strategy(module)
 
@@ -176,6 +181,9 @@ def trade_history(signal_id: str, state: dict | None = None) -> tuple[pl.DataFra
 
     state = state or compute_signal(signal_id)
     strategy, data, params = state["strategy"], state["data"], state["params"]
+    if hasattr(strategy, "history"):  # an oven signal walks its own engine
+        log, open_entry, state["equity_curve"] = strategy.history(data)
+        return log, open_entry
 
     engine = Engine(BacktestConfig(transaction_cost_bps=strategy.transaction_cost_bps))
     result = engine.add_signal(strategy.make_pipeline(params)).run(data)
@@ -247,5 +255,16 @@ def run_analysis(signal_id: str) -> dict:
         "gate_allow": last.get("gate_allow"),
         "fired": state["fired"],
     }
+    if hasattr(state["strategy"], "history"):
+        # an oven signal also logs the frozen setup and what its open position expects
+        _, held = trade_history(signal_id, state)
+        entry.update({
+            "oven_setup": state["registry_row"].get("oven_setup"),
+            "position": held["direction"] if held else "flat",
+            "position_entry_date": str(held["entry_date"]) if held else None,
+            "position_pnl_bps": _f(held["pnl_bps"]) if held else None,
+            "expected_return_bps": _f(held["expected_return_bps"]) if held else None,
+            "expected_bars": _f(held["expected_bars"]) if held else None,
+        })
     SignalLedger().log(entry)
     return {**state, "ledger_entry": entry}

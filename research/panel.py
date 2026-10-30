@@ -482,6 +482,13 @@ def _needed_sources(
     return sorted(yields), list(dict.fromkeys([*target_exo, *exo])), vols, composites
 
 
+def panel_tickers(target: TradeDef, features: list[str] | None = None) -> dict[str, str]:
+    """The md.index_eod tickers a panel of ``target`` and ``features`` reads, by column
+    name (swaption vols come from their own table and aren't included)."""
+    yields, exo, _vols, _composites = _needed_sources(target, list(features or []))
+    return {**{a: YIELDS[a] for a in yields}, **{a: EXO[a][0] for a in exo}}
+
+
 def build_panel(
     target: TradeDef,
     features: list[str] | None = None,
@@ -507,8 +514,7 @@ def build_panel(
                          "beta-hedge; choose fixed leg weighting.")
     yields, exo, vols, composites = _needed_sources(target, features)
 
-    tickers = {a: YIELDS[a] for a in yields}
-    tickers.update({a: EXO[a][0] for a in exo})
+    tickers = panel_tickers(target, features)
     bps_cols = [a for a in yields] + [a for a in exo if EXO[a][1]]
 
     if progress:

@@ -15,10 +15,9 @@ reads the same. Two tabs:
            above: the inputs (each input's best setup), that input's setups,
            and one setup laid out as the dashboard's Dig card -- stats, chart
            window + Copy, the chart grid, the paged trade table with Snap chart
-           to view -- followed by the research Dislocation tab's trade
-           mechanics (monthly P&L heatmap, return distribution, exit reasons)
-           and the Oven's own diagnostics (regression scatters, lookback x
-           entry, years, entry-state characteristics and correlations, P&L
+           to view beside the monthly P&L heatmap, the regression scatters --
+           followed by trade mechanics (exit reasons), multi-resolution and the
+           Oven's own diagnostics (lookback x entry, years, entry state, P&L
            correlation with other inputs' best setups).
 
 Every long table pages: header clicks sort ALL its rows on the server (click
@@ -45,7 +44,7 @@ import pandas as pd
 import polars as pl
 from dash import ALL, Input, Output, State, ctx, dcc, html, no_update
 
-from dashboard.charts import (WINDOW_PRESETS, input_chart, level_chart, pnl_chart, residual_bars_chart,
+from dashboard.charts import (WINDOW_PRESETS, input_chart, level_chart, pnl_chart,
                               return_distribution_chart, series_chart, signal_chart)
 from oven import engine
 from research import jobs
@@ -59,15 +58,24 @@ ALL_INPUTS = list(dict.fromkeys(name for names in FEATURE_GROUPS.values() for na
 GRID_CONTROLS = {
     "lookbacks": ("signal lookbacks · levels OLS (d)", [21, 63, 126, 252, 504], engine.LOOKBACKS),
     "z_entries": ("entries · normalized z", [1.0, 1.5, 2.0, 2.5, 3.0], engine.Z_ENTRIES),
-    "raw_entries": ("entries · raw bps", [3.0, 5.0, 10.0, 15.0, 20.0, 30.0], engine.RAW_ENTRIES),
+    "raw_entries": ("entries · raw bps", [2.5 * k for k in range(1, 13)], engine.RAW_ENTRIES),
     "reverts": ("exit · share of frozen residual recovered (0 = no reversion exit)", [0.0, 0.25, 0.5, 0.75, 1.0],
                 engine.REVERTS),
     "hl_mults": ("exit · time stop at × entry half-life (0 = off)", [0.0, 0.5, 1.0, 2.0, 3.0], engine.HL_MULTS),
     "max_holds": ("exit · max hold, the hard cap (bars)", [5, 10, 20, 40, 60, 120], engine.MAX_HOLDS),
     "stops": ("exit · stop, entry sigmas wider (0 = none)", [0.0, 0.5, 1.0, 2.0], engine.STOPS),
+    "pnl_stops": ("exit · stop loss, bps lost on the close (0 = none)", [0.0, 2.5, 5.0, 7.5, 10.0, 15.0, 20.0],
+                  engine.PNL_STOPS),
     "hedge_lookbacks": ("hedge lookback · changes OLS (d)", [21, 63, 126, 252, 504], engine.HEDGE_LOOKBACKS),
 }
-SETUP_COLS = ["lookback", "hedge_lb", "basis", "scale", "entry", "revert", "max_hold", "stop", "hl_mult"]
+SETUP_COLS = ["lookback", "hedge_lb", "basis", "scale", "entry", "revert", "max_hold", "stop", "hl_mult", "pnl_stop",
+              "sizing"]
+SIZING_TEXT = {
+    "flat": "every trade the same size",
+    "exp_return": "∝ expected return",
+    "exp_sharpe": "∝ expected return ÷ expected risk",
+    "bps_per_day": "∝ expected return ÷ expected days",
+}
 BASIS_TEXT = {
     "levels": "levels-fit residual, target − (a + levels β × input)",
     "portfolio": "the traded portfolio's own deviation from its mean",
@@ -76,7 +84,7 @@ STRATEGY_COLS = ["sharpe", "worst_half_sharpe", "sharpe_h1", "sharpe_h2", "total
                  "trades_per_year", "hit_rate", "avg_trade", "median_trade", "profit_factor", "max_drawdown",
                  "calmar", "time_in_market", "avg_bars", "trade_t", "best_trade_share", "worst_trade"]
 PAGED = ("inputs", "setups", "trades")
-PAGE_SIZE = {"inputs": 15, "setups": 15, "trades": 10}
+PAGE_SIZE = {"inputs": 15, "setups": 15, "trades": 10}  # the Dig card sizes trades to its monthly P&L rows
 DEFAULT_SORT = {"inputs": "score", "setups": "score", "trades": "entry"}
 DEFAULT_WINDOW = "All"
 SNAP_LEFT_BUFFER_BDAYS = 5  # as the dashboard's Snap chart to view
@@ -112,13 +120,18 @@ def run_options() -> list[dict]:
 def _with_basis(frame: pl.DataFrame, hedge_lb: int) -> pl.DataFrame:
     """Older bakes: before the portfolio basis everything was levels-basis, before
     half-life time stops no setup had one, and before the hedge lookback was swept
-    every setup used the bake's single one."""
+    every setup used the bake's single one; before the stop loss, none had one; before
+    sizing, every trade was flat (size 1)."""
     if "hedge_lb" not in frame.columns:
         frame = frame.with_columns(pl.lit(hedge_lb, pl.Int64).alias("hedge_lb"))
     if "basis" not in frame.columns:
         frame = frame.with_columns(pl.lit("levels").alias("basis"))
     if "hl_mult" not in frame.columns:
         frame = frame.with_columns(pl.lit(0.0).alias("hl_mult"))
+    if "pnl_stop" not in frame.columns:
+        frame = frame.with_columns(pl.lit(0.0).alias("pnl_stop"))
+    if "sizing" not in frame.columns:
+        frame = frame.with_columns(pl.lit("flat").alias("sizing"))
     return frame
 
 
@@ -132,7 +145,17 @@ def load_run(path: str) -> dict:
 
 @lru_cache(maxsize=2)
 def load_trades(path: str) -> pl.DataFrame:
-    return _with_basis(pl.read_parquet(Path(path) / "trades.parquet"), _old_hedge_lb(load_run(path)["meta"]))
+    """A run's closed trades. A bake's "open" rows are stale by the time it is read; the
+    Dig card finds the open position on today's data instead (open_trade)."""
+    trades = _with_basis(pl.read_parquet(Path(path) / "trades.parquet"), _old_hedge_lb(load_run(path)["meta"]))
+    return trades.filter(pl.col("reason") != "open")
+
+
+def open_trade(frame: pl.DataFrame, target: str, setup: dict, cost: float) -> pl.DataFrame:
+    """The setup's position still held at the last bar of ``frame`` (today's data), as a
+    one-row trade marked to that bar; empty when flat. Re-walks just this setup."""
+    trades = engine.setup_trades(frame, target, setup, cost)
+    return trades.filter(pl.col("reason") == "open") if not trades.is_empty() else trades
 
 
 def _old_hedge_lb(meta: dict) -> int:
@@ -140,27 +163,22 @@ def _old_hedge_lb(meta: dict) -> int:
 
 
 def describe(setup: dict) -> str:
-    """A setup in one line: 'lb 252 · hedge 126 · portfolio · raw > 5 · revert 1 · hl×1 · hold 120 · stop 2'."""
+    """A setup in one line: 'lb 252 · hedge 126 · portfolio · raw > 5 · revert 1 · hl×1 · hold 120 · stop 2
+    · stop loss 5bp'."""
     revert = f"revert {setup['revert']:g}" if setup["revert"] else "no revert"
     half_life = f" · hl×{setup['hl_mult']:g}" if setup["hl_mult"] else ""
+    stop_loss = f" · stop loss {setup['pnl_stop']:g}bp" if setup.get("pnl_stop") else ""
+    sizing = f" · sized {setup['sizing']}" if setup.get("sizing", "flat") != "flat" else ""
     return (f"lb {setup['lookback']} · hedge {setup['hedge_lb']} · {setup['basis']} · {setup['scale']} > {setup['entry']:g} · {revert}"
-            f"{half_life} · hold {setup['max_hold']} · stop {setup['stop']:g}")
+            f"{half_life} · hold {setup['max_hold']} · stop {setup['stop']:g}{stop_loss}{sizing}")
 
 
 @lru_cache(maxsize=32)
 def model_frame(target: str, name: str, lookback: int, hedge_lookback: int) -> pl.DataFrame:
     """ts, the target and the input under their own names, every model array, the
     hedged portfolio's level and the 126d correlation of daily moves."""
-    panel = build_panel(CATALOG[target], features=[name])
-    aligned = panel.data.select("ts", target, name).drop_nulls()
-    y = aligned[target].to_numpy().astype(float)
-    x = aligned[name].to_numpy().astype(float)
-    arrays = engine.model_arrays(y, x, lookback, hedge_lookback)
-    package = engine.held_package(y, x, arrays["beta_changes"], 1.0 if engine.hedgeable(name) else 0.0)
-    corr = (pl.DataFrame({"dy": np.diff(y, prepend=np.nan), "dx": np.diff(x, prepend=np.nan)})
-            .select(pl.rolling_corr("dy", "dx", window_size=126)).to_series())
-    return aligned.with_columns(*[pl.Series(k, v) for k, v in arrays.items()], pl.Series("portfolio", package),
-                                corr.alias("corr126"))
+    return engine.model_frame(build_panel(CATALOG[target], features=[name]).data, target, name, lookback,
+                              hedge_lookback)
 
 
 def input_board(board: pl.DataFrame, by: str, min_trades: int) -> pl.DataFrame:
@@ -186,19 +204,23 @@ def setup_id(row: dict) -> str:
 
 
 def setup_from_id(name: str, sid: str) -> dict:
-    lb, hedge_lb, basis, scale, entry, revert, hold, stop, hl_mult = sid.split("|")
+    lb, hedge_lb, basis, scale, entry, revert, hold, stop, hl_mult, pnl_stop, sizing = sid.split("|")
     return dict(input=name, lookback=int(lb), hedge_lb=int(hedge_lb), basis=basis, scale=scale, entry=float(entry), revert=float(revert),
-                max_hold=int(hold), stop=float(stop), hl_mult=float(hl_mult))
+                max_hold=int(hold), stop=float(stop), hl_mult=float(hl_mult), pnl_stop=float(pnl_stop), sizing=sizing)
 
 
 def matches(frame: pl.DataFrame, setup: dict) -> pl.DataFrame:
     return frame.filter(pl.all_horizontal([pl.col(k) == v for k, v in setup.items()]))
 
 
-def daily_frame(frame: pl.DataFrame, target: str, name: str, trades: pl.DataFrame, cost: float) -> pl.DataFrame:
-    """ts, daily P&L, cumulative P&L and drawdown of one setup."""
-    marks = engine.daily_marks(frame["ts"], frame[target].to_numpy().astype(float),
-                               frame[name].to_numpy().astype(float), trades, cost)
+def daily_frame(frame: pl.DataFrame, target: str, name: str, trades: pl.DataFrame, cost: float,
+                held: pl.DataFrame | None = None) -> pl.DataFrame:
+    """ts, daily P&L, cumulative P&L and drawdown of one setup; an open position
+    ``held`` is marked to the last bar, with no exit cost yet."""
+    y, x = frame[target].to_numpy().astype(float), frame[name].to_numpy().astype(float)
+    marks = engine.daily_marks(frame["ts"], y, x, trades, cost)
+    if held is not None and not held.is_empty():
+        marks = marks + engine.daily_marks(frame["ts"], y, x, held, 0.0)
     cum = np.cumsum(marks)
     return pl.DataFrame({"ts": frame["ts"], "daily_pnl": marks, "cumulative_pnl": cum,
                          "drawdown": cum - np.maximum.accumulate(cum)})
@@ -218,6 +240,20 @@ def by_year(daily: pl.DataFrame, trades: pl.DataFrame) -> pl.DataFrame:
             .with_columns(pl.col("trades_closed").fill_null(0).cast(pl.Int64)).sort("year"))
 
 
+def with_expected(trades: pl.DataFrame, frame: pl.DataFrame, target: str, setup: dict, cost: float) -> pl.DataFrame:
+    """Bakes from before expected return carry no size, exp_return or exp_bars: size is 1
+    (they were all flat) and the expectations come from re-walking the setup, matched to
+    each trade by its entry date."""
+    if "size" not in trades.columns:
+        trades = trades.with_columns(pl.lit(1.0, pl.Float32).alias("size"))
+    if "exp_return" in trades.columns:
+        return trades
+    raw, *_ = engine.walk_setup(frame, target, setup, cost)
+    expected = pl.DataFrame({"entry_ts": frame["ts"].gather(raw[:, 1].astype(np.int64) + 1),
+                             "exp_return": raw[:, 7].astype(np.float32), "exp_bars": raw[:, 8].astype(np.float32)})
+    return trades.join(expected, on="entry_ts", how="left")
+
+
 @lru_cache(maxsize=16)
 def bundle(path: str, name: str, sid: str) -> dict:
     """Everything one setup's views draw from, built once and reused by the chart
@@ -229,26 +265,42 @@ def bundle(path: str, name: str, sid: str) -> dict:
     trades = matches(load_trades(path), setup).sort("entry_ts")
     row = matches(run["board"], setup).to_dicts()
     frame = model_frame(target, name, setup["lookback"], setup["hedge_lb"])
-    daily = daily_frame(frame, target, name, trades, float(meta["settings"].get("cost", engine.COST)))
+    cost = float(meta["settings"].get("cost", engine.COST))
+    trades = with_expected(trades, frame, target, setup, cost)
+    held = open_trade(frame, target, setup, cost)
+    if not held.is_empty():  # a trade the bake saw close can't also be the open one
+        trades = trades.filter(pl.col("entry_ts") < held["entry_ts"][0])
+    daily = daily_frame(frame, target, name, trades, cost, held)
     levels = frame.select("ts", pl.col(target).alias("y"), pl.col(name).alias("x"), "portfolio")
     at = lambda when: levels.rename({"ts": f"{when}_ts", "y": f"{when}_level", "x": f"{when}_input",
                                      "portfolio": f"{when}_portfolio"})
-    # the P&L split into its legs: what the target did for the trade, and what the hedge did
-    with_levels = (trades.join(at("entry"), on="entry_ts", how="left").join(at("exit"), on="exit_ts", how="left")
+    # the P&L split into its legs: what the target did for the trade, and what the hedge did;
+    # the open position rides along as the last row, its "exit" today's mark
+    shown = pl.concat([trades, held], how="diagonal_relaxed") if not held.is_empty() else trades
+    with_levels = (shown.join(at("entry"), on="entry_ts", how="left").join(at("exit"), on="exit_ts", how="left")
                    .with_columns(
                        pl.when(pl.col("side") > 0).then(pl.lit("long")).otherwise(pl.lit("short")).alias("direction"),
                        (pl.col("side") * (pl.col("exit_level") - pl.col("entry_level"))).alias("target_leg"),
                        (-pl.col("side") * pl.col("hedge_ratio") * (pl.col("exit_input") - pl.col("entry_input")))
                        .alias("hedge_leg")))
 
+    closed = with_levels.filter(pl.col("reason") != "open")
+    position = with_levels.filter(pl.col("reason") == "open").to_dicts()
+    position = position[0] if position else None
+
     def markers(prefix: str) -> pl.DataFrame:
-        return with_levels.select(
+        return closed.select(
             "direction", pl.col("entry_ts").cast(pl.Datetime).alias("entry_date"),
             pl.col(f"entry_{prefix}").alias("entry_level"), pl.col("exit_ts").cast(pl.Datetime).alias("exit_date"),
             pl.col(f"exit_{prefix}").alias("exit_level"))
+
+    def open_entry(prefix: str) -> dict | None:  # level_chart's open-position marker
+        return position and dict(date=position["entry_ts"], level=position[f"entry_{prefix}"],
+                                 direction=position["direction"])
     return dict(meta=meta, setup=setup, target=target, trades=trades, with_levels=with_levels,
                 row=row[0] if row else None, frame=frame, daily=daily, markers=markers("level"),
-                portfolio_markers=markers("portfolio"), signal=engine.basis_arrays(frame, setup["basis"]),
+                portfolio_markers=markers("portfolio"), position=position, open_entry=open_entry("level"),
+                portfolio_open_entry=open_entry("portfolio"), signal=engine.basis_arrays(frame, setup["basis"]),
                 latest=frame.drop_nulls("beta_levels").tail(1).to_dicts()[0], years=_active_years(by_year(daily, trades)))
 
 
@@ -281,31 +333,74 @@ def peer_correlations(path: str, setup: dict, by: str, min_trades: int, peers: i
     return pl.DataFrame(rows)
 
 
-def feature_correlations(trades: pl.DataFrame) -> pl.DataFrame:
-    """Spearman correlation of each entry-state feature with trade P&L and with winning."""
+TERCILES = ("low", "mid", "high")
+
+
+def entry_state(trades: pl.DataFrame, setup: dict) -> pl.DataFrame:
+    """One row per entry-state feature: its spearman correlation with trade P&L, the
+    average trade (and count) in each tercile of the feature, and high minus low."""
+    terciles = engine.characteristics(trades, setup)
     rows = []
     for f in engine.FEATURES:
-        v = trades.select(f, "pnl").drop_nulls().filter(pl.col(f).is_finite())
-        if len(v) <= 5:
+        part = {r["tercile"]: r for r in terciles.filter(pl.col("feature") == f).to_dicts()}
+        if not part:
             continue
-        rows.append(dict(feature=f, corr_with_pnl=v.select(pl.corr(f, "pnl", method="spearman")).item(),
-                         corr_with_win=v.select(pl.corr(pl.col(f), (pl.col("pnl") > 0).cast(pl.Float64),
-                                                        method="spearman")).item(),
-                         winners_median=v.filter(pl.col("pnl") > 0)[f].median(),
-                         losers_median=v.filter(pl.col("pnl") <= 0)[f].median()))
+        v = trades.select(f, "pnl").drop_nulls().filter(pl.col(f).is_finite())
+        row = dict(feature=f, corr_with_pnl=v.select(pl.corr(f, "pnl", method="spearman")).item(),
+                   cuts=f"{part['low']['range_hi']:.3g} / {part['mid']['range_hi']:.3g}" if "mid" in part else "")
+        for t in TERCILES:
+            row[t] = part[t]["avg_trade"] if t in part else None
+            row[f"n_{t}"] = part[t]["trades"] if t in part else 0
+        row["high_minus_low"] = None if None in (row["high"], row["low"]) else row["high"] - row["low"]
+        rows.append(row)
     return pl.DataFrame(rows)
+
+
+def split_table(rows: pl.DataFrame, groups: tuple, base: float, title: str, headers: dict) -> html.Div:
+    """A table whose ``groups`` columns are average trades with an n_<group> count beside
+    them: each cell reads 'avg · n', green where it beats the setup's average trade
+    ``base`` and red where it trails it."""
+    pdf = show(rows.drop([f"n_{g}" for g in groups]))
+    devs = {}
+    for g in groups:
+        avg, n = rows[g].to_list(), rows[f"n_{g}"].to_list()
+        pdf[g] = ["" if a is None or not np.isfinite(a) else f"{a:+.2f} · {k}" for a, k in zip(avg, n)]
+        devs[g] = [None if a is None or not np.isfinite(a) else a - base for a in avg]
+        pdf[f"dev_{g}"] = devs[g]
+    scale = max((abs(d) for ds in devs.values() for d in ds if d is not None), default=0.0) or 1.0
+    columns = [c for c in rows.columns if not c.startswith("n_")]
+
+    def style(col, _value, row):
+        if col in groups:
+            return _diverging(row[f"dev_{col}"], scale) if row[f"dev_{col}"] is not None else None
+        return {"textAlign": "left"} if col in TEXT_COLS | {"other_horizon", "feature", "cuts"} else None
+
+    return table(pdf, title=title, columns=columns, headers=headers, float_fmt=",.2f", cell_style=style)
+
+
+def entry_state_view(trades: pl.DataFrame, setup: dict) -> html.Div:
+    rows = entry_state(trades, setup)
+    if rows.is_empty():
+        return note("Too few trades to split by entry state.", "dim")
+    return split_table(rows, TERCILES, trades["pnl"].mean(),
+                       f"entry state · avg trade · n in each tercile of the feature at entry "
+                       f"(setup avg {trades['pnl'].mean():+.2f})",
+                       {"corr_with_pnl": "spearman w/ pnl", "cuts": "tercile cuts", "high_minus_low": "high − low"})
 
 
 HORIZON_Z = 1.0  # |z| beyond which another horizon counts as saying something
 
 
+STATES = ("agrees", "neutral", "disagrees")
+
+
 def multi_resolution(trades: pl.DataFrame, setup: dict) -> pl.DataFrame:
-    """This setup's trades split by what each OTHER signal horizon said at entry:
-    'agrees' (same sign, |z| > HORIZON_Z: also rich, or also cheap), 'disagrees'
-    (opposite sign beyond it) or 'neutral'. A state whose average trade beats the
-    setup's own is one where that horizon adds information."""
+    """One row per OTHER signal horizon: the average trade (and count) of this setup's
+    trades when that horizon, at entry, 'agrees' (same sign, |z| > HORIZON_Z: also rich,
+    or also cheap), is 'neutral', or 'disagrees' (opposite sign beyond it), and agrees
+    minus disagrees. A state whose average trade beats the setup's own is one where
+    that horizon adds information."""
     horizons = sorted((int(c[4:]), c) for c in trades.columns if c.startswith("z_lb"))
-    base = trades["pnl"].mean()
     own = pl.col("entry_z").sign()
     rows = []
     for lb, col in horizons:
@@ -316,27 +411,171 @@ def multi_resolution(trades: pl.DataFrame, setup: dict) -> pl.DataFrame:
                  .when(z.sign() == own).then(pl.lit("agrees")).otherwise(pl.lit("disagrees")))
         both = trades.select("entry_z", col).drop_nulls().filter(pl.col(col).is_not_nan())
         corr = both.select(pl.corr("entry_z", col, method="spearman")).item() if len(both) > 5 else None
-        split = (trades.with_columns(state.alias("state")).group_by("state").agg(
-            pl.len().alias("trades"), pl.col("pnl").mean().alias("avg_trade"), (pl.col("pnl") > 0).mean().alias("hit_rate"),
-            pl.col("pnl").sum().alias("total_pnl")))
-        for row in split.to_dicts():
-            rows.append(dict(other_horizon=f"lb {lb}", z_corr_at_entry=corr, state=row["state"], trades=row["trades"],
-                             share=row["trades"] / len(trades), avg_trade=row["avg_trade"],
-                             vs_setup_avg=row["avg_trade"] - base, hit_rate=row["hit_rate"],
-                             total_pnl=row["total_pnl"]))
-    if not rows:
-        return pl.DataFrame()
-    order = {"agrees": 0, "neutral": 1, "disagrees": 2}
-    return (pl.DataFrame(rows).with_columns(pl.col("state").replace_strict(order, default=3).alias("_o"),
-                                            pl.col("other_horizon").str.slice(3).cast(pl.Int64).alias("_lb"))
-            .sort("_lb", "_o").drop("_o", "_lb"))
+        split = {r["state"]: r for r in trades.with_columns(state.alias("state")).group_by("state").agg(
+            pl.len().alias("n"), pl.col("pnl").mean().alias("avg")).to_dicts()}
+        row = dict(other_horizon=f"lb {lb}", z_corr_at_entry=corr)
+        for s in STATES:
+            row[s] = split[s]["avg"] if s in split else None
+            row[f"n_{s}"] = split[s]["n"] if s in split else 0
+        row["agree_minus_disagree"] = (None if None in (row["agrees"], row["disagrees"])
+                                       else row["agrees"] - row["disagrees"])
+        rows.append(row)
+    return pl.DataFrame(rows)
 
 
 def lookback_grid(board: pl.DataFrame, setup: dict, by: str) -> pl.DataFrame:
     """``by`` over lookback x entry for this input, holding the setup's scale, exit and stop."""
-    fixed = {k: setup[k] for k in ("input", "hedge_lb", "basis", "scale", "revert", "max_hold", "stop", "hl_mult")}
+    fixed = {k: setup[k] for k in ("input", "hedge_lb", "basis", "scale", "revert", "max_hold", "stop", "hl_mult",
+                                   "pnl_stop", "sizing")}
     return (matches(board, fixed).select("lookback", pl.format("entry {}", pl.col("entry")).alias("entry"), by)
             .pivot(on="entry", index="lookback", values=by).sort("lookback"))
+
+
+KNOBS = {"hedge_lb": "hedge lookback", "basis": "basis", "revert": "revert", "max_hold": "max hold",
+         "stop": "stop", "hl_mult": "half-life ×", "pnl_stop": "stop loss (bp)", "sizing": "sizing"}
+
+
+def sensitivity(board: pl.DataFrame, setup: dict, by: str) -> pl.DataFrame:
+    """Each exit and hedge knob moved on its own, everything else held at this setup:
+    the score, trades and total P&L at every value the bake tried (lookback and entry
+    are the score grid's)."""
+    frames = []
+    for knob, label in KNOBS.items():
+        fixed = {k: v for k, v in setup.items() if k in engine.SETUP and k != knob}
+        frames.append(matches(board, fixed).sort(knob).select(
+            pl.lit(label).alias("knob"), pl.col(knob).cast(pl.Utf8).alias("value"),
+            (pl.col(knob) == setup[knob]).alias("this"), pl.col(by).alias("score"), "n_trades", "total_pnl"))
+    return pl.concat(frames)
+
+
+STOP_LEVELS = [0.0] + [2.5 * k for k in range(1, 13)]  # the stop-loss table's rows, bps (0 = no stop loss)
+
+
+def _sharpe(total: float, total_sq: float, days: float) -> float:
+    """Annualised Sharpe of daily marks from their sum, sum of squares and count (as engine._sharpe)."""
+    if days <= 1:
+        return np.nan
+    mean = total / days
+    var = total_sq / days - mean ** 2
+    return mean / np.sqrt(var) * np.sqrt(engine.PERIODS) if var > 1e-12 else np.nan
+
+
+def subset_sharpe(b: dict, trades: pl.DataFrame, cost: float) -> float:
+    """Daily mark-to-market Sharpe of holding only ``trades`` (closed, from this setup),
+    over the days the board scores: from the first bar the setup's signal exists."""
+    frame, target, name = b["frame"], b["target"], b["setup"]["input"]
+    marks = engine.daily_marks(frame["ts"], frame[target].to_numpy().astype(float),
+                               frame[name].to_numpy().astype(float), trades, cost)
+    signal = b["signal"]["resid" if b["setup"]["scale"] == "raw" else "z"].to_numpy()
+    usable = np.flatnonzero(np.isfinite(signal))
+    days = marks[usable[0] + 1:] if len(usable) else marks
+    return _sharpe(days.sum(), (days ** 2).sum(), len(days))
+
+
+def exit_reasons(b: dict, cost: float) -> pl.DataFrame:
+    """Per exit reason, plus 'all': trades, avg and total P&L, its share of the total, hit
+    rate, bars held and the Sharpe of holding only those trades."""
+    trades = b["trades"]
+    total = trades["pnl"].sum()
+    groups = [("all", trades)] + [(r, trades.filter(pl.col("reason") == r))
+                                  for r in trades["reason"].value_counts(sort=True)["reason"]]
+    return pl.DataFrame([dict(reason=r, trades=len(t), sharpe=subset_sharpe(b, t, cost),
+                              mean_pnl_bps=t["pnl"].mean(), total_pnl=t["pnl"].sum(),
+                              share_of_pnl=t["pnl"].sum() / total if total else None,
+                              hit_rate=(t["pnl"] > 0).mean(), avg_held=t["bars"].mean())
+                         for r, t in groups])
+
+
+def stop_table(b: dict, cost: float) -> pl.DataFrame:
+    """This setup re-walked on today's data at every stop-loss level (STOP_LEVELS, plus its
+    own): the strategy stats each level would have produced. A stop changes which later
+    trades happen, so each level is a fresh walk, not a filter on the setup's trades."""
+    setup, frame = b["setup"], b["frame"]
+    levels = sorted({*STOP_LEVELS, float(setup["pnl_stop"])})
+    usable = np.flatnonzero(np.isfinite(frame["entry_z"].to_numpy()))
+    split = int(usable[0] + (len(frame) - usable[0]) // 2) if len(usable) else len(frame)  # as bake's halves
+    raw, stats, _, _, _ = engine.walk_setup(frame, b["target"], setup, cost, levels, split)
+    stopped, still_open = engine.EXIT_REASONS.index("pnl_stop"), engine.EXIT_REASONS.index("open")
+    rows = []
+    for c, level in enumerate(levels):
+        t = raw[(raw[:, 0] == c) & (raw[:, 5] != still_open)]
+        s = dict(zip(engine._STATS, stats[c]))
+        h1, h2 = _sharpe(s["sum1"], s["sumsq1"], s["days1"]), _sharpe(s["sum2"], s["sumsq2"], s["days2"])
+        rows.append(dict(stop_loss="off" if level == 0 else f"{level:g}", sharpe=_sharpe(s["sum"], s["sumsq"], s["days"]),
+                         worst_half_sharpe=np.nanmin([h1, h2]) if np.isfinite([h1, h2]).all() else np.nan,
+                         total_pnl=s["sum"], max_drawdown=s["max_dd"], n_trades=len(t),
+                         stopped=int((t[:, 5] == stopped).sum()), hit_rate=float((t[:, 4] > 0).mean()) if len(t) else np.nan,
+                         avg_trade=float(t[:, 4].mean()) if len(t) else np.nan,
+                         worst_trade=float(t[:, 4].min()) if len(t) else np.nan, this=level == setup["pnl_stop"]))
+    return pl.DataFrame(rows)
+
+
+def stop_view(b: dict, cost: float) -> html.Div:
+    rows = stop_table(b, cost)
+    sharpes = rows["sharpe"].fill_nan(None).drop_nulls()
+    colour = _score_style(float(sharpes.abs().max()) if len(sharpes) else 1.0)
+    best = rows["sharpe"].fill_nan(None).arg_max()
+
+    def style(col, value, row):
+        cell = colour(value) if col in ("sharpe", "worst_half_sharpe") else None
+        if col == "stop_loss":
+            cell = {"textAlign": "left", **({"fontWeight": "bold", "color": ORANGE} if row["#"] == best else {})}
+            return {**cell, **THIS} if row["this"] in (True,) else cell
+        return cell
+
+    frame = show(rows.with_row_index("#"))
+    return html.Div([
+        heading("stop loss"),
+        note("This setup re-walked on today's data with a stop loss at each level: exit when the trade is down that "
+             "many bps on a close, filled a bar later plus cost (so a loss can run past it). Everything else is held "
+             "at this setup; 'off' is no stop loss. Outlined: this setup's own level; orange: the best Sharpe. A stop "
+             "changes which later trades happen, so each row is its own walk.", "dim"),
+        table(frame, title="stop loss (bp lost on the close) · what each level would have done", float_fmt=",.2f",
+              columns=["stop_loss", "sharpe", "worst_half_sharpe", "total_pnl", "max_drawdown", "n_trades", "stopped",
+                       "hit_rate", "avg_trade", "worst_trade"],
+              headers={"stop_loss": "stop loss (bp)", "worst_half_sharpe": "worst half", "total_pnl": "total pnl",
+                       "max_drawdown": "max dd", "n_trades": "trades", "hit_rate": "hit", "avg_trade": "avg",
+                       "worst_trade": "worst"}, cell_style=style),
+    ], className="oven-full", style={"marginTop": 18})
+
+
+def _score_style(scale: float):
+    def style(score) -> dict | None:
+        return _diverging(score, scale) if isinstance(score, (int, float)) and np.isfinite(score) else None
+    return style
+
+
+THIS = {"outline": f"2px solid {ORANGE}", "outlineOffset": "-2px", "fontWeight": "bold"}
+
+
+def score_grid_view(board: pl.DataFrame, setup: dict, by: str) -> html.Div:
+    grid = lookback_grid(board, setup, by)
+    values = grid.drop("lookback").to_numpy().astype(float)
+    colour = _score_style(float(np.nanmax(np.abs(values))) if np.isfinite(values).any() else 1.0)
+    here = f"entry {setup['entry']}"
+
+    def style(col, value, row):
+        if col == "lookback":
+            return {"fontWeight": "bold"}
+        cell = colour(value) or {}
+        return {**cell, **THIS} if col == here and row["lookback"] == setup["lookback"] else cell or None
+
+    return table(show(grid), title=f"{engine.RANKS[by]} · lookback × entry ({setup['scale']}, same exit)",
+                 float_fmt=",.2f", cell_style=style)
+
+
+def sensitivity_view(board: pl.DataFrame, setup: dict, by: str) -> html.Div:
+    rows = sensitivity(board, setup, by)
+    scores = rows["score"].drop_nulls().drop_nans()
+    colour = _score_style(float(scores.abs().max()) if len(scores) else 1.0)
+
+    def style(col, value, row):
+        cell = colour(value) if col == "score" else {"textAlign": "left"} if col in ("knob", "value") else None
+        return {**(cell or {}), **THIS} if row["this"] in (True,) and col == "value" else cell
+
+    return table(show(rows), title=f"{engine.RANKS[by]} · one knob at a time", float_fmt=",.2f",
+                 columns=["knob", "value", "score", "n_trades", "total_pnl"],
+                 headers={"n_trades": "trades", "total_pnl": "total pnl"}, cell_style=style)
 
 
 # ---- paged tables ------------------------------------------------------------
@@ -370,13 +609,14 @@ def trades_rows(path: str, picked: dict) -> pl.DataFrame:
     return b["with_levels"].select(
         pl.col("entry_ts").alias("entry"), pl.col("exit_ts").alias("exit"), pl.col("direction").alias("dir"),
         "entry_level", "exit_level", pl.col("pnl").alias("pnl_bps"), "target_leg", "hedge_leg",
+        "size", "exp_return", "exp_bars",
         pl.col("hedge_ratio").alias("hedge_β"), pl.col("bars").alias("held"), pl.col("reason").alias("exit_reason"),
         "entry_z", "half_life", "r2")
 
 
 def _sorted_page(rows: pl.DataFrame, name: str, view: dict) -> tuple[pl.DataFrame, dict]:
     """The rows on ``view``'s page, sorted by its column; the page is clamped to what exists."""
-    size = PAGE_SIZE[name]
+    size = view.get("size", PAGE_SIZE[name])
     pages = max(1, math.ceil(len(rows) / size))
     view = {**view, "page": min(max(int(view.get("page", 0)), 0), pages - 1)}
     if view["sort"] not in rows.columns:
@@ -404,14 +644,18 @@ HEADERS = {"worst_half_sharpe": "worst half", "total_pnl": "total pnl", "n_trade
            "sharpe_h2": "h2", "pnl_per_year": "pnl/yr", "trades_per_year": "trades/yr", "avg_trade": "avg",
            "median_trade": "median", "profit_factor": "pf", "time_in_market": "in mkt", "avg_bars": "avg bars",
            "trade_t": "trade t", "best_trade_share": "best share", "worst_trade": "worst", "max_hold": "hold",
-           "hl_mult": "hl×", "exit_reason": "exit", "entry_level": "entry lvl", "exit_level": "exit lvl",
+           "hl_mult": "hl×", "pnl_stop": "stop loss", "exp_return": "exp ret", "exp_bars": "exp bars",
+           "exit_reason": "exit", "entry_level": "entry lvl", "exit_level": "exit lvl",
            "target_leg": "target leg", "hedge_leg": "hedge leg", "half_life": "half-life"}
 TEXT_COLS = {"input", "label", "best_setup", "basis", "scale", "exit_reason"}
 
 
 def _cell_style(trade_scale: float | None):
-    """Text columns read left-aligned; on trades, direction and P&L are coloured."""
+    """Text columns read left-aligned; on trades, direction and P&L are coloured and a
+    position still open is flagged."""
     def style(column, value, _row):
+        if column == "exit_reason" and value == "open":
+            return {"textAlign": "left", "color": ORANGE, "fontWeight": "bold"}
         if column in TEXT_COLS:
             return {"textAlign": "left"}
         if column == "dir":
@@ -444,11 +688,12 @@ def paged_table(name: str, rows: pl.DataFrame, view: dict, title: str) -> tuple[
         frame.insert(0, "inspect", [inspect_button(key[1], k) for k in shown[key[0]].to_list()])
         cols, headers = ["inspect", *cols], {**headers, "inspect": ""}
     parts = [table(frame, title=title, columns=cols, headers=headers, float_fmt=",.2f",
-                   max_rows=PAGE_SIZE[name], sortable=True, cell_style=cell_style,
+                   max_rows=view.get("size", PAGE_SIZE[name]), sortable=True, cell_style=cell_style,
                    header_props={c: {"data-board-rule": c, "data-board-store": store} for c in cols
                                  if c != "inspect"})]
-    first = view["page"] * PAGE_SIZE[name] + 1
-    pages = max(1, math.ceil(len(rows) / PAGE_SIZE[name]))
+    size = view.get("size", PAGE_SIZE[name])
+    first = view["page"] * size + 1
+    pages = max(1, math.ceil(len(rows) / size))
     parts.append(html.Span(f"rows {first:,}–{first + len(shown) - 1:,} of {len(rows):,} · page {view['page'] + 1} "
                            f"of {pages} · sorted by {HEADERS.get(view['sort'], view['sort'])} "
                            f"{'high → low' if view['desc'] else 'low → high'}",
@@ -553,7 +798,7 @@ def signal_now(b: dict) -> float:
 def charts_view(b: dict, window: str | None, date_range=None) -> list:
     """The Dig card's chart grid, two to a row: the traded portfolio | the target (both
     with trades), the entry signal | the input, cumulative P&L | the return
-    distribution -- then the Oven's own (drawdown, P&L by year, betas, fit quality)."""
+    distribution, betas | fit quality."""
     setup, target, name, frame, daily = b["setup"], b["target"], b["setup"]["input"], b["frame"], b["daily"]
     bars = None if date_range is not None else WINDOW_PRESETS[window or DEFAULT_WINDOW]
     raw = setup["scale"] == "raw"
@@ -565,21 +810,18 @@ def charts_view(b: dict, window: str | None, date_range=None) -> list:
               else f"{target} alone")
     shown = frame.with_columns(pl.col("portfolio").alias(f"portfolio · {traded}"),
                                pl.Series("signal_half_life", b["signal"]["half_life"]))
-    f, d = _slice(shown, date_range), _slice(daily, date_range)
-    years = b["years"]
+    f = _slice(shown, date_range)
     pngs = [
-        level_chart(shown, f"portfolio · {traded}", trades=b["portfolio_markers"], window_bars=bars,
+        level_chart(shown, f"portfolio · {traded}", trades=b["portfolio_markers"],
+                    open_entry=b["portfolio_open_entry"], window_bars=bars, date_range=date_range),
+        level_chart(frame, target, trades=b["markers"], open_entry=b["open_entry"], window_bars=bars,
                     date_range=date_range),
-        level_chart(frame, target, trades=b["markers"], window_bars=bars, date_range=date_range),
         # signal_chart draws "resid" for the label "residual" and "ou_z" for any other label
         signal_chart(frame, sig_frame, "residual" if raw else f"{setup['basis']} z-score", setup["entry"],
                      window_bars=bars, date_range=date_range, fired=fired),
         input_chart(frame, name, window_bars=bars, date_range=date_range),
         pnl_chart(daily.select("ts", "cumulative_pnl"), window_bars=bars, date_range=date_range),
         return_distribution_chart(b["trades"].select(pl.col("pnl").alias("pnl_bps")), bins=40, density=True),
-        series_chart(d, ["drawdown"], "drawdown", "bps", window_bars=bars, line_colors={"drawdown": C0}),
-        residual_bars_chart([str(y) for y in years["year"]], years["pnl"].to_list(), "P&L by year", "bps",
-                            rotate_labels=True),
         # series_chart: yaxis_title names the right-hand axis, yaxis_right_title the left one (the `left` columns)
         series_chart(f, ["beta_levels", "beta_changes", "corr126"], "levels beta · changes beta (the hedge) · "
                      "126d corr", "corr", left=["beta_levels", "beta_changes"], yaxis_right_title="beta",
@@ -649,12 +891,14 @@ def detail_view(path: str, picked: dict, by: str, min_trades: int, window: str) 
     beta = latest["beta_changes"]
     hedge_text = (f"P&L: {target} {'−' if beta >= 0 else '+'} {abs(beta):.2f} × {name} (changes β today; frozen "
                   f"per trade)" if row["hedged"] else f"P&L: {target} alone ({name} isn't tradable)")
-    page, view = render_page("trades", default_view("trades"), path, by, min_trades, name, picked)
-    reasons = (trades.group_by("reason").agg(pl.len().alias("trades"), pl.col("pnl").mean().alias("mean_pnl_bps"),
-                                             (pl.col("pnl") > 0).mean().alias("hit_rate"),
-                                             pl.col("bars").mean().alias("avg_held"))
-               .sort("trades", descending=True))
     periods = b["years"].select("year", pl.col("pnl").alias("pnl_bps"), "active_days")
+    # one trade row per monthly P&L row, so the two tables beside each other stand the same height
+    page, view = render_page("trades", {**default_view("trades"), "size": max(len(periods), 5)}, path, by,
+                             min_trades, name, picked)
+    reasons = exit_reasons(b, float(b["meta"]["settings"].get("cost", engine.COST)))
+    sharpes = reasons["sharpe"].fill_nan(None).drop_nulls()
+    reason_scale = float(sharpes.abs().max()) if len(sharpes) else 1.0
+    board = load_run(path)["board"]
 
     card = html.Div(style={"border": f"1px solid {BORDER}", "background": PANEL, "padding": "14px 18px",
                            "marginBottom": 18}, children=[
@@ -664,9 +908,21 @@ def detail_view(path: str, picked: dict, by: str, min_trades: int, window: str) 
             html.Span(hedge_text, style={"fontSize": 11, "color": DIM, "marginLeft": "auto", "fontStyle": "italic"}),
         ]),
         note(f"Signal: {BASIS_TEXT[setup['basis']]}.", "dim"),
+        html.Div(style={"display": "flex", "gap": 10, "alignItems": "center", "flexWrap": "wrap", "margin": "4px 0"},
+                 children=[
+            html.Button("Send to dashboard", id="oven-promote", n_clicks=0, className="ref-btn",
+                        title="Promote this setup to the dashboard as a live signal, run on oven's own engine",
+                        style={**btn_style(primary=True), "padding": "3px 12px", "fontSize": 11}),
+            html.Span(id="oven-promote-status", style={"fontSize": 11, "color": DIM}),
+            html.Code(f'python -m dashboard.registry --oven "{path}" --input {name} --setup "{picked["sid"]}"',
+                      style={"fontSize": 10, "color": DIM, "marginLeft": "auto", "userSelect": "all"}),
+        ]),
         html.Div(style=STATS_ROW, children=[
             stat_block("reading", "short" if now > setup["entry"] else "long" if now < -setup["entry"] else "flat",
                        alert=firing),
+            stat_block("open position", f"{b['position']['direction']} since {b['position']['entry_ts']} · "
+                       f"{b['position']['pnl']:+.1f} bps · {b['position']['bars']} bars" if b["position"] else "flat",
+                       alert=b["position"] is not None),
             stat_block(f"now · {setup['basis']} z / resid", f"{z_now:+.2f} / {resid_now:+.1f}"),
             stat_block("levels β / changes β", f"{latest['beta_levels']:+.3f} / {beta:+.3f}"),
             stat_block("r²", _fmt(latest["r2"], ".2f")),
@@ -691,46 +947,60 @@ def detail_view(path: str, picked: dict, by: str, min_trades: int, window: str) 
                                             "flexWrap": "wrap"}),
         html.Div(charts_view(b, window), id="card-charts-oven",
                  style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": 10}),
-        html.Div(style={"marginTop": 14}, children=[
-            html.Div(page, id="oven-trades-page"),
-            pager("trades", extra=[html.Button("Snap chart to view", id="oven-snap", n_clicks=0, className="ref-btn",
-                                               style={**btn_style(), "padding": "2px 8px", "fontSize": 11})]),
+        # the trades beside the monthly P&L (see oven.css)
+        html.Div(className="oven-trades-months", children=[
+            html.Div(style={"minWidth": 0}, children=[
+                html.Div(page, id="oven-trades-page"),
+                pager("trades", extra=[html.Button("Snap chart to view", id="oven-snap", n_clicks=0,
+                                                   className="ref-btn",
+                                                   style={**btn_style(), "padding": "2px 8px", "fontSize": 11})]),
+            ]),
+            html.Div(pnl_heatmap(daily.filter(pl.col("ts").dt.year() >= periods["year"].min())
+                                 .select("ts", pl.col("daily_pnl").alias("pnl_bps")), periods)),
         ]),
+        html.Div(scatter_window_row(setup["lookback"], "lookback"),
+                 style={"display": "flex", "gap": 8, "margin": "6px 0 8px", "alignItems": "center",
+                        "flexWrap": "wrap"}),
+        html.Div(scatter_pair(b, "lookback"), id="oven-scatters", style=TWO_UP),
     ])
     mechanics = html.Div([
         heading("trade mechanics"),
         note(f"Median closed-trade P&L: {trades['pnl'].median():,.2f} bps · of total P&L, the target leg made "
              f"{b['with_levels']['target_leg'].sum():+,.1f} bps and the hedge leg "
              f"{b['with_levels']['hedge_leg'].sum():+,.1f} bps", "dim"),
-        html.Div([
-            html.Div(pnl_heatmap(daily.filter(pl.col("ts").dt.year() >= periods["year"].min())
-                                 .select("ts", pl.col("daily_pnl").alias("pnl_bps")), periods),
-                     style={"flex": "0 1 auto", "minWidth": 0}),
-            html.Div(table(show(reasons), title="Exit reasons", float_fmt=",.2f"),
-                     style={"flex": "0 1 auto", "minWidth": 0}),
-        ], style={"display": "flex", "gap": 28, "flexWrap": "wrap", "alignItems": "flex-start"}),
+        table(show(reasons), title="Exit reasons · sharpe of only the trades that ended each way", float_fmt=",.2f",
+              headers={"mean_pnl_bps": "avg trade", "total_pnl": "total pnl", "hit_rate": "hit",
+                       "avg_held": "avg held", "share_of_pnl": "share of pnl"},
+              cell_style=lambda col, value, row: (
+                  {"textAlign": "left", **({"fontWeight": "bold"} if value == "all" else {})} if col == "reason"
+                  else _diverging(value, reason_scale) if col == "sharpe" and isinstance(value, float)
+                  and np.isfinite(value) else None)),
+        note("Each exit reason's sharpe is the daily mark-to-market sharpe of holding only those trades, over the "
+             "same days the board scores ('all' is the setup itself). It splits where the P&L came from; you can't "
+             "trade it, since the exit isn't known at entry.", "dim"),
     ], style={"marginBottom": 18})
+    peers = peer_correlations(path, setup, by, min_trades)
     diagnostics = html.Div([
         heading("relationship diagnostics"),
-        html.Div(scatter_window_row(setup["lookback"], "lookback"),
-                 style={"display": "flex", "gap": 8, "marginBottom": 8, "alignItems": "center", "flexWrap": "wrap"}),
-        html.Div(scatter_pair(b, "lookback"), id="oven-scatters", style=TWO_UP),
-        html.Div(style={**TWO_UP, "marginTop": 12}, children=[
-            table(show(lookback_grid(load_run(path)["board"], setup, by)),
-                  title=f"{engine.RANKS[by]} · lookback × entry ({setup['scale']}, same exit)", float_fmt=",.2f"),
-            table(show(b["years"]), title="by year", float_fmt=",.2f", sortable=True),
+        note(f"Is this setup a plateau or a spike? The grid and the knobs move one thing at a time from this setup "
+             f"(outlined) and show its {engine.RANKS[by]}; a good setup sits among neighbours that also score. "
+             f"Entry state asks which conditions at entry the winners came from.", "dim"),
+        # two columns, every table at full height (no inner scroll; see oven.css)
+        html.Div(className="oven-full", style=TWO_UP, children=[
+            html.Div([score_grid_view(board, setup, by), entry_state_view(trades, setup)],
+                     style={"display": "flex", "flexDirection": "column", "gap": 14, "minWidth": 0}),
+            html.Div([
+                sensitivity_view(board, setup, by),
+                table(show(peers), title="monthly P&L correlation with other inputs' best setups · does it add to "
+                                         "a book or is it the same bet?", float_fmt=",.3f", sortable=True)
+                if not peers.is_empty() else
+                note("Monthly P&L correlation with other inputs' best setups needs a bake with more than one input; "
+                     "this bake has only this one.", "dim"),
+            ], style={"display": "flex", "flexDirection": "column", "gap": 14, "minWidth": 0}),
         ]),
-        html.Div(style=TWO_UP, children=[
-            table(show(feature_correlations(trades)), title="entry state vs trade P&L · spearman",
-                  float_fmt=",.3f", sortable=True),
-            table(show(peer_correlations(path, setup, by, min_trades)),
-                  title="monthly P&L correlation with other inputs' best setups", float_fmt=",.3f", sortable=True),
-        ]),
-        table(show(engine.characteristics(trades, setup)),
-              title="entry-state characteristics · terciles of each feature at entry", float_fmt=",.3f",
-              sortable=True),
     ])
-    return html.Div([card, mechanics, resolution_view(trades, setup), diagnostics]), view
+    cost = float(b["meta"]["settings"].get("cost", engine.COST))
+    return html.Div([card, mechanics, resolution_view(trades, setup), diagnostics, stop_view(b, cost)]), view
 
 
 def resolution_view(trades: pl.DataFrame, setup: dict) -> html.Div:
@@ -740,22 +1010,18 @@ def resolution_view(trades: pl.DataFrame, setup: dict) -> html.Div:
         body = note("This bake has no other horizons recorded. Re-bake with more than one signal lookback to see "
                     "what the other horizons said at each entry.", "dim")
     else:
-        scale = float(np.nanmax(np.abs(table_rows["vs_setup_avg"].fill_null(0).to_numpy()))) or 1.0
-        body = table(show(table_rows), title=f"this setup's {len(trades)} trades, split by each other horizon's "
-                                             f"{setup['basis']} z at entry", float_fmt=",.2f",
-                     headers={"other_horizon": "other horizon", "z_corr_at_entry": "z corr at entry",
-                              "vs_setup_avg": "vs setup avg", "avg_trade": "avg trade", "hit_rate": "hit",
-                              "total_pnl": "total pnl"},
-                     cell_style=lambda col, value, _row: (_diverging(value, scale) if col == "vs_setup_avg" and
-                                                          value != "" else {"textAlign": "left"}
-                                                          if col in ("other_horizon", "state") else None))
+        body = split_table(table_rows, STATES, trades["pnl"].mean(),
+                           f"this setup's {len(trades)} trades · avg trade · n, by each other horizon's "
+                           f"{setup['basis']} z at entry (setup avg {trades['pnl'].mean():+.2f})",
+                           {"other_horizon": "other horizon", "z_corr_at_entry": "z corr at entry",
+                            "agree_minus_disagree": "agrees − disagrees"})
     return html.Div([
         heading("multi-resolution"),
         note(f"Same input, basis and hedge, read at the other signal lookbacks when this setup entered. 'agrees': "
              f"that horizon was also beyond ±{HORIZON_Z:g} z the same way (it saw the same rich/cheap); 'disagrees': "
-             f"beyond it the other way. Green 'vs setup avg' means trades in that state beat the setup's average "
-             f"trade, so that horizon carries information; watch the trade counts, small states are noise. z corr "
-             f"near 1 means the horizons are the same signal measured twice.", "dim"),
+             f"beyond it the other way. Green beats the setup's average trade, red trails it; a big positive "
+             f"'agrees − disagrees' says wait for that horizon to confirm. Small counts are noise. z corr near 1 "
+             f"means the horizons are the same signal measured twice.", "dim"),
         body,
     ], style={"marginBottom": 18})
 
@@ -821,7 +1087,17 @@ def bake_controls() -> html.Div:
             note("Combined per setup: a reversion exit, a half-life time stop, the stop and the max-hold cap. No "
                  "revert with a half-life multiple is a pure half-life time exit; neither is a pure max-hold exit.",
                  "dim"),
-            *[_multi(k) for k in ("reverts", "hl_mults", "max_holds", "stops")]]),
+            *[_multi(k) for k in ("reverts", "hl_mults", "max_holds", "stops", "pnl_stops")]]),
+        section("Sizing", [
+            note("How big each trade is, from what the frozen model expects of it at entry: its expected return "
+                 "(the OU reversion due by its expected exit, net of cost), that over its expected risk, or over its "
+                 "expected days held. A trade expected to lose is not taken. Sizes average 1, so P&L reads like "
+                 "flat sizing.", "dim"),
+            html.Div([field("sizing", dcc.Dropdown(
+                id="oven-sizings", value=list(engine.SIZING_DEFAULT), multi=True,
+                options=[{"label": f"{s} · {SIZING_TEXT[s]}", "value": s} for s in engine.SIZINGS])),
+                _all_none("oven-sizings")]),
+        ]),
         section("Hedge & costs", [
             _multi("hedge_lookbacks"),
             field("cost · bps per round trip", dcc.Input(id="oven-cost", type="number", value=engine.COST, min=0,
@@ -898,27 +1174,32 @@ def _clicked() -> bool:
 
 def register(app) -> None:
     choices = {"inputs": (ALL_INPUTS, ALL_INPUTS), "bases": (list(engine.BASES), list(engine.BASES)),
+               "sizings": (list(engine.SIZINGS), list(engine.SIZING_DEFAULT)),
                **{k: (opts, default) for k, (_label, opts, default) in GRID_CONTROLS.items()}}
     for key, (options, default) in choices.items():
-        # one callback per control: its own all / none, and the master Select all / Reset to defaults
+        # one callback per control: its own all / none, and -- for the params, not the inputs --
+        # the master Select all / Reset to defaults
         def _set(*_clicks, options=options, default=default, key=key):
             return {f"oven-{key}-all": list(options), "oven-select-all": list(options),
                     f"oven-{key}-none": [], "oven-defaults": list(default)}[ctx.triggered_id]
 
+        master = [] if key == "inputs" else [Input("oven-select-all", "n_clicks"), Input("oven-defaults", "n_clicks")]
         app.callback(Output(f"oven-{key}", "value"),
-                     Input(f"oven-{key}-all", "n_clicks"), Input(f"oven-{key}-none", "n_clicks"),
-                     Input("oven-select-all", "n_clicks"), Input("oven-defaults", "n_clicks"),
+                     Input(f"oven-{key}-all", "n_clicks"), Input(f"oven-{key}-none", "n_clicks"), *master,
                      prevent_initial_call=True)(_set)
 
     @app.callback(Output("oven-grid-size", "children"), Input("oven-target", "value"), Input("oven-inputs", "value"),
-                  *[Input(f"oven-{k}", "value") for k in GRID_CONTROLS], Input("oven-bases", "value"))
-    def _grid_size(target, inputs, lookbacks, z, raw, reverts, hl_mults, holds, stops, hedge_lbs, bases):
+                  *[Input(f"oven-{k}", "value") for k in GRID_CONTROLS], Input("oven-bases", "value"),
+                  Input("oven-sizings", "value"))
+    def _grid_size(target, inputs, lookbacks, z, raw, reverts, hl_mults, holds, stops, pnl_stops, hedge_lbs, bases,
+                   sizings):
         bases = bases or []
         # the portfolio basis only runs for inputs that can be held as a hedge
         models = sum(("levels" in bases) + ("portfolio" in bases and engine.hedgeable(i))
                      for i in dict.fromkeys(inputs or []) if i != target)
         per_model = ((len(z or []) + len(raw or [])) * len(reverts or []) * len(holds or [])
-                     * max(len(stops or []), 1) * max(len(hl_mults or []), 1))
+                     * max(len(stops or []), 1) * max(len(hl_mults or []), 1) * max(len(pnl_stops or []), 1)
+                     * max(len(sizings or []), 1))
         setups = models * len(lookbacks or []) * len(hedge_lbs or []) * per_model
         # measured on a select-everything 10s30s bake: 554,580 setups -> 39.2M trades, 18.8 GB peak, 23s
         trades = setups * 71
@@ -934,14 +1215,16 @@ def register(app) -> None:
     @app.callback(Output("oven-run-note", "children"), Input("oven-run", "n_clicks"),
                   State("oven-target", "value"), State("oven-inputs", "value"),
                   *[State(f"oven-{k}", "value") for k in GRID_CONTROLS],
-                  State("oven-cost", "value"), State("oven-bases", "value"),
+                  State("oven-cost", "value"), State("oven-bases", "value"), State("oven-sizings", "value"),
                   prevent_initial_call=True)
     def _bake(_clicks, target, inputs, *grid):
-        *lists, cost, bases = grid
+        *lists, cost, bases, sizings = grid
         settings = dict(zip(GRID_CONTROLS, [sorted(v or []) for v in lists]), cost=float(cost or 0),
-                        bases=[b for b in engine.BASES if b in (bases or [])])
+                        bases=[b for b in engine.BASES if b in (bases or [])],
+                        sizings=[s for s in engine.SIZINGS if s in (sizings or [])] or ["flat"])
         settings["stops"] = settings["stops"] or [0.0]
         settings["hl_mults"] = settings["hl_mults"] or [0.0]
+        settings["pnl_stops"] = settings["pnl_stops"] or [0.0]
         if not settings["bases"]:
             return note("Choose at least one signal basis.", "warn")
         inputs = [i for i in dict.fromkeys(inputs or []) if i != target]
@@ -1048,6 +1331,21 @@ def register(app) -> None:
                      Input(f"oven-{name}-sort", "data"), State(f"oven-{name}-view", "data"),
                      State("oven-run-pick", "value"), State("oven-rank", "value"), State("oven-min-trades", "value"),
                      State("oven-input", "data"), State("oven-setup", "data"), prevent_initial_call=True)(_page)
+
+    # Send to dashboard: the same promotion as `python -m dashboard.registry --oven ...`
+    @app.callback(Output("oven-promote-status", "children"), Input("oven-promote", "n_clicks"),
+                  State("oven-setup", "data"), State("oven-run-pick", "value"), prevent_initial_call=True)
+    def _promote(clicks, picked, path):
+        if not clicks or not picked or not path:
+            return no_update
+        from dashboard.registry import LiveRegistry
+
+        try:
+            entry = LiveRegistry().promote_oven(path, picked["input"], picked["sid"])
+        except Exception as exc:  # shown on the card rather than lost in the server log
+            return note(f"Not sent: {exc}", "warn")
+        return note(f"Sent · live on the dashboard as {entry['signal_id']} · Ref there pulls its data and "
+                    f"re-run logs it to the ledger", "dim")
 
     # the scatters' fit window redraws only the two scatters
     @app.callback(Output("oven-scatters", "children"),

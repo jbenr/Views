@@ -17,6 +17,7 @@ import ast
 PARAM_COLS = [
     "entry_signal", "beta_lb", "ou_lb", "entry_threshold",
     "exit_style", "exit_param", "gate", "gate_window", "stop_loss_bps",
+    "exit_text",  # oven signals only: their whole setup in words (exit_style "oven")
 ]
 
 # Null is a meaningful, explicit "disabled" value only for these columns.
@@ -95,6 +96,8 @@ def entry_label(params: dict) -> str:
 def exit_label(params: dict) -> str:
     """The primary exit rule, spelled out."""
     style = params["exit_style"]
+    if style == "oven":  # an oven setup's exits are several rules at once; its own description says them
+        return params.get("exit_text") or "oven setup"
     param = float(params["exit_param"])
     if style == "revert_frac":
         return (
@@ -143,6 +146,8 @@ def entry_short(params: dict) -> str:
 
 def exit_short(params: dict) -> str:
     """Exit rule in one cell. Style names collapse to a verb plus its size."""
+    if params["exit_style"] == "oven":
+        return f"oven revert {float(params['exit_param']):g}"
     style, param = params["exit_style"], float(params["exit_param"])
     if style == "revert_frac":
         return f"revert {param:.0%}"

@@ -10,6 +10,7 @@ as backtest.lab.MetricStore.
     python -m dashboard.registry --promote book.curve.tens_10s30s --rank 2
     python -m dashboard.registry --promote book.curve.twos_10s30s --defaults
     python -m dashboard.registry --promote book.curve.twos_10s30s --variant ou430_e09
+    python -m dashboard.registry --oven oven/data/<bake> --input 10y --setup "63|126|portfolio|raw|10.0|..."
     python -m dashboard.registry --list
     python -m dashboard.registry --remove book.curve.twos_10s30s::ou430_e09
 """
@@ -207,6 +208,13 @@ class LiveRegistry:
             selection_source="curated module defaults",
         )
 
+    def promote_oven(self, run_path: str, feature: str, setup_id: str, rationale: str | None = None) -> dict:
+        """Promote one setup of a saved Oven bake (see oven.live): it runs live on oven's
+        own engine. Replaces any prior promotion of the same setup."""
+        from oven.live import registry_entry
+
+        return self._replace(registry_entry(run_path, feature, setup_id, rationale))
+
     def promote_variant(self, module: str, variant: str) -> dict:
         """Promote one named config from ``module.DASHBOARD_VARIANTS``."""
         mod = importlib.import_module(module)
@@ -353,12 +361,22 @@ def main(argv: list[str] | None = None) -> None:
         "--variant",
         help="promote a named module.DASHBOARD_VARIANTS configuration",
     )
+    parser.add_argument("--oven", metavar="RUN_DIR",
+                        help="promote a setup from a saved Oven bake (with --input and --setup)")
+    parser.add_argument("--input", help="--oven: the setup's input")
+    parser.add_argument("--setup", help="--oven: the setup id, as the Oven app's Send to dashboard shows it")
     parser.add_argument("--remove", metavar="SIGNAL_ID")
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args(argv)
 
     reg = LiveRegistry()
-    if args.promote:
+    if args.oven:
+        if not (args.input and args.setup):
+            parser.error("--oven needs --input and --setup")
+        entry = reg.promote_oven(args.oven, args.input, args.setup)
+        print(f"promoted {entry['signal_id']} ({entry['selection_source']}): sharpe={entry['sharpe']:.2f}  "
+              f"n_trades={entry['n_trades']:.0f}  hit_rate={entry['hit_rate']:.0%}")
+    elif args.promote:
         if args.variant:
             entry = reg.promote_variant(args.promote, args.variant)
         elif args.defaults:

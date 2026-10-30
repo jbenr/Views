@@ -32,3 +32,17 @@
     color: #888888;
     margin-left: 4px;
 }
+/* Dig card: the trade table beside the monthly P&L heatmap. The trades page holds as many
+   rows as the heatmap has years, so the two stand the same height without scrolling. */
+.oven-tight .oven-trades-months {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 16px;
+    align-items: start;
+    margin-top: 14px;
+}
+/* relationship diagnostics: show every table whole rather than scrolling inside it */
+.oven-tight .oven-full div:has(> .viz-table) {
+    max-height: none !important;
+    overflow-y: visible !important;
+}
