@@ -229,6 +229,60 @@ def trade_history(signal_id: str, state: dict | None = None) -> tuple[pl.DataFra
     return log, open_entry
 
 
+# entry-state features confidence reads, per kind of signal: trade-log column -> label.
+# Chosen for a reason, not mined: fast reversion, a big dislocation and a fit that
+# holds are what should make a fade pay.
+OVEN_CONFIDENCE = {"entry_half_life": "half-life", "abs_z": "|z|", "r2": "fit r²", "abs_drift": "|β drift|"}
+BOOK_CONFIDENCE = {"entry_half_life": "half-life", "abs_signal": "|signal|"}
+
+
+def _num(value) -> float:
+    return float(value) if value is not None else float("nan")
+
+
+def live_read(state: dict, trades: pl.DataFrame, open_entry: dict | None) -> dict:
+    """The signal today, beyond its reading: the target level and the model's fair value
+    for it, the residual and z, half-life, what an entry now would be expected to make
+    (and how long it should take, for oven signals), and walk-forward confidence --
+    for an entry today and for every closed trade at its own entry (``trades``,
+    with conf columns added). One function for the Deep Dive page and the ledger,
+    so what is shown is what is logged."""
+    from stats import confidence_now, walk_forward_confidence
+
+    strategy, data, last = state["strategy"], state["data"], state["last"]
+    level = _num(data[strategy.target][-1])
+    resid, z, half_life = _num(last.get("resid")), _num(last.get("ou_z")), _num(last.get("half_life"))
+    out = dict(level=level, resid=resid, z=z, half_life=half_life, exp_return=float("nan"),
+               exp_bars=float("nan"), bps_per_day=float("nan"), exp_risk=float("nan"))
+    if hasattr(strategy, "history"):  # oven: the walk's own expectation arithmetic
+        from oven import engine
+
+        vol = data["port_vol60" if engine.hedgeable(strategy.feature) else "target_vol60"][-1]
+        out.update(engine.expected_now(resid, half_life, _num(vol), strategy.setup, strategy.cost))
+        out["fair"] = level - resid
+        labels = OVEN_CONFIDENCE
+        now = {"entry_half_life": half_life, "abs_z": abs(z), "r2": _num(data["r2"][-1]),
+               "abs_drift": abs(_num(data["beta_drift20"][-1]))}
+    else:  # a book signal reverts toward its OU mean
+        ou_mean = _num(last.get("ou_mean"))
+        out["fair"] = level - resid + (ou_mean if ou_mean == ou_mean else 0.0)
+        if ou_mean == ou_mean and resid == resid:
+            out["exp_return"] = abs(ou_mean - resid) - float(getattr(strategy, "transaction_cost_bps", 0.0))
+        labels = BOOK_CONFIDENCE
+        now = {"entry_half_life": half_life, "abs_signal": abs(_num(last.get("signal")))}
+        if trades is not None and not trades.is_empty() and "entry_signal" in trades.columns:
+            trades = trades.with_columns(pl.col("entry_signal").abs().alias("abs_signal"))
+    usable = trades is not None and not trades.is_empty() and all(c in trades.columns for c in labels)
+    if usable:
+        trades = walk_forward_confidence(trades, labels, entry="entry_date", exit="exit_date", pnl="pnl_bps")
+        out["confidence"] = confidence_now(trades, now, labels, pnl="pnl_bps")
+    else:
+        out["confidence"] = dict(score=None, label="—", drivers="", n_past=0)
+    out["trades"] = trades
+    out["held"] = open_entry
+    return out
+
+
 def run_analysis(signal_id: str) -> dict:
     """compute_signal() plus one auditable row appended to the ledger."""
     state = compute_signal(signal_id)
@@ -255,16 +309,23 @@ def run_analysis(signal_id: str) -> dict:
         "gate_allow": last.get("gate_allow"),
         "fired": state["fired"],
     }
+    # what the Deep Dive shows, logged with the reading: fair value, what an entry now
+    # expects, confidence and its drivers, and the open position
+    trades, held = trade_history(signal_id, state)
+    live = live_read(state, trades, held)
+    entry.update({
+        "fair": _f(live["fair"]),
+        "expected_return_bps": _f(live["exp_return"]),
+        "expected_bars": _f(live["exp_bars"]),
+        "confidence": live["confidence"]["label"],
+        "confidence_score": _f(live["confidence"]["score"]),
+        "confidence_drivers": live["confidence"]["drivers"],
+        "position": held["direction"] if held else "flat",
+        "position_entry_date": str(held["entry_date"]) if held else None,
+        "position_pnl_bps": _f(held["pnl_bps"]) if held else None,
+        "position_expected_return_bps": _f(held.get("expected_return_bps")) if held else None,
+    })
     if hasattr(state["strategy"], "history"):
-        # an oven signal also logs the frozen setup and what its open position expects
-        _, held = trade_history(signal_id, state)
-        entry.update({
-            "oven_setup": state["registry_row"].get("oven_setup"),
-            "position": held["direction"] if held else "flat",
-            "position_entry_date": str(held["entry_date"]) if held else None,
-            "position_pnl_bps": _f(held["pnl_bps"]) if held else None,
-            "expected_return_bps": _f(held["expected_return_bps"]) if held else None,
-            "expected_bars": _f(held["expected_bars"]) if held else None,
-        })
+        entry["oven_setup"] = state["registry_row"].get("oven_setup")
     SignalLedger().log(entry)
     return {**state, "ledger_entry": entry}

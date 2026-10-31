@@ -29,6 +29,7 @@ import datetime as dt
 import re
 
 import dash
+import numpy as np
 import pandas as pd
 import polars as pl
 from dash import ALL, MATCH, Input, Output, State, ctx, dcc, html
@@ -42,6 +43,7 @@ from dashboard.charts import (
     input_chart,
     level_chart,
     pnl_chart,
+    residual_bars_chart,
     return_distribution_chart,
     signal_chart,
 )
@@ -66,13 +68,13 @@ SNAP_LEFT_BUFFER_BDAYS = 5
 TRADE_TABLE_COLS = [
     "entry_date", "exit_date", "direction",
     "entry_level", "exit_level", "target_lvl", "expected_return_bps",
-    "pnl_bps", "entry_half_life", "bars_held", "exit_reason",
+    "pnl_bps", "conf", "entry_half_life", "bars_held", "exit_reason",
 ]
 TRADE_TABLE_HEADERS = {
     "entry_date": "Entry", "exit_date": "Exit", "direction": "Dir",
     "entry_level": "Entry Lvl", "exit_level": "Exit Lvl",
     "target_lvl": "Target Lvl", "expected_return_bps": "Exp Ret",
-    "pnl_bps": "PnL", "entry_half_life": "HL (d)",
+    "pnl_bps": "PnL", "conf": "Conf", "entry_half_life": "HL (d)",
     "bars_held": "Held (d)", "exit_reason": "Reason",
 }
 TRADE_TABLE_ROUND = {
@@ -88,6 +90,7 @@ OVERVIEW_COLUMNS = [
     # scrollbar; units (bps, %) are the dashboard's defaults and go unstated.
     ("name", "Signal"),
     ("position", "Position"),
+    ("conf", "Conf"),
     ("reading", "Reading"),
     ("gate_rule", "Gate"),
     ("gate_status", "Gate Now"),
@@ -443,6 +446,7 @@ def _overview_snapshot(row: dict) -> dict:
         "target": row["target"],
         "name": _display_name(row),
         "position": "UNAVAILABLE",
+        "conf": "—",
         "reading": "—",
         "gate_rule": "—",
         "gate_status": "—",
@@ -474,6 +478,7 @@ def _overview_snapshot(row: dict) -> dict:
     return {
         **base,
         "position": _position_label(state, open_entry),
+        "conf": _confidence_label(state, trades, open_entry),
         "reading": reading_str,
         "gate_rule": _gate_rule(params),
         "gate_status": _gate_status(state).upper(),
@@ -485,11 +490,22 @@ def _overview_snapshot(row: dict) -> dict:
     }
 
 
+def _confidence_label(state: dict, trades, open_entry: dict | None) -> str:
+    """Today's confidence for an overview row; '—' when the signal's state lacks what
+    confidence reads -- a decoration on the row must never break it."""
+    try:
+        return runner.live_read(state, trades, open_entry)["confidence"]["label"]
+    except (KeyError, AttributeError):
+        return "—"
+
+
 def _trade_cell_style(column: str, value, row: dict) -> dict | None:
     """Direction and P&L sign, coloured -- the trade table's two read-at-a-glance
     columns. Mirrors the style_data_conditional rules this replaced."""
     if column == "direction":
         return {"color": C1 if value == "long" else C0, "fontWeight": "bold"}
+    if column == "conf" and value in CONF_COLOURS:
+        return {"color": CONF_COLOURS[value], "fontWeight": "bold"}
     if column == "pnl_bps" and isinstance(value, (int, float)):
         if value > 0:
             return {"color": C1, "fontWeight": "bold"}
@@ -509,6 +525,8 @@ def _overview_cell_style(column: str, value, row: dict) -> dict | None:
         for token, colour in (("LONG", C1), ("SHORT", C0), ("GATED", ORANGE)):
             if token in str(value):
                 return {"color": colour, "fontWeight": "bold"}
+    elif column == "conf" and value in CONF_COLOURS:
+        return {"color": CONF_COLOURS[value], "fontWeight": "bold"}
     elif column == "gate_status":
         if "CLOSED" in str(value):
             return {"color": C0}
@@ -703,6 +721,9 @@ def _card_sections(
             error = str(exc)
 
     live_pnl = _live_pnl_bps(trades, open_entry) if state and not error else None
+    live = runner.live_read(state, trades, open_entry) if state and not error else None
+    if live is not None:
+        trades = live["trades"]  # with each trade's confidence at its entry
     trade_data = {
         "closed": _format_trade_rows(trades) if trades is not None else [],
         "open": _open_trade_row(open_entry) if open_entry is not None else None,
@@ -710,98 +731,141 @@ def _card_sections(
     asof_bar, asof_written, asof_stale = (
         _db_asof(signal_id, state["data_asof"]) if state else ("—", "", False)
     )
-    stats = [
-        stat_block(
-            # bar date on top, DB write time beneath it -- two facts, two lines
-            "data as-of", _stacked(asof_bar, asof_written), alert=asof_stale,
-        ),
-        stat_block(
-            "last analysis run",
-            _stacked(*_clock_parts(ledger_row["run_ts"], always_date=True))
-            if ledger_row
-            else "never",
-        ),
-        stat_block(
-            "reading",
-            state["fired"] if state else "—",
-            alert=bool(state and state["fired"] not in ("flat", "flat (gated)")),
-        ),
-        *(
-            [stat_block("gate", _gate_status(state))]
-            if state and state["params"].get("gate") is not None
-            else []
-        ),
-        stat_block("live pnl", _fnum(live_pnl, "+.1f", " bps"),
-                    alert=bool(live_pnl and live_pnl < 0)),
-        stat_block("params", _param_summary(row)),
-    ]
-    last = state["last"] if state else {}
-    backtest_stats = [
-        stat_block("sharpe", _fnum(row.get("sharpe"), ".2f")),
-        stat_block("n trades", _fnum(row.get("n_trades"), ".0f")),
-        stat_block("hit rate", _fnum(row.get("hit_rate"), ".0%")),
-        stat_block("max drawdown", _fnum(row.get("max_drawdown_bps"), "+.1f", " bps")),
-        stat_block("half-life", _fnum(last.get("half_life"), ".1f", "d")),
-        stat_block("r²", _fnum(last.get("r2"), ".2f")),
-        stat_block("beta", _fnum(last.get("beta"), "+.3f")),
+    small = lambda label, value, alert=False: html.Span(  # noqa: E731 -- one-line meta facts
+        [html.Span(f"{label} ", style={"color": DIM}), value],
+        style={"color": ORANGE if alert else TEXT})
+    meta = [
+        small("data", f"{asof_bar} · {asof_written}", asof_stale),
+        small("last run", _clock(ledger_row["run_ts"], always_date=True) if ledger_row else "never"),
+        *([small("gate", _gate_status(state))] if state and state["params"].get("gate") is not None else []),
+        small("live pnl", _fnum(live_pnl, "+.1f", " bps"), bool(live_pnl and live_pnl < 0)),
+        small("backtest", f"sharpe {_fnum(row.get('sharpe'), '.2f')} · {_fnum(row.get('n_trades'), '.0f')} trades · "
+                          f"hit {_fnum(row.get('hit_rate'), '.0%')} · max dd {_fnum(row.get('max_drawdown_bps'), '+.1f')}"),
+        small("params", _param_summary(row)),
     ]
 
     if error:
+        now_panel = html.Div()
         chart_body = html.Div(error, style={"color": ORANGE, "padding": "12px 0"})
     else:
+        now_panel = _now_panel(state, live, open_entry)
         window_bars = WINDOW_PRESETS.get(window, WINDOW_PRESETS[DEFAULT_WINDOW])
-        level_png = level_chart(
-            state["data"], state["strategy"].target,
-            trades=trades, open_entry=open_entry,
-            window_bars=window_bars, date_range=date_range,
-        )
-        input_png = input_chart(
-            state["data"], state["strategy"].feature,
-            window_bars=window_bars, date_range=date_range,
-        )
-        sig_png = signal_chart(
+        span = dict(window_bars=window_bars, date_range=date_range)
+        target = state["strategy"].target
+        data = state["data"].with_columns(pl.Series("fair", _fair_series(state)))
+        wide = signal_chart(
             state["data"], state["signal_frame"],
             state["params"]["entry_signal"], state["params"]["entry_threshold"],
-            window_bars=window_bars, date_range=date_range, fired=state["fired"],
+            fired=state["fired"], **span,
         )
+        level_png = level_chart(data, target, trades=trades, open_entry=open_entry, overlays=["fair"], **span)
+        # an oven signal holds the target hedged by its input: show that portfolio; a book signal its input
+        second = (level_chart(state["data"], "portfolio", **span) if "portfolio" in state["data"].columns
+                  else input_chart(state["data"], state["strategy"].feature, **span))
         gate_png = gate_chart(
-            state["data"],
-            state["signal_frame"],
-            state["params"].get("gate"),
-            window_bars=window_bars,
-            date_range=date_range,
-            gate_window=state["params"].get("gate_window"),
+            state["data"], state["signal_frame"], state["params"].get("gate"),
+            gate_window=state["params"].get("gate_window"), **span,
         )
-        pnl_png = pnl_chart(
-            state["equity_curve"],
-            window_bars=window_bars,
-            date_range=date_range,
-        )
-        returns_png = return_distribution_chart(trades)
-        chart_pngs = [level_png, input_png, sig_png]
-        if gate_png is not None:
-            chart_pngs.append(gate_png)
-        chart_pngs += [pnl_png, returns_png]
+        pnl_png = pnl_chart(state["equity_curve"], **span)
+        pngs = [level_png, second, *([gate_png] if gate_png is not None else []), pnl_png,
+                _confidence_chart(trades), return_distribution_chart(trades)]
+        img = lambda png: html.Img(  # noqa: E731
+            src=f"data:image/png;base64,{png}", style={"width": "100%", "border": f"1px solid {BORDER}"})
         chart_body = html.Div(
             style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": 10},
-            children=[
-                html.Img(
-                    src=f"data:image/png;base64,{png}",
-                    style={"width": "100%", "border": f"1px solid {BORDER}"},
-                )
-                for png in chart_pngs
-            ],
+            children=[html.Div(img(wide), style={"gridColumn": "1 / span 2"}),
+                      *[img(png) for png in pngs if png is not None]],
         )
 
     summary = html.Div([
-        html.Div(stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
-                                "padding": "8px 2px 8px"}),
-        html.Div(backtest_stats, style={"display": "flex", "gap": 28, "flexWrap": "wrap",
-                                         "padding": "0 2px 14px",
-                                         "borderTop": f"1px solid {BORDER}",
-                                         "marginTop": 4, "paddingTop": 8}),
+        now_panel,
+        html.Div(meta, style={"display": "flex", "gap": 18, "flexWrap": "wrap", "fontSize": 11,
+                              "padding": "6px 2px 10px"}),
     ])
     return summary, chart_body, trade_data
+
+
+def _fair_series(state: dict) -> np.ndarray:
+    """The model's fair value for the target, bar by bar: the target less its residual
+    (plus the OU mean a book signal reverts to)."""
+    sig = state["signal_frame"]
+    fair = state["data"][state["strategy"].target].to_numpy().astype(float) - sig["resid"].to_numpy().astype(float)
+    if "ou_mean" in sig.columns:
+        fair = fair + sig["ou_mean"].fill_null(0.0).to_numpy().astype(float)
+    return fair
+
+
+CONF_COLOURS = {"HIGH": C1, "LOW": C0, "MED": TEXT, "—": DIM}
+
+
+def _now_panel(state: dict, live: dict, open_entry: dict | None) -> html.Div:
+    """Today, at a glance: what the book holds or the signal calls for, the reading
+    against its threshold and fair value, what an entry now is expected to make,
+    walk-forward confidence and why, and the open position's progress."""
+    params = state["params"]
+    units = "bps" if params["entry_signal"] == "residual" else "z"
+    reading = live["resid"] if units == "bps" else live["z"]
+    position = _position_label(state, open_entry)
+    conf = live["confidence"]
+    bold = {"fontWeight": "bold"}
+    dim = {"color": DIM}
+
+    def line(*parts):
+        return html.Div(parts, style={"display": "flex", "gap": 18, "flexWrap": "wrap", "alignItems": "baseline"})
+
+    expected = (
+        [html.Span("if entered now", style=dim),
+         html.Span(f"{live['exp_return']:+.1f} bp", style=bold),
+         *([html.Span(f"over ~{live['exp_bars']:.0f}d ({live['bps_per_day']:+.2f} bp/day)")]
+           if live["exp_bars"] == live["exp_bars"] else [html.Span("to its OU mean")]),
+         *([html.Span(f"risk {live['exp_risk']:.1f} bp", style=dim)] if live["exp_risk"] == live["exp_risk"] else [])]
+        if live["exp_return"] == live["exp_return"] else
+        [html.Span("if entered now", style=dim), html.Span("— (no half-life yet)", style=dim)])
+    if open_entry is not None:
+        held = open_entry
+        progress = f"{held['bars_held']}d" + (f" of ~{held['expected_bars']:.0f}" if held.get("expected_bars") else "")
+        position_line = [html.Span("open", style=dim),
+                         html.Span(f"{held['direction']} since {held['entry_date']}", style=bold),
+                         html.Span(f"{held['pnl_bps']:+.1f} bp", style={"color": C1 if held["pnl_bps"] >= 0 else C0,
+                                                                         **bold}),
+                         html.Span(progress),
+                         *([html.Span(f"expected {held['expected_return_bps']:+.1f} bp at entry", style=dim)]
+                           if held.get("expected_return_bps") is not None else [])]
+    else:
+        position_line = [html.Span("open", style=dim), html.Span("no position")]
+    return html.Div(
+        style={"border": f"1px solid {BORDER}", "background": "#FFFFFF", "padding": "10px 14px",
+               "margin": "6px 0 4px", "fontFamily": "monospace", "fontSize": 13,
+               "display": "flex", "flexDirection": "column", "gap": 6},
+        children=[
+            line(html.Span(position, style={"fontSize": 15, **bold, "color": C1 if "LONG" in position
+                                            else C0 if "SHORT" in position else TEXT}),
+                 html.Span(f"{reading:+.2f}{units} vs ±{float(params['entry_threshold']):g}{units}", style=bold),
+                 html.Span(f"resid {live['resid']:+.1f} bp · z {live['z']:+.2f}", style=dim),
+                 html.Span(f"level {live['level']:.1f} · fair {live['fair']:.1f}"),
+                 html.Span(f"half-life {live['half_life']:.1f}d", style=dim)),
+            line(*expected),
+            line(html.Span("confidence", style=dim),
+                 html.Span(conf["label"], style={**bold, "color": CONF_COLOURS.get(conf["label"], TEXT)}),
+                 html.Span(conf["drivers"] or ("needs more closed trades" if conf["label"] == "—" else "")),
+                 html.Span(f"from {conf['n_past']} closed trades", style=dim)),
+            line(*position_line),
+        ],
+    )
+
+
+def _confidence_chart(trades) -> str | None:
+    """Realized average trade by the confidence each trade had at its own entry
+    (walk-forward): does HIGH actually beat LOW? None until there are confident trades."""
+    if trades is None or trades.is_empty() or "conf" not in trades.columns:
+        return None
+    rated = trades.filter(pl.col("conf") != "—")
+    if rated.is_empty():
+        return None
+    tiers = [t for t in ("HIGH", "MED", "LOW") if t in rated["conf"].to_list()]
+    groups = {t: rated.filter(pl.col("conf") == t)["pnl_bps"] for t in tiers}
+    return residual_bars_chart([f"{t} ·{len(groups[t])}" for t in tiers], [groups[t].mean() for t in tiers],
+                               "realized avg trade by confidence at entry", "bps")
 
 
 def _btn_style(primary: bool = False) -> dict:
@@ -941,14 +1005,20 @@ def _registry_rows() -> list[dict]:
 
 
 def build_app() -> dash.Dash:
+    # folder tabs: rounded tops sitting on the line under them, sized to their labels
+    # rather than stretched across the page (dcc.Tab splits the width by default); the
+    # open one is white and drops its bottom edge so it reads as joined to the page
     tab_style = {
-        "padding": "10px 18px",
+        "padding": "8px 20px",
         "fontSize": 12,
         "fontWeight": "bold",
         "background": PANEL,
         "border": f"1px solid {BORDER}",
+        "borderBottom": f"1px solid {BORDER}",
+        "borderRadius": "8px 8px 0 0",
+        "marginRight": 4,
+        "marginBottom": -1,
         "color": DIM,
-        # sized to the label, not stretched across the page (dcc.Tab splits the width by default)
         "width": "auto",
         "flex": "0 0 auto",
         "minWidth": 110,
@@ -958,6 +1028,7 @@ def build_app() -> dash.Dash:
         "background": "#FFFFFF",
         "color": ORANGE,
         "borderTop": f"3px solid {ORANGE}",
+        "borderBottom": "1px solid #FFFFFF",
     }
 
     def _overview_tab(rows):
@@ -1054,6 +1125,8 @@ def build_app() -> dash.Dash:
         return dcc.Tabs(
             id="dashboard-tabs",
             className="dashboard-tight",
+            # the line the folder tabs sit on
+            style={"borderBottom": f"1px solid {BORDER}", "padding": "8px 24px 0"},
             value="live-overview",
             children=[
                 dcc.Tab(
@@ -1064,7 +1137,7 @@ def build_app() -> dash.Dash:
                     children=_overview_tab(rows),
                 ),
                 dcc.Tab(
-                    label="Dig",
+                    label="Deep Dive",
                     value="signal-deep-dive",
                     style=tab_style,
                     selected_style=selected_tab_style,

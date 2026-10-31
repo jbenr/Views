@@ -156,16 +156,19 @@ def level_chart(
     features: list[str] | None = None,
     invert_features: bool = False,
     fig_height: float | None = None,
+    overlays: list[str] | None = None,
 ) -> str:
     """Tradable level with optional research inputs.
 
     Inputs use the independently scaled left axis, while the tradable target
     stays on the dashboard's standard right-hand BPS axis. This lets a target
     and feature share time/plot space without one level scale flattening the
-    other.
+    other. ``overlays`` are series in the target's own units (a fair value, say),
+    drawn dashed on the target's axis.
     """
     features = [feature for feature in (features or []) if feature != target]
-    cols = [target, *features]
+    overlays = [o for o in (overlays or []) if o != target]
+    cols = [target, *overlays, *features]
     frame = _pandas_indexed(data, cols)
     frame = _slice_window(frame, window_bars, date_range)
     display_features = features
@@ -175,11 +178,12 @@ def level_chart(
             feature: display for feature, display in zip(features, display_features)
         })
         frame[display_features] = -frame[display_features]
-        cols = [target, *display_features]
+        cols = [target, *overlays, *display_features]
     markers = _trade_markers(trades, open_entry, frame.index.min(), frame.index.max())
     palette = (C2, C1, C0, DIM)
     colors = {
         target: ORANGE,
+        **{overlay: DIM for overlay in overlays},
         **{
             feature: palette[i % len(palette)]
             for i, feature in enumerate(display_features)
@@ -190,6 +194,7 @@ def level_chart(
         frame, cols=cols, title=target, yaxis_title="bps",
         yaxis_right_title=feature_title, left=display_features,
         markers=markers, line_colors=colors,
+        linestyles={overlay: "dashed" for overlay in overlays} or None,
     )
 
 

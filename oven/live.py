@@ -135,6 +135,9 @@ class OvenStrategy:
             pl.col("exp_bars").cast(pl.Float64).alias("expected_bars"),
             pl.col("pnl").alias("pnl_bps"), pl.col("half_life").cast(pl.Float64).alias("entry_half_life"),
             pl.col("bars").alias("bars_held"), pl.col("reason").alias("exit_reason"),
+            # entry state the dashboard's confidence reads (dashboard.runner.live_read)
+            pl.col("entry_z").abs().cast(pl.Float64).alias("abs_z"), pl.col("r2").cast(pl.Float64),
+            pl.col("beta_drift20").abs().cast(pl.Float64).alias("abs_drift"),
         ).sort("exit_date", descending=True)
         open_entry = None
         if not held.is_empty():
