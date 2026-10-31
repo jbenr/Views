@@ -109,8 +109,9 @@ class OvenStrategy:
         fit it comes from, in the columns the dashboard's cards and ledger read."""
         m = engine.basis_arrays({c: data[c].to_numpy() for c in data.columns if c != "ts"}, self.setup["basis"])
         signal = m["resid"] if self.setup["scale"] == "raw" else m["z"]
+        # beta is the signal fit's own slope: levels beta on the levels basis, the hedge on the portfolio one
         return pl.DataFrame({"ts": data["ts"], "signal": signal, "resid": m["resid"], "ou_z": m["z"],
-                             "beta": data["beta_changes"], "r2": data["r2"], "half_life": m["half_life"]})
+                             "beta": m["beta"], "r2": data["r2"], "half_life": m["half_life"]})
 
     def history(self, data: pl.DataFrame) -> tuple[pl.DataFrame, dict | None, pl.DataFrame]:
         """(closed trade log, open position or None, daily equity curve) in the shapes

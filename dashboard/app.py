@@ -88,17 +88,17 @@ OVERVIEW_COLUMNS = [
     # threshold it is being judged against, so the four state columns become two.
     # Headers and cells are kept short so the table fits the page without a
     # scrollbar; units (bps, %) are the dashboard's defaults and go unstated.
+    # What each signal is and where it stands today; how the strategy has performed
+    # lives on the Deep Dive.
     ("name", "Signal"),
+    ("model", "Built From"),
+    ("input_now", "Input"),
+    ("fair", "Fair"),
+    ("reading", "Reading"),
     ("position", "Position"),
     ("conf", "Conf"),
-    ("reading", "Reading"),
     ("gate_rule", "Gate"),
     ("gate_status", "Gate Now"),
-    ("live_pnl_bps", "PnL"),
-    ("sharpe", "Sharpe"),
-    ("n_trades", "Trades"),
-    ("hit_rate", "Hit %"),
-    ("max_drawdown_bps", "Max DD"),
     ("data_asof", "As Of"),
 ]
 
@@ -146,20 +146,6 @@ def _fnum(value, fmt: str, suffix: str = "") -> str:
     if value != value:  # NaN
         return "—"
     return format(value, fmt) + suffix
-
-
-def _round(value, ndigits: int):
-    """Round a possibly-missing/NaN metric, keeping it numeric so sortable
-    table columns still sort correctly (unlike _fnum's formatted strings)."""
-    if value is None:
-        return None
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return None
-    if value != value:  # NaN
-        return None
-    return round(value, ndigits)
 
 
 def _live_pnl_bps(trades, open_entry: dict | None) -> float:
@@ -446,15 +432,14 @@ def _overview_snapshot(row: dict) -> dict:
         "target": row["target"],
         "name": _display_name(row),
         "position": "UNAVAILABLE",
+        "model": "—",
+        "input_now": "—",
+        "fair": "—",
         "conf": "—",
         "reading": "—",
         "gate_rule": "—",
         "gate_status": "—",
         "live_pnl_bps": None,
-        "sharpe": _round(row.get("sharpe"), 2),
-        "n_trades": _round(row.get("n_trades"), 0),
-        "hit_rate": _round(row.get("hit_rate") * 100 if row.get("hit_rate") is not None else None, 1),
-        "max_drawdown_bps": _round(row.get("max_drawdown_bps"), 1),
         "data_asof": "—",
         "data_stale": 0,
     }
@@ -477,8 +462,8 @@ def _overview_snapshot(row: dict) -> dict:
     )
     return {
         **base,
+        **_signal_facts(row, state, trades, open_entry),
         "position": _position_label(state, open_entry),
-        "conf": _confidence_label(state, trades, open_entry),
         "reading": reading_str,
         "gate_rule": _gate_rule(params),
         "gate_status": _gate_status(state).upper(),
@@ -490,13 +475,36 @@ def _overview_snapshot(row: dict) -> dict:
     }
 
 
-def _confidence_label(state: dict, trades, open_entry: dict | None) -> str:
-    """Today's confidence for an overview row; '—' when the signal's state lacks what
-    confidence reads -- a decoration on the row must never break it."""
+def _model_text(row: dict, state: dict) -> str:
+    """What the signal is built from, in one cell: the target (named by the section
+    header above the row) against beta x the input, and what is read off that -- the
+    lookback and basis for an oven signal, the residual or its OU z for a book one."""
+    feature = state["strategy"].feature
+    beta = state["last"].get("beta")
+    beta = f"{float(beta):+.2f}" if beta is not None and beta == beta else "β"
+    if row.get("kind") == "oven":
+        setup = state["strategy"].setup
+        basis = {"portfolio": "port"}.get(setup["basis"], setup["basis"])
+        return f"~ {beta}×{feature} · {setup['lookback']}d {basis}"
+    kind = "resid" if state["params"]["entry_signal"] == "residual" else "OU z"
+    return f"~ {beta}×{feature} · {kind}"
+
+
+def _signal_facts(row: dict, state: dict, trades, open_entry: dict | None) -> dict:
+    """An overview row's what-it-is and where-it-stands cells: model, the input's value
+    now, the target's fair value and today's confidence. '—' where the signal's state
+    lacks them -- a decoration on the row must never break it."""
     try:
-        return runner.live_read(state, trades, open_entry)["confidence"]["label"]
+        live = runner.live_read(state, trades, open_entry)
+        feature = state["strategy"].feature
+        return {
+            "model": _model_text(row, state),
+            "input_now": f"{float(state['data'][feature][-1]):.1f}",  # the input is named in Built From
+            "fair": f"{live['fair']:.1f}" if live["fair"] == live["fair"] else "—",
+            "conf": live["confidence"]["label"],
+        }
     except (KeyError, AttributeError):
-        return "—"
+        return {}
 
 
 def _trade_cell_style(column: str, value, row: dict) -> dict | None:
@@ -532,11 +540,6 @@ def _overview_cell_style(column: str, value, row: dict) -> dict | None:
             return {"color": C0}
         if "OPEN" in str(value):
             return {"color": C1}
-    elif column == "live_pnl_bps" and isinstance(value, (int, float)):
-        if value > 0:
-            return {"color": C1, "fontWeight": "bold"}
-        if value < 0:
-            return {"color": C0, "fontWeight": "bold"}
     elif column == "data_asof" and row.get("data_stale"):
         # the db holds a newer bar, or has rewritten this one, since the pull
         return {"color": ORANGE, "fontWeight": "bold"}
@@ -738,10 +741,15 @@ def _card_sections(
         small("data", f"{asof_bar} · {asof_written}", asof_stale),
         small("last run", _clock(ledger_row["run_ts"], always_date=True) if ledger_row else "never"),
         *([small("gate", _gate_status(state))] if state and state["params"].get("gate") is not None else []),
-        small("live pnl", _fnum(live_pnl, "+.1f", " bps"), bool(live_pnl and live_pnl < 0)),
-        small("backtest", f"sharpe {_fnum(row.get('sharpe'), '.2f')} · {_fnum(row.get('n_trades'), '.0f')} trades · "
-                          f"hit {_fnum(row.get('hit_rate'), '.0%')} · max dd {_fnum(row.get('max_drawdown_bps'), '+.1f')}"),
         small("params", _param_summary(row)),
+    ]
+    # how the strategy has done: live since promotion, and its backtest at promotion
+    performance = [
+        stat_block("live pnl", _fnum(live_pnl, "+.1f", " bps"), alert=bool(live_pnl and live_pnl < 0)),
+        stat_block("sharpe", _fnum(row.get("sharpe"), ".2f")),
+        stat_block("trades", _fnum(row.get("n_trades"), ".0f")),
+        stat_block("hit rate", _fnum(row.get("hit_rate"), ".0%")),
+        stat_block("max drawdown", _fnum(row.get("max_drawdown_bps"), "+.1f", " bps")),
     ]
 
     if error:
@@ -779,8 +787,9 @@ def _card_sections(
 
     summary = html.Div([
         now_panel,
+        html.Div(performance, style={"display": "flex", "gap": 28, "flexWrap": "wrap", "padding": "8px 2px 4px"}),
         html.Div(meta, style={"display": "flex", "gap": 18, "flexWrap": "wrap", "fontSize": 11,
-                              "padding": "6px 2px 10px"}),
+                              "padding": "4px 2px 10px"}),
     ])
     return summary, chart_body, trade_data
 
