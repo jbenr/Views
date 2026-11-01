@@ -34,7 +34,7 @@ def registry_entry(run_path: str | Path, name: str, sid: str, rationale: str | N
     """The registry row that promotes one setup of a saved bake: the frozen setup, the
     dashboard's shared param fields (filled so its labels and charts read it), and the
     bake's strategy stats for the setup."""
-    from oven.app import describe, load_run, matches, setup_from_id  # the bake's own readers
+    from oven.app import describe, load_run, matches, setup_from_id, setup_gate  # the bake's own readers
 
     run_path = str(Path(run_path))
     run = load_run(run_path)
@@ -78,6 +78,8 @@ def registry_entry(run_path: str | Path, name: str, sid: str, rationale: str | N
         # what the runner re-walks
         "oven_run": run_path,
         "oven_setup": json.dumps(setup),
+        # a full-sample gate's raw cut, frozen from the bake's window: live trading applies the same cut
+        "oven_gate_edges": json.dumps(setup_gate(run_path, setup)),
         "oven_cost": cost,
     }
 
@@ -88,6 +90,7 @@ class OvenStrategy:
     def __init__(self, row: dict):
         self.setup = json.loads(row["oven_setup"])
         self.cost = float(row["oven_cost"])
+        self.gate_edges = json.loads(row.get("oven_gate_edges") or "null")
         self.transaction_cost_bps = self.cost
         self.name = row["name"]
         self.target = row["target"]
@@ -116,7 +119,7 @@ class OvenStrategy:
     def history(self, data: pl.DataFrame) -> tuple[pl.DataFrame, dict | None, pl.DataFrame]:
         """(closed trade log, open position or None, daily equity curve) in the shapes
         dashboard.runner.trade_history returns for a book strategy."""
-        trades = engine.setup_trades(data, self.target, self.setup, self.cost)
+        trades = engine.setup_trades(data, self.target, self.setup, self.cost, gate_edges=self.gate_edges)
         y = data[self.target].to_numpy().astype(float)
         x = data[self.feature].to_numpy().astype(float)
         if trades.is_empty():

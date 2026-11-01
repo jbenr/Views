@@ -20,6 +20,7 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 
 from utils.market_data import last_updated
@@ -177,7 +178,7 @@ def trade_history(signal_id: str, state: dict | None = None) -> tuple[pl.DataFra
     describes the live position if the promoted config is currently in a
     trade (else None).
     """
-    from backtest.engine import BacktestConfig, Engine, trade_log
+    from backtest.legacy import BacktestConfig, Engine, trade_log
 
     state = state or compute_signal(signal_id)
     strategy, data, params = state["strategy"], state["data"], state["params"]
@@ -281,6 +282,36 @@ def live_read(state: dict, trades: pl.DataFrame, open_entry: dict | None) -> dic
     out["trades"] = trades
     out["held"] = open_entry
     return out
+
+
+def verify(signal_id: str) -> dict:
+    """Hold a promoted signal's backtest to the exact walk: its trades and statistics
+    from backtest.engine's fast walk against walk_exact's, bar by bar, on the cached
+    data. {"status": "match" | "MISMATCH" | why it can't be checked, ...}."""
+    from backtest import engine as core
+
+    row, strategy = _resolve(signal_id)
+    if row is None or not hasattr(strategy, "setup"):
+        return {"status": "not on backtest.engine yet (book signals move in phase 3)"}
+    data = cached_data(signal_id)
+    if data is None:
+        return {"status": "no cached data -- click Ref on the dashboard first"}
+    from oven.engine import setup_model
+
+    model, config, hedge, gate = setup_model(strategy.model_frame(data), strategy.target, strategy.setup,
+                                             strategy.gate_edges)
+    gates = None if gate is None else gate[None, :]
+    fast, stats = core.walk(model, core.configs_frame(config), hedge=hedge, cost=strategy.cost, gates=gates)
+    exact, marks = core.walk_exact(model, config, hedge=hedge, cost=strategy.cost, gate=gate)
+    s = model["signal_z" if config.get("scale", "z") == "z" else "signal_raw"]
+    start = 1 + int(np.argmax(np.isfinite(s[1:])))
+    want = core.exact_stats(exact, marks, start)
+    reasons = [core.EXIT_REASONS.index(t["reason"]) if c == "reason" else t[c]
+               for t in exact for c in core.TRADE_COLS[1:]]
+    trades_match = len(fast) == len(exact) and np.allclose(fast[:, 1:].ravel(), reasons, rtol=1e-9, atol=1e-9)
+    stats_match = np.allclose(stats[0], [want[k] for k in core.STATS], rtol=1e-9, atol=1e-9, equal_nan=True)
+    return {"status": "match" if trades_match and stats_match else "MISMATCH", "trades": len(exact),
+            "fast_trades": len(fast), "trades_match": trades_match, "stats_match": stats_match}
 
 
 def run_analysis(signal_id: str) -> dict:

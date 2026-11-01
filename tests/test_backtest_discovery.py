@@ -6,7 +6,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from backtest.engine import TradeDef
+from backtest.legacy import TradeDef
 from backtest.validation import cv_fold_labels, cv_scores, pooled_sharpe, selection_checks
 from research.dislocation import RANK_RULES, backtest_scan, placebo_scan, rank_board
 from research.dislocation_backtest import run_grid

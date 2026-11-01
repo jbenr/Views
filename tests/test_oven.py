@@ -9,7 +9,13 @@ from types import SimpleNamespace
 import numpy as np
 import polars as pl
 
+from backtest.engine import TRADE_COLS
 from oven.engine import bake, config_grid, daily_marks, walk_model
+
+# the engine's trade rows, read by name
+COL = {c: i for i, c in enumerate(TRADE_COLS)}
+CONFIG, DECIDED, EXIT_FILL, SIDE, PNL, REASON, SIZE, EXP_RETURN, EXP_BARS = (
+    COL[c] for c in ("config", "decided", "exit_fill", "side", "pnl", "reason", "size", "exp_return", "exp_bars"))
 
 
 def _panel(y, x, target="10s30s", feature="10y"):
@@ -33,14 +39,14 @@ def test_frozen_trade_is_the_hedged_portfolio():
 
     trades, stats = walk_model(y, x, arrays, configs, hedge=1.0)
     assert len(trades) == 1
-    cfg, decided, filled, side, pnl, reason = trades[0][:6]
+    decided, filled, side, pnl, reason = trades[0][[DECIDED, EXIT_FILL, SIDE, PNL, REASON]]
     assert (decided, filled, side, reason) == (2, 5, -1.0, 0)  # decided bar 2, reverted bar 4, filled bar 5
     # short the portfolio y - 0.2x from the bar-3 fill to the bar-5 fill: y 4 -> 2, x 2 -> 4
     assert np.isclose(pnl, -((2 - 4) - 0.2 * (4 - 2)))
     assert np.isclose(stats[0, 0], pnl)  # daily marks sum to the trade
 
     unhedged, _ = walk_model(y, x, arrays, configs, hedge=0.0)
-    assert np.isclose(unhedged[0, 4], -(2 - 4))  # an untradable input: y alone
+    assert np.isclose(unhedged[0, PNL], -(2 - 4))  # an untradable input: y alone
 
 
 def test_half_life_time_exit_and_reversion_off():
@@ -51,15 +57,15 @@ def test_half_life_time_exit_and_reversion_off():
     base = dict(scale=["raw"], entry=[2.0], max_hold=[8], stop=[0.0])
     trades, _ = walk_model(y, x, arrays, pl.DataFrame({**base, "revert": [0.0], "hl_mult": [1.5]}))
     # 1.5 x half-life 2 = 3 bars: decided bar 2, timed out bar 5, filled bar 6, reason half_life
-    assert (trades[0, 1], trades[0, 2], trades[0, 5]) == (2, 6, 3)
+    assert (trades[0, DECIDED], trades[0, EXIT_FILL], trades[0, REASON]) == (2, 6, 3)
     trades, _ = walk_model(y, x, arrays, pl.DataFrame({**base, "revert": [0.0], "hl_mult": [0.0]}))
-    assert (trades[0, 2], trades[0, 5]) == (11, 2)  # no half-life stop: the 8-bar max hold, reason time
+    assert (trades[0, EXIT_FILL], trades[0, REASON]) == (11, 2)  # no half-life stop: the 8-bar max hold, reason time
 
     # a reversion exit still wins when it comes first
     y2 = np.array([0.0, 0.0, 3.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     arrays2 = {**_arrays(12, resid=y2), "half_life": np.full(12, 4.0)}
     trades, _ = walk_model(y2, x, arrays2, pl.DataFrame({**base, "revert": [0.5], "hl_mult": [1.0]}))
-    assert (trades[0, 2], trades[0, 5]) == (4, 0)
+    assert (trades[0, EXIT_FILL], trades[0, REASON]) == (4, 0)
 
 
 def test_daily_marks_match_board_totals():
@@ -72,7 +78,7 @@ def test_daily_marks_match_board_totals():
     y = 0.5 * x + ou
     panel = _panel(y, x)
     configs = config_grid(z_entries=[2.0], raw_entries=[], reverts=[1.0], max_holds=[20], stops=[0.0], hl_mults=[0.0])
-    run = bake(panel, ["10y"], lookbacks=[126], hedge_lookbacks=[126], configs=configs, cost=0.5)
+    run = bake(panel, ["10y"], lookbacks=[126], hedge_lookbacks=[126], configs=configs, cost=0.5, keep_trades=True)
     for basis in ("levels", "portfolio"):
         # the board scores closed trades; a position still open at the end is kept out
         trades = run["trades"].filter((pl.col("basis") == basis) & (pl.col("reason") != "open"))
@@ -118,7 +124,8 @@ def test_trades_record_every_horizon_at_entry():
     x = np.cumsum(rng.normal(0, 5, n))
     y = 0.5 * x + np.cumsum(rng.normal(0, 1, n)) * 0.3
     configs = config_grid(z_entries=[1.5], raw_entries=[], reverts=[1.0], max_holds=[20], stops=[0.0], hl_mults=[0.0])
-    trades = bake(_panel(y, x), ["10y"], lookbacks=[63, 252], hedge_lookbacks=[126], configs=configs)["trades"]
+    trades = bake(_panel(y, x), ["10y"], lookbacks=[63, 252], hedge_lookbacks=[126], configs=configs,
+                  keep_trades=True)["trades"]
     assert {"z_lb63", "z_lb252"} <= set(trades.columns)
     for lb in (63, 252):  # a trade's own horizon is its entry z
         own = trades.filter(pl.col("lookback") == lb)
@@ -130,7 +137,8 @@ def test_untradable_input_trades_the_target_alone():
     n = 1200
     x, y = np.cumsum(rng.normal(size=n)), np.cumsum(rng.normal(size=n))
     configs = config_grid(z_entries=[1.0], raw_entries=[], reverts=[1.0], max_holds=[20], stops=[0.0], hl_mults=[0.0])
-    run = bake(_panel(y, x, feature="oil"), ["oil"], lookbacks=[63], hedge_lookbacks=[126], configs=configs)
+    run = bake(_panel(y, x, feature="oil"), ["oil"], lookbacks=[63], hedge_lookbacks=[126], configs=configs,
+               keep_trades=True)
     assert (run["trades"]["hedge_ratio"] == 0).all()
     assert not run["board"]["hedged"][0]
     assert run["board"]["basis"].to_list() == ["levels"]  # no hedge, so no portfolio basis
@@ -153,7 +161,7 @@ def test_position_still_held_at_the_end_is_an_open_trade_outside_the_stats():
 
     trades, stats = walk_model(y, x, arrays, configs, hedge=1.0, cost=0.5)
     assert len(trades) == 1
-    cfg, decided, filled, side, pnl, reason = trades[0][:6]
+    decided, filled, side, pnl, reason = trades[0][[DECIDED, EXIT_FILL, SIDE, PNL, REASON]]
     assert (decided, filled, side, reason) == (2, 6, -1.0, 4)  # "open", marked to the last bar
     assert np.isclose(pnl, -(5.0 - 3.5))  # short from the bar-3 fill, no exit cost yet
     assert stats[0, 0] == 0.0 and stats[0, 4] == 0  # no closed trade: nothing scored
@@ -169,9 +177,9 @@ def test_stop_loss_fires_on_the_close_and_fills_a_bar_later():
 
     trades, _ = walk_model(y, x, arrays, configs, hedge=1.0)
     stopped = trades[trades[:, 0] == 0][0]
-    assert (stopped[1], stopped[2], stopped[5]) == (2, 6, 5)  # decided bar 5, filled bar 6, "pnl_stop"
-    assert np.isclose(stopped[4], -(7.0 - 3.0))  # the fill is a bar after the close that tripped it
-    assert trades[trades[:, 0] == 1][0][5] == 4  # without the stop loss it is still open
+    assert (stopped[DECIDED], stopped[EXIT_FILL], stopped[REASON]) == (2, 6, 5)  # decided bar 5, filled bar 6, "pnl_stop"
+    assert np.isclose(stopped[PNL], -(7.0 - 3.0))  # the fill is a bar after the close that tripped it
+    assert trades[trades[:, 0] == 1][0][REASON] == 4  # without the stop loss it is still open
 
 
 def test_expected_return_and_time_follow_the_ou_half_life():
@@ -182,7 +190,7 @@ def test_expected_return_and_time_follow_the_ou_half_life():
     configs = pl.DataFrame(dict(scale=["raw"], entry=[2.0], revert=[0.5], max_hold=[10], stop=[0.0], hl_mult=[0.0]))
 
     trades, _ = walk_model(y, x, arrays, configs, hedge=1.0, cost=0.25)
-    size, exp_return, exp_bars = trades[0][6:]
+    size, exp_return, exp_bars = trades[0][[SIZE, EXP_RETURN, EXP_BARS]]
     assert np.isclose(exp_bars, 2.0)
     assert np.isclose(exp_return, 3.0 * 0.5 - 0.25)  # net of cost
     assert size == 1.0  # flat
@@ -199,11 +207,11 @@ def test_sizing_by_expected_return_scales_each_trade_and_averages_one():
 
     trades, stats = walk_model(y, x, arrays, configs, hedge=1.0)
     flat, sized = trades[trades[:, 0] == 0], trades[trades[:, 0] == 1]
-    assert np.allclose(flat[:, 4], [3.0, 6.0])
-    assert np.isclose(sized[:, 6].mean(), 1.0)  # sizes scaled to average 1
-    assert np.allclose(sized[:, 6], [2 / 3, 4 / 3], atol=1e-3)  # in proportion to expected return 3 : 6
-    assert np.allclose(sized[:, 4], flat[:, 4] * sized[:, 6])
-    assert np.isclose(stats[1, 0], sized[:, 4].sum())  # the stats score the sized marks
+    assert np.allclose(flat[:, PNL], [3.0, 6.0])
+    assert np.isclose(sized[:, SIZE].mean(), 1.0)  # sizes scaled to average 1
+    assert np.allclose(sized[:, SIZE], [2 / 3, 4 / 3], atol=1e-3)  # in proportion to expected return 3 : 6
+    assert np.allclose(sized[:, PNL], flat[:, PNL] * sized[:, SIZE])
+    assert np.isclose(stats[1, 0], sized[:, PNL].sum())  # the stats score the sized marks
 
 
 def test_full_reversion_expects_ninety_percent_by_three_point_three_half_lives():
@@ -212,8 +220,8 @@ def test_full_reversion_expects_ninety_percent_by_three_point_three_half_lives()
     arrays = {**_arrays(12, resid=y), "half_life": np.full(12, 2.0)}
     configs = pl.DataFrame(dict(scale=["raw"], entry=[2.0], revert=[1.0], max_hold=[20], stop=[0.0], hl_mult=[0.0]))
     trades, _ = walk_model(y, x, arrays, configs, hedge=1.0)
-    assert np.allclose(trades[:, 8], 2.0 * np.log2(10))  # well inside the 20-bar max hold
-    assert np.allclose(trades[:, 7], [0.9 * 3.0, 0.9 * 6.0])
+    assert np.allclose(trades[:, EXP_BARS], 2.0 * np.log2(10))  # well inside the 20-bar max hold
+    assert np.allclose(trades[:, EXP_RETURN], [0.9 * 3.0, 0.9 * 6.0])
 
 
 def test_a_promoted_setup_runs_on_the_dashboard_as_it_did_in_the_bake(tmp_path):
@@ -244,3 +252,44 @@ def test_a_promoted_setup_runs_on_the_dashboard_as_it_did_in_the_bake(tmp_path):
     assert len(log) == best["n_trades"]
     assert np.isclose(log["pnl_bps"].sum(), best["total_pnl"])
     assert set(equity.columns) == {"ts", "pnl_bps", "cumulative_pnl"}
+
+
+def test_a_bake_keeps_no_trades_and_its_setups_rewalk_to_the_board(tmp_path, monkeypatch):
+    """The board is scored from the engine's totals; opening a setup re-walks it on the
+    bake's own panel and window, and gets the same trades the board counted."""
+    from oven import app
+    from oven.engine import save
+
+    rng = np.random.default_rng(9)
+    n = 1500
+    x = np.cumsum(rng.normal(0, 5, n))
+    ou = np.zeros(n)
+    for i in range(1, n):
+        ou[i] = 0.9 * ou[i - 1] + rng.normal(0, 2)
+    panel = _panel(0.5 * x + ou, x)
+    configs = config_grid(z_entries=[1.5, 2.0], raw_entries=[], reverts=[0.5, 1.0], max_holds=[20], stops=[0.0],
+                          hl_mults=[0.0], rearms=["threshold", "by_exit"], fills=["same", "next"],
+                          gates=["none", "r2:high_75"])
+    run = bake(panel, ["10y"], lookbacks=[126], hedge_lookbacks=[126], configs=configs, cost=0.5)
+    assert run["trades"].is_empty()
+    run_dir = save(run, "10s30s", ["10y"], {"cost": 0.5, "lookbacks": [126]}, root=tmp_path)
+    assert not (run_dir / "trades.parquet").exists()
+    monkeypatch.setattr(app, "build_panel", lambda *_a, **_k: panel)
+    for row in run["board"].iter_rows(named=True):
+        setup = app.setup_from_id("10y", app.setup_id(row))
+        trades = app.bake_trades(str(run_dir), setup)
+        assert len(trades) == row["n_trades"]
+        assert np.isclose(trades["pnl"].sum(), row["total_pnl"], rtol=1e-4)
+    gated = run["board"].filter(pl.col("gate") != "none")
+    ungated = run["board"].filter(pl.col("gate") == "none")
+    assert gated["n_trades"].sum() < ungated["n_trades"].sum()
+
+
+def test_setup_ids_from_older_bakes_keep_their_rules():
+    from oven import app
+    from oven.engine import LEGACY_RULES
+
+    old = app.setup_from_id("10y", "126|504|portfolio|raw|2.5|0.75|40|0.0|2.0|0.0|bps_per_day")
+    assert {k: old[k] for k in LEGACY_RULES} == LEGACY_RULES
+    new = app.setup_from_id("10y", "126|504|portfolio|raw|2.5|0.75|40|0.0|2.0|0.0|flat|same|by_exit|r2:high_75|full|True")
+    assert (new["fill"], new["rearm"], new["gate"], new["need_half_life"]) == ("same", "by_exit", "r2:high_75", True)

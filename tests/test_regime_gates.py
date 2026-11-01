@@ -4,7 +4,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from backtest.engine import TradeDef
+from backtest.legacy import TradeDef
 from research import regimes as rg
 from research.dislocation import backtest_scan
 from research.dislocation_backtest import _entry_gate, run_grid, signal_frame

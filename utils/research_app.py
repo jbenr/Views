@@ -29,6 +29,21 @@ C0     = "#E74C3C"  # red  (short / sell)
 C1     = "#27AE60"  # green (long / buy)
 C2     = "#2980B9"  # blue
 
+# Folder tabs, shared by the signal dashboard and the Oven: rounded tops sitting on
+# the line under them (FOLDER_TABS on the dcc.Tabs), sized to their labels rather
+# than stretched across the page (dcc.Tab splits the width by default); the open one
+# is white and drops its bottom edge so it reads as joined to the page.
+FOLDER_TABS = {"borderBottom": f"1px solid {BORDER}", "padding": "8px 24px 0"}
+FOLDER_TAB = {
+    "padding": "8px 20px", "fontSize": 12, "fontWeight": "bold", "background": PANEL,
+    "border": f"1px solid {BORDER}", "borderBottom": f"1px solid {BORDER}", "borderRadius": "8px 8px 0 0",
+    "marginRight": 4, "marginBottom": -1, "color": DIM, "width": "auto", "flex": "0 0 auto", "minWidth": 110,
+}
+FOLDER_TAB_SELECTED = {
+    **FOLDER_TAB, "background": "#FFFFFF", "color": ORANGE, "borderTop": f"3px solid {ORANGE}",
+    "borderBottom": "1px solid #FFFFFF",
+}
+
 
 # ── Plotly figure factory ─────────────────────────────────────────────────────
 

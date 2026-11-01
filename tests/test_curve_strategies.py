@@ -7,7 +7,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from backtest.engine import BacktestConfig, Engine
+from backtest.legacy import BacktestConfig, Engine
 from tests import synthetic as syn
 
 MODULES = [

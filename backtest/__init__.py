@@ -1,4 +1,4 @@
-from .engine import (
+from .legacy import (
     TradeDef, TradeType, Position, ClosedPosition,
     SignalConfig, SignalPipeline, BooleanSignalPipeline,
     generate_signals, generate_boolean_actions,

@@ -56,11 +56,12 @@ class _PngViz(Viz):
     """Viz, but _make_time_nav renders to a base64 PNG instead of a
     notebook widget / PlotlyViz's live-server registry."""
 
-    def __init__(self, *args, fig_height: float | None = None, **kwargs):
+    def __init__(self, *args, fig_height: float | None = None, fig_width: float = 9, **kwargs):
         # No plt.switch_backend here: it closes every open figure, including
         # ones another request is still drawing. Agg is chosen at import.
         super().__init__(*args, **kwargs)
         self.fig_height = fig_height
+        self.fig_width = fig_width
 
     def _make_time_nav(self, df, render_fn, title=None, nrows=1,
                         height_ratios=None, fig_height=None):
@@ -72,7 +73,7 @@ class _PngViz(Viz):
             else (5.4 if nrows == 1 else 4.2 * nrows)
         )
         fig, axes = plt.subplots(
-            nrows, 1, figsize=(9, h), sharex=(nrows > 1),
+            nrows, 1, figsize=(self.fig_width, h), sharex=(nrows > 1),
             gridspec_kw={"height_ratios": height_ratios} if height_ratios else {},
         )
         fig.patch.set_facecolor("white")
@@ -315,10 +316,13 @@ def signal_chart(
     window_bars: int | None = WINDOW_PRESETS[DEFAULT_WINDOW],
     date_range: tuple | None = None,
     fired: str = "flat",
+    wide: bool = False,
 ) -> str:
     """Residual/OU-z chart with entry threshold bands and the current
     reading flagged -- base64 PNG. Line is colored red while a sell (short)
-    signal is firing, green while a buy (long) signal is firing."""
+    signal is firing, green while a buy (long) signal is firing. ``wide`` draws
+    it for a slot spanning the whole card (the dashboard's Deep Dive); otherwise
+    it is the standard half-width chart (the Oven's chart grid)."""
     col = "resid" if entry_signal == "residual" else "ou_z"
     combined = data.select("ts").with_columns(sig_frame[col].alias(col))
     frame = _pandas_indexed(combined, [col])
@@ -329,7 +333,10 @@ def signal_chart(
         line_colors = {col: C0}
     elif fired == "long":
         line_colors = {col: C1}
-    return _PngViz().line(
+    # spanning the whole card, it is drawn on a wide, short canvas so it isn't a
+    # half-width chart stretched up (soft, oversized text and lines, too tall)
+    viz = _PngViz(fig_width=18, fig_height=4.2) if wide else _PngViz()
+    return viz.line(
         frame, cols=[col],
         title=f"{entry_signal} vs entry ({entry_threshold:g} {units})",
         yaxis_title=units,

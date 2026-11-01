@@ -3,7 +3,7 @@ from datetime import date, timedelta
 import numpy as np
 import polars as pl
 
-from backtest.engine import TradeDef
+from backtest.legacy import TradeDef
 from research.dislocation import dislocation_scan
 from research.dislocation_backtest import signal_frame, run_grid
 from research.saved_runs import grid_spec, compare_run

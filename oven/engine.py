@@ -61,8 +61,9 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-from numba import njit
-
+from backtest import engine as core
+from backtest.engine import EXIT_REASONS, FILLS, REARMS, SCALES, SIZINGS, STATS, TRADE_COLS, expect, horizon
+from backtest.lab import CONDITION_NAMES, REGIME_GATE_BUCKETS
 from research.panel import CATALOG, TRADEABLE_LEGS, build_panel
 from stats import roll_half_life, roll_lr, roll_lr_diff
 
@@ -86,19 +87,22 @@ PNL_STOPS = [0.0]  # stop loss: bps the trade may lose, marked on the close, bef
 # A trade the model expects to lose on (or can't say: no half-life) is sized to nothing,
 # i.e. not taken. Sizes are scaled to average 1 over a setup's trades, a constant that
 # leaves Sharpe untouched and keeps P&L comparable to flat sizing.
-SIZINGS = ("flat", "exp_return", "exp_sharpe", "bps_per_day")
 SIZING_DEFAULT = ["flat"]
 COST = 0.0  # bps per round trip
 MIN_BARS = 500  # an input needs this much overlap with the target beyond its lookback
 PERIODS = 252
 
-SCALES = ("z", "raw")
-# "open": still held at the last bar; "pnl_stop": the stop loss in bps of trade P&L
-EXIT_REASONS = ("revert", "stop", "time", "half_life", "open", "pnl_stop")
 FEATURES = ("entry_z", "r2", "beta_levels", "beta_changes", "hedge_gap", "beta_drift20",
             "half_life", "resid_sigma", "input_vol60", "target_vol60")
 SETUP = ["input", "lookback", "hedge_lb", "basis", "scale", "entry", "revert", "max_hold", "stop", "hl_mult",
-         "pnl_stop", "sizing"]
+         "pnl_stop", "sizing", "fill", "rearm", "gate", "gate_mode", "need_half_life"]
+# fills, re-arms and gates (backtest.engine): a gate is "<condition>:<bucket>" or none
+FILLS_DEFAULT = ["same"]
+REARMS_DEFAULT = ["by_exit"]
+GATE_CONDITIONS = CONDITION_NAMES
+GATE_BUCKETS = tuple(bucket[0] for bucket in REGIME_GATE_BUCKETS)
+GATE_BUCKETS_DEFAULT = ["low_25", "high_75", "mid_25_75"]
+NO_GATE = "none"
 # What the entry signal measures (both trade the same hedged portfolio):
 #   levels     y - (a + bL x): rich/cheap vs where the levels fit says y should be
 #   portfolio  (y - bC x) - its rolling mean: the traded portfolio's own dislocation
@@ -110,8 +114,10 @@ RANKS = {
     "total_pnl": "total P&L",
     "calmar": "Calmar",
 }
-# per-config daily sufficient statistics written by _walk
-_STATS = ("sum", "sumsq", "days", "max_dd", "held", "sum1", "sumsq1", "days1", "sum2", "sumsq2", "days2")
+# what a setup from before these were knobs ran on (older bakes, setups promoted from them):
+# filled a bar after each decision, re-armed back inside the entry band, no gate, and could
+# enter with no measured half-life
+LEGACY_RULES = {"fill": "next", "rearm": "threshold", "gate": NO_GATE, "gate_mode": "full", "need_half_life": False}
 
 
 # ---- model arrays -----------------------------------------------------------
@@ -201,51 +207,37 @@ def held_package(y: np.ndarray, x: np.ndarray, beta_c: np.ndarray, hedge: float 
 
 def config_grid(z_entries=Z_ENTRIES, raw_entries=RAW_ENTRIES, reverts=REVERTS,
                 max_holds=MAX_HOLDS, stops=STOPS, hl_mults=HL_MULTS, pnl_stops=PNL_STOPS,
-                sizings=SIZING_DEFAULT) -> pl.DataFrame:
-    """Every (scale, entry, revert, hold, stop, half-life multiple, P&L stop, sizing) cell a
-    model is walked through. A cell with no reversion exit and no half-life stop is a pure
-    max-hold exit."""
-    unknown = [s for s in sizings if s not in SIZINGS]
-    if unknown:
-        raise ValueError(f"unknown sizing {unknown}; expected some of {SIZINGS}")
+                sizings=SIZING_DEFAULT, fills=FILLS_DEFAULT, rearms=REARMS_DEFAULT, gates=(NO_GATE,),
+                gate_mode: str = "full") -> pl.DataFrame:
+    """Every (scale, entry, revert, hold, stop, half-life multiple, P&L stop, sizing, fill,
+    re-arm, gate) cell a model is walked through. A cell with no reversion exit and no
+    half-life stop is a pure max-hold exit. ``gates`` are labels (gate_label) or none;
+    ``gate_mode`` (backtest.engine.GATE_MODES) is the bake's, the same for every gate."""
+    for name, values, allowed in (("sizing", sizings, SIZINGS), ("fill", fills, FILLS), ("rearm", rearms, REARMS)):
+        unknown = [v for v in values if v not in allowed]
+        if unknown:
+            raise ValueError(f"unknown {name} {unknown}; expected some of {allowed}")
     rows = [("z", e) for e in z_entries] + [("raw", e) for e in raw_entries]
     # cast every value: the app sends whole numbers as ints, and a row-built frame typed
     # from its first rows would otherwise truncate a later 2.5 to 2
-    cells = [(s, float(e), float(r), int(h), float(st), float(m), float(p), z)
-             for (s, e), r, h, st, m, p, z in product(rows, reverts, max_holds, stops, hl_mults, pnl_stops, sizings)]
+    cells = [(s, float(e), float(r), int(h), float(st), float(m), float(p), z, f, ra, g, gate_mode, True)
+             for (s, e), r, h, st, m, p, z, f, ra, g in product(rows, reverts, max_holds, stops, hl_mults, pnl_stops,
+                                                                sizings, fills, rearms, gates)]
     return pl.DataFrame(cells, schema=["scale", "entry", "revert", "max_hold", "stop", "hl_mult", "pnl_stop",
-                                       "sizing"], orient="row")
+                                       "sizing", "fill", "rearm", "gate", "gate_mode", "need_half_life"],
+                        orient="row")
 
 
-# ---- the walk ---------------------------------------------------------------
+def gate_label(condition: str, bucket: str) -> str:
+    return f"{condition}:{bucket}"
 
 
-@njit(cache=True)
-def _horizon(hold, hl_mult, half_life):
-    """(bars to the time stop, its exit reason): max_hold, or sooner at hl_mult x the
-    half-life measured at entry."""
-    horizon, timeout = hold, 2
-    if hl_mult > 0:
-        by_half_life = max(1, int(np.ceil(hl_mult * half_life)))
-        if by_half_life < horizon:
-            horizon, timeout = by_half_life, 3
-    return horizon, timeout
+def gate_grid(conditions, buckets) -> list[str]:
+    """No gate, then every condition in every bucket."""
+    return [NO_GATE] + [gate_label(c, b) for c in conditions for b in buckets]
 
 
-@njit(cache=True)
-def _expect(abs_r0, hl, revert, horizon, cost):
-    """(exp_return, exp_bars) the frozen model expects of an entry residual |r0| (module
-    docstring): OU recovery with half-life hl by the expected exit, net of cost."""
-    exp_bars = float(horizon)
-    exp_return = np.nan
-    if np.isfinite(hl) and hl > 0:
-        if 0.0 < revert < 1.0:  # revert 0.5: one half-life; 0.75: two
-            exp_bars = min(exp_bars, hl * np.log(1.0 / (1.0 - revert)) / np.log(2.0))
-        elif revert >= 1.0:  # all the way back never arrives: count 90% of it (3.3 half-lives)
-            exp_bars = min(exp_bars, hl * np.log(10.0) / np.log(2.0))
-        exp_bars = max(exp_bars, 1.0)
-        exp_return = abs_r0 * (1.0 - 2.0 ** (-exp_bars / hl)) - cost
-    return exp_return, exp_bars
+# ---- the walk (backtest.engine) ---------------------------------------------
 
 
 def expected_now(resid: float, half_life: float, port_vol: float, setup: dict, cost: float = COST) -> dict:
@@ -253,161 +245,10 @@ def expected_now(resid: float, half_life: float, port_vol: float, setup: dict, c
     the setup's exits: exp_return (bps, net of cost), exp_bars, bps_per_day and exp_risk
     (the portfolio's daily vol over the expected hold). The walk's own arithmetic."""
     hl = float(half_life) if half_life is not None else np.nan
-    horizon, _ = _horizon(int(setup["max_hold"]), float(setup["hl_mult"]), hl)
-    exp_return, exp_bars = _expect(abs(float(resid)), hl, float(setup["revert"]), horizon, float(cost))
+    bars, _ = horizon(int(setup["max_hold"]), float(setup["hl_mult"]), hl)
+    exp_return, exp_bars = expect(abs(float(resid)), hl, float(setup["revert"]), bars, float(cost))
     return dict(exp_return=exp_return, exp_bars=exp_bars, bps_per_day=exp_return / exp_bars,
                 exp_risk=float(port_vol) * np.sqrt(exp_bars) if port_vol is not None else np.nan)
-
-
-@njit(cache=True)
-def _walk(y, x, alpha, beta_l, beta_c, sigma, half_life, port_vol, signals, hedge, scale, entry, revert, hold, stop,
-          hl_mult, pnl_stop, sizing, cost, split, trades, stats):
-    """Every config's trades and daily P&L statistics for one model.
-
-    trades rows: (config, decision bar, exit fill bar, side, pnl, reason, size,
-    exp_return, exp_bars), pnl already sized.
-    stats rows:  _STATS, from daily marks of the held portfolio y - hedge*beta_c[entry]*x
-    times the trade's size, over every bar from the first usable signal (flat days
-    are zero), with the two halves split at bar ``split``. Entries are first
-    crossings of |signal| over the threshold; the model is frozen at the decision bar."""
-    n = y.shape[0]
-    count = 0
-    for c in range(scale.shape[0]):
-        first = count
-        s = signals[scale[c]]
-        start = 1
-        while start < n and not np.isfinite(s[start]):
-            start += 1
-        thr = entry[c]
-        total = 0.0
-        total_sq = 0.0
-        s1 = 0.0
-        ss1 = 0.0
-        s2 = 0.0
-        ss2 = 0.0
-        cum = 0.0
-        peak = 0.0
-        dd = 0.0
-        held = 0
-        t = start + 1
-        while t < n - 1:
-            ok = (np.isfinite(s[t]) and np.isfinite(s[t - 1]) and abs(s[t]) > thr and abs(s[t - 1]) <= thr
-                  and np.isfinite(alpha[t]) and np.isfinite(beta_l[t]) and np.isfinite(beta_c[t])
-                  and sigma[t] > 0)
-            if not ok:
-                t += 1
-                continue
-            # a half-life time stop needs a half-life at entry; without one there is no such trade
-            if hl_mult[c] > 0 and not (np.isfinite(half_life[t]) and half_life[t] > 0):
-                t += 1
-                continue
-            r0 = y[t] - alpha[t] - beta_l[t] * x[t]
-            sign0 = 1.0 if r0 > 0 else -1.0
-            goal = (1.0 - revert[c]) * abs(r0)
-            limit = abs(r0) + stop[c] * sigma[t]
-            horizon, timeout = _horizon(hold[c], hl_mult[c], half_life[t])
-            exp_return, exp_bars = _expect(abs(r0), half_life[t], revert[c], horizon, cost)
-            size = 1.0
-            if sizing[c] == 1:
-                size = exp_return
-            elif sizing[c] == 2:
-                size = exp_return / (port_vol[t] * np.sqrt(exp_bars)) if port_vol[t] > 0 else np.nan
-            elif sizing[c] == 3:
-                size = exp_return / exp_bars
-            if not (np.isfinite(size) and size > 0):  # expected to lose, or can't say: not taken
-                t += 1
-                continue
-            f0 = t + 1
-            side = -sign0
-            ratio = hedge * beta_c[t]
-            exit_u = -1
-            reason = timeout
-            for k in range(1, horizon + 1):
-                u = t + k
-                if u >= n - 1:
-                    break
-                frozen = sign0 * (y[u] - alpha[t] - beta_l[t] * x[u])
-                if revert[c] > 0 and frozen <= goal:  # revert 0 = no reversion exit, time only
-                    exit_u, reason = u, 0
-                    break
-                if stop[c] > 0 and frozen >= limit:
-                    exit_u, reason = u, 1
-                    break
-                # the stop loss: the trade's P&L since its entry fill, marked on this close
-                if pnl_stop[c] > 0 and side * ((y[u] - y[f0]) - ratio * (x[u] - x[f0])) <= -pnl_stop[c]:
-                    exit_u, reason = u, 5
-                    break
-                if k == horizon:
-                    exit_u, reason = u, timeout
-            # runs off the end of the sample: still open, marked to the last bar; it is
-            # recorded as an "open" trade but kept out of the stats, which score closed trades
-            still_open = exit_u < 0
-            if still_open:
-                exit_u, reason = n - 2, 4
-            f1 = exit_u + 1
-            pnl = 0.0
-            for d in range(f0 + 1, f1 + 1):  # daily marks of the held portfolio, at the trade's size
-                mark = size * side * ((y[d] - y[d - 1]) - ratio * (x[d] - x[d - 1]))
-                if still_open:
-                    pnl += mark
-                    continue
-                if d == f1:
-                    mark -= size * cost
-                pnl += mark
-                total += mark
-                total_sq += mark * mark
-                if d < split:
-                    s1 += mark
-                    ss1 += mark * mark
-                else:
-                    s2 += mark
-                    ss2 += mark * mark
-                cum += mark
-                if cum > peak:
-                    peak = cum
-                if cum - peak < dd:
-                    dd = cum - peak
-                held += 1
-            trades[count, 0] = c
-            trades[count, 1] = t
-            trades[count, 2] = f1
-            trades[count, 3] = side
-            trades[count, 4] = pnl
-            trades[count, 5] = reason
-            trades[count, 6] = size
-            trades[count, 7] = exp_return
-            trades[count, 8] = exp_bars
-            count += 1
-            if still_open:
-                break
-            t = f1
-        # scale sizes to average 1 over this config's trades: Sharpe is unchanged by a
-        # constant, and P&L reads on the same scale as flat sizing
-        if count > first:
-            norm = trades[first:count, 6].mean()
-            trades[first:count, 4] /= norm
-            trades[first:count, 6] /= norm
-            total /= norm
-            total_sq /= norm * norm
-            s1 /= norm
-            ss1 /= norm * norm
-            s2 /= norm
-            ss2 /= norm * norm
-            dd /= norm
-        days = max(n - 1 - start, 0)
-        days1 = min(max(split - start - 1, 0), days)
-        stats[c, 0] = total
-        stats[c, 1] = total_sq
-        stats[c, 2] = days
-        stats[c, 3] = dd
-        stats[c, 4] = held
-        stats[c, 5] = s1
-        stats[c, 6] = ss1
-        stats[c, 7] = days1
-        stats[c, 8] = s2
-        stats[c, 9] = ss2
-        stats[c, 10] = days - days1
-    return count
 
 
 def basis_arrays(arrays: dict, basis: str) -> dict[str, np.ndarray]:
@@ -422,86 +263,157 @@ def basis_arrays(arrays: dict, basis: str) -> dict[str, np.ndarray]:
     raise ValueError(f"unknown signal basis {basis!r}; expected one of {BASES}")
 
 
-def walk_model(y: np.ndarray, x: np.ndarray, arrays: dict, configs: pl.DataFrame, hedge: float = 1.0,
-               cost: float = COST, split: int | None = None, basis: str = "levels") -> tuple[np.ndarray, np.ndarray]:
-    """(trades, stats) for every config of one model: the raw arrays _walk fills.
-    Configs without a pnl_stop or sizing column (hand-built ones) have no stop loss
-    and flat sizing."""
-    n = len(y)
+def _with_legacy(configs: pl.DataFrame) -> pl.DataFrame:
+    """Configs from before fills, re-arms and gates were knobs run on LEGACY_RULES."""
+    if "fill" in configs.columns:  # a current config: every rule is set, and entries need a half-life
+        return configs if "need_half_life" in configs.columns else configs.with_columns(need_half_life=pl.lit(True))
+    return configs.with_columns(*[pl.lit(v).alias(k) for k, v in LEGACY_RULES.items() if k not in configs.columns])
+
+
+def gate_conditions(arrays: dict, basis: str, lookback: int) -> dict[str, np.ndarray]:
+    """The gate conditions of one model's signal fit (backtest.engine.condition_arrays)."""
     m = basis_arrays(arrays, basis)
-    signals = np.ascontiguousarray(np.vstack([m["z"], m["resid"]]))
-    scale = np.array([SCALES.index(s) for s in configs["scale"]], dtype=np.int64)
-    sizing = np.array([SIZINGS.index(s) for s in configs["sizing"]] if "sizing" in configs.columns
-                      else np.zeros(len(configs)), dtype=np.int64)
+    return core.condition_arrays(m["beta"], arrays["r2"], m["resid"], lookback)
+
+
+def gate_masks(arrays: dict, basis: str, lookback: int, configs: pl.DataFrame,
+               gate_edges: dict | None = None) -> tuple[np.ndarray | None, np.ndarray]:
+    """(allow-masks, each config's row in them or -1): one mask per (gate, mode) the configs
+    use. ``gate_edges`` ({label: [kind, edges]}, freeze_gate) replaces a full-sample gate's
+    cut with one frozen elsewhere."""
+    keys = list(zip(configs["gate"].to_list(), configs["gate_mode"].to_list()))
+    wanted = list(dict.fromkeys(k for k in keys if k[0] != NO_GATE))
+    if not wanted:
+        return None, np.full(len(configs), -1, dtype=np.int64)
+    conds = gate_conditions(arrays, basis, lookback)
+    masks = []
+    for label, mode in wanted:
+        condition, bucket = label.split(":")
+        if gate_edges and label in gate_edges and mode == "full":
+            kind, edges = gate_edges[label]
+            masks.append(core.mask_from_edges(conds[condition], kind, tuple(edges)))
+        else:
+            masks.append(core.gate_mask(conds[condition], (condition, bucket), mode=mode))
+    row = {k: r for r, k in enumerate(wanted)}
+    return np.vstack(masks), np.array([row.get(k, -1) for k in keys], dtype=np.int64)
+
+
+def walk_model(y: np.ndarray, x: np.ndarray, arrays: dict, configs: pl.DataFrame, hedge: float = 1.0,
+               cost: float = COST, split: int | None = None, basis: str = "levels", lookback: int | None = None,
+               keep=True, gate_edges: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """(trades, stats) for every config of one model, from backtest.engine.walk: rows of
+    its TRADE_COLS and STATS. ``lookback`` is the model's (its gates are computed over
+    it); ``keep`` says whose trades to return. Configs without the newer columns walk on
+    LEGACY_RULES, with no stop loss and flat sizing."""
+    configs = _with_legacy(configs)
+    masks, rows = gate_masks(arrays, basis, lookback, configs, gate_edges)
+    return core.walk(engine_model(y, x, arrays, hedge, basis), configs.with_columns(pl.Series("gate", rows)),
+                     hedge=hedge, cost=cost, split=split, gates=masks, keep=keep)
+
+
+def engine_model(y: np.ndarray, x: np.ndarray, arrays: dict, hedge: float, basis: str) -> dict:
+    """One Oven model on one signal basis, as backtest.engine's model arrays."""
+    m = basis_arrays(arrays, basis)
     # the trade's risk: the hedged portfolio's vol, or the target's own when it trades alone
     vol = arrays.get("port_vol60") if hedge else arrays.get("target_vol60")
-    vol = np.full(n, np.nan) if vol is None else vol
-    trades = np.empty((len(configs) * (n // 2 + 1), 9))
-    stats = np.zeros((len(configs), len(_STATS)))
-    count = _walk(np.ascontiguousarray(y, dtype=np.float64), np.ascontiguousarray(x, dtype=np.float64),
-                  np.ascontiguousarray(m["alpha"]), np.ascontiguousarray(m["beta"]), arrays["beta_changes"],
-                  np.ascontiguousarray(m["sigma"]), np.ascontiguousarray(m["half_life"], dtype=np.float64),
-                  np.ascontiguousarray(vol, dtype=np.float64),
-                  signals, float(hedge), scale, configs["entry"].to_numpy().astype(np.float64),
-                  configs["revert"].to_numpy().astype(np.float64), configs["max_hold"].to_numpy().astype(np.int64),
-                  configs["stop"].to_numpy().astype(np.float64), configs["hl_mult"].to_numpy().astype(np.float64),
-                  (configs["pnl_stop"].to_numpy().astype(np.float64) if "pnl_stop" in configs.columns
-                   else np.zeros(len(configs))), sizing,
-                  float(cost), int(n if split is None else split), trades, stats)
-    return trades[:count], stats
+    return dict(y=y, x=x, signal_z=m["z"], signal_raw=m["resid"], alpha=m["alpha"], beta=m["beta"],
+                center=np.zeros(len(y)), sigma=m["sigma"], half_life=m["half_life"],
+                hedge_beta=arrays["beta_changes"], port_vol=np.full(len(y), np.nan) if vol is None else vol)
 
 
-def walk_setup(frame: pl.DataFrame, target: str, setup: dict, cost: float = COST, pnl_stops=None, split=None):
+def _frame_arrays(frame: pl.DataFrame, target: str, name: str) -> tuple[np.ndarray, np.ndarray, dict]:
+    """A model_frame's (y, x, model arrays)."""
+    return (frame[target].to_numpy().astype(float), frame[name].to_numpy().astype(float),
+            {c: frame[c].to_numpy().astype(float) for c in frame.columns
+             if c not in ("ts", target, name, "portfolio", "corr126")})
+
+
+def _setup_configs(setup: dict, pnl_stops=None) -> pl.DataFrame:
+    """One setup as engine configs: one row, or one per stop loss in ``pnl_stops``. A rule
+    the setup doesn't name is the one it was baked under before it existed (LEGACY_RULES)."""
+    stops = [float(setup.get("pnl_stop", 0.0))] if pnl_stops is None else [float(p) for p in pnl_stops]
+    rules = {k: setup.get(k, v) for k, v in LEGACY_RULES.items()}
+    return pl.DataFrame({"scale": setup["scale"], "entry": float(setup["entry"]), "revert": float(setup["revert"]),
+                         "max_hold": int(setup["max_hold"]), "stop": float(setup["stop"]),
+                         "hl_mult": float(setup["hl_mult"]), "pnl_stop": stops,
+                         "sizing": setup.get("sizing", "flat"), **rules})
+
+
+def freeze_gate(frame: pl.DataFrame, target: str, setup: dict) -> dict | None:
+    """A full-sample gate's raw cut on ``frame`` ({label: [kind, edges]}), to apply unchanged
+    on other data -- today's, or live. None when the setup has no such gate."""
+    label = setup.get("gate", NO_GATE)
+    if label == NO_GATE or setup.get("gate_mode", "full") != "full":
+        return None
+    condition, bucket = label.split(":")
+    _, _, arrays = _frame_arrays(frame, target, setup["input"])
+    kind, edges = core.gate_edges(gate_conditions(arrays, setup["basis"], setup["lookback"])[condition],
+                                  (condition, bucket))
+    return {label: [kind, list(edges)]}
+
+
+def setup_model(frame: pl.DataFrame, target: str, setup: dict, gate_edges: dict | None = None):
+    """One setup on a model_frame, ready for backtest.engine: (model, config, hedge, gate
+    mask or None). What a promoted oven signal's exact check walks."""
+    name = setup["input"]
+    y, x, arrays = _frame_arrays(frame, target, name)
+    hedge = 1.0 if hedgeable(name) else 0.0
+    configs = _setup_configs(setup)
+    masks, rows = gate_masks(arrays, setup["basis"], setup["lookback"], configs, gate_edges)
+    config = {**configs.row(0, named=True), "gate": int(rows[0])}
+    return (engine_model(y, x, arrays, hedge, setup["basis"]), config, hedge,
+            masks[0] if masks is not None else None)
+
+
+def walk_setup(frame: pl.DataFrame, target: str, setup: dict, cost: float = COST, pnl_stops=None, split=None,
+               gate_edges: dict | None = None):
     """Walk one setup (a dict of SETUP keys) on a model_frame -- at its own stop loss, or
     at each of ``pnl_stops``: (raw trades, stats, configs, model arrays, hedge)."""
     name = setup["input"]
-    y, x = frame[target].to_numpy().astype(float), frame[name].to_numpy().astype(float)
-    arrays = {c: frame[c].to_numpy().astype(float) for c in frame.columns
-              if c not in ("ts", target, name, "portfolio", "corr126")}
-    stops = [float(setup.get("pnl_stop", 0.0))] if pnl_stops is None else [float(p) for p in pnl_stops]
-    configs = pl.DataFrame({"scale": setup["scale"], "entry": float(setup["entry"]), "revert": float(setup["revert"]),
-                            "max_hold": int(setup["max_hold"]), "stop": float(setup["stop"]),
-                            "hl_mult": float(setup["hl_mult"]), "pnl_stop": stops,
-                            "sizing": setup.get("sizing", "flat")})
+    y, x, arrays = _frame_arrays(frame, target, name)
+    configs = _setup_configs(setup, pnl_stops)
     hedge = 1.0 if hedgeable(name) else 0.0
-    raw, stats = walk_model(y, x, arrays, configs, hedge, cost, split, setup["basis"])
+    raw, stats = walk_model(y, x, arrays, configs, hedge, cost, split, setup["basis"], setup["lookback"],
+                            gate_edges=gate_edges)
     return raw, stats, configs, arrays, hedge
 
 
-def setup_trades(frame: pl.DataFrame, target: str, setup: dict, cost: float = COST) -> pl.DataFrame:
+def setup_trades(frame: pl.DataFrame, target: str, setup: dict, cost: float = COST, horizons: dict | None = None,
+                 gate_edges: dict | None = None) -> pl.DataFrame:
     """Every trade of one setup on a model_frame, closed and (last, reason "open") any
-    position still held, with entry state and expectations; empty if it never traded."""
-    raw, _, configs, arrays, hedge = walk_setup(frame, target, setup, cost)
+    position still held, with entry state and expectations; empty if it never traded.
+    ``horizons`` ({lookback: model arrays} on the same rows) adds what the other signal
+    lookbacks said at each entry (z_lb<L>)."""
+    raw, _, configs, arrays, hedge = walk_setup(frame, target, setup, cost, gate_edges=gate_edges)
     if not len(raw):
         return pl.DataFrame()
     lb = setup["lookback"]
-    return trade_frame(raw, setup["input"], lb, setup["hedge_lb"], setup["basis"], frame["ts"], arrays, {lb: arrays},
-                       [lb], configs, hedge)
-
-
-def _sharpe(total, total_sq, days):
-    mean = total / days
-    var = total_sq / days - mean ** 2
-    return pl.when((days > 1) & (var > 1e-12)).then(mean / var.sqrt() * np.sqrt(PERIODS)).otherwise(None)
+    fits = {**(horizons or {}), lb: arrays}
+    return trade_frame(raw, setup["input"], lb, setup["hedge_lb"], setup["basis"], frame["ts"], arrays, fits,
+                       sorted(fits), configs, hedge)
 
 
 # ---- bake: the whole search -------------------------------------------------
 
 
 def bake(panel, inputs: list[str], lookbacks=LOOKBACKS, hedge_lookbacks=HEDGE_LOOKBACKS,
-         configs: pl.DataFrame | None = None, cost: float = COST, progress=None, bases=BASES) -> dict:
+         configs: pl.DataFrame | None = None, cost: float = COST, progress=None, bases=BASES,
+         keep_trades: bool = False) -> dict:
     """Walk every (input, signal lookback, hedge lookback, signal basis, config) for the
     panel's target.
 
-    Returns ``trades`` (one row per trade, with its entry-state features),
-    ``board`` (one row per setup, with its strategy stats) and ``skipped``
-    (inputs without enough overlap, with the reason). Each model's halves
-    split its own usable sample, so an input with a short history still gets
-    two halves; ``split_date`` on the board says where."""
+    Returns ``board`` (one row per setup that traded, with its strategy stats),
+    ``skipped`` (inputs without enough overlap, with the reason), ``data_end`` (the
+    last bar baked) and, only with ``keep_trades``, ``trades`` (one row per trade,
+    with its entry state). A bake keeps no trades by default: the board is scored
+    from the engine's per-setup totals, and one setup's trades are re-walked when
+    it is opened (setup_trades). Each model's halves split its own usable sample,
+    so an input with a short history still gets two halves; ``split_date`` on the
+    board says where."""
     configs = config_grid() if configs is None else configs
     target = panel.target.name
     data = panel.data
-    trade_frames, stat_frames, skipped = [], [], []
+    trade_frames, board_frames, skipped = [], [], []
     names = [i for i in dict.fromkeys(inputs) if i != target]
     total, k = len(names) * len(lookbacks) * len(hedge_lookbacks), 0
     for name, hedge_lookback in product(names, hedge_lookbacks):
@@ -529,39 +441,41 @@ def bake(panel, inputs: list[str], lookbacks=LOOKBACKS, hedge_lookbacks=HEDGE_LO
             # with no hedge the "portfolio" is the target alone, the same for every input: skip it
             for basis in [b for b in bases if hedge or b == "levels"]:
                 _walk_basis(name, lookback, hedge_lookback, basis, y, x, ts, arrays, fits, lookbacks, configs, hedge,
-                            cost, split, stat_frames, trade_frames)
-    if progress:
-        progress(total, total, f"Scoring {sum(len(f) for f in trade_frames):,} trades")
-    trades = pl.concat(trade_frames) if trade_frames else pl.DataFrame()
-    stats = pl.concat(stat_frames) if stat_frames else pl.DataFrame()
-    return {"trades": trades, "board": board(trades, stats), "skipped": pl.DataFrame(skipped)}
+                            cost, split, board_frames, trade_frames if keep_trades else None)
+    return {"board": pl.concat(board_frames) if board_frames else pl.DataFrame(),
+            "trades": pl.concat(trade_frames) if trade_frames else pl.DataFrame(),
+            "skipped": pl.DataFrame(skipped), "data_end": data["ts"].max()}
 
 
 def _walk_basis(name, lookback, hedge_lookback, basis, y, x, ts, arrays, fits, lookbacks, configs, hedge, cost, split,
-                stat_frames, trade_frames) -> None:
-    """One model on one signal basis: its setups' stats and its trades, appended.
+                board_frames, trade_frames=None) -> None:
+    """One model on one signal basis: its setups' board rows, appended -- and, when
+    ``trade_frames`` is given, its trades.
 
     Each trade also records the same input's signal z, on the same basis and hedge,
     at every signal lookback of the bake (``z_lb<L>``; null where that horizon had
     too little history) -- what the other horizons said when this one fired."""
-    raw, stats = walk_model(y, x, arrays, configs, hedge, cost, split, basis)
-    stat_frames.append(pl.concat([
+    raw, stats = walk_model(y, x, arrays, configs, hedge, cost, split, basis, lookback, keep=trade_frames is not None)
+    scored = core.score(stats)
+    board_frames.append(pl.concat([
         pl.DataFrame({"input": [name] * len(configs), "lookback": [lookback] * len(configs),
                       "hedge_lb": [hedge_lookback] * len(configs), "basis": [basis] * len(configs),
                       "split_date": [ts[min(split, len(ts) - 1)]] * len(configs)}), configs,
-        pl.DataFrame(stats, schema=list(_STATS), orient="row")], how="horizontal"))
-    if len(raw):
+        scored.with_columns(pl.selectors.float().cast(pl.Float32)),
+        pl.DataFrame({"hedged": [bool(hedge)] * len(configs)})], how="horizontal").filter(pl.col("n_trades") > 0))
+    if trade_frames is not None and len(raw):
         trade_frames.append(trade_frame(raw, name, lookback, hedge_lookback, basis, ts, arrays, fits, lookbacks,
                                         configs, hedge))
 
 
 def trade_frame(raw, name, lookback, hedge_lookback, basis, ts, arrays, fits, lookbacks, configs,
                 hedge) -> pl.DataFrame:
-    """_walk's raw trade rows as a frame, with each trade's entry state and what the
-    other horizons said at entry."""
-    decided = raw[:, 1].astype(np.int64)
-    filled = raw[:, 2].astype(np.int64)
-    cfg = configs[raw[:, 0].astype(np.int64)]
+    """The engine's raw trade rows as a frame, with each trade's entry state and what
+    the other horizons said at entry."""
+    col = {c: raw[:, i] for i, c in enumerate(TRADE_COLS)}
+    decided = col["decided"].astype(np.int64)
+    entered, filled = col["entry_fill"].astype(np.int64), col["exit_fill"].astype(np.int64)
+    cfg = configs[col["config"].astype(np.int64)]
     m = basis_arrays(arrays, basis)
     entry_state = {**arrays, "entry_z": m["z"], "resid_sigma": m["sigma"], "half_life": m["half_life"]}
     horizons = {f"z_lb{lb}": (basis_arrays(fits[lb], basis)["z"][decided].astype(np.float32) if lb in fits
@@ -569,51 +483,15 @@ def trade_frame(raw, name, lookback, hedge_lookback, basis, ts, arrays, fits, lo
     return pl.DataFrame({
         "input": name, "lookback": lookback, "hedge_lb": hedge_lookback, "basis": basis,
         **{c: cfg[c] for c in configs.columns},
-        "entry_ts": ts.gather(decided + 1), "exit_ts": ts.gather(filled),
-        "bars": filled - decided - 1, "side": raw[:, 3],
-        "hedge_ratio": hedge * arrays["beta_changes"][decided], "pnl": raw[:, 4],
-        "reason": [EXIT_REASONS[int(r)] for r in raw[:, 5]],
-        "size": raw[:, 6].astype(np.float32), "exp_return": raw[:, 7].astype(np.float32),
-        "exp_bars": raw[:, 8].astype(np.float32),
+        "entry_ts": ts.gather(entered), "exit_ts": ts.gather(filled),
+        "bars": filled - entered, "side": col["side"],
+        "hedge_ratio": col["hedge_ratio"], "pnl": col["pnl"],
+        "reason": [EXIT_REASONS[int(r)] for r in col["reason"]],
+        "size": col["size"].astype(np.float32), "exp_return": col["exp_return"].astype(np.float32),
+        "exp_bars": col["exp_bars"].astype(np.float32),
         **{f: entry_state[f][decided].astype(np.float32) for f in FEATURES},
         **horizons,
     })
-
-
-def board(trades: pl.DataFrame, stats: pl.DataFrame) -> pl.DataFrame:
-    """One row per setup with its strategy stats (see the module docstring).
-    Setups that never traded are dropped."""
-    if trades.is_empty() or stats.is_empty():
-        return pl.DataFrame()
-    trades = trades.filter(pl.col("reason") != "open")  # the board scores closed trades
-    p = pl.col("pnl")
-    per_trade = trades.group_by(SETUP).agg(
-        pl.len().alias("n_trades"), p.mean().alias("avg_trade"), p.median().alias("median_trade"),
-        (p > 0).mean().alias("hit_rate"), p.max().alias("best_trade"), p.min().alias("worst_trade"),
-        (p.mean() / p.std() * pl.len().sqrt()).alias("trade_t"),
-        # no losing trade leaves it undefined, not infinite
-        pl.when((p < 0).any()).then(p.filter(p > 0).sum() / -p.filter(p < 0).sum()).otherwise(None)
-        .alias("profit_factor"),
-        pl.col("bars").mean().alias("avg_bars"), pl.col("hedge_ratio").mean().alias("avg_hedge_ratio"))
-    years = pl.col("days") / PERIODS
-    return (stats.join(per_trade, on=SETUP, how="inner").with_columns(
-        _sharpe(pl.col("sum"), pl.col("sumsq"), pl.col("days")).alias("sharpe"),
-        _sharpe(pl.col("sum1"), pl.col("sumsq1"), pl.col("days1")).alias("sharpe_h1"),
-        _sharpe(pl.col("sum2"), pl.col("sumsq2"), pl.col("days2")).alias("sharpe_h2"),
-        pl.col("sum").alias("total_pnl"),
-        (pl.col("sum") / years).alias("pnl_per_year"),
-        pl.col("max_dd").alias("max_drawdown"),
-        (pl.col("n_trades") / years).alias("trades_per_year"),
-        (pl.col("held") / pl.col("days")).alias("time_in_market"),
-        (pl.col("best_trade") / pl.col("sum")).alias("best_trade_share"),
-        pl.col("input").is_in(list(CATALOG)).or_(pl.col("input").is_in(list(TRADEABLE_LEGS))).alias("hedged"),
-    ).with_columns(
-        # null unless both halves have a Sharpe: one half alone is not consistency
-        pl.when(pl.col("sharpe_h1").is_not_null() & pl.col("sharpe_h2").is_not_null())
-        .then(pl.min_horizontal("sharpe_h1", "sharpe_h2")).otherwise(None).alias("worst_half_sharpe"),
-        pl.when(pl.col("max_drawdown") < 0).then(pl.col("pnl_per_year") / -pl.col("max_drawdown"))
-        .otherwise(None).alias("calmar"),
-    ).drop(*_STATS))
 
 
 def rank(board_df: pl.DataFrame, by: str = "sharpe", min_trades: int = 20, top: int | None = 50) -> pl.DataFrame:
@@ -664,20 +542,24 @@ def save(run: dict, target: str, inputs: list[str], settings: dict, root: Path =
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = root / f"{stamp}_{target}"
     path.mkdir(parents=True, exist_ok=True)
-    run["trades"].write_parquet(path / "trades.parquet")
+    if not run["trades"].is_empty():
+        run["trades"].write_parquet(path / "trades.parquet")
     run["board"].write_parquet(path / "board.parquet")
     if not run["skipped"].is_empty():
         run["skipped"].write_parquet(path / "skipped.parquet")
+    n_trades = int(run["board"]["n_trades"].sum()) if not run["board"].is_empty() else 0
     (path / "meta.json").write_text(json.dumps(dict(
-        target=target, inputs=inputs, settings=settings, created_at=stamp,
-        n_trades=len(run["trades"]), n_setups=len(run["board"])), indent=2), encoding="utf-8")
+        target=target, inputs=inputs, settings=settings, created_at=stamp, n_trades=n_trades,
+        n_setups=len(run["board"]), data_end=str(run.get("data_end")), trades_saved=not run["trades"].is_empty()),
+        indent=2), encoding="utf-8")
     return path
 
 
 def load(path: Path) -> dict:
     path = Path(path)
     return dict(meta=json.loads((path / "meta.json").read_text(encoding="utf-8")),
-                trades=pl.read_parquet(path / "trades.parquet"), board=pl.read_parquet(path / "board.parquet"),
+                trades=pl.read_parquet(path / "trades.parquet") if (path / "trades.parquet").is_file()
+                else pl.DataFrame(), board=pl.read_parquet(path / "board.parquet"),
                 skipped=pl.read_parquet(path / "skipped.parquet") if (path / "skipped.parquet").is_file()
                 else pl.DataFrame())
 
@@ -705,12 +587,16 @@ def oven_job(target: str, inputs: list[str], settings: dict) -> dict:
     configs = config_grid(settings.get("z_entries", Z_ENTRIES), settings.get("raw_entries", RAW_ENTRIES),
                           settings.get("reverts", REVERTS), settings.get("max_holds", MAX_HOLDS),
                           settings.get("stops", STOPS), settings.get("hl_mults", HL_MULTS),
-                          settings.get("pnl_stops", PNL_STOPS), settings.get("sizings", SIZING_DEFAULT))
+                          settings.get("pnl_stops", PNL_STOPS), settings.get("sizings", SIZING_DEFAULT),
+                          settings.get("fills", FILLS_DEFAULT), settings.get("rearms", REARMS_DEFAULT),
+                          gate_grid(settings.get("gate_conditions", []), settings.get("gate_buckets", [])),
+                          settings.get("gate_mode", "full"))
     run = bake(panel, inputs, lookbacks=settings.get("lookbacks", LOOKBACKS),
                hedge_lookbacks=[int(h) for h in settings.get("hedge_lookbacks", HEDGE_LOOKBACKS)],
                configs=configs,
                cost=float(settings.get("cost", COST)), progress=progress,
                bases=tuple(settings.get("bases", BASES)))
     path = save(run, target, inputs, settings, Path(settings.get("runs_dir", OVEN_RUNS)))
-    progress(1, 1, f"Completed · {len(run['board']):,} setups, {len(run['trades']):,} trades")
+    n_trades = int(run["board"]["n_trades"].sum()) if not run["board"].is_empty() else 0
+    progress(1, 1, f"Completed · {len(run['board']):,} setups, {n_trades:,} trades")
     return {"run_path": str(path), "summary": f"{len(run['board']):,} setups"}

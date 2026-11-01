@@ -53,10 +53,11 @@ from dashboard.params import (
     signal_label as _display_name,
 )
 from dashboard.registry import LiveRegistry
+from research.app import note, pnl_heatmap, regression_scatter, table
 from utils.viz import column_widths, table_div
 from utils.research_app import (
-    BORDER, C0, C1, DIM, ORANGE, PANEL, TEXT, make_app, run, shimmer_loader,
-    stat_block,
+    BORDER, C0, C1, DIM, FOLDER_TAB, FOLDER_TAB_SELECTED, FOLDER_TABS, ORANGE, PANEL, TEXT, make_app, run,
+    shimmer_loader, stat_block,
 )
 
 REGISTRY = LiveRegistry()
@@ -703,13 +704,13 @@ def _card_sections(
     window: str = DEFAULT_WINDOW,
     page: int = 0,
     date_range: tuple | None = None,
-) -> tuple[html.Div, html.Div]:
+) -> tuple[html.Div, html.Div, dict | None, html.Div, html.Div]:
     row = REGISTRY.get(signal_id)
     if row is None:
         return (
             html.Div(),
             html.Div(f"{signal_id}: no longer promoted", style={"color": DIM}),
-            None,
+            None, html.Div(), html.Div(),
         )
 
     ledger_row = LEDGER.latest(signal_id)
@@ -743,33 +744,34 @@ def _card_sections(
         *([small("gate", _gate_status(state))] if state and state["params"].get("gate") is not None else []),
         small("params", _param_summary(row)),
     ]
-    # how the strategy has done: live since promotion, and its backtest at promotion
-    performance = [
-        stat_block("live pnl", _fnum(live_pnl, "+.1f", " bps"), alert=bool(live_pnl and live_pnl < 0)),
-        stat_block("sharpe", _fnum(row.get("sharpe"), ".2f")),
-        stat_block("trades", _fnum(row.get("n_trades"), ".0f")),
-        stat_block("hit rate", _fnum(row.get("hit_rate"), ".0%")),
-        stat_block("max drawdown", _fnum(row.get("max_drawdown_bps"), "+.1f", " bps")),
-    ]
+    # how the strategy has done: live since promotion, and its backtest on today's history
+    stats = _backtest_stats(state["equity_curve"], trades) if state and not error else None
+    performance = _stats_rows(state if not error else None, stats, row, live_pnl)
 
     if error:
         now_panel = html.Div()
         chart_body = html.Div(error, style={"color": ORANGE, "padding": "12px 0"})
+        months = extra = html.Div()
     else:
+        months = _monthly_pnl(state["equity_curve"])
+        extra = html.Div([_scatters(state),
+                          *([_trade_mechanics(state, trades)] if trades is not None and not trades.is_empty() else [])])
         now_panel = _now_panel(state, live, open_entry)
         window_bars = WINDOW_PRESETS.get(window, WINDOW_PRESETS[DEFAULT_WINDOW])
         span = dict(window_bars=window_bars, date_range=date_range)
         target = state["strategy"].target
-        data = state["data"].with_columns(pl.Series("fair", _fair_series(state)))
+        # chart what the signal is built on: the hedged portfolio for a portfolio-basis
+        # signal, else the outright target -- and beside it, always the input
+        traded = "portfolio" if getattr(state["strategy"], "setup", {}).get("basis") == "portfolio" else target
+        data = state["data"].with_columns(pl.Series("fair", _fair_series(state, traded)))
         wide = signal_chart(
             state["data"], state["signal_frame"],
             state["params"]["entry_signal"], state["params"]["entry_threshold"],
-            fired=state["fired"], **span,
+            fired=state["fired"], wide=True, **span,
         )
-        level_png = level_chart(data, target, trades=trades, open_entry=open_entry, overlays=["fair"], **span)
-        # an oven signal holds the target hedged by its input: show that portfolio; a book signal its input
-        second = (level_chart(state["data"], "portfolio", **span) if "portfolio" in state["data"].columns
-                  else input_chart(state["data"], state["strategy"].feature, **span))
+        marks, held_mark = _on_series(trades, open_entry, state["data"], traded) if traded != target             else (trades, open_entry)
+        level_png = level_chart(data, traded, trades=marks, open_entry=held_mark, overlays=["fair"], **span)
+        second = input_chart(state["data"], state["strategy"].feature, **span)
         gate_png = gate_chart(
             state["data"], state["signal_frame"], state["params"].get("gate"),
             gate_window=state["params"].get("gate_window"), **span,
@@ -787,21 +789,161 @@ def _card_sections(
 
     summary = html.Div([
         now_panel,
-        html.Div(performance, style={"display": "flex", "gap": 28, "flexWrap": "wrap", "padding": "8px 2px 4px"}),
+        *performance,
         html.Div(meta, style={"display": "flex", "gap": 18, "flexWrap": "wrap", "fontSize": 11,
                               "padding": "4px 2px 10px"}),
     ])
-    return summary, chart_body, trade_data
+    return summary, chart_body, trade_data, months, extra
 
 
-def _fair_series(state: dict) -> np.ndarray:
-    """The model's fair value for the target, bar by bar: the target less its residual
-    (plus the OU mean a book signal reverts to)."""
+def _fair_series(state: dict, series: str) -> np.ndarray:
+    """The model's fair value for the series the signal is built on, bar by bar: that
+    series less its residual (plus the OU mean a book signal reverts to)."""
     sig = state["signal_frame"]
-    fair = state["data"][state["strategy"].target].to_numpy().astype(float) - sig["resid"].to_numpy().astype(float)
+    fair = state["data"][series].to_numpy().astype(float) - sig["resid"].to_numpy().astype(float)
     if "ou_mean" in sig.columns:
         fair = fair + sig["ou_mean"].fill_null(0.0).to_numpy().astype(float)
     return fair
+
+
+def _on_series(trades, open_entry: dict | None, data: pl.DataFrame, series: str):
+    """Trade markers moved onto another series (the portfolio): each entry and exit at
+    that series' level on its date, since the logged levels are the target's."""
+    level = data.select(pl.col("ts").cast(pl.Date), pl.col(series))
+    if trades is not None and not trades.is_empty():
+        trades = (trades.drop("entry_level", "exit_level")
+                  .join(level.rename({"ts": "entry_date", series: "entry_level"}), on="entry_date", how="left")
+                  .join(level.rename({"ts": "exit_date", series: "exit_level"}), on="exit_date", how="left"))
+    if open_entry is not None:
+        at = level.filter(pl.col("ts") == pl.lit(open_entry["date"]).cast(pl.Date))[series]
+        open_entry = {**open_entry, "level": float(at[0]) if len(at) else open_entry["level"]}
+    return trades, open_entry
+
+
+def _backtest_stats(equity: pl.DataFrame, trades: pl.DataFrame | None) -> dict | None:
+    """The Oven's strategy stats from this signal's own daily P&L and closed trades on
+    the cached history, scored from its first entry (the warm-up before says nothing);
+    the halves split those days down the middle."""
+    if trades is None or trades.is_empty() or equity.is_empty():
+        return None
+    scored = equity.with_columns(pl.col("ts").cast(pl.Date)).filter(pl.col("ts") >= trades["entry_date"].min())
+    daily = scored["pnl_bps"].to_numpy().astype(float)
+
+    def sharpe(d):
+        return d.mean() / d.std() * np.sqrt(252) if len(d) > 1 and d.std() > 0 else np.nan
+
+    half = len(daily) // 2
+    cum = np.cumsum(daily)
+    total = float(cum[-1])
+    max_dd = float((cum - np.maximum.accumulate(cum)).min())
+    years = len(daily) / 252
+    pnl = trades["pnl_bps"]
+    losses = float(pnl.filter(pnl <= 0).sum())
+    return dict(
+        sharpe=sharpe(daily), sharpe_h1=sharpe(daily[:half]), sharpe_h2=sharpe(daily[half:]),
+        split=scored["ts"][half], total_pnl=total, pnl_per_year=total / years, n_trades=len(pnl),
+        trades_per_year=len(pnl) / years, hit_rate=float((pnl > 0).mean()), avg_trade=float(pnl.mean()),
+        median_trade=float(pnl.median()),
+        profit_factor=float(pnl.filter(pnl > 0).sum()) / abs(losses) if losses else np.nan,
+        max_drawdown=max_dd, calmar=total / abs(max_dd) if max_dd else np.nan,
+        time_in_market=float((daily != 0).mean()),
+        best_trade_share=float(pnl.max()) / total if total > 0 else np.nan,
+    )
+
+
+def _stats_rows(state: dict, stats: dict | None, row: dict, live_pnl) -> list:
+    """The Oven card's two stat rows: the model as it stands, then the backtest."""
+    stats_row = {"display": "flex", "gap": 28, "flexWrap": "wrap", "padding": "8px 2px 8px"}
+    last = state["last"] if state else {}
+    model = [
+        stat_block("live pnl", _fnum(live_pnl, "+.1f", " bps"), alert=bool(live_pnl and live_pnl < 0)),
+        stat_block("β now", _fnum(last.get("beta"), "+.3f")),
+        stat_block("r² now", _fnum(last.get("r2"), ".2f")),
+        stat_block("sharpe at promotion", _fnum(row.get("sharpe"), ".2f")),
+        *([stat_block("halves split", str(stats["split"]))] if stats else []),
+    ]
+    rows = [html.Div(model, style=stats_row)]
+    if stats:
+        s = stats
+        rows.append(html.Div(style={**stats_row, "borderTop": f"1px solid {BORDER}", "marginTop": 4}, children=[
+            stat_block("sharpe", _fnum(s["sharpe"], ".2f")),
+            stat_block("halves", f"{_fnum(s['sharpe_h1'], '.2f')} / {_fnum(s['sharpe_h2'], '.2f')}"),
+            stat_block("total pnl", f"{s['total_pnl']:+,.0f} bps"),
+            stat_block("per year", f"{s['pnl_per_year']:+,.1f} bps"),
+            stat_block("n trades", f"{s['n_trades']} · {s['trades_per_year']:.1f}/yr"),
+            stat_block("hit rate", f"{s['hit_rate']:.0%}"),
+            stat_block("avg / median", f"{s['avg_trade']:+.2f} / {s['median_trade']:+.2f}"),
+            stat_block("profit factor", _fnum(s["profit_factor"], ".2f")),
+            stat_block("max drawdown", f"{s['max_drawdown']:+,.1f} bps"),
+            stat_block("calmar", _fnum(s["calmar"], ".2f")),
+            stat_block("time in market", f"{s['time_in_market']:.0%}"),
+            stat_block("best trade share", _fnum(s["best_trade_share"], ".0%")),
+        ]))
+    return rows
+
+
+def _monthly_pnl(equity: pl.DataFrame) -> html.Div:
+    """The Oven's monthly P&L heatmap, from the first year the signal was in the market."""
+    daily = equity.select(pl.col("ts").cast(pl.Date), "pnl_bps")
+    years = (daily.group_by(pl.col("ts").dt.year().alias("year"))
+             .agg(pl.col("pnl_bps").sum(), (pl.col("pnl_bps") != 0).sum().alias("active_days")).sort("year"))
+    first = years.filter(pl.col("active_days") > 0)["year"].min()
+    if first is None:
+        return html.Div()
+    return pnl_heatmap(daily.filter(pl.col("ts").dt.year() >= first), years.filter(pl.col("year") >= first))
+
+
+def _scatters(state: dict) -> html.Div:
+    """The Oven's levels and changes scatters of the target on its input, fitted over the
+    signal's own lookback with the stretch before it in grey."""
+    target, feature = state["strategy"].target, state["strategy"].feature
+    if feature not in state["data"].columns:
+        return html.Div()
+    lookback = int(state["params"]["beta_lb"])
+    return html.Div(
+        style={"display": "grid", "gridTemplateColumns": "minmax(0, 1fr) minmax(0, 1fr)", "gap": 12,
+               "alignItems": "start", "marginTop": 10},
+        children=[regression_scatter(state["data"], target, feature, basis, lookback, "previous")
+                  for basis in ("levels", "changes")],
+    )
+
+
+def _exit_reasons(trades: pl.DataFrame) -> pl.DataFrame:
+    """Per exit reason, plus 'all': trades, avg and total P&L, its share of the total, hit
+    rate and bars held."""
+    total = trades["pnl_bps"].sum()
+    groups = [("all", trades)] + [(r, trades.filter(pl.col("exit_reason") == r))
+                                  for r in trades["exit_reason"].value_counts(sort=True)["exit_reason"]]
+    return pl.DataFrame([dict(reason=r, trades=len(t), avg_trade=t["pnl_bps"].mean(), total_pnl=t["pnl_bps"].sum(),
+                              share_of_pnl=t["pnl_bps"].sum() / total if total else None,
+                              hit_rate=(t["pnl_bps"] > 0).mean(), avg_held=t["bars_held"].mean())
+                         for r, t in groups])
+
+
+def _trade_mechanics(state: dict, trades: pl.DataFrame) -> html.Div:
+    """The Oven's trade mechanics: where the P&L came from, by how each trade ended."""
+    target = state["strategy"].target
+    lines = [f"Median closed-trade P&L: {trades['pnl_bps'].median():,.2f} bps"]
+    if "portfolio" in state["data"].columns:  # an oven signal: the target hedged by its input
+        level = state["data"].select(pl.col("ts").cast(pl.Date), pl.col(target))
+        legs = (trades.join(level.rename({"ts": "entry_date", target: "y0"}), on="entry_date", how="left")
+                .join(level.rename({"ts": "exit_date", target: "y1"}), on="exit_date", how="left")
+                .with_columns((pl.when(pl.col("direction") == "long").then(1).otherwise(-1)
+                               * (pl.col("y1") - pl.col("y0"))).alias("target_leg")))
+        target_leg = legs["target_leg"].sum()
+        lines.append(f"of total P&L, the target leg made {target_leg:+,.1f} bps and the hedge leg and costs "
+                     f"{trades['pnl_bps'].sum() - target_leg:+,.1f} bps")
+    return html.Div(style={"marginTop": 18}, children=[
+        html.Div("TRADE MECHANICS", style={"fontSize": 12, "fontWeight": "bold", "marginBottom": 6}),
+        note(" · ".join(lines), "dim"),
+        table(_exit_reasons(trades).to_pandas(), title="Exit reasons · the trades that ended each way",
+              float_fmt=",.2f",
+              headers={"avg_trade": "avg trade", "total_pnl": "total pnl", "hit_rate": "hit",
+                       "avg_held": "avg held", "share_of_pnl": "share of pnl"},
+              cell_style=lambda col, value, row: (
+                  {"textAlign": "left", **({"fontWeight": "bold"} if value == "all" else {})}
+                  if col == "reason" else None)),
+    ])
 
 
 CONF_COLOURS = {"HIGH": C1, "LOW": C0, "MED": TEXT, "—": DIM}
@@ -921,7 +1063,7 @@ def _card(row: dict) -> html.Div:
     module = row["module"]
     signal_id = _row_id(row)
     slug = _slug(signal_id)
-    summary, chart_body, trade_data = _card_sections(signal_id)
+    summary, chart_body, trade_data, months, extra = _card_sections(signal_id)
     return html.Div(
         style={"border": f"1px solid {BORDER}", "background": PANEL,
                "padding": "14px 18px", "marginBottom": 18},
@@ -996,9 +1138,18 @@ def _card(row: dict) -> html.Div:
                     # the callbacks fill the pattern-id div inside it
                     html.Div(id=f"card-charts-{slug}",
                              children=html.Div(id=_pid("card-charts", signal_id), children=chart_body)),
-                    _trade_table_section(
-                        trade_data["closed"], 0, trade_data["open"], signal_id,
-                    ) if trade_data is not None else html.Div(),
+                    # the trades beside the monthly P&L, as on the Oven's setup card
+                    html.Div(
+                        style={"display": "grid", "gridTemplateColumns": "minmax(0, 1fr) auto",
+                               "gap": 16, "alignItems": "start"},
+                        children=[
+                            html.Div(_trade_table_section(
+                                trade_data["closed"], 0, trade_data["open"], signal_id,
+                            ) if trade_data is not None else html.Div(), style={"minWidth": 0}),
+                            html.Div(months, id=_pid("card-months", signal_id), style={"marginTop": 14}),
+                        ],
+                    ),
+                    html.Div(extra, id=_pid("card-extra", signal_id)),
                 ],
             ),
         ],
@@ -1014,31 +1165,7 @@ def _registry_rows() -> list[dict]:
 
 
 def build_app() -> dash.Dash:
-    # folder tabs: rounded tops sitting on the line under them, sized to their labels
-    # rather than stretched across the page (dcc.Tab splits the width by default); the
-    # open one is white and drops its bottom edge so it reads as joined to the page
-    tab_style = {
-        "padding": "8px 20px",
-        "fontSize": 12,
-        "fontWeight": "bold",
-        "background": PANEL,
-        "border": f"1px solid {BORDER}",
-        "borderBottom": f"1px solid {BORDER}",
-        "borderRadius": "8px 8px 0 0",
-        "marginRight": 4,
-        "marginBottom": -1,
-        "color": DIM,
-        "width": "auto",
-        "flex": "0 0 auto",
-        "minWidth": 110,
-    }
-    selected_tab_style = {
-        **tab_style,
-        "background": "#FFFFFF",
-        "color": ORANGE,
-        "borderTop": f"3px solid {ORANGE}",
-        "borderBottom": "1px solid #FFFFFF",
-    }
+    tab_style, selected_tab_style = FOLDER_TAB, FOLDER_TAB_SELECTED  # shared with the Oven
 
     def _overview_tab(rows):
         return html.Div(
@@ -1134,8 +1261,7 @@ def build_app() -> dash.Dash:
         return dcc.Tabs(
             id="dashboard-tabs",
             className="dashboard-tight",
-            # the line the folder tabs sit on
-            style={"borderBottom": f"1px solid {BORDER}", "padding": "8px 24px 0"},
+            style=FOLDER_TABS,  # the line the folder tabs sit on
             value="live-overview",
             children=[
                 dcc.Tab(
@@ -1236,7 +1362,7 @@ def build_app() -> dash.Dash:
             return (
                 html.Div(), err, None,
                 dash.no_update, dash.no_update, 0,
-                window, snap_range, *no_btn_styles,
+                window, snap_range, html.Div(), html.Div(), *no_btn_styles,
             )
 
         if kind == "snap":
@@ -1248,7 +1374,7 @@ def build_app() -> dash.Dash:
         if snap_range:
             date_range = (pd.Timestamp(snap_range[0]), pd.Timestamp(snap_range[1]))
 
-        summary, chart_body, trade_data = _card_sections(
+        summary, chart_body, trade_data, months, extra = _card_sections(
             signal_id,
             state=state,
             trades=trades,
@@ -1264,13 +1390,13 @@ def build_app() -> dash.Dash:
             return (
                 summary, chart_body,
                 dash.no_update, dash.no_update, dash.no_update, dash.no_update,
-                window, snap_range, *btn_styles,
+                window, snap_range, dash.no_update, dash.no_update, *btn_styles,
             )
         return (
             summary, chart_body, trade_data,
             _trade_table_block(trade_data["closed"], page, trade_data["open"]),
             _trade_page_label(len(trade_data["closed"]), page), page,
-            window, snap_range, *btn_styles,
+            window, snap_range, months, extra, *btn_styles,
         )
 
     app.callback(
@@ -1282,6 +1408,8 @@ def build_app() -> dash.Dash:
         Output(_pid("trades-page", MATCH), "data"),
         Output(_pid("window", MATCH), "data"),
         Output(_pid("snap-range", MATCH), "data"),
+        Output(_pid("card-months", MATCH), "children"),
+        Output(_pid("card-extra", MATCH), "children"),
         *[Output(_pid(f"window-{k}", MATCH), "style") for k in window_keys],
         Input(_pid("ref", MATCH), "n_clicks"),
         *[Input(_pid(f"window-{k}", MATCH), "n_clicks") for k in window_keys],

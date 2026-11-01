@@ -71,7 +71,7 @@ from research.saved_runs import (board_rules, grid_spec, input_hash, list_exit_r
 from research.saved_runs import target_definition, definition_match, target_label
 from research import artifacts, jobs, progress as work
 from research.preferences import load_controls, load_preferences, save_controls, save_preferences
-from backtest.engine import TradeDef
+from backtest.legacy import TradeDef
 from utils.research_app import (
     BORDER, C0, C1, C2, DIM, ORANGE, PANEL, TEXT, make_app, run,
     shimmer_loader, stat_block,

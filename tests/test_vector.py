@@ -6,7 +6,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from backtest.engine import BacktestConfig, Engine, TradeDef, trade_log
+from backtest.legacy import BacktestConfig, Engine, TradeDef, trade_log
 from backtest.vector import run_vector
 from research.dislocation_backtest import _entry_gate, make_pipeline, signal_frame
 

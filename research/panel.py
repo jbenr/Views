@@ -27,7 +27,7 @@ from dataclasses import dataclass
 import numpy as np
 import polars as pl
 
-from backtest.engine import TradeDef
+from backtest.legacy import TradeDef
 from stats import roll_mlr_diff
 from utils.market_data import (
     align_columns,

@@ -78,7 +78,7 @@ import utils
 from stats import beta_cv, horizon_backtest, roll_lr, roll_lr_diff, roll_ou_features
 from utils.market_data import align_columns, coverage_report, load_wide
 
-from .engine import (
+from .legacy import (
     BacktestConfig,
     Engine,
     SignalConfig,

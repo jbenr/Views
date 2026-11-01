@@ -151,7 +151,7 @@ class LiveRegistry:
         selection_source: str,
     ) -> dict:
         """Exact-engine promotion for an explicit frozen parameter set."""
-        from backtest.engine import BacktestConfig, Engine, compute_metrics
+        from backtest.legacy import BacktestConfig, Engine, compute_metrics
 
         strategy = load_strategy(module)
         params = strategy._params(params)
@@ -367,6 +367,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--setup", help="--oven: the setup id, as the Oven app's Send to dashboard shows it")
     parser.add_argument("--remove", metavar="SIGNAL_ID")
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--verify", action="store_true",
+                        help="hold every promoted signal's backtest to the exact bar-by-bar walk")
     args = parser.parse_args(argv)
 
     reg = LiveRegistry()
@@ -392,6 +394,15 @@ def main(argv: list[str] | None = None) -> None:
     elif args.remove:
         ok = reg.remove(args.remove)
         print(f"{'removed' if ok else 'not found:'} {args.remove}")
+    elif args.verify:
+        from dashboard import runner
+
+        rows = reg.list()
+        for signal_id in ([] if rows.is_empty() else rows["signal_id"].to_list()):
+            result = runner.verify(signal_id)
+            detail = (f"  {result['trades']} trades" if "trades" in result else "")
+            print(f"{result['status']:>10}  {signal_id}{detail}" if result["status"] in ("match", "MISMATCH")
+                  else f"{'skipped':>10}  {signal_id}  ({result['status']})")
     elif args.list:
         df = reg.list()
         if df.is_empty():

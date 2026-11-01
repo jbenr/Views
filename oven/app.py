@@ -33,7 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
@@ -48,11 +48,12 @@ from dashboard.charts import (WINDOW_PRESETS, input_chart, level_chart, pnl_char
                               return_distribution_chart, series_chart, signal_chart)
 from oven import engine
 from research import jobs
-from research.app import (FEATURE_GROUPS, FEATURE_LABELS, INPUT, SELECTED_TAB_STYLE, TAB_STYLE, TARGET_OPTIONS,
+from research.app import (FEATURE_GROUPS, FEATURE_LABELS, INPUT, TARGET_OPTIONS,
                           _diverging, btn_style, field, heading, info, loading_panel, note, pnl_heatmap,
                           progress_view, regression_scatter, section, table)
 from research.panel import CATALOG, build_panel
-from utils.research_app import BORDER, C0, C1, DIM, ORANGE, PANEL, make_app, run, shimmer_loader, stat_block
+from utils.research_app import (BORDER, C0, C1, DIM, FOLDER_TAB, FOLDER_TAB_SELECTED, FOLDER_TABS, ORANGE, PANEL,
+                                make_app, run, shimmer_loader, stat_block)
 
 ALL_INPUTS = list(dict.fromkeys(name for names in FEATURE_GROUPS.values() for name in names))
 GRID_CONTROLS = {
@@ -69,7 +70,7 @@ GRID_CONTROLS = {
     "hedge_lookbacks": ("hedge lookback · changes OLS (d)", [21, 63, 126, 252, 504], engine.HEDGE_LOOKBACKS),
 }
 SETUP_COLS = ["lookback", "hedge_lb", "basis", "scale", "entry", "revert", "max_hold", "stop", "hl_mult", "pnl_stop",
-              "sizing"]
+              "sizing", "fill", "rearm", "gate", "gate_mode", "need_half_life"]
 SIZING_TEXT = {
     "flat": "every trade the same size",
     "exp_return": "∝ expected return",
@@ -81,8 +82,15 @@ BASIS_TEXT = {
     "portfolio": "the traded portfolio's own deviation from its mean",
 }
 STRATEGY_COLS = ["sharpe", "worst_half_sharpe", "sharpe_h1", "sharpe_h2", "total_pnl", "pnl_per_year", "n_trades",
-                 "trades_per_year", "hit_rate", "avg_trade", "median_trade", "profit_factor", "max_drawdown",
+                 "n_episodes", "trades_per_year", "hit_rate", "avg_trade", "profit_factor", "max_drawdown",
                  "calmar", "time_in_market", "avg_bars", "trade_t", "best_trade_share", "worst_trade"]
+FILL_TEXT = {"same": "filled on the decision's close", "next": "filled on the next bar's close"}
+REARM_TEXT = {
+    "threshold": "back inside the entry band",
+    "half": "back inside half the entry band",
+    "mean": "back through the mean",
+    "by_exit": "inside the band after a revert, through the mean after a stop or time exit",
+}
 PAGED = ("inputs", "setups", "trades")
 PAGE_SIZE = {"inputs": 15, "setups": 15, "trades": 10}  # the Dig card sizes trades to its monthly P&L rows
 DEFAULT_SORT = {"inputs": "score", "setups": "score", "trades": "entry"}
@@ -132,6 +140,10 @@ def _with_basis(frame: pl.DataFrame, hedge_lb: int) -> pl.DataFrame:
         frame = frame.with_columns(pl.lit(0.0).alias("pnl_stop"))
     if "sizing" not in frame.columns:
         frame = frame.with_columns(pl.lit("flat").alias("sizing"))
+    # before fills, re-arms and gates were knobs: the rules those bakes ran on
+    frame = frame.with_columns(*[pl.lit(v).alias(k) for k, v in engine.LEGACY_RULES.items() if k not in frame.columns])
+    if "sharpe" in frame.columns and "n_episodes" not in frame.columns:
+        frame = frame.with_columns(pl.lit(None, pl.Int64).alias("n_episodes"))
     return frame
 
 
@@ -145,16 +157,64 @@ def load_run(path: str) -> dict:
 
 @lru_cache(maxsize=2)
 def load_trades(path: str) -> pl.DataFrame:
-    """A run's closed trades. A bake's "open" rows are stale by the time it is read; the
-    Dig card finds the open position on today's data instead (open_trade)."""
+    """An older run's saved closed trades. A bake's "open" rows are stale by the time it is
+    read; the Dig card finds the open position on today's data instead (open_trade)."""
     trades = _with_basis(pl.read_parquet(Path(path) / "trades.parquet"), _old_hedge_lb(load_run(path)["meta"]))
     return trades.filter(pl.col("reason") != "open")
 
 
-def open_trade(frame: pl.DataFrame, target: str, setup: dict, cost: float) -> pl.DataFrame:
+def saved_trades(path: str) -> bool:
+    """Older bakes saved every trade; newer ones keep only the board and re-walk a setup's."""
+    return (Path(path) / "trades.parquet").is_file()
+
+
+@lru_cache(maxsize=2)
+def run_panel(path: str) -> pl.DataFrame:
+    """The bake's panel -- its target and every input -- as the bake built it."""
+    meta = load_run(path)["meta"]
+    return build_panel(CATALOG[meta["target"]], features=meta["inputs"]).data
+
+
+@lru_cache(maxsize=32)
+def bake_frame(path: str, name: str, lookback: int, hedge_lookback: int) -> pl.DataFrame:
+    """One model on the bake's panel, up to the last bar it baked: what its board was scored on."""
+    meta = load_run(path)["meta"]
+    frame = engine.model_frame(run_panel(path), meta["target"], name, lookback, hedge_lookback)
+    end = meta.get("data_end")
+    return frame.filter(pl.col("ts").cast(pl.Date) <= date.fromisoformat(end[:10])) if end else frame
+
+
+def bake_trades(path: str, setup: dict) -> pl.DataFrame:
+    """One setup's closed trades as the bake scored them: saved (older bakes) or re-walked
+    on the bake's own panel and window, with what the bake's other lookbacks said at entry."""
+    if saved_trades(path):
+        return matches(load_trades(path), setup).sort("entry_ts")
+    meta = load_run(path)["meta"]
+    name, lb, hlb = setup["input"], setup["lookback"], setup["hedge_lb"]
+    horizons = {}
+    for other in meta["settings"].get("lookbacks", [lb]):
+        if other != lb:
+            fit = bake_frame(path, name, int(other), hlb)
+            horizons[int(other)] = {c: fit[c].to_numpy().astype(float) for c in fit.columns
+                                    if c not in ("ts", meta["target"], name, "portfolio", "corr126")}
+    trades = engine.setup_trades(bake_frame(path, name, lb, hlb), meta["target"], setup,
+                                 float(meta["settings"].get("cost", engine.COST)), horizons)
+    return trades.filter(pl.col("reason") != "open").sort("entry_ts") if not trades.is_empty() else trades
+
+
+def setup_gate(path: str, setup: dict) -> dict | None:
+    """The setup's gate as the bake cut it (engine.freeze_gate on its window), to apply on
+    today's data and live; None without a full-sample gate."""
+    if setup.get("gate", engine.NO_GATE) == engine.NO_GATE:
+        return None
+    return engine.freeze_gate(bake_frame(path, setup["input"], setup["lookback"], setup["hedge_lb"]),
+                              load_run(path)["meta"]["target"], setup)
+
+
+def open_trade(frame: pl.DataFrame, target: str, setup: dict, cost: float, gate_edges: dict | None = None):
     """The setup's position still held at the last bar of ``frame`` (today's data), as a
     one-row trade marked to that bar; empty when flat. Re-walks just this setup."""
-    trades = engine.setup_trades(frame, target, setup, cost)
+    trades = engine.setup_trades(frame, target, setup, cost, gate_edges=gate_edges)
     return trades.filter(pl.col("reason") == "open") if not trades.is_empty() else trades
 
 
@@ -169,8 +229,12 @@ def describe(setup: dict) -> str:
     half_life = f" · hl×{setup['hl_mult']:g}" if setup["hl_mult"] else ""
     stop_loss = f" · stop loss {setup['pnl_stop']:g}bp" if setup.get("pnl_stop") else ""
     sizing = f" · sized {setup['sizing']}" if setup.get("sizing", "flat") != "flat" else ""
+    rules = {k: setup.get(k, v) for k, v in engine.LEGACY_RULES.items()}
+    gate = (f" · gate {rules['gate']}" + (" (point in time)" if rules["gate_mode"] == "causal" else "")
+            if rules["gate"] != engine.NO_GATE else "")
     return (f"lb {setup['lookback']} · hedge {setup['hedge_lb']} · {setup['basis']} · {setup['scale']} > {setup['entry']:g} · {revert}"
-            f"{half_life} · hold {setup['max_hold']} · stop {setup['stop']:g}{stop_loss}{sizing}")
+            f"{half_life} · hold {setup['max_hold']} · stop {setup['stop']:g}{stop_loss}{sizing} · {rules['fill']} fill"
+            f" · re-arm {rules['rearm']}{gate}" + ("" if rules["need_half_life"] else " · no half-life needed"))
 
 
 @lru_cache(maxsize=32)
@@ -204,13 +268,22 @@ def setup_id(row: dict) -> str:
 
 
 def setup_from_id(name: str, sid: str) -> dict:
-    lb, hedge_lb, basis, scale, entry, revert, hold, stop, hl_mult, pnl_stop, sizing = sid.split("|")
-    return dict(input=name, lookback=int(lb), hedge_lb=int(hedge_lb), basis=basis, scale=scale, entry=float(entry), revert=float(revert),
-                max_hold=int(hold), stop=float(stop), hl_mult=float(hl_mult), pnl_stop=float(pnl_stop), sizing=sizing)
+    """A setup from its id; an id from before fills, re-arms and gates (11 parts) is a
+    setup on the rules it was baked under (engine.LEGACY_RULES)."""
+    parts = sid.split("|")
+    lb, hedge_lb, basis, scale, entry, revert, hold, stop, hl_mult, pnl_stop, sizing = parts[:11]
+    setup = dict(input=name, lookback=int(lb), hedge_lb=int(hedge_lb), basis=basis, scale=scale, entry=float(entry),
+                 revert=float(revert), max_hold=int(hold), stop=float(stop), hl_mult=float(hl_mult),
+                 pnl_stop=float(pnl_stop), sizing=sizing)
+    if len(parts) == 11:
+        return {**setup, **engine.LEGACY_RULES}
+    fill, rearm, gate, gate_mode, need_half_life = parts[11:]
+    return {**setup, "fill": fill, "rearm": rearm, "gate": gate, "gate_mode": gate_mode,
+            "need_half_life": need_half_life == "True"}
 
 
 def matches(frame: pl.DataFrame, setup: dict) -> pl.DataFrame:
-    return frame.filter(pl.all_horizontal([pl.col(k) == v for k, v in setup.items()]))
+    return frame.filter(pl.all_horizontal([pl.col(k) == v for k, v in setup.items() if k in frame.columns]))
 
 
 def daily_frame(frame: pl.DataFrame, target: str, name: str, trades: pl.DataFrame, cost: float,
@@ -249,8 +322,10 @@ def with_expected(trades: pl.DataFrame, frame: pl.DataFrame, target: str, setup:
     if "exp_return" in trades.columns:
         return trades
     raw, *_ = engine.walk_setup(frame, target, setup, cost)
-    expected = pl.DataFrame({"entry_ts": frame["ts"].gather(raw[:, 1].astype(np.int64) + 1),
-                             "exp_return": raw[:, 7].astype(np.float32), "exp_bars": raw[:, 8].astype(np.float32)})
+    col = {c: raw[:, i] for i, c in enumerate(engine.TRADE_COLS)}
+    expected = pl.DataFrame({"entry_ts": frame["ts"].gather(col["entry_fill"].astype(np.int64)),
+                             "exp_return": col["exp_return"].astype(np.float32),
+                             "exp_bars": col["exp_bars"].astype(np.float32)})
     return trades.join(expected, on="entry_ts", how="left")
 
 
@@ -262,12 +337,14 @@ def bundle(path: str, name: str, sid: str) -> dict:
     meta = run["meta"]
     setup = setup_from_id(name, sid)
     target = meta["target"]
-    trades = matches(load_trades(path), setup).sort("entry_ts")
+    trades = bake_trades(path, setup)
     row = matches(run["board"], setup).to_dicts()
     frame = model_frame(target, name, setup["lookback"], setup["hedge_lb"])
     cost = float(meta["settings"].get("cost", engine.COST))
-    trades = with_expected(trades, frame, target, setup, cost)
-    held = open_trade(frame, target, setup, cost)
+    gate_edges = setup_gate(path, setup)
+    if saved_trades(path):
+        trades = with_expected(trades, frame, target, setup, cost)
+    held = open_trade(frame, target, setup, cost, gate_edges)
     if not held.is_empty():  # a trade the bake saw close can't also be the open one
         trades = trades.filter(pl.col("entry_ts") < held["entry_ts"][0])
     daily = daily_frame(frame, target, name, trades, cost, held)
@@ -297,7 +374,7 @@ def bundle(path: str, name: str, sid: str) -> dict:
     def open_entry(prefix: str) -> dict | None:  # level_chart's open-position marker
         return position and dict(date=position["entry_ts"], level=position[f"entry_{prefix}"],
                                  direction=position["direction"])
-    return dict(meta=meta, setup=setup, target=target, trades=trades, with_levels=with_levels,
+    return dict(meta=meta, setup=setup, target=target, trades=trades, with_levels=with_levels, gate_edges=gate_edges,
                 row=row[0] if row else None, frame=frame, daily=daily, markers=markers("level"),
                 portfolio_markers=markers("portfolio"), position=position, open_entry=open_entry("level"),
                 portfolio_open_entry=open_entry("portfolio"), signal=engine.basis_arrays(frame, setup["basis"]),
@@ -318,14 +395,13 @@ def monthly_pnl(trades: pl.DataFrame) -> pl.DataFrame:
 def peer_correlations(path: str, setup: dict, by: str, min_trades: int, peers: int = 12) -> pl.DataFrame:
     """Monthly P&L correlation of this setup with the best setup of each other top input:
     does it add something to a book of signals, or is it the same bet?"""
-    trades = load_trades(path)
     ranked = engine.rank(load_run(path)["board"], by, min_trades, top=None)
     best = (ranked.filter(pl.col("input") != setup["input"])
             .unique("input", keep="first", maintain_order=True).head(peers))
-    mine = monthly_pnl(matches(trades, setup))
+    mine = monthly_pnl(bake_trades(path, setup))
     rows = []
     for r in best.to_dicts():
-        theirs = monthly_pnl(matches(trades, {k: r[k] for k in engine.SETUP}))
+        theirs = monthly_pnl(bake_trades(path, {k: r[k] for k in engine.SETUP}))
         both = mine.join(theirs, on="month", how="full", coalesce=True, suffix="_peer").fill_null(0.0)
         rows.append(dict(peer=f"{r['input']} · {describe(r)}",
                          peer_sharpe=r["sharpe"], monthly_corr=both.select(pl.corr("pnl", "pnl_peer")).item(),
@@ -336,9 +412,11 @@ def peer_correlations(path: str, setup: dict, by: str, min_trades: int, peers: i
 TERCILES = ("low", "mid", "high")
 
 
-def entry_state(trades: pl.DataFrame, setup: dict) -> pl.DataFrame:
+def entry_state(trades: pl.DataFrame, setup: dict, sharpe=None) -> pl.DataFrame:
     """One row per entry-state feature: its spearman correlation with trade P&L, the
-    average trade (and count) in each tercile of the feature, and high minus low."""
+    average trade (and count) in each tercile of the feature, and high minus low. With
+    ``sharpe`` (trades -> Sharpe of holding only those), each tercile's Sharpe too
+    (sharpe_<tercile>), on the same cuts as engine.characteristics."""
     terciles = engine.characteristics(trades, setup)
     rows = []
     for f in engine.FEATURES:
@@ -352,6 +430,13 @@ def entry_state(trades: pl.DataFrame, setup: dict) -> pl.DataFrame:
             row[t] = part[t]["avg_trade"] if t in part else None
             row[f"n_{t}"] = part[t]["trades"] if t in part else 0
         row["high_minus_low"] = None if None in (row["high"], row["low"]) else row["high"] - row["low"]
+        if sharpe is not None:
+            lo, hi = v[f].quantile(1 / 3), v[f].quantile(2 / 3)
+            x = pl.col(f)
+            usable = trades.filter(x.is_not_null() & x.is_finite())
+            for t, in_tercile in (("low", x <= lo), ("mid", (x > lo) & (x <= hi)), ("high", x > hi)):
+                subset = usable.filter(in_tercile)
+                row[f"sharpe_{t}"] = sharpe(subset) if len(subset) else None
         rows.append(row)
     return pl.DataFrame(rows)
 
@@ -369,23 +454,34 @@ def split_table(rows: pl.DataFrame, groups: tuple, base: float, title: str, head
         pdf[f"dev_{g}"] = devs[g]
     scale = max((abs(d) for ds in devs.values() for d in ds if d is not None), default=0.0) or 1.0
     columns = [c for c in rows.columns if not c.startswith("n_")]
+    # any sharpe_* columns: green above zero, red below, on their own scale
+    sharpes = [v for c in columns if c.startswith("sharpe_") for v in rows[c].to_list()
+               if v is not None and np.isfinite(v)]
+    sharpe_scale = max((abs(v) for v in sharpes), default=0.0) or 1.0
 
-    def style(col, _value, row):
+    def style(col, value, row):
         if col in groups:
             return _diverging(row[f"dev_{col}"], scale) if row[f"dev_{col}"] is not None else None
+        if col.startswith("sharpe_"):
+            return _diverging(value, sharpe_scale) if isinstance(value, float) and np.isfinite(value) else None
         return {"textAlign": "left"} if col in TEXT_COLS | {"other_horizon", "feature", "cuts"} else None
 
     return table(pdf, title=title, columns=columns, headers=headers, float_fmt=",.2f", cell_style=style)
 
 
-def entry_state_view(trades: pl.DataFrame, setup: dict) -> html.Div:
-    rows = entry_state(trades, setup)
+def entry_state_view(b: dict, cost: float) -> html.Div:
+    """Entry state: each feature's terciles' average trade and the Sharpe of holding only
+    their trades (as the exit reasons table measures it), against the setup's own."""
+    trades, setup = b["trades"], b["setup"]
+    sharpe = lambda subset: subset_sharpe(b, subset, cost)  # noqa: E731
+    rows = entry_state(trades, setup, sharpe)
     if rows.is_empty():
         return note("Too few trades to split by entry state.", "dim")
     return split_table(rows, TERCILES, trades["pnl"].mean(),
-                       f"entry state · avg trade · n in each tercile of the feature at entry "
-                       f"(setup avg {trades['pnl'].mean():+.2f})",
-                       {"corr_with_pnl": "spearman w/ pnl", "cuts": "tercile cuts", "high_minus_low": "high − low"})
+                       f"entry state · avg trade · n, and sharpe, in each tercile of the feature at entry "
+                       f"(setup avg {trades['pnl'].mean():+.2f}, sharpe {sharpe(trades):.2f})",
+                       {"corr_with_pnl": "spearman w/ pnl", "cuts": "tercile cuts", "high_minus_low": "high − low",
+                        **{f"sharpe_{t}": f"sharpe {t}" for t in TERCILES}})
 
 
 HORIZON_Z = 1.0  # |z| beyond which another horizon counts as saying something
@@ -394,12 +490,13 @@ HORIZON_Z = 1.0  # |z| beyond which another horizon counts as saying something
 STATES = ("agrees", "neutral", "disagrees")
 
 
-def multi_resolution(trades: pl.DataFrame, setup: dict) -> pl.DataFrame:
+def multi_resolution(trades: pl.DataFrame, setup: dict, sharpe=None) -> pl.DataFrame:
     """One row per OTHER signal horizon: the average trade (and count) of this setup's
     trades when that horizon, at entry, 'agrees' (same sign, |z| > HORIZON_Z: also rich,
     or also cheap), is 'neutral', or 'disagrees' (opposite sign beyond it), and agrees
     minus disagrees. A state whose average trade beats the setup's own is one where
-    that horizon adds information."""
+    that horizon adds information. With ``sharpe`` (trades -> Sharpe of holding only
+    those), each state's Sharpe too (sharpe_<state>)."""
     horizons = sorted((int(c[4:]), c) for c in trades.columns if c.startswith("z_lb"))
     own = pl.col("entry_z").sign()
     rows = []
@@ -411,7 +508,8 @@ def multi_resolution(trades: pl.DataFrame, setup: dict) -> pl.DataFrame:
                  .when(z.sign() == own).then(pl.lit("agrees")).otherwise(pl.lit("disagrees")))
         both = trades.select("entry_z", col).drop_nulls().filter(pl.col(col).is_not_nan())
         corr = both.select(pl.corr("entry_z", col, method="spearman")).item() if len(both) > 5 else None
-        split = {r["state"]: r for r in trades.with_columns(state.alias("state")).group_by("state").agg(
+        labelled = trades.with_columns(state.alias("state"))
+        split = {r["state"]: r for r in labelled.group_by("state").agg(
             pl.len().alias("n"), pl.col("pnl").mean().alias("avg")).to_dicts()}
         row = dict(other_horizon=f"lb {lb}", z_corr_at_entry=corr)
         for s in STATES:
@@ -419,6 +517,9 @@ def multi_resolution(trades: pl.DataFrame, setup: dict) -> pl.DataFrame:
             row[f"n_{s}"] = split[s]["n"] if s in split else 0
         row["agree_minus_disagree"] = (None if None in (row["agrees"], row["disagrees"])
                                        else row["agrees"] - row["disagrees"])
+        if sharpe is not None:
+            for s in STATES:
+                row[f"sharpe_{s}"] = sharpe(labelled.filter(pl.col("state") == s)) if s in split else None
         rows.append(row)
     return pl.DataFrame(rows)
 
@@ -426,13 +527,14 @@ def multi_resolution(trades: pl.DataFrame, setup: dict) -> pl.DataFrame:
 def lookback_grid(board: pl.DataFrame, setup: dict, by: str) -> pl.DataFrame:
     """``by`` over lookback x entry for this input, holding the setup's scale, exit and stop."""
     fixed = {k: setup[k] for k in ("input", "hedge_lb", "basis", "scale", "revert", "max_hold", "stop", "hl_mult",
-                                   "pnl_stop", "sizing")}
+                                   "pnl_stop", "sizing", "fill", "rearm", "gate", "gate_mode", "need_half_life")}
     return (matches(board, fixed).select("lookback", pl.format("entry {}", pl.col("entry")).alias("entry"), by)
             .pivot(on="entry", index="lookback", values=by).sort("lookback"))
 
 
 KNOBS = {"hedge_lb": "hedge lookback", "basis": "basis", "revert": "revert", "max_hold": "max hold",
-         "stop": "stop", "hl_mult": "half-life ×", "pnl_stop": "stop loss (bp)", "sizing": "sizing"}
+         "stop": "stop", "hl_mult": "half-life ×", "sizing": "sizing", "fill": "fill", "rearm": "re-arm",
+         "gate": "gate"}
 
 
 def sensitivity(board: pl.DataFrame, setup: dict, by: str) -> pl.DataFrame:
@@ -494,19 +596,20 @@ def stop_table(b: dict, cost: float) -> pl.DataFrame:
     levels = sorted({*STOP_LEVELS, float(setup["pnl_stop"])})
     usable = np.flatnonzero(np.isfinite(frame["entry_z"].to_numpy()))
     split = int(usable[0] + (len(frame) - usable[0]) // 2) if len(usable) else len(frame)  # as bake's halves
-    raw, stats, _, _, _ = engine.walk_setup(frame, b["target"], setup, cost, levels, split)
+    raw, stats, _, _, _ = engine.walk_setup(frame, b["target"], setup, cost, levels, split, b["gate_edges"])
     stopped, still_open = engine.EXIT_REASONS.index("pnl_stop"), engine.EXIT_REASONS.index("open")
+    REASON, PNL = engine.TRADE_COLS.index("reason"), engine.TRADE_COLS.index("pnl")
     rows = []
     for c, level in enumerate(levels):
-        t = raw[(raw[:, 0] == c) & (raw[:, 5] != still_open)]
-        s = dict(zip(engine._STATS, stats[c]))
+        t = raw[(raw[:, 0] == c) & (raw[:, REASON] != still_open)]
+        s = dict(zip(engine.STATS, stats[c]))
         h1, h2 = _sharpe(s["sum1"], s["sumsq1"], s["days1"]), _sharpe(s["sum2"], s["sumsq2"], s["days2"])
         rows.append(dict(stop_loss="off" if level == 0 else f"{level:g}", sharpe=_sharpe(s["sum"], s["sumsq"], s["days"]),
                          worst_half_sharpe=np.nanmin([h1, h2]) if np.isfinite([h1, h2]).all() else np.nan,
                          total_pnl=s["sum"], max_drawdown=s["max_dd"], n_trades=len(t),
-                         stopped=int((t[:, 5] == stopped).sum()), hit_rate=float((t[:, 4] > 0).mean()) if len(t) else np.nan,
-                         avg_trade=float(t[:, 4].mean()) if len(t) else np.nan,
-                         worst_trade=float(t[:, 4].min()) if len(t) else np.nan, this=level == setup["pnl_stop"]))
+                         stopped=int((t[:, REASON] == stopped).sum()), hit_rate=float((t[:, PNL] > 0).mean()) if len(t) else np.nan,
+                         avg_trade=float(t[:, PNL].mean()) if len(t) else np.nan,
+                         worst_trade=float(t[:, PNL].min()) if len(t) else np.nan, this=level == setup["pnl_stop"]))
     return pl.DataFrame(rows)
 
 
@@ -526,10 +629,6 @@ def stop_view(b: dict, cost: float) -> html.Div:
     frame = show(rows.with_row_index("#"))
     return html.Div([
         heading("stop loss"),
-        note("This setup re-walked on today's data with a stop loss at each level: exit when the trade is down that "
-             "many bps on a close, filled a bar later plus cost (so a loss can run past it). Everything else is held "
-             "at this setup; 'off' is no stop loss. Outlined: this setup's own level; orange: the best Sharpe. A stop "
-             "changes which later trades happen, so each row is its own walk.", "dim"),
         table(frame, title="stop loss (bp lost on the close) · what each level would have done", float_fmt=",.2f",
               columns=["stop_loss", "sharpe", "worst_half_sharpe", "total_pnl", "max_drawdown", "n_trades", "stopped",
                        "hit_rate", "avg_trade", "worst_trade"],
@@ -564,18 +663,48 @@ def score_grid_view(board: pl.DataFrame, setup: dict, by: str) -> html.Div:
                  float_fmt=",.2f", cell_style=style)
 
 
+KNOB_CELLS = 10  # a knob with more values than this (gates) shows none, this setup's and the best of the rest
+
+
 def sensitivity_view(board: pl.DataFrame, setup: dict, by: str) -> html.Div:
+    """One knob at a time, one row per knob: its values across the row, each cell 'value ·
+    score' coloured by the score, this setup's value outlined. Knobs the bake didn't vary
+    are left out."""
     rows = sensitivity(board, setup, by)
     scores = rows["score"].drop_nulls().drop_nans()
     colour = _score_style(float(scores.abs().max()) if len(scores) else 1.0)
+    records, width = [], 0
+    for knob in rows["knob"].unique(maintain_order=True).to_list():
+        part = rows.filter(pl.col("knob") == knob)
+        if len(part) < 2:
+            continue
+        if len(part) > KNOB_CELLS:
+            rest = part.filter(~pl.col("this") & (pl.col("value") != engine.NO_GATE))
+            part = pl.concat([part.filter(pl.col("this")), part.filter(pl.col("value") == engine.NO_GATE),
+                              rest.sort("score", descending=True, nulls_last=True).head(KNOB_CELLS - 2)])
+            knob = f"{knob} · this, none, best {KNOB_CELLS - 2} of {len(rest) + 2}"
+        record = {"knob": knob}
+        for i, r in enumerate(part.to_dicts()):
+            score = r["score"]
+            record[f"c{i}"] = f"{r['value']} · {score:.2f}" if score is not None and np.isfinite(score) else r["value"]
+            record[f"score_{i}"], record[f"this_{i}"] = score, bool(r["this"])
+        records.append(record)
+        width = max(width, len(part))
+    if not records:
+        return note("The bake varied no exit or hedge knob around this setup.", "dim")
+    frame = pd.DataFrame(records).astype(object)
+    frame = frame.where(frame.notna(), "")
+    cells = [f"c{i}" for i in range(width)]
 
-    def style(col, value, row):
-        cell = colour(value) if col == "score" else {"textAlign": "left"} if col in ("knob", "value") else None
-        return {**(cell or {}), **THIS} if row["this"] in (True,) and col == "value" else cell
+    def style(col, _value, row):
+        if col == "knob":
+            return {"textAlign": "left", "fontWeight": "bold"}
+        i = col[1:]
+        cell = colour(row.get(f"score_{i}")) or {}
+        return {**cell, **THIS} if row.get(f"this_{i}") is True else cell or None
 
-    return table(show(rows), title=f"{engine.RANKS[by]} · one knob at a time", float_fmt=",.2f",
-                 columns=["knob", "value", "score", "n_trades", "total_pnl"],
-                 headers={"n_trades": "trades", "total_pnl": "total pnl"}, cell_style=style)
+    return table(frame, title=f"{engine.RANKS[by]} · one knob at a time · value · score, this setup outlined",
+                 columns=["knob", *cells], headers={"knob": "knob", **{c: "" for c in cells}}, cell_style=style)
 
 
 # ---- paged tables ------------------------------------------------------------
@@ -595,12 +724,12 @@ def inputs_rows(path: str, by: str, min_trades: int) -> pl.DataFrame:
 
 
 def setups_rows(path: str, name: str, by: str, min_trades: int) -> pl.DataFrame:
+    """One input's setups, best first. Their ids (sid, for Inspect) are built only for the
+    page on screen, in paged_table: one per setup takes minutes on a bake of millions."""
     ranked = engine.rank(load_run(path)["board"].filter(pl.col("input") == name), by, min_trades, top=None)
     if ranked.is_empty():
         return ranked
-    return ranked.with_row_index("#", offset=1).with_columns(
-        pl.struct(SETUP_COLS).map_elements(setup_id, return_dtype=pl.Utf8).alias("sid")
-    ).select("#", "sid", "score", *SETUP_COLS, *STRATEGY_COLS)
+    return ranked.with_row_index("#", offset=1).select("#", "score", *SETUP_COLS, *STRATEGY_COLS)
 
 
 def trades_rows(path: str, picked: dict) -> pl.DataFrame:
@@ -644,7 +773,8 @@ HEADERS = {"worst_half_sharpe": "worst half", "total_pnl": "total pnl", "n_trade
            "sharpe_h2": "h2", "pnl_per_year": "pnl/yr", "trades_per_year": "trades/yr", "avg_trade": "avg",
            "median_trade": "median", "profit_factor": "pf", "time_in_market": "in mkt", "avg_bars": "avg bars",
            "trade_t": "trade t", "best_trade_share": "best share", "worst_trade": "worst", "max_hold": "hold",
-           "hl_mult": "hl×", "pnl_stop": "stop loss", "exp_return": "exp ret", "exp_bars": "exp bars",
+           "hl_mult": "hl×", "pnl_stop": "stop loss", "n_episodes": "episodes", "rearm": "re-arm",
+           "gate_mode": "gate mode", "need_half_life": "needs hl", "exp_return": "exp ret", "exp_bars": "exp bars",
            "exit_reason": "exit", "entry_level": "entry lvl", "exit_level": "exit lvl",
            "target_leg": "target leg", "hedge_leg": "hedge leg", "half_life": "half-life"}
 TEXT_COLS = {"input", "label", "best_setup", "basis", "scale", "exit_reason"}
@@ -675,8 +805,9 @@ def paged_table(name: str, rows: pl.DataFrame, view: dict, title: str) -> tuple[
     rows = rows.with_columns(pl.when(pl.selectors.float().is_infinite()).then(None)
                              .otherwise(pl.selectors.float()).name.keep())
     shown, view = _sorted_page(rows, name, view)
-    hidden = {"inputs": [], "setups": ["sid"], "trades": []}[name]
-    cols = [c for c in rows.columns if c not in hidden]
+    if name == "setups":  # each setup's id for its Inspect button, for this page only (see setups_rows)
+        shown = shown.with_columns(pl.struct(SETUP_COLS).map_elements(setup_id, return_dtype=pl.Utf8).alias("sid"))
+    cols = list(rows.columns)
     arrow = " ▼" if view["desc"] else " ▲"
     headers = {c: HEADERS.get(c, c) + (arrow if c == view["sort"] else "") for c in cols}
     store = f"oven-{name}-sort"
@@ -895,7 +1026,8 @@ def detail_view(path: str, picked: dict, by: str, min_trades: int, window: str) 
     # one trade row per monthly P&L row, so the two tables beside each other stand the same height
     page, view = render_page("trades", {**default_view("trades"), "size": max(len(periods), 5)}, path, by,
                              min_trades, name, picked)
-    reasons = exit_reasons(b, float(b["meta"]["settings"].get("cost", engine.COST)))
+    cost = float(b["meta"]["settings"].get("cost", engine.COST))
+    reasons = exit_reasons(b, cost)
     sharpes = reasons["sharpe"].fill_nan(None).drop_nulls()
     reason_scale = float(sharpes.abs().max()) if len(sharpes) else 1.0
     board = load_run(path)["board"]
@@ -907,7 +1039,6 @@ def detail_view(path: str, picked: dict, by: str, min_trades: int, window: str) 
             html.Span(describe(setup), style={"fontSize": 12, "color": DIM}),
             html.Span(hedge_text, style={"fontSize": 11, "color": DIM, "marginLeft": "auto", "fontStyle": "italic"}),
         ]),
-        note(f"Signal: {BASIS_TEXT[setup['basis']]}.", "dim"),
         html.Div(style={"display": "flex", "gap": 10, "alignItems": "center", "flexWrap": "wrap", "margin": "4px 0"},
                  children=[
             html.Button("Send to dashboard", id="oven-promote", n_clicks=0, className="ref-btn",
@@ -937,7 +1068,8 @@ def detail_view(path: str, picked: dict, by: str, min_trades: int, window: str) 
             stat_block("per year", f"{row['pnl_per_year']:+,.1f} bps"),
             stat_block("n trades", f"{row['n_trades']} · {row['trades_per_year']:.1f}/yr"),
             stat_block("hit rate", f"{row['hit_rate']:.0%}"),
-            stat_block("avg / median", f"{row['avg_trade']:+.2f} / {row['median_trade']:+.2f}"),
+            stat_block("avg / median", f"{row['avg_trade']:+.2f} / {trades['pnl'].median():+.2f}"),
+            stat_block("episodes", "—" if row.get("n_episodes") is None else f"{row['n_episodes']}"),
             stat_block("profit factor", _fmt(row["profit_factor"], ".2f")),
             stat_block("max drawdown", f"{row['max_drawdown']:+,.1f} bps"),
             stat_block("calmar", _fmt(row["calmar"], ".2f")),
@@ -975,55 +1107,62 @@ def detail_view(path: str, picked: dict, by: str, min_trades: int, window: str) 
                   {"textAlign": "left", **({"fontWeight": "bold"} if value == "all" else {})} if col == "reason"
                   else _diverging(value, reason_scale) if col == "sharpe" and isinstance(value, float)
                   and np.isfinite(value) else None)),
-        note("Each exit reason's sharpe is the daily mark-to-market sharpe of holding only those trades, over the "
-             "same days the board scores ('all' is the setup itself). It splits where the P&L came from; you can't "
-             "trade it, since the exit isn't known at entry.", "dim"),
     ], style={"marginBottom": 18})
     peers = peer_correlations(path, setup, by, min_trades)
-    diagnostics = html.Div([
-        heading("relationship diagnostics"),
-        note(f"Is this setup a plateau or a spike? The grid and the knobs move one thing at a time from this setup "
-             f"(outlined) and show its {engine.RANKS[by]}; a good setup sits among neighbours that also score. "
-             f"Entry state asks which conditions at entry the winners came from.", "dim"),
-        # two columns, every table at full height (no inner scroll; see oven.css)
-        html.Div(className="oven-full", style=TWO_UP, children=[
-            html.Div([score_grid_view(board, setup, by), entry_state_view(trades, setup)],
-                     style={"display": "flex", "flexDirection": "column", "gap": 14, "minWidth": 0}),
-            html.Div([
-                sensitivity_view(board, setup, by),
-                table(show(peers), title="monthly P&L correlation with other inputs' best setups · does it add to "
-                                         "a book or is it the same bet?", float_fmt=",.3f", sortable=True)
-                if not peers.is_empty() else
-                note("Monthly P&L correlation with other inputs' best setups needs a bake with more than one input; "
-                     "this bake has only this one.", "dim"),
-            ], style={"display": "flex", "flexDirection": "column", "gap": 14, "minWidth": 0}),
+    return html.Div([card, mechanics, drivers_view(b, board, by, cost, peers), stop_view(b, cost)]), view
+
+
+def resolution_table(b: dict, cost: float, table_rows: pl.DataFrame) -> html.Div:
+    """Multi-resolution's numbers: each state's average trade (and count) and the Sharpe
+    of holding only its trades (as the exit reasons table measures it)."""
+    trades, setup = b["trades"], b["setup"]
+    return split_table(table_rows, STATES, trades["pnl"].mean(),
+                       f"this setup's {len(trades)} trades · avg trade · n, and sharpe, by each other horizon's "
+                       f"{setup['basis']} z at entry (setup avg {trades['pnl'].mean():+.2f}, "
+                       f"sharpe {subset_sharpe(b, trades, cost):.2f})",
+                       {"other_horizon": "other horizon", "z_corr_at_entry": "z corr at entry",
+                        "agree_minus_disagree": "agrees − disagrees",
+                        **{f"sharpe_{s}": f"sharpe {s}" for s in STATES}})
+
+
+def drivers_view(b: dict, board: pl.DataFrame, by: str, cost: float, peers: pl.DataFrame) -> html.Div:
+    """What the setup's results rest on, as tables at full height: robustness (each knob
+    moved alone; lookback x entry; overlap with other inputs) and when it works (entry
+    state; what the other horizons said), with the Sharpe of holding only each bucket's
+    trades."""
+    setup, trades = b["setup"], b["trades"]
+    horizon_rows = multi_resolution(trades, setup, lambda subset: subset_sharpe(b, subset, cost))
+    share = subset_sharpe(b, trades, cost) / np.sqrt(3)
+    column = {"display": "flex", "flexDirection": "column", "gap": 14, "minWidth": 0}
+    robustness = html.Div([
+        heading("robustness"),
+        note(f"Is this setup a plateau or a spike? Each knob moved alone, everything else held at this setup "
+             f"(outlined); a good setup sits among neighbours that also score.", "dim"),
+        html.Div(sensitivity_view(board, setup, by), className="oven-full"),
+        html.Div(className="oven-full", style={**TWO_UP, "marginTop": 12}, children=[
+            html.Div([score_grid_view(board, setup, by)], style=column),
+            html.Div([table(show(peers), title="monthly P&L correlation with other inputs' best setups · does it "
+                                               "add to a book or is it the same bet?", float_fmt=",.3f",
+                            sortable=True)
+                      if not peers.is_empty() else
+                      note("Monthly P&L correlation with other inputs' best setups needs a bake with more than one "
+                           "input; this bake has only this one.", "dim")], style=column),
         ]),
-    ])
-    cost = float(b["meta"]["settings"].get("cost", engine.COST))
-    return html.Div([card, mechanics, resolution_view(trades, setup), diagnostics, stop_view(b, cost)]), view
-
-
-def resolution_view(trades: pl.DataFrame, setup: dict) -> html.Div:
-    """The multi-resolution section: does another horizon change what this one's trades are worth?"""
-    table_rows = multi_resolution(trades, setup)
-    if table_rows.is_empty():
-        body = note("This bake has no other horizons recorded. Re-bake with more than one signal lookback to see "
-                    "what the other horizons said at each entry.", "dim")
-    else:
-        body = split_table(table_rows, STATES, trades["pnl"].mean(),
-                           f"this setup's {len(trades)} trades · avg trade · n, by each other horizon's "
-                           f"{setup['basis']} z at entry (setup avg {trades['pnl'].mean():+.2f})",
-                           {"other_horizon": "other horizon", "z_corr_at_entry": "z corr at entry",
-                            "agree_minus_disagree": "agrees − disagrees"})
-    return html.Div([
-        heading("multi-resolution"),
-        note(f"Same input, basis and hedge, read at the other signal lookbacks when this setup entered. 'agrees': "
-             f"that horizon was also beyond ±{HORIZON_Z:g} z the same way (it saw the same rich/cheap); 'disagrees': "
-             f"beyond it the other way. Green beats the setup's average trade, red trails it; a big positive "
-             f"'agrees − disagrees' says wait for that horizon to confirm. Small counts are noise. z corr near 1 "
-             f"means the horizons are the same signal measured twice.", "dim"),
-        body,
     ], style={"marginBottom": 18})
+    when = html.Div([
+        heading("when it works"),
+        note(f"Which conditions at entry its trades paid in. A bucket's sharpe is lower than the setup's just for "
+             f"holding fewer trades: a random third of them would score about {share:.2f}. 'agrees': that lookback "
+             f"was also beyond ±{HORIZON_Z:g} z the same way; 'disagrees': beyond it the other way. Small buckets "
+             f"are noise.", "dim"),
+        html.Div(className="oven-full", style=TWO_UP, children=[
+            html.Div([entry_state_view(b, cost)], style=column),
+            html.Div([resolution_table(b, cost, horizon_rows) if not horizon_rows.is_empty() else
+                      note("This bake has no other horizons recorded. Re-bake with more than one signal lookback to "
+                           "see what the other horizons said at each entry.", "dim")], style=column),
+        ]),
+    ], style={"marginBottom": 18})
+    return html.Div([robustness, when])
 
 
 def snap_range(path: str, picked: dict, view: dict):
@@ -1084,20 +1223,36 @@ def bake_controls() -> html.Div:
                 _all_none("oven-bases")]),
             *[_multi(k) for k in ("lookbacks", "z_entries", "raw_entries")]]),
         section("Exits", [
-            note("Combined per setup: a reversion exit, a half-life time stop, the stop and the max-hold cap. No "
-                 "revert with a half-life multiple is a pure half-life time exit; neither is a pure max-hold exit.",
-                 "dim"),
             *[_multi(k) for k in ("reverts", "hl_mults", "max_holds", "stops", "pnl_stops")]]),
         section("Sizing", [
-            note("How big each trade is, from what the frozen model expects of it at entry: its expected return "
-                 "(the OU reversion due by its expected exit, net of cost), that over its expected risk, or over its "
-                 "expected days held. A trade expected to lose is not taken. Sizes average 1, so P&L reads like "
-                 "flat sizing.", "dim"),
             html.Div([field("sizing", dcc.Dropdown(
                 id="oven-sizings", value=list(engine.SIZING_DEFAULT), multi=True,
                 options=[{"label": f"{s} · {SIZING_TEXT[s]}", "value": s} for s in engine.SIZINGS])),
                 _all_none("oven-sizings")]),
         ]),
+        section("Fills & re-entry", [
+            html.Div([field("fill", dcc.Dropdown(
+                id="oven-fills", value=list(engine.FILLS_DEFAULT), multi=True,
+                options=[{"label": f"{f} · {FILL_TEXT[f]}", "value": f} for f in engine.FILLS])),
+                _all_none("oven-fills")]),
+            html.Div([field("re-arm · before the next entry, the signal is", dcc.Dropdown(
+                id="oven-rearms", value=list(engine.REARMS_DEFAULT), multi=True,
+                options=[{"label": f"{r} · {REARM_TEXT[r]}", "value": r} for r in engine.REARMS])),
+                _all_none("oven-rearms")]),
+        ]),
+        section("Gates", [
+            html.Div([field("conditions · none = no gate", dcc.Dropdown(
+                id="oven-gate-conditions", value=[], multi=True,
+                options=[{"label": c, "value": c} for c in engine.GATE_CONDITIONS])),
+                _all_none("oven-gate-conditions")]),
+            html.Div([field("buckets", dcc.Dropdown(
+                id="oven-gate-buckets", value=list(engine.GATE_BUCKETS_DEFAULT), multi=True,
+                options=[{"label": b, "value": b} for b in engine.GATE_BUCKETS])),
+                _all_none("oven-gate-buckets")]),
+            field("bucket edges", dcc.Dropdown(id="oven-gate-mode", value="full", clearable=False, options=[
+                {"label": "full sample · fixed raw cut", "value": "full"},
+                {"label": "point in time · no look-ahead", "value": "causal"}])),
+        ], open=False),
         section("Hedge & costs", [
             _multi("hedge_lookbacks"),
             field("cost · bps per round trip", dcc.Input(id="oven-cost", type="number", value=engine.COST, min=0,
@@ -1112,13 +1267,6 @@ def bake_controls() -> html.Div:
 
 def bake_tab() -> html.Div:
     return html.Div(style={"padding": "18px 24px"}, children=[
-        html.Div([heading("oven"), note(
-            "Bake one target against a boatload of inputs to find the relationships whose trades pay. For every "
-            "input and lookback: the signal is the levels-OLS residual of the target on the input; the trade holds "
-            "the target hedged by the input at the changes-OLS beta; and the model freezes at entry, so a trade "
-            "exits only when prices move. Every setup is scored as a strategy: Sharpe, P&L, drawdown, hit rate, "
-            "and both halves of the sample. Results open on the Results tab.", "dim")],
-            className="research-banner", style={"display": "block"}),
         html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)", "gap": 26,
                         "alignItems": "start"}, children=[
             bake_controls(),
@@ -1155,10 +1303,11 @@ def tabs() -> html.Div:
         dcc.Store(id="oven-session", data=uuid4().hex),
         dcc.Store(id="oven-seen-job"),
         dcc.Interval(id="oven-poll", interval=750),
-        dcc.Tabs(id="oven-tabs", value="bake", children=[
-            dcc.Tab(label="Bake", value="bake", style=TAB_STYLE, selected_style=SELECTED_TAB_STYLE,
+        # the signal dashboard's folder tabs
+        dcc.Tabs(id="oven-tabs", value="bake", style=FOLDER_TABS, children=[
+            dcc.Tab(label="Bake", value="bake", style=FOLDER_TAB, selected_style=FOLDER_TAB_SELECTED,
                     children=bake_tab()),
-            dcc.Tab(label="Results", value="results", style=TAB_STYLE, selected_style=SELECTED_TAB_STYLE,
+            dcc.Tab(label="Results", value="results", style=FOLDER_TAB, selected_style=FOLDER_TAB_SELECTED,
                     children=results_tab()),
         ]),
     ], className="research-bench oven-tight")
@@ -1174,6 +1323,10 @@ def _clicked() -> bool:
 
 def register(app) -> None:
     choices = {"inputs": (ALL_INPUTS, ALL_INPUTS), "bases": (list(engine.BASES), list(engine.BASES)),
+               "fills": (list(engine.FILLS), list(engine.FILLS_DEFAULT)),
+               "rearms": (list(engine.REARMS), list(engine.REARMS_DEFAULT)),
+               "gate-conditions": (list(engine.GATE_CONDITIONS), []),
+               "gate-buckets": (list(engine.GATE_BUCKETS), list(engine.GATE_BUCKETS_DEFAULT)),
                "sizings": (list(engine.SIZINGS), list(engine.SIZING_DEFAULT)),
                **{k: (opts, default) for k, (_label, opts, default) in GRID_CONTROLS.items()}}
     for key, (options, default) in choices.items():
@@ -1183,29 +1336,32 @@ def register(app) -> None:
             return {f"oven-{key}-all": list(options), "oven-select-all": list(options),
                     f"oven-{key}-none": [], "oven-defaults": list(default)}[ctx.triggered_id]
 
-        master = [] if key == "inputs" else [Input("oven-select-all", "n_clicks"), Input("oven-defaults", "n_clicks")]
+        # Select all leaves the inputs and gates alone: every gate multiplies the grid ~50x
+        master = [] if key in ("inputs", "gate-conditions", "gate-buckets") else [
+            Input("oven-select-all", "n_clicks"), Input("oven-defaults", "n_clicks")]
         app.callback(Output(f"oven-{key}", "value"),
                      Input(f"oven-{key}-all", "n_clicks"), Input(f"oven-{key}-none", "n_clicks"), *master,
                      prevent_initial_call=True)(_set)
 
     @app.callback(Output("oven-grid-size", "children"), Input("oven-target", "value"), Input("oven-inputs", "value"),
                   *[Input(f"oven-{k}", "value") for k in GRID_CONTROLS], Input("oven-bases", "value"),
-                  Input("oven-sizings", "value"))
+                  Input("oven-sizings", "value"), Input("oven-fills", "value"), Input("oven-rearms", "value"),
+                  Input("oven-gate-conditions", "value"), Input("oven-gate-buckets", "value"))
     def _grid_size(target, inputs, lookbacks, z, raw, reverts, hl_mults, holds, stops, pnl_stops, hedge_lbs, bases,
-                   sizings):
+                   sizings, fills, rearms, gate_conditions, gate_buckets):
         bases = bases or []
         # the portfolio basis only runs for inputs that can be held as a hedge
         models = sum(("levels" in bases) + ("portfolio" in bases and engine.hedgeable(i))
                      for i in dict.fromkeys(inputs or []) if i != target)
         per_model = ((len(z or []) + len(raw or [])) * len(reverts or []) * len(holds or [])
                      * max(len(stops or []), 1) * max(len(hl_mults or []), 1) * max(len(pnl_stops or []), 1)
-                     * max(len(sizings or []), 1))
+                     * max(len(sizings or []), 1) * max(len(fills or []), 1) * max(len(rearms or []), 1)
+                     * len(engine.gate_grid(gate_conditions or [], gate_buckets or [])))
         setups = models * len(lookbacks or []) * len(hedge_lbs or []) * per_model
-        # measured on a select-everything 10s30s bake: 554,580 setups -> 39.2M trades, 18.8 GB peak, 23s
-        trades = setups * 71
-        ram_gb = trades / 1e6 * 0.48
+        # a bake keeps one board row per setup (about 400 bytes in memory), not its trades
+        ram_gb = setups * 400 / 1e9
         tone = "bad" if ram_gb > 40 else "warn" if ram_gb > 10 else "dim"
-        text = f"{setups:,} setups · about {trades / 1e6:.1f}M trades · about {ram_gb:.0f} GB RAM while baking"
+        text = f"{setups:,} setups · about {ram_gb:.1f} GB RAM for the board"
         if tone == "bad":
             text += " · too big for this machine; trim inputs or parameters"
         elif tone == "warn":
@@ -1216,12 +1372,19 @@ def register(app) -> None:
                   State("oven-target", "value"), State("oven-inputs", "value"),
                   *[State(f"oven-{k}", "value") for k in GRID_CONTROLS],
                   State("oven-cost", "value"), State("oven-bases", "value"), State("oven-sizings", "value"),
+                  State("oven-fills", "value"), State("oven-rearms", "value"), State("oven-gate-conditions", "value"),
+                  State("oven-gate-buckets", "value"), State("oven-gate-mode", "value"),
                   prevent_initial_call=True)
     def _bake(_clicks, target, inputs, *grid):
-        *lists, cost, bases, sizings = grid
+        *lists, cost, bases, sizings, fills, rearms, gate_conditions, gate_buckets, gate_mode = grid
         settings = dict(zip(GRID_CONTROLS, [sorted(v or []) for v in lists]), cost=float(cost or 0),
                         bases=[b for b in engine.BASES if b in (bases or [])],
-                        sizings=[s for s in engine.SIZINGS if s in (sizings or [])] or ["flat"])
+                        sizings=[s for s in engine.SIZINGS if s in (sizings or [])] or ["flat"],
+                        fills=[f for f in engine.FILLS if f in (fills or [])] or list(engine.FILLS_DEFAULT),
+                        rearms=[r for r in engine.REARMS if r in (rearms or [])] or list(engine.REARMS_DEFAULT),
+                        gate_conditions=[c for c in engine.GATE_CONDITIONS if c in (gate_conditions or [])],
+                        gate_buckets=[g for g in engine.GATE_BUCKETS if g in (gate_buckets or [])],
+                        gate_mode=gate_mode or "full")
         settings["stops"] = settings["stops"] or [0.0]
         settings["hl_mults"] = settings["hl_mults"] or [0.0]
         settings["pnl_stops"] = settings["pnl_stops"] or [0.0]

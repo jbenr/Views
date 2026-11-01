@@ -6,7 +6,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from backtest.engine import TradeDef
+from backtest.legacy import TradeDef
 from research.panel import (
     CATALOG,
     Panel,

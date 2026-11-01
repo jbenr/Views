@@ -144,7 +144,7 @@ def _param_row(params: dict) -> dict:
 
 
 def _run_combo(params: dict) -> dict:
-    from .engine import BacktestConfig, Engine
+    from .legacy import BacktestConfig, Engine
 
     try:
         pipeline = _WORKER_STATE["module"].make_pipeline(params)
@@ -1385,9 +1385,8 @@ def signal_matrix(
 
     Returns (z, combos) or (z, combos, conditions).
     """
-    from stats.diagnostics import beta_cv as _beta_cv
     from stats.ols import roll_lr_diff
-    from stats.ou import roll_ou_features, roll_ou_zscore
+    from stats.ou import roll_ou_zscore
 
     valid_signal_kinds = {"ou_zscore", "zscore", "z", "residual", "resid"}
     if signal_kind not in valid_signal_kinds:
@@ -1423,22 +1422,11 @@ def signal_matrix(
             reg["resid"].rolling_sum(beta_lb, min_samples=beta_lb),
         ])
         if return_conditions:
-            beta = pl.concat([null1, reg["beta"]])
-            r2 = pl.concat([null1, reg["r2"]])
-            ou_state = roll_ou_features(resid_roll, lookback=beta_lb)
-            conds = {
-                "r2": r2,
-                "beta_cv": _beta_cv(beta, lookback=beta_lb),
-                "beta": beta,
-                "beta_vol20": beta.diff().rolling_std(20),
-                "beta_mom10": beta.diff(10),
-                "r2_vol20": r2.diff().rolling_std(20),
-                "r2_mom10": r2.diff(10),
-                "resid_phi": ou_state["ou_rho"] - 1.0,
-                "resid_half_life": ou_state["half_life"],
-                "resid_vol20": resid_roll.diff().rolling_std(20),
-                "resid_mom10": resid_roll.diff(10),
-            }
+            # the one definition of the gate conditions, shared with every strategy's gates
+            from backtest.engine import condition_arrays
+
+            conds = condition_arrays(pl.concat([null1, reg["beta"]]), pl.concat([null1, reg["r2"]]),
+                                     resid_roll, beta_lb)
         for z_lb in z_lbs:
             if signal_kind in {"ou_zscore", "zscore", "z"}:
                 signal = roll_ou_zscore(resid_roll, lookback=z_lb)
@@ -1448,9 +1436,7 @@ def signal_matrix(
             combos.append({"beta_lb": beta_lb, lookback_name: z_lb})
             if return_conditions:
                 for name in CONDITION_NAMES:
-                    cond_cols[name].append(
-                        conds[name].to_numpy().astype(float)[:t_len]
-                    )
+                    cond_cols[name].append(conds[name][:t_len])
 
     z_mat = np.column_stack(cols)
     if not return_conditions:

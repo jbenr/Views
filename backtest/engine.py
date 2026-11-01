@@ -1,1188 +1,744 @@
-"""The exact backtest simulator — everything about running one true backtest.
+"""The backtest engine: the one trade walk every strategy runs on.
 
-Signals are pre-computed vectorially (polars); position management is a
-lightweight row-by-row state machine over the pre-computed arrays.
+A strategy hands the engine a MODEL -- per-bar arrays it fitted itself -- and a
+grid of CONFIGS (entry, exits, sizing, fill, re-arm, gate). The engine walks
+each config through time, one position at a time, and returns its trades and
+the daily P&L statistics it is scored on. ``walk`` is the fast path (numba,
+every config of a model at once); ``walk_exact`` is the same rules written out
+bar by bar in plain Python, the sense check a promoted strategy is held to,
+trade for trade.
 
-Sections:
-    trade definitions    TradeDef / Position / ClosedPosition
-    signal interface     SignalConfig / SignalPipeline / exit recipes
-    sizing               DV01Map / size_dv01_neutral / size_beta_weighted
-    the engine           BacktestConfig / BacktestResult / Engine
-    metrics & reporting  compute_metrics / trade_log / print_summary
-    spread book          SpreadBook — cross-sectional multi-spread allocation
+The model (all arrays aligned, length n):
 
-Usage:
-    engine = Engine(BacktestConfig(...))
-    engine.add_signal(pipeline1)
-    engine.add_signal(pipeline2)
-    result = engine.run(data)
+    y, x          the target and the input, in bps
+    signal_z      the live entry signal in z units ...
+    signal_raw    ... and in bps; a config picks one by its scale
+    alpha, beta   the fit's intercept and slope, so the residual is y - alpha - beta x
+    center        a mean the residual reverts to (0 for a plain fit; an OU mean)
+    sigma         the residual's scale (bps per z)
+    half_life     the residual's half-life in bars
+    hedge_beta    the hedge ratio a trade holds x at (y - hedge * hedge_beta x)
+    port_vol      the held portfolio's daily vol, for risk-based sizing
+
+The rules:
+
+  Entry      on a crossing: the live signal moves beyond +/-entry while ARMED.
+             A crossing is spent whether or not it is taken (gated out, no
+             measured half-life, expected to lose under sizing). An entry needs
+             a finite, positive half-life: without one the residual shows no
+             reversion to trade (need_half_life; off only for older setups
+             that ran without it, and then only a half-life stop needs one).
+  Re-arm     after a crossing, the live signal must come back before another
+             entry can fire (REARMS):
+               threshold   back inside +/-entry
+               half        back inside +/-entry/2
+               mean        back through its mean (a new dislocation)
+               by_exit     threshold after a revert or band exit; mean after a
+                           stop, stop loss or time exit (the thesis failed)
+             Re-arming reads the LIVE model, from the exit's decision bar on.
+  Holding    the model is FROZEN at the entry decision: the residual is
+             y - alpha[t] - beta[t] x - center[t] with entry-day values, so a
+             trade exits only when prices move, never because the fit moved.
+  Exits      checked each bar after entry, in this order (EXIT_REASONS):
+               revert     the frozen residual recovers that share of its entry value
+               band       it comes back within `band` of the mean (signal units)
+               stop       it widens `stop` entry-sigmas past its entry value
+               pnl_stop   the trade's P&L since its fill is down `pnl_stop` bps
+               time       max_hold bars, or half_life at hl_mult x the entry half-life
+  Fill       "same": decided and filled on the same close; "next": filled on
+             the next bar's close. Applies to entries and exits alike.
+  Gate       a boolean allow-mask per gate (gate_mask); a config's gate must
+             allow the crossing bar. -1 = no gate.
+  P&L        marked daily from the entry fill to the exit fill on the held
+             portfolio y - ratio x (ratio = hedge * hedge_beta frozen at entry),
+             times the trade's size; one round-trip cost at the exit. A trade
+             still held at the last bar is reported as "open" and kept out of
+             the statistics, which score closed trades.
+  Sizing     (SIZINGS) from what the frozen model expects at entry: an OU
+             recovery with the entry half-life by the expected exit, net of cost.
+             Sizes are scaled to average 1 per config.
+  Episodes   trades are grouped into dislocations: a trade starts a new episode
+             unless the previous one was on the same side and the live signal
+             never crossed its mean in between. Re-entering one dislocation adds
+             trades, not episodes.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Callable, Optional
+
+import os
+
+import numba
 import numpy as np
 import polars as pl
-
-
-# ── trade definitions ────────────────────────────────────────────────────────
-#
-# Everything (outrights, spreads, butterflies, N-leg custom) is just a dict of
-# {instrument: weight}. TradeDef is the immutable 'what', Position is the live
-# 'when/how much', ClosedPosition is the archive.
-
-
-class TradeType(Enum):
-    OUTRIGHT = "outright"
-    SPREAD = "spread"
-    BUTTERFLY = "butterfly"
-    CUSTOM = "custom"
-
-
-@dataclass(frozen=True)
-class TradeDef:
-    """Immutable trade definition — the 'what' of a trade."""
-
-    name: str
-    legs: dict[str, float]  # instrument -> weight
-    trade_type: TradeType = TradeType.CUSTOM
-
-    @classmethod
-    def outright(cls, name: str, instrument: str, direction: float = 1.0) -> TradeDef:
-        return cls(name=name, legs={instrument: direction}, trade_type=TradeType.OUTRIGHT)
-
-    @classmethod
-    def spread(
-        cls,
-        name: str,
-        short_leg: str,
-        long_leg: str,
-        weights: tuple[float, float] = (-1.0, 1.0),
-    ) -> TradeDef:
-        return cls(
-            name=name,
-            legs={short_leg: weights[0], long_leg: weights[1]},
-            trade_type=TradeType.SPREAD,
-        )
-
-    @classmethod
-    def butterfly(
-        cls,
-        name: str,
-        wing1: str,
-        belly: str,
-        wing2: str,
-        weights: tuple[float, float, float] = (1.0, -2.0, 1.0),
-    ) -> TradeDef:
-        return cls(
-            name=name,
-            legs={wing1: weights[0], belly: weights[1], wing2: weights[2]},
-            trade_type=TradeType.BUTTERFLY,
-        )
-
-    def composite_series(self, data: pl.DataFrame) -> pl.Series:
-        """Compute weighted combination from wide-format yields DataFrame.
-
-        E.g. for 2s10s with legs {"2Y": -1, "10Y": 1}:
-            result = -1 * data["2Y"] + 1 * data["10Y"]
-        """
-        expr = None
-        for col, wt in self.legs.items():
-            term = pl.col(col) * wt
-            expr = term if expr is None else expr + term
-        return data.select(expr.alias(self.name))[self.name]
-
-
-@dataclass
-class Position:
-    """A live position — tracks state from entry through exit."""
-
-    trade_def: TradeDef
-    entry_date: object
-    entry_level: float
-    direction: int  # +1 long, -1 short
-    size: float = 1.0
-    entry_signal: float = 0.0
-    leg_sizes: dict[str, float] = field(default_factory=dict)
-
-    # Arbitrary per-bar data captured at entry (e.g. resid, ou_mean for exit_fn)
-    entry_extras: dict = field(default_factory=dict)
-
-    # Mutable tracking state
-    peak_pnl: float = 0.0
-    bars_held: int = 0
-    dynamic_time_stop: Optional[int] = None  # per-trade time stop (e.g. rolling half-life at entry)
-
-    def unrealized_pnl(self, current_level: float) -> float:
-        """PnL in composite units (bps for yield spreads)."""
-        return self.direction * (current_level - self.entry_level) * self.size
-
-
-@dataclass
-class ClosedPosition:
-    """Archived position with full PnL record."""
-
-    trade_def: TradeDef
-    entry_date: object
-    exit_date: object
-    entry_level: float
-    exit_level: float
-    direction: int
-    size: float
-    pnl_bps: float
-    pnl_dollar: float
-    bars_held: int
-    exit_reason: str  # "signal", "exit_fn", "stop_loss", "time_stop", "trailing_stop"
-    entry_signal: float
-    exit_signal: float
-    leg_sizes: dict[str, float] = field(default_factory=dict)
-    entry_extras: dict = field(default_factory=dict)
-    exit_extras: dict = field(default_factory=dict)
-
-
-# ── signal interface ─────────────────────────────────────────────────────────
-#
-# Signals are just polars Series of floats (z-scores, residuals, etc.).
-# SignalConfig defines the thresholds. SignalPipeline ties a signal
-# computation function to a TradeDef and config.
-
-
-@dataclass
-class SignalConfig:
-    """Entry/exit mechanics for a signal.
-
-    Entry: go long when signal < entry_long, short when signal > entry_short.
-    Exit:  close long when signal > exit_long, close short when signal < exit_short.
-           Set to None to disable signal-based exits (use stops only).
-    """
-
-    # Entry thresholds
-    entry_long: float = -2.0
-    entry_short: float = 2.0
-
-    # Exit thresholds — None means signal exits disabled
-    exit_long: Optional[float] = 0.0
-    exit_short: Optional[float] = 0.0
-
-    # Scale-in: list of (threshold, additional_size_fraction)
-    scale_in_levels: list[tuple[float, float]] = field(default_factory=list)
-
-    # Stops
-    stop_loss_bps: Optional[float] = None
-    time_stop_bars: Optional[int] = None
-    trailing_stop_bps: Optional[float] = None
-
-    # Custom exit function — called each bar for every open position.
-    # Signature: (pos: Position, bar: dict) -> Optional[str]
-    # Return a reason string to exit, None to stay in.
-    # Runs after time_stop; trailing_stop still overrides it.
-    # bar contains: "signal", "level", plus any extras the compute_fn passed through.
-    exit_fn: Optional[Callable] = None
-
-    # Entry gate — called before opening each new position.
-    # Signature: (direction: int, bar: dict) -> bool
-    # Return False to block the entry. direction is +1 or -1.
-    # bar contains: "signal", "level", plus any extras from compute_fn.
-    entry_filter_fn: Optional[Callable] = None
-
-    # Position limits per signal
-    max_positions: int = 1
-    # Optional per-leg weight columns in the signal frame, frozen at entry.
-    entry_weight_columns: dict[str, str] | None = None
-
-
-def generate_signals(signal_series: pl.Series, config: SignalConfig) -> pl.DataFrame:
-    """Convert continuous signal into discrete entry/exit actions.
-
-    Returns DataFrame with ``signal``, legacy ``action``, and independent
-    boolean columns for each direction-specific entry/exit condition.
-    Actions: "enter_long", "enter_short", "exit_long", "exit_short", or null.
-
-    The booleans are authoritative for the Engine. A single action string
-    cannot represent the central region of a hysteresis band, where both
-    ``exit_long`` and ``exit_short`` are valid depending on the position
-    currently held.
-    """
-    sig = pl.col("signal")
-    frame = pl.DataFrame({"signal": signal_series}).with_columns(
-        (sig < config.entry_long).fill_null(False).alias("enter_long"),
-        (sig > config.entry_short).fill_null(False).alias("enter_short"),
-        (
-            ((sig > config.exit_long) & (sig < config.entry_short))
-            if config.exit_long is not None
-            else pl.lit(False)
-        )
-        .fill_null(False)
-        .alias("exit_long"),
-        (
-            ((sig < config.exit_short) & (sig > config.entry_long))
-            if config.exit_short is not None
-            else pl.lit(False)
-        )
-        .fill_null(False)
-        .alias("exit_short"),
-    )
-
-    # Preserve the historical one-action view for callers that display it.
-    # The Engine consumes all four booleans above and therefore does not lose
-    # an overlapping direction-specific exit.
-    action = (
-        pl.when(pl.col("enter_long")).then(pl.lit("enter_long"))
-        .when(pl.col("enter_short")).then(pl.lit("enter_short"))
-        .when(pl.col("exit_long")).then(pl.lit("exit_long"))
-        .when(pl.col("exit_short")).then(pl.lit("exit_short"))
-        .otherwise(pl.lit(None))
-        .alias("action")
-    )
-    return frame.with_columns(action)
-
-
-def generate_boolean_actions(signal_frame: pl.DataFrame) -> pl.DataFrame:
-    """Convert explicit boolean signal columns into engine actions.
-
-    Required columns:
-      - signal
-      - enter_long, enter_short, exit_long, exit_short
-
-    Exits take priority over entries. That keeps the engine conservative:
-    it will close an existing trade before considering a fresh entry on a
-    later bar, instead of same-bar reversing.
-    """
-    required = {"signal", "enter_long", "enter_short", "exit_long", "exit_short"}
-    missing = required.difference(signal_frame.columns)
-    if missing:
-        raise ValueError(f"boolean signal frame missing columns: {sorted(missing)}")
-
-    action = (
-        pl.when(pl.col("exit_long")).then(pl.lit("exit_long"))
-        .when(pl.col("exit_short")).then(pl.lit("exit_short"))
-        .when(pl.col("enter_long")).then(pl.lit("enter_long"))
-        .when(pl.col("enter_short")).then(pl.lit("enter_short"))
-        .otherwise(pl.lit(None))
-        .alias("action")
-    )
-    return signal_frame.with_columns(action)
-
-
-@dataclass
-class SignalPipeline:
-    """Wraps a signal computation function + its TradeDef + config.
-
-    The compute_fn takes a polars DataFrame (wide-format data) and returns
-    a polars Series of signal values (z-scores, residuals, etc.).
-
-    Example:
-        def my_signal(data: pl.DataFrame) -> pl.Series:
-            reg = roll_lr(data["10Y"], data["2Y"], lookback=100)
-            return ou_zscore(reg["resid"], lookback=100)
-
-        pipeline = SignalPipeline(
-            name="2s10s_ou",
-            trade_def=TradeDef.spread("2s10s", "2Y", "10Y"),
-            compute_fn=my_signal,
-            config=SignalConfig(entry_long=-2.0, entry_short=2.0),
-        )
-    """
-
-    name: str
-    trade_def: TradeDef
-    compute_fn: Callable[[pl.DataFrame], pl.Series]
-    config: SignalConfig = field(default_factory=SignalConfig)
-
-    def run(self, data: pl.DataFrame) -> pl.DataFrame:
-        """Compute signal and generate entry/exit actions.
-
-        compute_fn may return:
-          - pl.Series: just the signal values
-          - pl.DataFrame: must contain "signal" column, may contain "time_stop"
-        """
-        result = self.compute_fn(data)
-
-        if isinstance(result, pl.DataFrame):
-            signal = result["signal"]
-            extras = {c: result[c] for c in result.columns if c != "signal"}
-        else:
-            signal = result
-            extras = {}
-
-        actions = generate_signals(signal, self.config)
-
-        # Attach extra columns (e.g. time_stop) from compute_fn
-        for col_name, col_series in extras.items():
-            actions = actions.with_columns(col_series.alias(col_name))
-
-        return actions
-
-
-@dataclass
-class BooleanSignalPipeline:
-    """Pipeline for strategies that already produce boolean entry/exit arrays."""
-
-    name: str
-    trade_def: TradeDef
-    compute_fn: Callable[[pl.DataFrame], pl.DataFrame]
-    config: SignalConfig = field(default_factory=SignalConfig)
-
-    def run(self, data: pl.DataFrame) -> pl.DataFrame:
-        return generate_boolean_actions(self.compute_fn(data))
-
-
-# ── standard exit recipes ────────────────────────────────────────────────────
-
-def profit_target(pct: float = 0.5) -> Callable:
-    """Exit when signal has reverted `pct` of its entry value back toward zero.
-
-    Works on any z-score signal. For an entry at z=1.5 with pct=0.5,
-    exits when z drops to 0.75.
-    """
-    def fn(pos: Position, bar: dict) -> Optional[str]:
-        target = pos.entry_signal * (1.0 - pct)
-        if pos.direction == 1 and bar["signal"] >= target:
-            return "profit_target"
-        if pos.direction == -1 and bar["signal"] <= target:
-            return "profit_target"
-    return fn
-
-
-def half_drift_residual(frac: float = 0.5) -> Callable:
-    """Exit when residual has reverted `frac` of the way from entry to OU mean.
-
-    Requires compute_fn to pass 'resid' and 'ou_mean' as extra columns so
-    they are captured in pos.entry_extras at entry and available in bar at exit.
-
-    frac=0.5 is the half-drift target. Lower values take profit earlier.
-    """
-    def fn(pos: Position, bar: dict) -> Optional[str]:
-        if "resid" not in bar or "resid" not in pos.entry_extras:
-            return None
-        mu          = pos.entry_extras.get("ou_mean", 0.0)
-        entry_resid = pos.entry_extras["resid"]
-        target      = mu + (entry_resid - mu) * (1.0 - frac)
-        if pos.direction == -1 and bar["resid"] <= target:
-            return f"resid_target_{frac:.2f}"
-        if pos.direction == 1 and bar["resid"] >= target:
-            return f"resid_target_{frac:.2f}"
-    return fn
-
-
-# ── sizing ───────────────────────────────────────────────────────────────────
-#
-# All sizing functions return dict[str, float] mapping instrument -> notional size.
-
-
-@dataclass
-class DV01Map:
-    """DV01 (dollar value of a basis point) per instrument.
-
-    For quick approximation, use .from_tenors() which estimates
-    DV01 ~ modified_duration * 100 (per $1M notional).
-    For actual bonds, populate from Bloomberg or database.
-    """
-
-    dv01: dict[str, float]
-
-    @classmethod
-    def from_tenors(cls, tenors: dict[str, float]) -> DV01Map:
-        """Quick approx: DV01 ~ tenor_years * 100 ($ per bp per $1M notional).
-
-        Args:
-            tenors: e.g. {"2Y": 2.0, "5Y": 5.0, "10Y": 10.0, "30Y": 30.0}
-        """
-        return cls({k: v * 100 for k, v in tenors.items()})
-
-
-def size_dv01_neutral(
-    trade_def: TradeDef,
-    dv01_map: DV01Map,
-    target_risk_bps: float = 100.0,
-) -> dict[str, float]:
-    """Scale per-leg sizes so net DV01 exposure is zero.
-
-    For outrights, just scale to target_risk_bps.
-    For spreads/flies, sizes are inversely proportional to DV01.
-    """
-    legs = trade_def.legs
-    instruments = list(legs.keys())
-    weights = np.array([legs[k] for k in instruments])
-    dv01s = np.array([dv01_map.dv01.get(k, 1.0) for k in instruments])
-
-    if len(instruments) == 1:
-        return {instruments[0]: target_risk_bps / dv01s[0]}
-
-    # Size inversely proportional to DV01 per leg
-    risk_per_leg = np.abs(weights) * dv01s
-    base_size = 1.0 / risk_per_leg
-    base_size = base_size / base_size[0]
-
-    total_risk_per_unit = np.sum(np.abs(weights) * dv01s * base_size)
-    scale = target_risk_bps / total_risk_per_unit if total_risk_per_unit > 0 else 1.0
-
-    return {k: base_size[i] * scale for i, k in enumerate(instruments)}
-
-
-def size_beta_weighted(
-    trade_def: TradeDef,
-    beta: float,
-    dv01_map: DV01Map,
-    target_risk_bps: float = 100.0,
-) -> dict[str, float]:
-    """Beta-weighted sizing: adjust one leg by regression beta.
-
-    For a spread y ~ beta*x, the x-leg weight is scaled by |beta|
-    to match the empirical relationship before DV01 neutralization.
-    """
-    legs = trade_def.legs
-    instruments = list(legs.keys())
-
-    if len(instruments) != 2:
-        raise ValueError("Beta-weighted sizing requires exactly 2 legs")
-
-    adjusted_legs = {
-        instruments[0]: legs[instruments[0]] * abs(beta),
-        instruments[1]: legs[instruments[1]],
-    }
-
-    adjusted_trade = TradeDef(
-        name=trade_def.name + "_beta",
-        legs=adjusted_legs,
-        trade_type=trade_def.trade_type,
-    )
-
-    return size_dv01_neutral(adjusted_trade, dv01_map, target_risk_bps)
-
-
-def size_custom(
-    custom_weights: dict[str, float],
-    target_risk_bps: float = 100.0,
-) -> dict[str, float]:
-    """Pass-through for fully custom sizing, normalized to target risk."""
-    total = sum(abs(v) for v in custom_weights.values())
-    scale = target_risk_bps / total if total > 0 else 1.0
-    return {k: v * scale for k, v in custom_weights.items()}
-
-
-# ── the engine ───────────────────────────────────────────────────────────────
-
-
-@dataclass
-class BacktestConfig:
-    """Global backtest configuration."""
-
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    transaction_cost_bps: float = 0.0
-    slippage_bps: float = 0.0
-    max_total_positions: int = 10
-    dv01_map: Optional[DV01Map] = None
-
-
-@dataclass
-class BacktestResult:
-    """Complete backtest output."""
-
-    daily_pnl: pl.DataFrame          # ts, signal_name, pnl_bps, position_count
-    equity_curve: pl.DataFrame       # ts, pnl_bps, cumulative_pnl
-    signals_ts: pl.DataFrame         # ts, signal_name, signal_value
-    closed_trades: list[ClosedPosition]
-    open_trades: list[Position]
-
-    _metrics: Optional[dict] = field(default=None, repr=False)
-
-    def summary(self) -> dict:
-        if self._metrics is None:
-            self._metrics = compute_metrics(self)
-        return self._metrics
-
-
-class Engine:
-    """Core backtest engine with fluent API for adding signals."""
-
-    def __init__(self, config: BacktestConfig = None):
-        self.config = config or BacktestConfig()
-        self.pipelines: list[SignalPipeline] = []
-
-    def add_signal(self, pipeline: SignalPipeline) -> Engine:
-        self.pipelines.append(pipeline)
-        return self
-
-    def run(self, data: pl.DataFrame, dates_col: str = "ts") -> BacktestResult:
-        """Run the backtest.
-
-        Args:
-            data: Wide-format polars DataFrame with a date column and
-                  instrument columns (e.g. [ts, 2Y, 5Y, 10Y, 30Y]).
-            dates_col: Name of the date column.
-        """
-        # Date filtering — parse ISO strings so they compare against Date columns
-        def _as_date(d):
-            import datetime as _dt
-            return _dt.date.fromisoformat(d) if isinstance(d, str) else d
-
-        df = data
-        if self.config.start_date:
-            df = df.filter(pl.col(dates_col) >= _as_date(self.config.start_date))
-        if self.config.end_date:
-            df = df.filter(pl.col(dates_col) <= _as_date(self.config.end_date))
-
-        # 1. Pre-compute all signals (vectorized, polars)
-        signal_frames: dict[str, pl.DataFrame] = {}
-        for pipeline in self.pipelines:
-            signal_frames[pipeline.name] = pipeline.run(df)
-
-        # 2. Pre-compute composite trade levels
-        composite_levels: dict[str, pl.Series] = {}
-        for pipeline in self.pipelines:
-            composite_levels[pipeline.name] = pipeline.trade_def.composite_series(df)
-
-        # 3. Extract numpy arrays for fast row-by-row access
-        dates = df[dates_col].to_list()
-        n = len(dates)
-
-        sig_arrays: dict[str, np.ndarray] = {}
-        act_arrays: dict[str, list] = {}
-        bool_arrays: dict[str, dict[str, np.ndarray]] = {}
-        lvl_arrays: dict[str, np.ndarray] = {}
-        ts_arrays: dict[str, Optional[np.ndarray]] = {}  # dynamic time stops
-        sz_arrays: dict[str, Optional[np.ndarray]] = {}  # dynamic position sizes
-
-        # Extra columns passed through from compute_fn (beyond signal/action/time_stop/size)
-        extras_arrays: dict[str, dict[str, np.ndarray]] = {}
-
-        for pipeline in self.pipelines:
-            name = pipeline.name
-            sf = signal_frames[name]
-            sig_arrays[name] = sf["signal"].to_numpy()
-            act_arrays[name] = sf["action"].to_list()
-            bool_cols = {"enter_long", "enter_short", "exit_long", "exit_short"}
-            bool_arrays[name] = {
-                c: sf[c].to_numpy()
-                for c in bool_cols
-                if c in sf.columns
-            }
-            for c in bool_cols:
-                bool_arrays[name].setdefault(c, np.zeros(len(sf), dtype=bool))
-            lvl_arrays[name] = composite_levels[name].to_numpy()
-            ts_arrays[name] = sf["time_stop"].to_numpy() if "time_stop" in sf.columns else None
-            sz_arrays[name] = sf["size"].to_numpy() if "size" in sf.columns else None
-            reserved = {"signal", "action", "time_stop", "size", *bool_cols}
-            extras_arrays[name] = {
-                c: sf[c].to_numpy()
-                for c in sf.columns
-                if c not in reserved
-            }
-
-        # 4. State machine — position management
-        all_closed: list[ClosedPosition] = []
-        active: dict[str, list[Position]] = {p.name: [] for p in self.pipelines}
-        prev_unrealized: dict[str, float] = {p.name: 0.0 for p in self.pipelines}
-        daily_records: list[dict] = []
-
-        tc = self.config.transaction_cost_bps
-        slip = self.config.slippage_bps
-        leg_arrays = {leg: data[leg].to_numpy() for p in self.pipelines for leg in p.trade_def.legs}
-
-        def marked_level(position, index):
-            return sum(weight * leg_arrays[leg][index] for leg, weight in position.trade_def.legs.items())
-
-        for i in range(n):
-            date = dates[i]
-
-            for pipeline in self.pipelines:
-                name = pipeline.name
-                config = pipeline.config
-                signal_val = sig_arrays[name][i]
-                action = act_arrays[name][i]
-                level = lvl_arrays[name][i]
-                bools = bool_arrays[name]
-
-                if np.isnan(signal_val) or np.isnan(level):
-                    daily_records.append({
-                        "ts": date,
-                        "signal_name": name,
-                        "signal_value": None,
-                        "pnl_bps": 0.0,
-                        "position_count": len(active[name]),
-                    })
-                    continue
-
-                positions = active[name]
-
-                # --- Exits first ---
-                remaining = []
-                realized_today = 0.0
-                for pos in positions:
-                    pos.bars_held += 1
-                    held_level = marked_level(pos, i)
-                    current_pnl = pos.unrealized_pnl(held_level)
-                    pos.peak_pnl = max(pos.peak_pnl, current_pnl)
-
-                    exit_reason = None
-
-                    # Signal-based exit
-                    if pos.direction == 1 and (action == "exit_long" or bools["exit_long"][i]):
-                        exit_reason = "signal"
-                    elif pos.direction == -1 and (action == "exit_short" or bools["exit_short"][i]):
-                        exit_reason = "signal"
-
-                    # Stop loss
-                    if config.stop_loss_bps and current_pnl < -config.stop_loss_bps:
-                        exit_reason = "stop_loss"
-
-                    # Time stop — per-trade dynamic value takes priority over global config
-                    effective_ts = pos.dynamic_time_stop or config.time_stop_bars
-                    if effective_ts and pos.bars_held >= effective_ts:
-                        exit_reason = "time_stop"
-
-                    # Custom exit function — fires after time_stop, before trailing_stop
-                    if exit_reason is None and config.exit_fn is not None:
-                        bar_data = {"signal": signal_val, "level": held_level}
-                        bar_data.update({
-                            c: float(arr[i])
-                            for c, arr in extras_arrays[name].items()
-                        })
-                        fn_reason = config.exit_fn(pos, bar_data)
-                        if fn_reason:
-                            exit_reason = fn_reason
-
-                    # Trailing stop
-                    if (
-                        config.trailing_stop_bps
-                        and pos.peak_pnl - current_pnl > config.trailing_stop_bps
-                    ):
-                        exit_reason = "trailing_stop"
-
-                    if exit_reason:
-                        exit_extras = {
-                            c: float(arr[i])
-                            for c, arr in extras_arrays[name].items()
-                        }
-                        pnl_bps = current_pnl - tc
-                        realized_today += pnl_bps
-                        all_closed.append(
-                            ClosedPosition(
-                                trade_def=pos.trade_def,
-                                entry_date=pos.entry_date,
-                                exit_date=date,
-                                entry_level=pos.entry_level,
-                                exit_level=held_level,
-                                direction=pos.direction,
-                                size=pos.size,
-                                pnl_bps=pnl_bps,
-                                pnl_dollar=self._to_dollar_pnl(pnl_bps, pos),
-                                bars_held=pos.bars_held,
-                                exit_reason=exit_reason,
-                                entry_signal=pos.entry_signal,
-                                exit_signal=float(signal_val),
-                                leg_sizes=pos.leg_sizes,
-                                entry_extras=pos.entry_extras,
-                                exit_extras=exit_extras,
-                            )
-                        )
-                    else:
-                        remaining.append(pos)
-
-                active[name] = remaining
-
-                # --- Entries ---
-                total_active = sum(len(v) for v in active.values())
-                if (
-                    len(active[name]) < config.max_positions
-                    and total_active < self.config.max_total_positions
-                ):
-                    direction = None
-                    if action == "enter_long" or bools["enter_long"][i]:
-                        direction = 1
-                    elif action == "enter_short" or bools["enter_short"][i]:
-                        direction = -1
-
-                    if direction is not None and config.entry_filter_fn is not None:
-                        filter_bar = {"signal": signal_val, "level": level}
-                        filter_bar.update({c: float(arr[i]) for c, arr in extras_arrays[name].items()})
-                        if not config.entry_filter_fn(direction, filter_bar):
-                            direction = None
-
-                    entry_trade = pipeline.trade_def
-                    entry_level = level
-                    if direction is not None and config.entry_weight_columns:
-                        weights = {leg: float(extras_arrays[name][column][i])
-                                   for leg, column in config.entry_weight_columns.items()}
-                        if not all(np.isfinite(w) for w in weights.values()):
-                            direction = None
-                        else:
-                            entry_trade = TradeDef(pipeline.trade_def.name, weights, pipeline.trade_def.trade_type)
-                            entry_level = sum(w * leg_arrays[leg][i] for leg, w in weights.items())
-
-                    if direction is not None:
-                        leg_sizes = {}
-                        if self.config.dv01_map:
-                            leg_sizes = size_dv01_neutral(
-                                entry_trade, self.config.dv01_map
-                            )
-
-                        # Capture rolling time stop at entry (if provided by signal)
-                        dyn_ts = None
-                        if ts_arrays[name] is not None:
-                            raw = ts_arrays[name][i]
-                            if not np.isnan(raw):
-                                dyn_ts = max(1, int(round(raw)))
-
-                        # Capture dynamic size at entry (if provided by signal)
-                        entry_size = 1.0
-                        if sz_arrays[name] is not None:
-                            raw_sz = sz_arrays[name][i]
-                            if not np.isnan(raw_sz) and raw_sz > 0:
-                                entry_size = float(raw_sz)
-
-                        entry_extras = {
-                            c: float(arr[i])
-                            for c, arr in extras_arrays[name].items()
-                        }
-
-                        pos = Position(
-                            trade_def=entry_trade,
-                            entry_date=date,
-                            entry_level=entry_level + (slip * direction),
-                            direction=direction,
-                            size=entry_size,
-                            entry_signal=float(signal_val),
-                            leg_sizes=leg_sizes,
-                            dynamic_time_stop=dyn_ts,
-                            entry_extras=entry_extras,
-                        )
-                        active[name].append(pos)
-
-                # --- Daily PnL (daily change in mark-to-market) ---
-                current_unrealized = sum(p.unrealized_pnl(marked_level(p, i)) for p in active[name])
-                daily_pnl_change = realized_today + current_unrealized - prev_unrealized[name]
-                prev_unrealized[name] = current_unrealized
-
-                daily_records.append({
-                    "ts": date,
-                    "signal_name": name,
-                    "signal_value": float(signal_val),
-                    "pnl_bps": daily_pnl_change,
-                    "position_count": len(active[name]),
-                })
-
-        # Collect open positions
-        all_open = [pos for positions in active.values() for pos in positions]
-
-        # Build output — explicit schema to avoid type inference issues
-        daily_pnl = pl.DataFrame(
-            daily_records,
-            schema={
-                "ts": pl.Date,
-                "signal_name": pl.Utf8,
-                "signal_value": pl.Float64,
-                "pnl_bps": pl.Float64,
-                "position_count": pl.Int64,
-            },
-        )
-
-        equity_curve = (
-            daily_pnl.group_by("ts", maintain_order=True)
-            .agg(pl.col("pnl_bps").sum())
-            .sort("ts")
-            .with_columns(pl.col("pnl_bps").cum_sum().alias("cumulative_pnl"))
-        )
-
-        signals_ts = daily_pnl.select("ts", "signal_name", "signal_value")
-
-        return BacktestResult(
-            daily_pnl=daily_pnl,
-            equity_curve=equity_curve,
-            signals_ts=signals_ts,
-            closed_trades=all_closed,
-            open_trades=all_open,
-        )
-
-    def _to_dollar_pnl(self, pnl_bps: float, pos: Position) -> float:
-        if not self.config.dv01_map or not pos.leg_sizes:
-            return pnl_bps
+from numba import njit, prange
+
+from backtest.lab import gate_allow_mask, parse_gate
+
+SCALES = ("z", "raw")
+FILLS = ("same", "next")
+REARMS = ("threshold", "half", "mean", "by_exit")
+SIZINGS = ("flat", "exp_return", "exp_sharpe", "bps_per_day")
+# "open": still held at the last bar
+EXIT_REASONS = ("revert", "stop", "time", "half_life", "open", "pnl_stop", "band")
+GATE_MODES = ("full", "causal")  # raw edges from full-sample quantiles, or point-in-time percentiles
+PERIODS = 252
+
+# the config columns walk reads, with the value a missing column means
+CONFIG_DEFAULTS = {
+    "scale": "z", "entry": None, "revert": 0.0, "band": np.nan, "max_hold": None, "stop": 0.0, "hl_mult": 0.0,
+    "pnl_stop": 0.0, "sizing": "flat", "fill": "same", "rearm": "threshold", "gate": -1, "need_half_life": True,
+}
+MODEL_KEYS = ("y", "x", "signal_z", "signal_raw", "alpha", "beta", "center", "sigma", "half_life", "hedge_beta",
+              "port_vol")
+
+# A walk of at least PARALLEL_CONFIGS configs (a bake's grid) runs its configs across
+# WALK_THREADS threads: half the machine's logical cores, so the dashboard, the apps and
+# whatever else is running keep the rest. Smaller walks (a setup re-walked for a page)
+# stay on one thread, where starting threads would cost more than it saves.
+WALK_THREADS = max(1, min(numba.config.NUMBA_NUM_THREADS, (os.cpu_count() or 2) // 2))
+PARALLEL_CONFIGS = 256
+
+# one row per trade
+TRADE_COLS = ("config", "decided", "entry_fill", "exit_fill", "side", "pnl", "reason", "size", "exp_return",
+              "exp_bars", "hedge_ratio", "new_episode")
+# per config: daily-mark sufficient statistics (whole sample and each half), then closed-trade aggregates
+STATS = ("sum", "sumsq", "days", "max_dd", "held", "sum1", "sumsq1", "days1", "sum2", "sumsq2", "days2",
+         "n_trades", "trade_sum", "trade_sumsq", "wins", "gross_win", "gross_loss", "best_trade", "worst_trade",
+         "bars_sum", "hedge_sum", "episodes")
+
+_REVERT, _STOP, _TIME, _HALF_LIFE, _OPEN, _PNL_STOP, _BAND = range(7)
+
+
+# ---- shared arithmetic ------------------------------------------------------
+
+
+@njit(cache=True)
+def horizon(hold, hl_mult, half_life):
+    """(bars to the time stop, its exit reason): max_hold, or sooner at hl_mult x the
+    half-life measured at entry."""
+    bars, reason = hold, _TIME
+    if hl_mult > 0:
+        by_half_life = max(1, int(np.ceil(hl_mult * half_life)))
+        if by_half_life < bars:
+            bars, reason = by_half_life, _HALF_LIFE
+    return bars, reason
+
+
+@njit(cache=True)
+def expect(abs_r0, hl, revert, bars, cost):
+    """(exp_return, exp_bars) the frozen model expects of an entry residual |r0|: OU
+    recovery with half-life hl by the expected exit, net of cost. A revert target is
+    reached after hl log2(1 / (1 - revert)) bars; all the way back (revert 1) never
+    quite arrives, so it counts 90% of the way. Capped at the time stop."""
+    exp_bars = float(bars)
+    exp_return = np.nan
+    if np.isfinite(hl) and hl > 0:
+        if 0.0 < revert < 1.0:
+            exp_bars = min(exp_bars, hl * np.log(1.0 / (1.0 - revert)) / np.log(2.0))
+        elif revert >= 1.0:
+            exp_bars = min(exp_bars, hl * np.log(10.0) / np.log(2.0))
+        exp_bars = max(exp_bars, 1.0)
+        exp_return = abs_r0 * (1.0 - 2.0 ** (-exp_bars / hl)) - cost
+    return exp_return, exp_bars
+
+
+@njit(cache=True)
+def _size(sizing, exp_return, exp_bars, port_vol):
+    if sizing == 1:
+        return exp_return
+    if sizing == 2:
+        return exp_return / (port_vol * np.sqrt(exp_bars)) if port_vol > 0 else np.nan
+    if sizing == 3:
+        return exp_return / exp_bars
+    return 1.0
+
+
+@njit(cache=True)
+def _armed(rule, s, thr, last_sign):
+    """Has the live signal come back far enough to allow the next crossing?"""
+    if rule == 1:
+        return abs(s) <= thr / 2.0
+    if rule == 2:
+        return last_sign == 0.0 or last_sign * s <= 0.0
+    return abs(s) <= thr
+
+
+@njit(cache=True)
+def _rule_after(rearm, reason):
+    """The re-arm rule in force after an exit (0 threshold, 1 half, 2 mean)."""
+    if rearm == 3:  # by_exit
+        return 0 if (reason == _REVERT or reason == _BAND) else 2
+    return rearm
+
+
+# ---- the fast walk -----------------------------------------------------------
+
+
+@njit(cache=True)
+def _walk_one(c, y, x, alpha, beta, center, sigma, half_life, port_vol, hedge_beta, signals, gates, hedge,
+              scale, entry, revert, band, hold, stop, hl_mult, pnl_stop, sizing, fill, rearm, gate, need_hl,
+              cost, split, keep, first, room, trades, stats):
+    """Config ``c``: its STATS row, and -- if kept -- its trades (rows of TRADE_COLS) written
+    from row ``first``, at most ``room`` of them. Returns how many it wrote, or -1 if it
+    had more than ``room``. Touches only its own rows, so configs can run in parallel."""
+    n = y.shape[0]
+    count = first
+    if True:  # the body of one config's walk
+        s = signals[scale[c]]
+        thr = entry[c]
+        f = fill[c]
+        last = n - 1 - f  # the last bar a decision can still be filled on
+        start = 1
+        while start < n and not np.isfinite(s[start]):
+            start += 1
         total = 0.0
-        for instrument, size in pos.leg_sizes.items():
-            dv01 = self.config.dv01_map.dv01.get(instrument, 1.0)
-            total += abs(size) * dv01 * pnl_bps / 100
-        return total
-
-
-# ── metrics & reporting ──────────────────────────────────────────────────────
-#
-# Performance analytics — Sharpe, drawdown, hit rate, PnL decomposition.
-
-
-def compute_metrics(result) -> dict:
-    """Compute comprehensive performance metrics from a BacktestResult."""
-    eq = result.equity_curve
-    trades = result.closed_trades
-
-    if eq.is_empty() or not trades:
-        return _empty_metrics()
-
-    daily_pnl = eq["pnl_bps"].to_numpy().astype(float)
-    cum_pnl = eq["cumulative_pnl"].to_numpy().astype(float)
-
-    total_pnl = float(cum_pnl[-1]) if len(cum_pnl) > 0 else 0.0
-    n_trades = len(trades)
-    winners = [t for t in trades if t.pnl_bps > 0]
-    losers = [t for t in trades if t.pnl_bps <= 0]
-
-    hit_rate = len(winners) / n_trades if n_trades > 0 else 0.0
-    avg_win = float(np.mean([t.pnl_bps for t in winners])) if winners else 0.0
-    avg_loss = float(np.mean([t.pnl_bps for t in losers])) if losers else 0.0
-
-    total_wins = sum(t.pnl_bps for t in winners)
-    total_losses = sum(t.pnl_bps for t in losers)
-    profit_factor = (
-        abs(total_wins / total_losses) if total_losses != 0 else float("inf")
-    )
-
-    # Sharpe (annualized, daily data)
-    daily_std = float(np.std(daily_pnl)) if len(daily_pnl) > 1 else 1.0
-    daily_mean = float(np.mean(daily_pnl))
-    sharpe = (daily_mean / daily_std) * np.sqrt(252) if daily_std > 0 else 0.0
-
-    # Drawdown
-    running_max = np.maximum.accumulate(cum_pnl)
-    drawdown = cum_pnl - running_max
-    max_drawdown = float(drawdown.min())
-
-    # Calmar
-    calmar = total_pnl / abs(max_drawdown) if max_drawdown != 0 else float("inf")
-
-    # Average holding period
-    avg_bars = float(np.mean([t.bars_held for t in trades]))
-
-    return {
-        "total_pnl_bps": total_pnl,
-        "n_trades": n_trades,
-        "hit_rate": hit_rate,
-        "avg_win_bps": avg_win,
-        "avg_loss_bps": avg_loss,
-        "profit_factor": profit_factor,
-        "sharpe": float(sharpe),
-        "max_drawdown_bps": max_drawdown,
-        "calmar": float(calmar),
-        "avg_holding_days": avg_bars,
-        "win_loss_ratio": abs(avg_win / avg_loss) if avg_loss != 0 else float("inf"),
-    }
-
-
-def drawdown_series(equity_curve: pl.DataFrame) -> pl.DataFrame:
-    """Compute rolling drawdown from equity curve."""
-    return equity_curve.with_columns(
-        pl.col("cumulative_pnl").cum_max().alias("peak"),
-    ).with_columns(
-        (pl.col("cumulative_pnl") - pl.col("peak")).alias("drawdown"),
-    )
-
-
-def trade_log(closed_trades: list) -> pl.DataFrame:
-    """Convert closed trades to a polars DataFrame for analysis."""
-    if not closed_trades:
-        return pl.DataFrame()
-
-    records = []
-    for t in closed_trades:
-        record = {
-            "trade_name": t.trade_def.name,
-            "entry_date": t.entry_date,
-            "exit_date": t.exit_date,
-            "direction": "long" if t.direction == 1 else "short",
-            "size": t.size,
-            "entry_level": t.entry_level,
-            "exit_level": t.exit_level,
-            "pnl_bps": t.pnl_bps,
-            "pnl_dollar": t.pnl_dollar,
-            "bars_held": t.bars_held,
-            "exit_reason": t.exit_reason,
-            "entry_signal": t.entry_signal,
-            "exit_signal": t.exit_signal,
-        }
-        for key, value in getattr(t, "entry_extras", {}).items():
-            record[f"entry_{key}"] = value
-        for key, value in getattr(t, "exit_extras", {}).items():
-            record[f"exit_{key}"] = value
-        records.append(record)
-    return pl.DataFrame(records)
-
-
-def _empty_metrics() -> dict:
-    return {
-        k: 0.0
-        for k in [
-            "total_pnl_bps",
-            "n_trades",
-            "hit_rate",
-            "avg_win_bps",
-            "avg_loss_bps",
-            "profit_factor",
-            "sharpe",
-            "max_drawdown_bps",
-            "calmar",
-            "avg_holding_days",
-            "win_loss_ratio",
-        ]
-    }
-
-
-def summary_table(result) -> pl.DataFrame:
-    """One-row summary table."""
-    return pl.DataFrame([result.summary()])
-
-
-def equity_curve_pd(result):
-    """Convert equity curve to pandas for visualization with Viz class."""
-    return result.equity_curve.to_pandas().set_index("ts")
-
-
-def trade_log_pd(result):
-    """Convert trade log to pandas for display."""
-    return trade_log(result.closed_trades).to_pandas()
-
-
-def print_summary(result) -> None:
-    """Pretty-print the backtest summary."""
-    m = result.summary()
-    print("=" * 60)
-    print("  BACKTEST SUMMARY")
-    print("=" * 60)
-    print(f"  Total PnL:         {m['total_pnl_bps']:>10.1f} bps")
-    print(f"  # Trades:          {m['n_trades']:>10d}")
-    print(f"  Hit Rate:          {m['hit_rate']:>10.1%}")
-    print(f"  Avg Win:           {m['avg_win_bps']:>10.1f} bps")
-    print(f"  Avg Loss:          {m['avg_loss_bps']:>10.1f} bps")
-    print(f"  Profit Factor:     {m['profit_factor']:>10.2f}")
-    print(f"  Sharpe:            {m['sharpe']:>10.2f}")
-    print(f"  Max Drawdown:      {m['max_drawdown_bps']:>10.1f} bps")
-    print(f"  Calmar:            {m['calmar']:>10.2f}")
-    print(f"  Avg Holding:       {m['avg_holding_days']:>10.1f} days")
-    print(f"  Win/Loss Ratio:    {m['win_loss_ratio']:>10.2f}")
-    print("=" * 60)
-
-    if result.open_trades:
-        print(f"\n  Open Positions: {len(result.open_trades)}")
-        for pos in result.open_trades:
-            d = "LONG" if pos.direction == 1 else "SHORT"
-            print(f"    {pos.trade_def.name} {d} @ {pos.entry_level:.4f} ({pos.bars_held}d)")
-
-
-# ── spread book ──────────────────────────────────────────────────────────────
-#
-# Cross-sectional spread portfolio — rank signals, allocate risk. The big
-# Sharpe multiplier: instead of trading one spread, score ALL spreads each
-# day by |z| × confidence, allocate to top-K with risk parity (inverse-vol
-# sizing). Diversification is mechanical Sharpe improvement.
-#
-# Usage:
-#     book = SpreadBook(BookConfig(max_spreads=3))
-#     book.add_spread("2s10s",  gen_x="gen_2Y",  gen_y="gen_2s10s",
-#                      otr_short="otr_2Y", otr_long="otr_10Y")
-#     book.add_spread("10s30s", gen_x="gen_10Y", gen_y="gen_1030",
-#                      otr_short="otr_10Y", otr_long="otr_30Y")
-#     result = book.run(data, lookback=50, z_entry=2.0)
-
-
-@dataclass
-class SpreadDef:
-    """One spread to include in the cross-sectional book."""
-
-    name: str
-    gen_x: str       # generic column for regression x (e.g. "gen_10Y")
-    gen_y: str       # generic column for regression y (e.g. "gen_1030")
-    otr_short: str   # OTR column for short leg PnL (e.g. "otr_10Y")
-    otr_long: str    # OTR column for long leg PnL  (e.g. "otr_30Y")
-    dv01_short: float = 1.0
-    dv01_long: float = 1.0
-
-
-@dataclass
-class BookConfig:
-    """Configuration for the cross-sectional spread book."""
-
-    max_spreads: int = 3
-    allocation: str = "risk_parity"   # "risk_parity", "equal_weight", "rank_weighted"
-    total_risk_budget: float = 1.0
-    transaction_cost_bps: float = 0.1
-    slippage_bps: float = 0.0
-
-
-def _compute_spread_signals(
-    data: pl.DataFrame, gen_x: str, gen_y: str,
-    lookback: int, z_entry: float,
-) -> pl.DataFrame:
-    """Compute signal, time_stop, size, confidence, vol for one spread."""
-    from stats import roll_lr, ou_zscore, roll_half_life
-
-    reg = roll_lr(data[gen_x], data[gen_y], lookback=lookback)
-    z = ou_zscore(reg["resid"], lookback=lookback)
-    rhl = roll_half_life(reg["resid"], lookback=lookback)
-
-    # Confidence: R² × beta stability
-    r2 = reg["r2"].fill_null(0).clip(0, 1)
-    beta_cv = (
-        reg["beta"].rolling_std(lookback)
-        / reg["beta"].rolling_mean(lookback).abs()
-    ).fill_null(2.0).clip(0, 2)
-    conf = (r2 * (1 - beta_cv / 2)).clip(0.05, 1.0)
-
-    # Vol scaling
-    resid_vol = reg["resid"].diff().rolling_std(20)
-    vol_target = resid_vol.rolling_mean(252)
-    vol_scale = (vol_target / resid_vol).fill_null(1.0).clip(0.2, 5.0)
-
-    # Continuous sizing
-    raw_size = z.abs() / z_entry
-    size = (raw_size * vol_scale * conf).clip(0.1, 3.0)
-
-    out = pl.DataFrame({
-        "signal": z, "time_stop": rhl, "size": size,
-        "confidence": conf, "vol": resid_vol,
-    })
-
-    # Suppress when not mean-reverting
-    return out.with_columns(
-        pl.when(pl.col("time_stop").is_not_null())
-        .then(pl.col("signal"))
-        .otherwise(None)
-        .alias("signal")
-    )
-
-
-class SpreadBook:
-    """Cross-sectional spread portfolio with ranking and allocation."""
-
-    def __init__(self, config: BookConfig = None):
-        self.config = config or BookConfig()
-        self.spreads: list[SpreadDef] = []
-
-    def add_spread(self, name: str, gen_x: str, gen_y: str,
-                   otr_short: str, otr_long: str,
-                   dv01_short: float = 1.0,
-                   dv01_long: float = 1.0) -> SpreadBook:
-        self.spreads.append(SpreadDef(
-            name=name, gen_x=gen_x, gen_y=gen_y,
-            otr_short=otr_short, otr_long=otr_long,
-            dv01_short=dv01_short, dv01_long=dv01_long,
-        ))
-        return self
-
-    def run(self, data: pl.DataFrame, lookback: int = 50,
-            z_entry: float = 2.0) -> BacktestResult:
-        """Run cross-sectional backtest.
-
-        1. Compute signals for all spreads
-        2. Cross-sectional rank by |z| × confidence
-        3. Allocate top-K with risk parity
-        4. Feed modified signals into Engine
-        """
-        names = [s.name for s in self.spreads]
-        n = data.shape[0]
-
-        # ── 1. Pre-compute raw signals for every spread ───────────────
-        raw_frames: dict[str, pl.DataFrame] = {}
-        for s in self.spreads:
-            raw_frames[s.name] = _compute_spread_signals(
-                data, s.gen_x, s.gen_y, lookback, z_entry,
-            )
-
-        # ── 2. Extract to mutable numpy for cross-sectional ranking ───
-        sig = {nm: raw_frames[nm]["signal"].to_numpy() for nm in names}
-        sz = {nm: raw_frames[nm]["size"].to_numpy() for nm in names}
-        conf = {nm: raw_frames[nm]["confidence"].to_numpy() for nm in names}
-        vol = {nm: raw_frames[nm]["vol"].to_numpy() for nm in names}
-
-        # ── 3. Row-by-row cross-sectional ranking ─────────────────────
-        for i in range(n):
-            # Score each spread: |z| × confidence
-            scores = {}
-            for nm in names:
-                s_val = sig[nm][i]
-                c_val = conf[nm][i]
-                if np.isnan(s_val) or np.isnan(c_val):
-                    continue
-                scores[nm] = abs(s_val) * c_val
-
-            if not scores:
+        total_sq = 0.0
+        s1 = 0.0
+        ss1 = 0.0
+        s2 = 0.0
+        ss2 = 0.0
+        cum = 0.0
+        peak = 0.0
+        dd = 0.0
+        held = 0
+        n_trades = 0
+        t_sum = 0.0
+        t_sq = 0.0
+        wins = 0
+        gross_win = 0.0
+        gross_loss = 0.0
+        best = -np.inf
+        worst = np.inf
+        bars_sum = 0.0
+        hedge_sum = 0.0
+        episodes = 0
+        size_sum = 0.0
+        size_n = 0
+        traded = False
+        armed = False
+        rule = 0  # the first entry needs the signal inside the threshold first
+        last_sign = 0.0
+        last_side = 0.0
+        crossed_mean = True
+        t = start
+        while t <= last:
+            st = s[t]
+            if not np.isfinite(st):
+                t += 1
                 continue
-
-            # Top-K selection
-            ranked = sorted(scores, key=scores.get, reverse=True)
-            top_k = set(ranked[:self.config.max_spreads])
-
-            # Allocate risk budget
-            if self.config.allocation == "risk_parity":
-                vols = {}
-                for nm in top_k:
-                    v = vol[nm][i]
-                    vols[nm] = v if not np.isnan(v) and v > 0 else 1.0
-                inv_vol_sum = sum(1.0 / v for v in vols.values())
-                weights = {nm: (1.0 / vols[nm]) / inv_vol_sum for nm in top_k}
-            elif self.config.allocation == "rank_weighted":
-                total_score = sum(scores[nm] for nm in top_k)
-                weights = {nm: scores[nm] / total_score for nm in top_k} if total_score > 0 else {nm: 1.0 / len(top_k) for nm in top_k}
-            else:  # equal_weight
-                weights = {nm: 1.0 / len(top_k) for nm in top_k}
-
-            budget = self.config.total_risk_budget
-
-            # Apply: scale top-K sizes, suppress non-top-K signals
-            for nm in names:
-                if nm in top_k:
-                    if not np.isnan(sz[nm][i]):
-                        sz[nm][i] *= weights[nm] * budget
+            if last_sign != 0.0 and last_sign * st <= 0.0:
+                crossed_mean = True
+            if not armed:
+                armed = _armed(rule, st, thr, last_sign)
+            if not (armed and abs(st) > thr):
+                t += 1
+                continue
+            armed = False  # the crossing is spent, taken or not
+            rule = 1 if rearm[c] == 1 else 0  # one not taken: the next needs a fresh crossing
+            if not (np.isfinite(alpha[t]) and np.isfinite(beta[t]) and np.isfinite(center[t])
+                    and np.isfinite(hedge_beta[t]) and sigma[t] > 0):
+                t += 1
+                continue
+            if gate[c] >= 0 and not gates[gate[c], t]:
+                t += 1
+                continue
+            if (need_hl[c] or hl_mult[c] > 0) and not (np.isfinite(half_life[t]) and half_life[t] > 0):
+                t += 1
+                continue
+            r0 = y[t] - alpha[t] - beta[t] * x[t] - center[t]
+            sign0 = 1.0 if r0 > 0 else -1.0
+            bars, timeout = horizon(hold[c], hl_mult[c], half_life[t])
+            exp_return, exp_bars = expect(abs(r0), half_life[t], revert[c], bars, cost)
+            size = _size(sizing[c], exp_return, exp_bars, port_vol[t])
+            if not (np.isfinite(size) and size > 0):
+                t += 1
+                continue
+            goal = (1.0 - revert[c]) * abs(r0)
+            band_level = band[c] * (sigma[t] if scale[c] == 0 else 1.0)
+            limit = abs(r0) + stop[c] * sigma[t]
+            side = -sign0
+            ratio = hedge * hedge_beta[t]
+            f0 = t + f
+            new_episode = (not traded) or crossed_mean or side != last_side
+            traded = True
+            size_sum += size
+            size_n += 1
+            last_sign = 1.0 if st > 0 else -1.0
+            last_side = side
+            crossed_mean = False
+            exit_u = -1
+            reason = timeout
+            for k in range(1, bars + 1):
+                u = t + k
+                if u > last:
+                    break
+                if np.isfinite(s[u]) and last_sign * s[u] <= 0.0:
+                    crossed_mean = True
+                frozen = sign0 * (y[u] - alpha[t] - beta[t] * x[u] - center[t])
+                if revert[c] > 0 and frozen <= goal:
+                    exit_u, reason = u, _REVERT
+                    break
+                if np.isfinite(band_level) and frozen <= band_level:
+                    exit_u, reason = u, _BAND
+                    break
+                if stop[c] > 0 and frozen >= limit:
+                    exit_u, reason = u, _STOP
+                    break
+                if pnl_stop[c] > 0 and side * ((y[u] - y[f0]) - ratio * (x[u] - x[f0])) <= -pnl_stop[c]:
+                    exit_u, reason = u, _PNL_STOP
+                    break
+                if k == bars:
+                    exit_u, reason = u, timeout
+            still_open = exit_u < 0
+            if still_open:
+                exit_u, reason = last, _OPEN
+            f1 = exit_u + f
+            pnl = 0.0
+            for d in range(f0 + 1, f1 + 1):
+                mark = size * side * ((y[d] - y[d - 1]) - ratio * (x[d] - x[d - 1]))
+                if still_open:
+                    pnl += mark
+                    continue
+                if d == f1:
+                    mark -= size * cost
+                pnl += mark
+                total += mark
+                total_sq += mark * mark
+                if d < split:
+                    s1 += mark
+                    ss1 += mark * mark
                 else:
-                    sig[nm][i] = np.nan  # engine skips NaN signals
+                    s2 += mark
+                    ss2 += mark * mark
+                cum += mark
+                if cum > peak:
+                    peak = cum
+                if cum - peak < dd:
+                    dd = cum - peak
+                held += 1
+            if not still_open:
+                n_trades += 1
+                t_sum += pnl
+                t_sq += pnl * pnl
+                if pnl > 0:
+                    wins += 1
+                    gross_win += pnl
+                elif pnl < 0:
+                    gross_loss -= pnl
+                best = max(best, pnl)
+                worst = min(worst, pnl)
+                bars_sum += f1 - f0
+                hedge_sum += ratio
+                if new_episode:
+                    episodes += 1
+            if keep[c]:
+                if count - first >= room:
+                    return -1  # more trades than the room set aside for it: walk() raises
+                trades[count, 0] = c
+                trades[count, 1] = t
+                trades[count, 2] = f0
+                trades[count, 3] = f1
+                trades[count, 4] = side
+                trades[count, 5] = pnl
+                trades[count, 6] = reason
+                trades[count, 7] = size
+                trades[count, 8] = exp_return
+                trades[count, 9] = exp_bars
+                trades[count, 10] = ratio
+                trades[count, 11] = 1.0 if new_episode else 0.0
+                count += 1
+            if still_open:
+                break
+            # re-arming reads the live signal from the exit's decision bar on
+            rule = _rule_after(rearm[c], reason)
+            t = exit_u
+        # sizes average 1 over the config's trades: Sharpe is unchanged, P&L reads like flat sizing
+        norm = size_sum / size_n if size_n else 1.0
+        stats[c, 0] = total / norm
+        stats[c, 1] = total_sq / (norm * norm)
+        days = max(n - 1 - start, 0)
+        days1 = min(max(split - start - 1, 0), days)
+        stats[c, 2] = days
+        stats[c, 3] = dd / norm
+        stats[c, 4] = held
+        stats[c, 5] = s1 / norm
+        stats[c, 6] = ss1 / (norm * norm)
+        stats[c, 7] = days1
+        stats[c, 8] = s2 / norm
+        stats[c, 9] = ss2 / (norm * norm)
+        stats[c, 10] = days - days1
+        stats[c, 11] = n_trades
+        stats[c, 12] = t_sum / norm
+        stats[c, 13] = t_sq / (norm * norm)
+        stats[c, 14] = wins
+        stats[c, 15] = gross_win / norm
+        stats[c, 16] = gross_loss / norm
+        stats[c, 17] = best / norm if n_trades else np.nan
+        stats[c, 18] = worst / norm if n_trades else np.nan
+        stats[c, 19] = bars_sum
+        stats[c, 20] = hedge_sum
+        stats[c, 21] = episodes
+        if keep[c] and count > first:
+            trades[first:count, 5] /= norm
+            trades[first:count, 7] /= norm
+    return count - first
 
-        # ── 4. Rebuild modified signal frames ─────────────────────────
-        modified_frames: dict[str, pl.DataFrame] = {}
-        for nm in names:
-            rf = raw_frames[nm]
-            modified_frames[nm] = rf.with_columns(
-                pl.Series("signal", sig[nm]),
-                pl.Series("size", sz[nm]),
-            )
 
-        # ── 5. Build Engine with wrapper pipelines ────────────────────
-        dv01_map = {}
-        for s in self.spreads:
-            dv01_map[s.otr_short] = s.dv01_short
-            dv01_map[s.otr_long] = s.dv01_long
+@njit(cache=True)
+def _walk_serial(y, x, alpha, beta, center, sigma, half_life, port_vol, hedge_beta, signals, gates, hedge,
+                 scale, entry, revert, band, hold, stop, hl_mult, pnl_stop, sizing, fill, rearm, gate, need_hl,
+                 cost, split, keep, firsts, rooms, written, trades, stats):
+    """Every config one after another (small walks: no threads to start)."""
+    for c in range(scale.shape[0]):
+        written[c] = _walk_one(c, y, x, alpha, beta, center, sigma, half_life, port_vol, hedge_beta, signals,
+                               gates, hedge, scale, entry, revert, band, hold, stop, hl_mult, pnl_stop, sizing,
+                               fill, rearm, gate, need_hl, cost, split, keep, firsts[c], rooms[c], trades, stats)
 
-        engine = Engine(BacktestConfig(
-            transaction_cost_bps=self.config.transaction_cost_bps,
-            slippage_bps=self.config.slippage_bps,
-            max_total_positions=self.config.max_spreads * 2,
-            dv01_map=DV01Map(dv01=dv01_map) if dv01_map else None,
-        ))
 
-        # Create pipelines whose compute_fn returns the pre-computed frame.
-        # Pipeline.run() will extract "signal", run generate_signals(), then
-        # re-attach extras (time_stop, size, etc.). This is correct because
-        # we modified the signal column to suppress non-top-K entries.
-        for s in self.spreads:
-            frame = modified_frames[s.name]
+@njit(cache=True, parallel=True)
+def _walk_parallel(y, x, alpha, beta, center, sigma, half_life, port_vol, hedge_beta, signals, gates, hedge,
+                   scale, entry, revert, band, hold, stop, hl_mult, pnl_stop, sizing, fill, rearm, gate, need_hl,
+                   cost, split, keep, firsts, rooms, written, trades, stats):
+    """Every config across WALK_THREADS threads: each writes only its own rows."""
+    for c in prange(scale.shape[0]):
+        written[c] = _walk_one(c, y, x, alpha, beta, center, sigma, half_life, port_vol, hedge_beta, signals,
+                               gates, hedge, scale, entry, revert, band, hold, stop, hl_mult, pnl_stop, sizing,
+                               fill, rearm, gate, need_hl, cost, split, keep, firsts[c], rooms[c], trades, stats)
 
-            def _make_fn(f):
-                def fn(d):
-                    return f
-                return fn
 
-            trade_def = TradeDef.spread(s.name, s.otr_short, s.otr_long)
-            pipeline = SignalPipeline(
-                name=s.name,
-                trade_def=trade_def,
-                compute_fn=_make_fn(frame),
-                config=SignalConfig(
-                    entry_long=-z_entry,
-                    entry_short=z_entry,
-                    exit_long=None,
-                    exit_short=None,
-                    time_stop_bars=None,
-                    max_positions=1,
-                ),
-            )
-            engine.add_signal(pipeline)
+# ---- configs and the fast path ----------------------------------------------
 
-        return engine.run(data)
+
+def configs_frame(configs: pl.DataFrame | dict | list[dict]) -> pl.DataFrame:
+    """Configs with every CONFIG_DEFAULTS column, missing ones at their defaults
+    (entry and max_hold have none and are required)."""
+    frame = configs if isinstance(configs, pl.DataFrame) else pl.DataFrame(
+        configs if isinstance(configs, list) else [configs])
+    for col, default in CONFIG_DEFAULTS.items():
+        if col not in frame.columns:
+            if default is None:
+                raise ValueError(f"configs need a {col!r} column")
+            frame = frame.with_columns(pl.lit(default).alias(col))
+    for col, allowed in (("scale", SCALES), ("fill", FILLS), ("rearm", REARMS), ("sizing", SIZINGS)):
+        unknown = set(frame[col].unique().to_list()) - set(allowed)
+        if unknown:
+            raise ValueError(f"unknown {col} {sorted(unknown)}; expected some of {allowed}")
+    return frame
+
+
+def _crossing_runs(s: np.ndarray, thr: float) -> int:
+    """How many separate runs the signal spends beyond +/-thr: at most one entry per run,
+    since re-arming needs the signal back inside (or through its mean: a new run)."""
+    side = np.where(np.isfinite(s), np.sign(s) * (np.abs(s) > thr), 0)
+    return int(((side != 0) & (side != np.r_[0, side[:-1]])).sum())
+
+
+def walk(model: dict, configs: pl.DataFrame, hedge: float = 1.0, cost: float = 0.0, split: int | None = None,
+         gates: np.ndarray | None = None, keep=True) -> tuple[np.ndarray, np.ndarray]:
+    """Walk every config through one model: (trades, stats), rows of TRADE_COLS and
+    STATS. ``gates`` is a (n_gates, n) bool array the configs' ``gate`` column indexes;
+    ``keep`` (a bool, or one per config) says whose trades to return -- every config's
+    stats come back either way."""
+    configs = configs_frame(configs)
+    arr = {k: np.ascontiguousarray(model[k], dtype=np.float64) for k in MODEL_KEYS}
+    n = len(arr["y"])
+    signals = np.ascontiguousarray(np.vstack([arr["signal_z"], arr["signal_raw"]]))
+    # labels to their indices, vectorised: a bake's grid is millions of configs
+    index = lambda col, names: configs[col].replace_strict({v: i for i, v in enumerate(names)},  # noqa: E731
+                                                            return_dtype=pl.Int64).to_numpy()
+    scale = index("scale", SCALES)
+    entry = configs["entry"].to_numpy().astype(np.float64)
+    keep = np.full(len(configs), bool(keep)) if np.isscalar(keep) else np.asarray(keep, dtype=bool)
+    # room for every kept config's trades: at most one per run beyond its threshold, plus one;
+    # each config gets its own block of rows (firsts, rooms) so configs can walk in parallel
+    rooms = np.zeros(len(configs), dtype=np.int64)
+    if keep.any():
+        pairs, which = np.unique(np.c_[scale, entry], axis=0, return_inverse=True)
+        runs = np.array([_crossing_runs(signals[int(sc)], e) for sc, e in pairs], dtype=np.int64)
+        rooms = np.where(keep, runs[which.ravel()] + 1, 0).astype(np.int64)
+    firsts = np.r_[0, np.cumsum(rooms)[:-1]].astype(np.int64)
+    written = np.zeros(len(configs), dtype=np.int64)
+    trades = np.empty((int(rooms.sum()), len(TRADE_COLS)))
+    stats = np.zeros((len(configs), len(STATS)))
+    gates = np.zeros((1, n), dtype=np.bool_) if gates is None else np.ascontiguousarray(gates, dtype=np.bool_)
+    args = (arr["y"], arr["x"], arr["alpha"], arr["beta"], arr["center"], arr["sigma"], arr["half_life"],
+            arr["port_vol"], arr["hedge_beta"], signals, gates, float(hedge), scale, entry,
+            configs["revert"].to_numpy().astype(np.float64), configs["band"].to_numpy().astype(np.float64),
+            configs["max_hold"].to_numpy().astype(np.int64), configs["stop"].to_numpy().astype(np.float64),
+            configs["hl_mult"].to_numpy().astype(np.float64), configs["pnl_stop"].to_numpy().astype(np.float64),
+            index("sizing", SIZINGS), index("fill", FILLS), index("rearm", REARMS),
+            configs["gate"].to_numpy().astype(np.int64), configs["need_half_life"].to_numpy().astype(np.bool_),
+            float(cost), int(n if split is None else split), keep, firsts, rooms, written, trades, stats)
+    if len(configs) >= PARALLEL_CONFIGS and WALK_THREADS > 1:
+        numba.set_num_threads(WALK_THREADS)
+        _walk_parallel(*args)
+    else:
+        _walk_serial(*args)
+    if (written < 0).any():
+        raise RuntimeError("a config produced more trades than the walk set aside room for")
+    # each config's trades, in config order: the same rows, in the same order, as walking them one by one
+    used = np.repeat(firsts, written) + (np.arange(written.sum()) - np.repeat(np.cumsum(written) - written, written))
+    return trades[used], stats
+
+
+# ---- the exact walk: the same rules, bar by bar ------------------------------
+
+
+def walk_exact(model: dict, config: dict, hedge: float = 1.0, cost: float = 0.0,
+               gate: np.ndarray | None = None) -> tuple[list[dict], np.ndarray]:
+    """One config walked one bar at a time in plain Python: (trades, daily marks).
+
+    The sense check for ``walk``. It shares only the expectation arithmetic with the
+    fast path -- it is a bar-by-bar state machine where ``walk`` jumps trade to
+    trade -- so the two agreeing trade for trade is evidence both implement the
+    module's rules. Trades are dicts with TRADE_COLS keys (``reason`` by name);
+    marks are the closed trades' daily P&L, which every statistic is built from."""
+    cfg = configs_frame(config).row(0, named=True)
+    m = {k: np.asarray(model[k], dtype=float) for k in MODEL_KEYS}
+    y, x, n = m["y"], m["x"], len(m["y"])
+    s = m["signal_z"] if cfg["scale"] == "z" else m["signal_raw"]
+    thr, f = cfg["entry"], FILLS.index(cfg["fill"])
+    last = n - 1 - f
+    rearm = REARMS.index(cfg["rearm"])
+    allow = np.ones(n, dtype=bool) if gate is None else np.asarray(gate, dtype=bool)
+
+    trades, pos = [], None  # pos: the trade being held, until its exit is decided
+    armed, rule = False, 0  # rule: 0 back inside entry, 1 inside half of it, 2 through the mean
+    last_sign, last_side, crossed_mean = 0.0, 0.0, True
+    first = 1
+    while first < n and not np.isfinite(s[first]):
+        first += 1
+    for t in range(first, last + 1):
+        st = s[t]
+        live = np.isfinite(st)
+        if live and last_sign != 0.0 and last_sign * st <= 0.0:
+            crossed_mean = True
+
+        if pos is not None:  # holding: is today the exit?
+            frozen = pos["sign0"] * (y[t] - pos["alpha"] - pos["beta"] * x[t] - pos["center"])
+            f0 = pos["entry_fill"]
+            pnl_now = pos["side"] * ((y[t] - y[f0]) - pos["hedge_ratio"] * (x[t] - x[f0]))
+            reason = None
+            if cfg["revert"] > 0 and frozen <= pos["goal"]:
+                reason = "revert"
+            elif np.isfinite(pos["band"]) and frozen <= pos["band"]:
+                reason = "band"
+            elif cfg["stop"] > 0 and frozen >= pos["limit"]:
+                reason = "stop"
+            elif cfg["pnl_stop"] > 0 and pnl_now <= -cfg["pnl_stop"]:
+                reason = "pnl_stop"
+            elif t - pos["decided"] == pos["bars"]:
+                reason = pos["timeout"]
+            if reason is None:
+                continue
+            pos.update(exit_fill=t + f, reason=reason)
+            trades.append(pos)
+            pos = None
+            rule = _rule_after(rearm, EXIT_REASONS.index(reason))
+            armed = False
+
+        if not live:
+            continue
+        if not armed:
+            armed = bool(_armed(rule, st, thr, last_sign))
+        if not (armed and abs(st) > thr):
+            continue
+        armed, rule = False, (1 if rearm == 1 else 0)
+        if not (np.isfinite(m["alpha"][t]) and np.isfinite(m["beta"][t]) and np.isfinite(m["center"][t])
+                and np.isfinite(m["hedge_beta"][t]) and m["sigma"][t] > 0):
+            continue
+        if cfg["gate"] >= 0 and not allow[t]:
+            continue
+        hl = m["half_life"][t]
+        if (cfg["need_half_life"] or cfg["hl_mult"] > 0) and not (np.isfinite(hl) and hl > 0):
+            continue
+        r0 = y[t] - m["alpha"][t] - m["beta"][t] * x[t] - m["center"][t]
+        bars, timeout = horizon(int(cfg["max_hold"]), float(cfg["hl_mult"]), hl)
+        exp_return, exp_bars = expect(abs(r0), hl, float(cfg["revert"]), bars, float(cost))
+        size = _size(SIZINGS.index(cfg["sizing"]), exp_return, exp_bars, m["port_vol"][t])
+        if not (np.isfinite(size) and size > 0):
+            continue
+        sign0 = 1.0 if r0 > 0 else -1.0
+        side = -sign0
+        new_episode = not trades or crossed_mean or side != last_side
+        last_sign, last_side, crossed_mean = (1.0 if st > 0 else -1.0), side, False
+        band = cfg["band"] * (m["sigma"][t] if cfg["scale"] == "z" else 1.0)
+        pos = dict(config=0, decided=t, entry_fill=t + f, side=side, size=size, exp_return=exp_return,
+                   exp_bars=exp_bars, hedge_ratio=hedge * m["hedge_beta"][t], new_episode=new_episode,
+                   alpha=m["alpha"][t], beta=m["beta"][t], center=m["center"][t], sign0=sign0,
+                   goal=(1.0 - cfg["revert"]) * abs(r0), limit=abs(r0) + cfg["stop"] * m["sigma"][t],
+                   band=band, bars=bars, timeout=EXIT_REASONS[timeout])
+    if pos is not None:  # still held: marked to the last bar, kept out of the statistics
+        pos.update(exit_fill=n - 1, reason="open")
+        trades.append(pos)
+
+    dy, dx = np.diff(y, prepend=np.nan), np.diff(x, prepend=np.nan)
+    marks = np.zeros(n)
+    for tr in trades:
+        span = np.arange(tr["entry_fill"] + 1, tr["exit_fill"] + 1)
+        daily = tr["size"] * tr["side"] * (dy[span] - tr["hedge_ratio"] * dx[span])
+        if tr["reason"] != "open":
+            daily[-1] -= tr["size"] * cost
+            marks[span] += daily
+        tr["pnl"] = float(daily.sum())
+    norm = float(np.mean([tr["size"] for tr in trades])) if trades else 1.0
+    marks /= norm
+    out = []
+    for tr in trades:
+        tr["pnl"] /= norm
+        tr["size"] /= norm
+        out.append({k: v for k, v in tr.items() if k in TRADE_COLS})
+    return out, marks
+
+
+def exact_stats(trades: list[dict], marks: np.ndarray, start: int, split: int | None = None) -> dict:
+    """STATS from walk_exact's output, computed the plain way: what ``walk`` reports
+    for the same config. ``start`` is the first bar the signal exists."""
+    n = len(marks)
+    split = n if split is None else split
+    scored = marks[start + 1:]
+    first = marks[start + 1:max(split, start + 1)]
+    second = marks[max(split, start + 1):]
+    cum = np.cumsum(scored)
+    closed = [t for t in trades if t["reason"] != "open"]
+    pnl = np.array([t["pnl"] for t in closed])
+    days = max(n - 1 - start, 0)
+    days1 = min(max(split - start - 1, 0), days)
+    held = sum(t["exit_fill"] - t["entry_fill"] for t in closed)
+    return dict(
+        sum=scored.sum(), sumsq=(scored ** 2).sum(), days=days,
+        max_dd=float(min(0.0, (cum - np.maximum(np.maximum.accumulate(cum), 0.0)).min())) if len(cum) else 0.0,
+        held=held, sum1=first.sum(), sumsq1=(first ** 2).sum(), days1=days1,
+        sum2=second.sum(), sumsq2=(second ** 2).sum(), days2=days - days1,
+        n_trades=len(closed), trade_sum=pnl.sum(), trade_sumsq=(pnl ** 2).sum(), wins=int((pnl > 0).sum()),
+        gross_win=pnl[pnl > 0].sum(), gross_loss=-pnl[pnl < 0].sum(),
+        best_trade=pnl.max() if len(pnl) else np.nan, worst_trade=pnl.min() if len(pnl) else np.nan,
+        bars_sum=held, hedge_sum=sum(t["hedge_ratio"] for t in closed),
+        episodes=sum(bool(t["new_episode"]) for t in closed),
+    )
+
+
+# ---- scoring ----------------------------------------------------------------
+
+
+def _sharpe(total: pl.Expr, total_sq: pl.Expr, days: pl.Expr) -> pl.Expr:
+    """Annualised Sharpe of daily marks from their sum, sum of squares and count."""
+    mean = total / days
+    var = total_sq / days - mean ** 2
+    return pl.when((days > 1) & (var > 1e-12)).then(mean / var.sqrt() * np.sqrt(PERIODS)).otherwise(None)
+
+
+def score(stats: np.ndarray | pl.DataFrame) -> pl.DataFrame:
+    """Each config's strategy statistics from walk's STATS, one row per config:
+
+      sharpe, sharpe_h1/h2, worst_half_sharpe   daily mark-to-market, flat days count as zero
+      total_pnl, pnl_per_year, max_drawdown, calmar, time_in_market
+      n_trades, trades_per_year, n_episodes, hit_rate, avg_trade, best/worst_trade,
+      best_trade_share, trade_t, profit_factor, avg_bars, avg_hedge_ratio
+
+    Closed trades only. (A median needs the trades themselves, so it isn't here.)"""
+    s = stats if isinstance(stats, pl.DataFrame) else pl.DataFrame(stats, schema=list(STATS), orient="row")
+    n = pl.col("n_trades")
+    years = pl.col("days") / PERIODS
+    mean = pl.col("trade_sum") / n
+    var = (pl.col("trade_sumsq") - n * mean ** 2) / (n - 1)
+    return s.select(
+        _sharpe(pl.col("sum"), pl.col("sumsq"), pl.col("days")).alias("sharpe"),
+        _sharpe(pl.col("sum1"), pl.col("sumsq1"), pl.col("days1")).alias("sharpe_h1"),
+        _sharpe(pl.col("sum2"), pl.col("sumsq2"), pl.col("days2")).alias("sharpe_h2"),
+        pl.col("sum").alias("total_pnl"),
+        (pl.col("sum") / years).alias("pnl_per_year"),
+        pl.col("max_dd").alias("max_drawdown"),
+        n.cast(pl.Int64).alias("n_trades"),
+        (n / years).alias("trades_per_year"),
+        pl.col("episodes").cast(pl.Int64).alias("n_episodes"),
+        (pl.col("wins") / n).alias("hit_rate"),
+        mean.alias("avg_trade"),
+        pl.col("best_trade"), pl.col("worst_trade"),
+        (pl.col("best_trade") / pl.col("sum")).alias("best_trade_share"),
+        pl.when((n > 1) & (var > 0)).then(mean / var.sqrt() * n.sqrt()).otherwise(None).alias("trade_t"),
+        # no losing trade leaves it undefined, not infinite
+        pl.when(pl.col("gross_loss") > 0).then(pl.col("gross_win") / pl.col("gross_loss")).otherwise(None)
+        .alias("profit_factor"),
+        (pl.col("bars_sum") / n).alias("avg_bars"),
+        (pl.col("hedge_sum") / n).alias("avg_hedge_ratio"),
+        (pl.col("held") / pl.col("days")).alias("time_in_market"),
+    ).with_columns(
+        # null unless both halves have a Sharpe: one half alone is not consistency
+        pl.when(pl.col("sharpe_h1").is_not_null() & pl.col("sharpe_h2").is_not_null())
+        .then(pl.min_horizontal("sharpe_h1", "sharpe_h2")).otherwise(None).alias("worst_half_sharpe"),
+        pl.when(pl.col("max_drawdown") < 0).then(pl.col("pnl_per_year") / -pl.col("max_drawdown"))
+        .otherwise(None).alias("calmar"),
+    )
+
+
+# ---- gates ------------------------------------------------------------------
+
+
+def condition_arrays(beta, r2, resid, lookback: int) -> dict[str, np.ndarray]:
+    """The gate conditions of one fit (backtest.lab.CONDITION_NAMES), each aligned to its
+    inputs: the fit's quality and stability (r2, beta_cv, beta), their 20-bar vol and
+    10-bar momentum, and the residual's AR(1) state, half-life, vol and momentum. Every
+    strategy's gates read these, whatever model produced the fit."""
+    from stats.diagnostics import beta_cv
+    from stats.ou import roll_ou_features
+
+    beta, r2, resid = (pl.Series(v, dtype=pl.Float64) if not isinstance(v, pl.Series) else v.cast(pl.Float64)
+                       for v in (beta, r2, resid))
+    beta, r2, resid = (v.fill_nan(None) for v in (beta, r2, resid))
+    ou = roll_ou_features(resid, lookback=lookback)
+    conds = {
+        "r2": r2,
+        "beta_cv": beta_cv(beta, lookback=lookback),
+        "beta": beta,
+        "beta_vol20": beta.diff().rolling_std(20),
+        "beta_mom10": beta.diff(10),
+        "r2_vol20": r2.diff().rolling_std(20),
+        "r2_mom10": r2.diff(10),
+        "resid_phi": ou["ou_rho"] - 1.0,
+        "resid_half_life": ou["half_life"],
+        "resid_vol20": resid.diff().rolling_std(20),
+        "resid_mom10": resid.diff(10),
+    }
+    return {k: pl.Series(v).cast(pl.Float64).to_numpy().astype(float) for k, v in conds.items()}
+
+
+def gate_edges(values: np.ndarray, spec) -> tuple[str, tuple[float, ...]]:
+    """A gate's bucket as raw values of its condition: (kind, edges), the bucket's
+    quantiles over the whole sample. Frozen with a promoted signal, so live trading
+    applies the same raw cut the backtest did."""
+    _, kind, qs = parse_gate(spec)
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    return kind, tuple(float(np.quantile(v, q)) for q in qs)
+
+
+def mask_from_edges(values: np.ndarray, kind: str, edges: tuple[float, ...]) -> np.ndarray:
+    """Entry-allow mask of a raw bucket; a missing value is never allowed."""
+    v = np.asarray(values, dtype=float)
+    finite = np.isfinite(v)
+    with np.errstate(invalid="ignore"):
+        if kind == "below":
+            return finite & (v <= edges[0])
+        if kind == "above":
+            return finite & (v >= edges[0])
+        if kind == "between":
+            return finite & (v > edges[0]) & (v < edges[1])
+        return finite & ((v <= edges[0]) | (v >= edges[1]))
+
+
+def gate_mask(values: np.ndarray, spec, mode: str = "full", min_history: int = 252,
+              window: int | None = None) -> np.ndarray:
+    """Entry-allow mask of one gate (a backtest.lab gate spec, e.g. ("r2", "high_75")):
+
+      full     raw edges at the whole sample's quantiles (gate_edges): one fixed cut
+               for every bar, placed with hindsight
+      causal   each bar ranked only against the history up to it (point in time, no
+               look-ahead): at least ``min_history`` bars, over a trailing ``window``
+               if given
+    """
+    if mode == "full":
+        return mask_from_edges(values, *gate_edges(values, spec))
+    if mode == "causal":
+        return gate_allow_mask(np.asarray(values, dtype=float), spec, min_history=min_history, window=window)
+    raise ValueError(f"unknown gate mode {mode!r}; expected one of {GATE_MODES}")

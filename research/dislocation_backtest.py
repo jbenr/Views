@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable
 import numpy as np
 import polars as pl
 
-from backtest.engine import (
+from backtest.legacy import (
     BacktestConfig,
     BooleanSignalPipeline,
     Engine,
