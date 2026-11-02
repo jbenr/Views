@@ -1075,14 +1075,28 @@ def _confidence_by_component(days, daily, trades: pl.DataFrame) -> pl.DataFrame:
     return pl.DataFrame(rows, infer_schema_length=None)
 
 
-def _confidence_now(conf: dict) -> pl.DataFrame:
+def _tercile_trades(trades: pl.DataFrame, c: dict) -> pl.DataFrame:
+    """The closed trades in today's tercile of one confidence feature (component ``c``),
+    on the same cuts the score used."""
+    x = pl.col(c["col"])
+    usable = trades.filter(x.is_not_null() & x.is_finite())
+    lo, hi = c["cut_lo"], c["cut_hi"]
+    return usable.filter({"low": x <= lo, "high": x > hi}.get(c["bucket"], (x > lo) & (x <= hi)))
+
+
+def _confidence_now(conf: dict, trades: pl.DataFrame, days, daily) -> pl.DataFrame:
     """Today's confidence, built up: per feature, where today's value falls among the
-    closed trades and what that tercile made; then a bottom 'score' row -- the mean
-    edge, the cuts that tier it (in the low / high columns), the tier it lands in (in
-    the tercile column) and the closed trades it is scored from."""
+    closed trades and what that tercile made -- its average trade, which the score is
+    built from, and for reference its Sharpe beside all trades' (neither Sharpe enters
+    the score); then a bottom 'score' row -- the mean edge, the cuts that tier it (in
+    the low / high columns), the tier it lands in (in the tercile column) and the
+    closed trades it is scored from."""
+    total = float(trades["pnl_bps"].sum())
+    all_sharpe = _performance(days, daily, trades, total)["sharpe"]
     rows = [dict(feature=c["feature"], now=c["value"], low_to=c["cut_lo"], high_from=c["cut_hi"], tercile=c["bucket"],
-                 trades=c["n"], tercile_avg=c["avg"], all_avg=c["past_avg"], spread=c["spread"], weight=c["weight"],
-                 edge=c["edge"])
+                 trades=c["n"], tercile_avg=c["avg"], all_avg=c["past_avg"],
+                 tercile_sharpe=_performance(days, daily, _tercile_trades(trades, c), total)["sharpe"],
+                 all_sharpe=all_sharpe, spread=c["spread"], weight=c["weight"], edge=c["edge"])
             for c in conf["components"]]
     rows.append(dict(feature="score", low_to=conf["tier_lo"], high_from=conf["tier_hi"], tercile=conf["label"],
                      trades=conf["n_past"], edge=conf["score"]))
@@ -1149,7 +1163,7 @@ def _confidence_section(equity: pl.DataFrame, trades: pl.DataFrame, conf: dict) 
                                       headers=PERF_HEADERS, cell_style=perf_style),
                                 _subtitle("terciles cut on the trades closed before each entry")]))
     if conf.get("components"):
-        now = _confidence_now(conf)
+        now = _confidence_now(conf, trades, days, daily)
         edge_scale = float(now["edge"].abs().max() or 1.0)
 
         def now_style(col, value, row):
@@ -1163,29 +1177,40 @@ def _confidence_section(equity: pl.DataFrame, trades: pl.DataFrame, conf: dict) 
                 return {**(_diverging(value, edge_scale) or {}), **line}
             if col == "tercile_avg" and not score_row:
                 return _diverging(value - row["all_avg"], row["spread"])
+            if col == "tercile_sharpe" and not score_row and isinstance(value, float) and row["all_sharpe"]:
+                return _diverging(value - row["all_sharpe"], abs(row["all_sharpe"]))  # green: beats all trades
             return line or None
 
         blocks.insert(0, html.Div([
             table(_shown(now), title="today's score", float_fmt=",.2f", cell_style=now_style,
-                  headers={"low_to": "low ≤", "high_from": "high >", "tercile_avg": "tercile avg", "all_avg": "all avg"}),
+                  headers={"low_to": "low ≤", "high_from": "high >", "tercile_avg": "tercile avg", "all_avg": "all avg",
+                           "tercile_sharpe": "tercile sharpe", "all_sharpe": "all sharpe"}),
             _subtitle(f"edge = weight × (tercile avg − all avg) ÷ spread · weight = trades ÷ (trades + {CONF_SHRINK})"
-                      f" · score = mean edge, tiered by {conf['tier_from']}")]))
+                      f" · score = mean edge, tiered by {conf['tier_from']} · sharpes shown, not scored")]))
     return _section("CONFIDENCE", blocks)
 
 
-def _regime_rule(name: str, p) -> str:
-    """One line: what a research regime reads and where its state thresholds sit (from
-    research.regimes.RegimeParams ``p``, so they match the research app)."""
+def _regime_rule(name: str, p) -> tuple[str, str, dict]:
+    """A research regime's short name, what it measures in a few words, and where each
+    of its states sits on that measure (from research.regimes.RegimeParams ``p``, so
+    the ranges match the research app)."""
     years = f"{p.vol_rank_window / 252:g}y"
-    pct = f"low < {p.vol_low * 100:.0f}th pct, high ≥ {p.vol_high * 100:.0f}th"
+    lo, hi = f"{p.vol_low * 100:.0f}", f"{p.vol_high * 100:.0f}"
+    vol = {"low vol": f"< {lo}th pct", "normal vol": f"{lo}–{hi}th", "high vol": f"≥ {hi}th pct"}
+    cut = p.cycle_threshold_bp
+    infl_lo, infl_hi = p.inflation_low_bp / 100, p.inflation_high_bp / 100
     return {
-        "policy": f"Fed moves, last 6m + priced next 6m (FF futures): cutting < −{p.cycle_threshold_bp:g}bp, "
-                  f"hiking ≥ +{p.cycle_threshold_bp:g}bp",
-        "vol": f"10y realized vol ({p.vol_window}d), ranked vs its last {years}: {pct}",
-        "implied": f"1m10y swaption normal vol, ranked vs its last {years}: {pct}",
-        "oil": f"{p.oil_window}d corr of 10y and oil daily changes: none < {p.oil_low:g}, with oil ≥ {p.oil_high:g}",
-        "inflation": f"5y inflation swap: low < {p.inflation_low_bp / 100:.2f}%, high ≥ {p.inflation_high_bp / 100:.2f}%",
-    }.get(name, "")
+        "policy": ("Policy cycle", "fed: 6m done + 6m priced",
+                   {"cutting": f"< −{cut:g}bp", "on hold": f"−{cut:g} to +{cut:g}bp", "hiking": f"≥ +{cut:g}bp"}),
+        "vol": ("Rate vol", f"10y {p.vol_window}d realized, {years} pct", vol),
+        "implied": ("Implied vol", f"1m10y normal vol, {years} pct", vol),
+        "oil": ("Oil sensitivity", f"{p.oil_window}d corr, 10y vs oil",
+                {"none / inverse": f"< {p.oil_low:g}", "weak": f"{p.oil_low:g} to {p.oil_high:g}",
+                 "trades with oil": f"≥ {p.oil_high:g}"}),
+        "inflation": ("Inflation", "5y inflation swap",
+                      {"low inflation": f"< {infl_lo:.2f}%", "anchored": f"{infl_lo:.2f}–{infl_hi:.2f}%",
+                       "high inflation": f"≥ {infl_hi:.2f}%"}),
+    }[name]
 
 
 def _regime_live(name: str, today: dict, col: str) -> str:
@@ -1205,9 +1230,10 @@ def _by_regime(days, daily, trades: pl.DataFrame, states: pl.DataFrame) -> pl.Da
     so one that starts late (implied vol, 2022) is judged only on the trades and days
     it covers: an 'all' row first (every trade entered in its span), then its states,
     each Sharpe over the span's days and each share of P&L of the span's total. The
-    regime's first row carries when its data starts, what it reads with its
-    thresholds, and its value today; today's state is marked (a row even if no
-    trade entered in it)."""
+    regime column names it on the first row and says what it measures on the second;
+    the first row also carries when its data starts and its value today; each state
+    row says where that state sits on the measure (range). Today's state is marked
+    (a row even if no trade entered in it)."""
     from research.regimes import REGIMES, STATES, RegimeParams, regime_column
 
     params = RegimeParams()
@@ -1215,25 +1241,27 @@ def _by_regime(days, daily, trades: pl.DataFrame, states: pl.DataFrame) -> pl.Da
                .join_asof(states.sort("ts"), on="ts", strategy="backward"))
     today = states.tail(1).to_dicts()[0]
     rows = []
-    for name, spec in REGIMES.items():
+    for name in REGIMES:
         col = regime_column(name)
         start = states.filter(pl.col(col).is_not_null())["ts"].min()
         if start is None:
             continue
+        label, what, ranges = _regime_rule(name, params)
         in_span = entries.filter(pl.col(col).is_not_null())
         keep = days >= np.datetime64(start)
         span_days, span_daily = days[keep], daily[keep]
         total = float(in_span["pnl_bps"].sum())
-        rows.append(dict(regime=spec["title"], data_from=str(start), rule=_regime_rule(name, params),
-                         live=_regime_live(name, today, col), state="all", now="",
-                         **_performance(span_days, span_daily, in_span, total)))
+        group = [dict(regime=label, data_from=str(start), live=_regime_live(name, today, col), state="all", range="",
+                      now="", **_performance(span_days, span_daily, in_span, total))]
         for state in STATES[name]:
             part = in_span.filter(pl.col(col) == state)
             if not len(part) and today[col] != state:
                 continue
-            rows.append(dict(regime="", data_from="", rule="", live="", state=state,
-                             now="●" if today[col] == state else "",
-                             **_performance(span_days, span_daily, part, total)))
+            group.append(dict(regime="", data_from="", live="", state=state,
+                              range=ranges.get(state, ""), now="●" if today[col] == state else "",
+                              **_performance(span_days, span_daily, part, total)))
+        group[1]["regime"] = what  # always there: today's state has a row
+        rows += group
     return pl.DataFrame(rows, infer_schema_length=None)
 
 
@@ -1248,15 +1276,17 @@ def _regime_section(equity: pl.DataFrame, trades: pl.DataFrame, states: pl.DataF
     base = _perf_style([rows], trades)
 
     def style(col, value, row):
-        # a rule above each regime's first row sets the groups apart
-        rule = {"borderTop": f"1.5px solid {DIM}"} if row["state"] == "all" else {}
-        if col in ("data_from", "rule", "live"):
-            return {"textAlign": "left", "color": DIM if col == "rule" else TEXT, **rule}
-        return {**(base(col, value, row) or {}), **rule} or None
+        first = row["state"] == "all"
+        divider = {"borderTop": f"1.5px solid {DIM}"} if first else {}  # sets each regime's group apart
+        if col == "regime":  # its name bold on the first row, what it measures dim beneath
+            return {"textAlign": "left", **({"fontWeight": "bold"} if first else {"color": DIM}), **divider}
+        if col in ("data_from", "live", "range"):
+            return {"textAlign": "left", **({"color": DIM} if col == "range" else {}), **divider}
+        return {**(base(col, value, row) or {}), **divider} or None
 
     return _section("REGIMES", [html.Div([
         table(_shown(rows), title="by macro regime at entry", float_fmt=",.2f",
-              headers={**PERF_HEADERS, "data_from": "data from", "rule": "what · thresholds"}, cell_style=style),
+              headers={**PERF_HEADERS, "data_from": "data from"}, cell_style=style),
         _subtitle(f"state on each trade's entry day (a new state counts after {RegimeParams().confirm} days in a row)"
                   f" · each regime scored over its own span · ● today (as of {states['ts'][-1]})")])])
 

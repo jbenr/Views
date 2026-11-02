@@ -521,10 +521,11 @@ def test_regime_table_splits_trades_by_the_state_on_their_entry_day(monkeypatch,
     d, daily = app._scored_days(equity, trades)
     table = app._by_regime(d, daily, trades, states)
     policy = table.head(3)
-    assert policy["regime"].to_list() == ["Policy cycle", "", ""]
+    assert policy["regime"].to_list() == ["Policy cycle", "fed: 6m done + 6m priced", ""]
     assert policy["state"].to_list() == ["all", "cutting", "hiking"] and policy["now"].to_list() == ["", "", "●"]
+    assert policy["range"].to_list() == ["", "< −25bp", "≥ +25bp"]
     assert policy["trades"].to_list() == [3, 2, 1] and policy["total_pnl"].to_list() == [-1.0, 3.0, -4.0]
-    assert policy["data_from"][0] == "2020-01-01" and "cutting < −25bp" in policy["rule"][0]
+    assert policy["data_from"][0] == "2020-01-01"
     implied = table.filter(pl.col("regime").str.starts_with("Implied"))
     assert implied["data_from"][0] == str(days[60].date()) and implied["trades"][0] == 1
     assert implied["share_of_pnl"][0] == 1.0  # of its own span's P&L, not the whole history's
