@@ -299,3 +299,8 @@ body .dash-dropdown-value-count {
 .dashboard-tight .viz-table td {
     padding: 3px 6px !important;
 }
+/* the Deep Dive card wears the Oven's density (oven.css); keep its cell padding over the rule above */
+.dashboard-tight .oven-tight .viz-table th,
+.dashboard-tight .oven-tight .viz-table td {
+    padding: 2px 7px !important;
+}

@@ -4,6 +4,7 @@ from datetime import date, timedelta
 
 import numpy as np
 import polars as pl
+import pytest
 
 from stats import CONF_MIN_PAST, confidence_now, walk_forward_confidence
 
@@ -45,3 +46,21 @@ def test_a_trade_never_sees_trades_that_closed_after_it_entered():
     before = walk_forward_confidence(trades, LABELS)["conf_score"][: k + 1]
     after = walk_forward_confidence(changed, LABELS)["conf_score"][: k + 1]
     assert before.to_list() == after.to_list()  # trade k entered before trade k closed
+
+
+def test_today_carries_every_number_its_score_is_built_from():
+    trades = walk_forward_confidence(_trades(), LABELS)
+    now = confidence_now(trades, {"half_life": 3.0}, LABELS)
+    (c,) = now["components"]
+    assert (c["feature"], c["value"], c["bucket"]) == ("half-life", 3.0, "low") and c["cut_lo"] < c["cut_hi"]
+    assert c["edge"] == pytest.approx(c["weight"] * (c["avg"] - c["past_avg"]) / c["spread"])
+    assert now["score"] == pytest.approx(c["edge"])  # one feature: the score is its edge
+    assert now["score"] > now["tier_hi"] and now["label"] == "HIGH"
+
+
+def test_each_trade_records_the_tercile_and_edge_it_entered_with():
+    out = walk_forward_confidence(_trades(), LABELS)
+    rated, unrated = out.filter(pl.col("conf") != "—"), out.filter(pl.col("conf") == "—")
+    assert rated["conf_bucket_half_life"].is_in(["low", "mid", "high"]).all()
+    assert rated["conf_score"].to_list() == pytest.approx(rated["conf_edge_half_life"].to_list())
+    assert unrated["conf_bucket_half_life"].is_null().all()

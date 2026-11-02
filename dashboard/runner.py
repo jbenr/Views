@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
 import polars as pl
 
-from utils.market_data import last_updated
+from utils.market_data import last_updated, last_updated_by_ticker
 
 from .ledger import SignalLedger
 from .params import params_from_row
@@ -64,6 +65,7 @@ def pull_data(signal_id: str) -> dict:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     data.write_parquet(cache_path)
     _freshness_cache.clear()  # a pull is exactly when freshness changes
+    regime_states(refresh=True)  # the regimes' states up to the same day
     return {
         "data": data,
         "pulled_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -124,6 +126,103 @@ def db_freshness(signal_id: str) -> dict | None:
         fresh = None
     _freshness_cache[key] = (now, fresh)
     return fresh
+
+
+_regimes: pl.DataFrame | None = None
+
+
+def regime_states(refresh: bool = False) -> pl.DataFrame | None:
+    """The research app's macro regimes (research.regimes) as daily states: ts plus, per
+    regime, regime_<name> (its state), regime_<name>_value (the series it is read
+    off) and, for the ranked vols, regime_<name>_pct (that value's percentile) -- all
+    causal, carried over days a regime's inputs did not print, null before its data
+    starts. Built from the database once and cached to store/live_data/regimes.parquet,
+    so page loads never touch the database; a Ref (pull_data) rebuilds it. None if it
+    was never built and cannot be now."""
+    global _regimes
+    from research.regimes import HISTORY_START, REGIMES, RegimeParams, load_inputs, regime_column
+
+    path = _store_dir() / "live_data" / "regimes.parquet"
+    wanted = [f"{regime_column(name)}_value" for name in REGIMES]
+    if not refresh:
+        if _regimes is not None:
+            return _regimes
+        if path.exists():
+            cached = pl.read_parquet(path)
+            if all(c in cached.columns for c in wanted):  # else an older cache: rebuild below
+                _regimes = cached
+                return _regimes
+    try:
+        inputs = load_inputs(HISTORY_START)
+    except Exception:
+        return _regimes
+    frame = None
+    for name, spec in REGIMES.items():
+        col = regime_column(name)
+        built = spec["build"](inputs, RegimeParams())
+        states = built.select(pl.col("ts").cast(pl.Date), pl.col("state").alias(col),
+                              pl.col("value").cast(pl.Float64).alias(f"{col}_value"),
+                              *([pl.col("percentile").alias(f"{col}_pct")] if "percentile" in built.columns else []))
+        frame = states if frame is None else frame.join(states, on="ts", how="full", coalesce=True)
+    frame = frame.sort("ts").with_columns(pl.exclude("ts").forward_fill())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.write_parquet(path)
+    _regimes = frame
+    return frame
+
+
+def prime_freshness(signal_ids: list[str]) -> None:
+    """Fill db_freshness's cache for every signal from ONE query: a page lists many
+    signals, and one round trip each to the database cost seconds on every load.
+    Ticker sets already fresh in the cache are left alone; if the database is
+    unreachable they are cached as None, as db_freshness would."""
+    now = time.monotonic()
+    keys = set()
+    for signal_id in signal_ids:
+        _, strategy = _resolve(signal_id)
+        key = tuple(sorted(strategy.tickers.values()))
+        cached = _freshness_cache.get(key)
+        if cached is None or now - cached[0] >= FRESHNESS_TTL_SECONDS:
+            keys.add(key)
+    if not keys:
+        return
+    try:
+        per_ticker = last_updated_by_ticker({t for key in keys for t in key}, wake=False)
+    except Exception:
+        per_ticker = None
+    for key in keys:
+        rows = None if per_ticker is None else per_ticker[per_ticker["ticker"].isin(key)]
+        fresh = (None if rows is None or rows.empty or rows["last_ts"].isna().all()
+                 else {"last_ts": rows["last_ts"].max(), "last_written": rows["last_written"].max()})
+        _freshness_cache[key] = (now, fresh)
+
+
+_analysis_cache: dict[str, tuple[tuple, dict]] = {}
+_analysis_lock = threading.Lock()
+
+
+def analysis(signal_id: str) -> dict:
+    """compute_signal, trade_history and live_read for one signal -- {state, trades,
+    open_entry, live} -- computed once and reused until the signal's cached data is
+    rewritten (a Ref pulls it) or its registry row changes. The overview and the
+    Deep Dive both read a signal on every page load; this is what keeps them from
+    each recomputing it. Raises RuntimeError as compute_signal does."""
+    row, strategy = _resolve(signal_id)
+    cache_path = _data_cache_path(strategy.name)
+    key = (repr(sorted((row or {}).items())), cache_path.stat().st_mtime_ns if cache_path.exists() else None)
+    with _analysis_lock:
+        cached = _analysis_cache.get(signal_id)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        state = compute_signal(signal_id)
+        trades, open_entry = trade_history(signal_id, state)
+        try:
+            live = live_read(state, trades, open_entry)
+        except (KeyError, AttributeError):  # a signal whose state lacks what the live read needs
+            live = None
+        out = dict(state=state, trades=trades, open_entry=open_entry, live=live)
+        _analysis_cache[signal_id] = (key, out)
+        return out
 
 
 def compute_signal(signal_id: str) -> dict:

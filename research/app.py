@@ -1392,7 +1392,7 @@ def pnl_heatmap(equity: pl.DataFrame, periods: pl.DataFrame) -> html.Div:
             return {**(_diverging(row["raw_full_year"], year_scale) or {}), "fontWeight": "bold"}
         return None
 
-    return table(shown.to_pandas(), title="P&L by month and year (bp) · green gains, red losses; full year on its own scale",
+    return table(shown.to_pandas(), title="monthly P&L (bp)",
                  columns=["year", *MONTHS, "full_year", "active_days"], cell_style=colour,
                  headers={"full_year": "full year", "active_days": "active days"})
 

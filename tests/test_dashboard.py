@@ -7,6 +7,7 @@ import sys
 import matplotlib.pyplot as plt
 import pandas as pd
 import polars as pl
+import pytest
 from matplotlib.collections import LineCollection
 
 from dashboard import charts
@@ -457,6 +458,76 @@ def test_snap_range_adds_five_business_days_before_first_entry(
 
     assert start == pd.Timestamp("2026-07-06")
     assert end == pd.Timestamp("2026-07-20")
+
+
+def test_the_open_position_pages_in_first_so_every_page_holds_one_row_per_heatmap_year(monkeypatch, tmp_path):
+    app = _load_app_module(monkeypatch, tmp_path)
+    closed = [{"entry_date": f"2026-0{i}-01", "exit_date": f"2026-0{i}-05", "pnl_bps": float(i)} for i in (9, 8, 7)]
+    held = {"entry_date": "2026-10-01", "exit_date": "open", "pnl_bps": 1.0, "exit_reason": "active"}
+
+    def find(c):
+        if type(c).__name__ == "Table":
+            return c
+        kids = getattr(c, "children", None)
+        for k in kids if isinstance(kids, list) else [kids]:
+            if k is not None and not isinstance(k, str) and (hit := find(k)) is not None:
+                return hit
+
+    def shown(page):
+        body = find(app._trade_table_block(closed, page, held, 2)).children[1]
+        return [tr.children[0].children for tr in body.children]
+
+    assert shown(0) == ["2026-10-01", "2026-09-01"] and shown(2) == ["2026-08-01", "2026-07-01"]
+    assert app._trade_page_label(len(closed) + 1, 2, 2) == "rows 3–4 of 4 · page 2 of 2 · newest first"
+    trades = pl.DataFrame({"entry_date": [pd.Timestamp(r["entry_date"]) for r in closed],
+                           "exit_date": [pd.Timestamp(r["exit_date"]) for r in closed]})
+    start, end = app._visible_trade_range(trades, {"entry_date": pd.Timestamp("2026-10-01")}, 2, None, 2)
+    assert (start, end) == (pd.Timestamp("2026-06-24"), pd.Timestamp("2026-08-05"))
+
+
+def test_confidence_tables_split_sharpe_pnl_hit_and_count_by_tier_and_feature(monkeypatch, tmp_path):
+    app = _load_app_module(monkeypatch, tmp_path)
+    days = pd.bdate_range("2020-01-01", periods=400)
+    trades = pl.DataFrame({
+        "entry_date": [d.date() for d in days[5:395:10]], "exit_date": [d.date() for d in days[9:399:10]],
+        "pnl_bps": [(-1.0) ** i * (i % 7) + 0.5 for i in range(39)], "conf": (["HIGH", "LOW", "—"] * 13),
+        "conf_score": [0.1, -0.1, None] * 13, "conf_bucket_abs_z": ["low", "high", None] * 13,
+        "conf_edge_abs_z": [0.1, -0.1, None] * 13})
+    equity = pl.DataFrame({"ts": [d.date() for d in days], "pnl_bps": [0.1 * ((i % 5) - 2) for i in range(400)]})
+    d, daily = app._scored_days(equity, trades)
+    tiers = app._confidence_by_tier(d, daily, trades)
+    assert tiers["conf"].to_list() == ["all", "HIGH", "LOW", "—"]
+    assert tiers["trades"].to_list() == [39, 13, 13, 13]
+    assert tiers.filter(pl.col("conf") == "all")["total_pnl"][0] == pytest.approx(trades["pnl_bps"].sum())
+    assert tiers["share_of_pnl"][1:].sum() == pytest.approx(1.0)
+    assert set(tiers.columns) >= {"sharpe", "hit_rate", "avg_trade"}
+    parts = app._confidence_by_component(d, daily, trades)
+    assert parts["tercile"].to_list() == ["low", "high"] and parts["feature"].to_list() == ["|z|", ""]
+
+
+def test_regime_table_splits_trades_by_the_state_on_their_entry_day(monkeypatch, tmp_path):
+    app = _load_app_module(monkeypatch, tmp_path)
+    days = pd.bdate_range("2020-01-01", periods=100)
+    # every regime "low" side for the first half, "high" side after; today: high
+    sides = {"policy": ("cutting", "hiking"), "vol": ("low vol", "high vol"), "implied": ("low vol", "high vol"),
+             "oil": ("none / inverse", "trades with oil"), "inflation": ("low inflation", "high inflation")}
+    states = pl.DataFrame({"ts": [d.date() for d in days],
+                           **{f"regime_{k}": [lo] * 50 + [hi] * 50 for k, (lo, hi) in sides.items()}})
+    # implied vol's data starts late (day 60): only the last trade falls in its span
+    states = states.with_columns(pl.when(pl.int_range(pl.len()) >= 60).then(pl.col("regime_implied")))
+    trades = pl.DataFrame({"entry_date": [days[i].date() for i in (5, 20, 70)],
+                           "exit_date": [days[i].date() for i in (8, 25, 75)], "pnl_bps": [1.0, 2.0, -4.0]})
+    equity = pl.DataFrame({"ts": [d.date() for d in days], "pnl_bps": [0.1 * ((i % 3) - 1) for i in range(100)]})
+    d, daily = app._scored_days(equity, trades)
+    table = app._by_regime(d, daily, trades, states)
+    policy = table.head(3)
+    assert policy["regime"].to_list() == ["Policy cycle", "", ""]
+    assert policy["state"].to_list() == ["all", "cutting", "hiking"] and policy["now"].to_list() == ["", "", "●"]
+    assert policy["trades"].to_list() == [3, 2, 1] and policy["total_pnl"].to_list() == [-1.0, 3.0, -4.0]
+    assert policy["data_from"][0] == "2020-01-01" and "cutting < −25bp" in policy["rule"][0]
+    implied = table.filter(pl.col("regime").str.starts_with("Implied"))
+    assert implied["data_from"][0] == str(days[60].date()) and implied["trades"][0] == 1
+    assert implied["share_of_pnl"][0] == 1.0  # of its own span's P&L, not the whole history's
 
 
 def test_param_summary_explains_exit_and_hard_stop(monkeypatch, tmp_path):

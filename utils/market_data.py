@@ -347,6 +347,24 @@ def last_updated(
     }
 
 
+def last_updated_by_ticker(tickers: Iterable[str], wake: bool = True) -> pd.DataFrame:
+    """last_updated for many tickers in one round trip: one row per ticker that has
+    rows, with its last_ts and last_written. Callers combine tickers into sets
+    themselves (the newest of each), which is what last_updated returns."""
+    return query_db(
+        """
+        SELECT ticker,
+               MAX(ts) AS last_ts,
+               MAX(COALESCE(updated_at, created_at)) AS last_written
+        FROM md.index_eod
+        WHERE ticker = ANY(%s)
+        GROUP BY ticker
+        """,
+        params=[sorted(set(tickers))],
+        wake=wake,
+    )
+
+
 def pick_ticker(candidates: list[str], start: str) -> str | None:
     """Pick the candidate ticker with the most md.index_eod rows since `start`.
 

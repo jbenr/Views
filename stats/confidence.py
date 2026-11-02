@@ -31,18 +31,28 @@ CONF_MIN_SCORED = 10  # earlier scored entries needed to tier against them rathe
 CONF_SHRINK = 20  # a tercile of n trades counts n / (n + CONF_SHRINK) of its edge
 
 
-def _tier(score: float, earlier: np.ndarray) -> str:
-    """HIGH / MED / LOW: against the terciles of earlier entries' scores, or the fixed
-    band while there are too few of them."""
+def _tier_cuts(earlier: np.ndarray) -> tuple[float, float, str]:
+    """(LOW at or below, HIGH above, where the cuts come from): the terciles of earlier
+    entries' scores, or the fixed band while there are too few of them."""
     earlier = earlier[np.isfinite(earlier)]
     if len(earlier) >= CONF_MIN_SCORED:
         lo, hi = np.quantile(earlier, [1 / 3, 2 / 3])
-        return "HIGH" if score > hi else "LOW" if score <= lo else "MED"
-    return "HIGH" if score >= CONF_BAND else "LOW" if score <= -CONF_BAND else "MED"
+        return float(lo), float(hi), f"terciles of {len(earlier)} earlier scores"
+    return -CONF_BAND, CONF_BAND, "fixed band"
+
+
+def _tier(score: float, earlier: np.ndarray) -> str:
+    """HIGH / MED / LOW against _tier_cuts."""
+    lo, hi, source = _tier_cuts(earlier)
+    if source == "fixed band":  # the band is inclusive at both ends
+        return "HIGH" if score >= hi else "LOW" if score <= lo else "MED"
+    return "HIGH" if score > hi else "LOW" if score <= lo else "MED"
 
 
 def _feature_edge(values: np.ndarray, pnl: np.ndarray, value: float, shrink: float) -> dict | None:
-    """One feature's edge for ``value`` against past (values, pnl)."""
+    """One feature's edge for ``value`` against past (values, pnl), with every number
+    that goes into it: the tercile cuts, the bucket's trades and average, the past
+    average and spread, and the shrink weight."""
     ok = np.isfinite(values) & np.isfinite(pnl)
     values, pnl = values[ok], pnl[ok]
     if len(values) < 3 or not np.isfinite(value):
@@ -57,31 +67,36 @@ def _feature_edge(values: np.ndarray, pnl: np.ndarray, value: float, shrink: flo
     n, spread = int(mask.sum()), pnl.std()
     if n == 0 or spread <= 0:
         return None
-    avg = float(pnl[mask].mean())
-    edge = n / (n + shrink) * (avg - pnl.mean()) / spread
-    return dict(edge=float(edge), bucket=bucket, avg=avg, n=n)
+    avg, weight = float(pnl[mask].mean()), n / (n + shrink)
+    edge = weight * (avg - pnl.mean()) / spread
+    return dict(edge=float(edge), bucket=bucket, avg=avg, n=n, cut_lo=float(lo), cut_hi=float(hi),
+                past_avg=float(pnl.mean()), spread=float(spread), weight=float(weight))
 
 
 def _score(past: pl.DataFrame, values: dict, labels: dict, min_past: int, shrink: float, pnl_col: str,
            earlier: np.ndarray) -> dict:
     """Confidence for one entry with feature ``values``, given the closed trades ``past``
-    and the ``earlier`` entries' scores."""
+    and the ``earlier`` entries' scores. ``components`` holds each feature's
+    _feature_edge (with col, feature and value), and tier_lo / tier_hi / tier_from
+    the cuts the score was tiered against."""
     if len(past) < min_past:
-        return dict(score=None, label="—", drivers="", n_past=len(past))
+        return dict(score=None, label="—", drivers="", n_past=len(past), components=[])
     pnl = past[pnl_col].to_numpy().astype(float)
     edges = []
     for col, label in labels.items():
         e = _feature_edge(past[col].to_numpy().astype(float), pnl, float(values.get(col, np.nan)), shrink)
         if e is not None:
-            edges.append((label, float(values[col]), e))
+            edges.append(dict(col=col, feature=label, value=float(values[col]), **e))
     if not edges:
-        return dict(score=None, label="—", drivers="", n_past=len(past))
-    score = float(np.mean([e["edge"] for _, _, e in edges]))
+        return dict(score=None, label="—", drivers="", n_past=len(past), components=[])
+    score = float(np.mean([e["edge"] for e in edges]))
     tier = _tier(score, earlier)
-    top = sorted(edges, key=lambda item: -abs(item[2]["edge"]))[:2]
-    drivers = " · ".join(f"{label} {value:.3g} ({e['bucket']}): past {e['avg']:+.1f}bp ×{e['n']}"
-                         for label, value, e in top)
-    return dict(score=score, label=tier, drivers=drivers, n_past=len(past))
+    tier_lo, tier_hi, tier_from = _tier_cuts(earlier)
+    top = sorted(edges, key=lambda e: -abs(e["edge"]))[:2]
+    drivers = " · ".join(f"{e['feature']} {e['value']:.3g} ({e['bucket']}): past {e['avg']:+.1f}bp ×{e['n']}"
+                         for e in top)
+    return dict(score=score, label=tier, drivers=drivers, n_past=len(past), components=edges,
+                tier_lo=tier_lo, tier_hi=tier_hi, tier_from=tier_from)
 
 
 def walk_forward_confidence(trades: pl.DataFrame, labels: dict[str, str], entry: str = "entry_ts",
@@ -91,7 +106,9 @@ def walk_forward_confidence(trades: pl.DataFrame, labels: dict[str, str], entry:
 
     ``trades`` needs ``entry``, ``exit``, ``pnl`` and a column per key of ``labels``
     (feature column -> display name). Returns the trades in their order with
-    conf_score, conf (HIGH/MED/LOW/—), conf_drivers and conf_n_past."""
+    conf_score, conf (HIGH/MED/LOW/—), conf_drivers and conf_n_past, and per
+    feature the tercile the trade entered in (conf_bucket_<col>: low/mid/high, as
+    the past trades cut it) and that feature's edge (conf_edge_<col>)."""
     rows = [None] * len(trades)
     scored: list[tuple] = []  # (entry, score) of the entries walked so far, in entry order
     for i in trades.with_row_index("_i").sort(entry)["_i"].to_list():
@@ -101,9 +118,13 @@ def walk_forward_confidence(trades: pl.DataFrame, labels: dict[str, str], entry:
         r = _score(past, t, labels, min_past, shrink, pnl, earlier)
         if r["score"] is not None:
             scored.append((t[entry], r["score"]))
-        rows[i] = dict(conf_score=r["score"], conf=r["label"], conf_drivers=r["drivers"], conf_n_past=r["n_past"])
+        parts = {c["col"]: c for c in r["components"]}
+        rows[i] = dict(conf_score=r["score"], conf=r["label"], conf_drivers=r["drivers"], conf_n_past=r["n_past"],
+                       **{f"conf_bucket_{col}": parts[col]["bucket"] if col in parts else None for col in labels},
+                       **{f"conf_edge_{col}": parts[col]["edge"] if col in parts else None for col in labels})
     out = pl.DataFrame(rows, schema={"conf_score": pl.Float64, "conf": pl.String, "conf_drivers": pl.String,
-                                     "conf_n_past": pl.Int64})
+                                     "conf_n_past": pl.Int64, **{f"conf_bucket_{c}": pl.String for c in labels},
+                                     **{f"conf_edge_{c}": pl.Float64 for c in labels}})
     return pl.concat([trades, out], how="horizontal")
 
 

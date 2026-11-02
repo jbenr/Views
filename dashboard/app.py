@@ -32,7 +32,7 @@ import dash
 import numpy as np
 import pandas as pd
 import polars as pl
-from dash import ALL, MATCH, Input, Output, State, ctx, dcc, html
+from dash import ALL, MATCH, Input, Output, Patch, State, ctx, dcc, html
 
 import utils.helpers
 from dashboard import runner
@@ -43,7 +43,6 @@ from dashboard.charts import (
     input_chart,
     level_chart,
     pnl_chart,
-    residual_bars_chart,
     return_distribution_chart,
     signal_chart,
 )
@@ -53,7 +52,8 @@ from dashboard.params import (
     signal_label as _display_name,
 )
 from dashboard.registry import LiveRegistry
-from research.app import note, pnl_heatmap, regression_scatter, table
+from stats import CONF_SHRINK
+from research.app import _diverging, note, pnl_heatmap, regression_scatter, table
 from utils.viz import column_widths, table_div
 from utils.research_app import (
     BORDER, C0, C1, DIM, FOLDER_TAB, FOLDER_TAB_SELECTED, FOLDER_TABS, ORANGE, PANEL, TEXT, make_app, run,
@@ -63,25 +63,27 @@ from utils.research_app import (
 REGISTRY = LiveRegistry()
 LEDGER = SignalLedger()
 
-TRADES_PER_PAGE = 6
+TRADES_PER_PAGE = 6  # fewest trade rows a page holds; it grows to the monthly heatmap's years
 SNAP_LEFT_BUFFER_BDAYS = 5
 
+# the Oven's trade table: its columns, short lower-case headers and colours (oven.app)
 TRADE_TABLE_COLS = [
     "entry_date", "exit_date", "direction",
-    "entry_level", "exit_level", "target_lvl", "expected_return_bps",
-    "pnl_bps", "conf", "entry_half_life", "bars_held", "exit_reason",
+    "entry_level", "exit_level", "target_lvl", "pnl_bps", "expected_return_bps", "expected_bars",
+    "conf", "conf_score", "entry_half_life", "bars_held", "exit_reason",
 ]
 TRADE_TABLE_HEADERS = {
-    "entry_date": "Entry", "exit_date": "Exit", "direction": "Dir",
-    "entry_level": "Entry Lvl", "exit_level": "Exit Lvl",
-    "target_lvl": "Target Lvl", "expected_return_bps": "Exp Ret",
-    "pnl_bps": "PnL", "conf": "Conf", "entry_half_life": "HL (d)",
-    "bars_held": "Held (d)", "exit_reason": "Reason",
+    "entry_date": "entry", "exit_date": "exit", "direction": "dir",
+    "entry_level": "entry lvl", "exit_level": "exit lvl",
+    "target_lvl": "target lvl", "expected_return_bps": "exp ret", "expected_bars": "exp bars",
+    "conf_score": "conf score", "entry_half_life": "half-life",
+    "bars_held": "held", "exit_reason": "exit",
 }
 TRADE_TABLE_ROUND = {
-    "entry_level": 2, "exit_level": 2, "target_lvl": 2,
-    "expected_return_bps": 1, "pnl_bps": 1, "entry_half_life": 1,
+    "entry_level": 2, "exit_level": 2, "target_lvl": 2, "expected_return_bps": 2, "expected_bars": 1,
+    "pnl_bps": 2, "conf_score": 2, "entry_half_life": 1,
 }
+TRADE_TEXT_COLS = {"entry_date", "exit_date", "exit_reason"}
 
 OVERVIEW_COLUMNS = [
     # Feature is dropped: the Signal name already leads with it. Position folds
@@ -197,12 +199,14 @@ def _open_trade_row(open_entry: dict) -> dict:
     return out
 
 
-def _visible_trade_range(trades, open_entry: dict | None, page: int, data_asof):
+def _visible_trade_range(trades, open_entry: dict | None, page: int, data_asof, size: int = TRADES_PER_PAGE):
     """Date span covering exactly what's currently shown in the trade table --
-    the open row (page 0 only) plus the current page of closed trades."""
+    the open row (first, on page 0) plus the closed trades on the current page."""
     dates = []
+    shift = int(open_entry is not None)  # the open row takes the first slot, so closed rows sit one later
     if trades is not None and not trades.is_empty():
-        for row in trades.slice(page, TRADES_PER_PAGE).to_dicts():
+        first = max(0, page - shift)
+        for row in trades.slice(first, page + size - shift - first).to_dicts():
             dates.append(row["entry_date"])
             dates.append(row["exit_date"])
     if open_entry is not None and page == 0:
@@ -446,10 +450,10 @@ def _overview_snapshot(row: dict) -> dict:
     }
     try:
         signal_id = _row_id(row)
-        state = runner.compute_signal(signal_id)
-        trades, open_entry = runner.trade_history(signal_id, state)
+        read = runner.analysis(signal_id)
     except RuntimeError as exc:
         return {**base, "reading": str(exc)}
+    state, trades, open_entry = read["state"], read["trades"], read["open_entry"]
 
     asof_bar, asof_written, asof_stale = _db_asof(signal_id, state["data_asof"])
     params = state["params"]
@@ -463,7 +467,7 @@ def _overview_snapshot(row: dict) -> dict:
     )
     return {
         **base,
-        **_signal_facts(row, state, trades, open_entry),
+        **_signal_facts(row, state, read["live"]),
         "position": _position_label(state, open_entry),
         "reading": reading_str,
         "gate_rule": _gate_rule(params),
@@ -491,12 +495,11 @@ def _model_text(row: dict, state: dict) -> str:
     return f"~ {beta}×{feature} · {kind}"
 
 
-def _signal_facts(row: dict, state: dict, trades, open_entry: dict | None) -> dict:
+def _signal_facts(row: dict, state: dict, live: dict | None) -> dict:
     """An overview row's what-it-is and where-it-stands cells: model, the input's value
-    now, the target's fair value and today's confidence. '—' where the signal's state
-    lacks them -- a decoration on the row must never break it."""
+    now, the target's fair value and today's confidence (``live``, runner.live_read's).
+    '—' where the signal's state lacks them -- a decoration on the row must never break it."""
     try:
-        live = runner.live_read(state, trades, open_entry)
         feature = state["strategy"].feature
         return {
             "model": _model_text(row, state),
@@ -504,23 +507,26 @@ def _signal_facts(row: dict, state: dict, trades, open_entry: dict | None) -> di
             "fair": f"{live['fair']:.1f}" if live["fair"] == live["fair"] else "—",
             "conf": live["confidence"]["label"],
         }
-    except (KeyError, AttributeError):
+    except (KeyError, AttributeError, TypeError):  # TypeError: no live read (None)
         return {}
 
 
-def _trade_cell_style(column: str, value, row: dict) -> dict | None:
-    """Direction and P&L sign, coloured -- the trade table's two read-at-a-glance
-    columns. Mirrors the style_data_conditional rules this replaced."""
-    if column == "direction":
-        return {"color": C1 if value == "long" else C0, "fontWeight": "bold"}
-    if column == "conf" and value in CONF_COLOURS:
-        return {"color": CONF_COLOURS[value], "fontWeight": "bold"}
-    if column == "pnl_bps" and isinstance(value, (int, float)):
-        if value > 0:
-            return {"color": C1, "fontWeight": "bold"}
-        if value < 0:
-            return {"color": C0, "fontWeight": "bold"}
-    return None
+def _trade_cell_style(pnl_scale: float):
+    """The Oven's trade colours: direction, P&L filled on a scale of the 95th percentile
+    |P&L|, the open position flagged; plus confidence at entry."""
+    def style(column: str, value, _row: dict) -> dict | None:
+        if column == "exit_reason" and value == "active":
+            return {"textAlign": "left", "color": ORANGE, "fontWeight": "bold"}
+        if column in TRADE_TEXT_COLS:
+            return {"textAlign": "left"}
+        if column == "direction":
+            return {"color": C1 if value == "long" else C0, "fontWeight": "bold"}
+        if column == "conf" and value in CONF_COLOURS:
+            return {"color": CONF_COLOURS[value], "fontWeight": "bold"}
+        if column == "pnl_bps":
+            return _diverging(value, pnl_scale)
+        return None
+    return style
 
 
 def _overview_cell_style(column: str, value, row: dict) -> dict | None:
@@ -596,6 +602,7 @@ def _overview_content(rows: list[dict]) -> list:
         )
         for target in targets
     }
+    runner.prime_freshness([_row_id(row) for row in rows])  # every signal's db stamp in one query
     # snapshot everything first: the column widths have to be measured over
     # every section at once, or each table sizes itself and the page reads as
     # a stack of unrelated grids
@@ -616,37 +623,47 @@ def _overview_content(rows: list[dict]) -> list:
     ]
 
 
-def _trade_page_label(n: int, page: int) -> str:
-    """The trade-count caption shown beside the persistent pager controls."""
+def _trade_page_label(n: int, page: int, size: int = TRADES_PER_PAGE) -> str:
+    """The Oven's pager caption: which rows are on screen, and which page. ``n`` counts
+    every row, the open position (listed first) included."""
     if not n:
         return "no closed trades yet"
-    lo, hi = page + 1, min(page + TRADES_PER_PAGE, n)
-    return f"showing {lo}-{hi} of {n} closed trades"
+    lo, hi = page + 1, min(page + size, n)
+    return f"rows {lo:,}–{hi:,} of {n:,} · page {page // size + 1} of {(n - 1) // size + 1} · newest first"
+
+
+def _trade_page_size(equity: pl.DataFrame) -> int:
+    """One trade row per year of the monthly P&L heatmap beside it, so the two stand
+    the same height without scrolling (as on the Oven's setup card)."""
+    years = _active_years(equity)
+    return max(TRADES_PER_PAGE, len(years))
 
 
 def _trade_table_block(
-    closed_rows: list[dict], page: int, open_row: dict | None
+    closed_rows: list[dict], page: int, open_row: dict | None, size: int = TRADES_PER_PAGE
 ) -> html.Div:
-    """One visible trade page from already-formatted trade rows."""
+    """One visible trade page from already-formatted trade rows, as the Oven's trade
+    table: its headers, two decimals, P&L filled. Columns this signal never fills
+    (target lvl on an oven signal, exp bars on a book one) are left out."""
     n = len(closed_rows)
     if n == 0 and open_row is None:
         return html.Div("no closed trades yet", style={"color": DIM, "padding": "8px 0"})
 
-    rows = ([open_row] if open_row is not None and page == 0 else [])
-    rows += closed_rows[page:page + TRADES_PER_PAGE]
-    return table_div(
-        pd.DataFrame(rows),
-        columns=TRADE_TABLE_COLS,
-        headers=TRADE_TABLE_HEADERS,
-        max_rows=len(rows),
-        cell_style=_trade_cell_style,
-        float_fmt=",.4g",
-        table_style={"background": "#FFFFFF"},
-    )
+    every = closed_rows + ([open_row] if open_row is not None else [])
+    columns = [c for c in TRADE_TABLE_COLS if any(r.get(c) is not None for r in every)]
+    pnls = np.abs([r["pnl_bps"] for r in every if isinstance(r.get("pnl_bps"), (int, float))])
+    scale = float(np.nanpercentile(pnls, 95)) if len(pnls) else 0.0
+    rows = every[-1:] + closed_rows if open_row is not None else closed_rows  # the open position first
+    rows = rows[page:page + size]
+    frame = pd.DataFrame(rows).reindex(columns=columns)
+    frame = frame.astype(object).where(frame.notna(), "")
+    return table(frame, title="trades",
+                 columns=columns, headers=TRADE_TABLE_HEADERS, max_rows=len(rows), float_fmt=",.2f",
+                 cell_style=_trade_cell_style(scale))
 
 
 def _trade_table_section(
-    closed_rows: list[dict], page: int, open_row: dict | None, signal_id: str
+    closed_rows: list[dict], page: int, open_row: dict | None, signal_id: str, size: int = TRADES_PER_PAGE
 ) -> html.Div:
     """A fixed control row around the table area that the pager replaces.
 
@@ -655,45 +672,28 @@ def _trade_table_section(
     pager therefore only replaces rows and its caption, never chart controls.
     """
     table = html.Div(
-        _trade_table_block(closed_rows, page, open_row),
+        _trade_table_block(closed_rows, page, open_row, size),
         id=_pid("trade-table", signal_id),
     )
     n = len(closed_rows)
     if n == 0 and open_row is None:
-        return html.Div(table, style={"marginTop": 14})
-    return html.Div(
-        style={"marginTop": 14},
-        children=[
-            table,
-            html.Div(
-                style={"display": "flex", "gap": 8, "alignItems": "center", "marginTop": 8},
-                children=[
-                    html.Button("<<", id=_pid("trades-first", signal_id), n_clicks=0,
-                                className="ref-btn",
-                                title="First trade page",
-                                style={**_btn_style(), "padding": "3px 6px"}),
-                    html.Button("< prev", id=_pid("trades-prev", signal_id), n_clicks=0,
-                                className="ref-btn",
-                                style=_btn_style()),
-                    html.Button("next >", id=_pid("trades-next", signal_id), n_clicks=0,
-                                className="ref-btn",
-                                style=_btn_style()),
-                    html.Button(">>", id=_pid("trades-last", signal_id), n_clicks=0,
-                                className="ref-btn",
-                                title="Last trade page",
-                                style={**_btn_style(), "padding": "3px 6px"}),
-                    html.Button("Snap chart to view", id=_pid("snap", signal_id), n_clicks=0,
-                                className="ref-btn",
-                                style=_btn_style()),
-                    html.Span(
-                        _trade_page_label(n, page),
-                        id=_pid("trades-status", signal_id),
-                        style={"fontSize": 11, "color": DIM},
-                    ),
-                ],
-            ),
-        ],
-    )
+        return table
+    small = {**_btn_style(), "padding": "2px 8px", "fontSize": 11}  # the Oven's pager buttons
+    return html.Div([
+        table,
+        html.Span(_trade_page_label(n + (open_row is not None), page, size), id=_pid("trades-status", signal_id),
+                  className="oven-pager-status"),
+        html.Div(className="oven-pager", children=[
+            html.Button("<<", id=_pid("trades-first", signal_id), n_clicks=0, className="ref-btn",
+                        title="First trade page", style=small),
+            html.Button("< prev", id=_pid("trades-prev", signal_id), n_clicks=0, className="ref-btn", style=small),
+            html.Button("next >", id=_pid("trades-next", signal_id), n_clicks=0, className="ref-btn", style=small),
+            html.Button(">>", id=_pid("trades-last", signal_id), n_clicks=0, className="ref-btn",
+                        title="Last trade page", style=small),
+            html.Button("Snap chart to view", id=_pid("snap", signal_id), n_clicks=0, className="ref-btn",
+                        style=small),
+        ]),
+    ])
 
 
 def _card_sections(
@@ -704,6 +704,7 @@ def _card_sections(
     window: str = DEFAULT_WINDOW,
     page: int = 0,
     date_range: tuple | None = None,
+    read_live: dict | None = None,
 ) -> tuple[html.Div, html.Div, dict | None, html.Div, html.Div]:
     row = REGISTRY.get(signal_id)
     if row is None:
@@ -715,22 +716,26 @@ def _card_sections(
 
     ledger_row = LEDGER.latest(signal_id)
     error = None
+    live = None
     if state is None:
-        # initial non-callback render at build_app() time -- callback-driven
-        # renders always pass a precomputed state/trades pair down.
+        # the card's first render; callback-driven renders pass the same read down
         try:
-            state = runner.compute_signal(signal_id)
-            trades, open_entry = runner.trade_history(signal_id, state)
+            read = runner.analysis(signal_id)
+            state, trades, open_entry, live = read["state"], read["trades"], read["open_entry"], read["live"]
         except RuntimeError as exc:
             error = str(exc)
+    elif read_live is not None:
+        live = read_live
 
     live_pnl = _live_pnl_bps(trades, open_entry) if state and not error else None
-    live = runner.live_read(state, trades, open_entry) if state and not error else None
+    if live is None and state and not error:
+        live = runner.live_read(state, trades, open_entry)
     if live is not None:
         trades = live["trades"]  # with each trade's confidence at its entry
     trade_data = {
         "closed": _format_trade_rows(trades) if trades is not None else [],
         "open": _open_trade_row(open_entry) if open_entry is not None else None,
+        "size": _trade_page_size(state["equity_curve"]) if state and not error else TRADES_PER_PAGE,
     }
     asof_bar, asof_written, asof_stale = (
         _db_asof(signal_id, state["data_asof"]) if state else ("—", "", False)
@@ -754,8 +759,13 @@ def _card_sections(
         months = extra = html.Div()
     else:
         months = _monthly_pnl(state["equity_curve"])
+        closed = trades is not None and not trades.is_empty()
         extra = html.Div([_scatters(state),
-                          *([_trade_mechanics(state, trades)] if trades is not None and not trades.is_empty() else [])])
+                          *([_trade_mechanics(state, trades)] if closed else []),
+                          *([_confidence_section(state["equity_curve"], trades, live["confidence"])]
+                            if closed and live is not None else []),
+                          *([_regime_section(state["equity_curve"], trades, runner.regime_states())]
+                            if closed else [])])
         now_panel = _now_panel(state, live, open_entry)
         window_bars = WINDOW_PRESETS.get(window, WINDOW_PRESETS[DEFAULT_WINDOW])
         span = dict(window_bars=window_bars, date_range=date_range)
@@ -778,7 +788,7 @@ def _card_sections(
         )
         pnl_png = pnl_chart(state["equity_curve"], **span)
         pngs = [level_png, second, *([gate_png] if gate_png is not None else []), pnl_png,
-                _confidence_chart(trades), return_distribution_chart(trades)]
+                return_distribution_chart(trades)]
         img = lambda png: html.Img(  # noqa: E731
             src=f"data:image/png;base64,{png}", style={"width": "100%", "border": f"1px solid {BORDER}"})
         chart_body = html.Div(
@@ -882,15 +892,22 @@ def _stats_rows(state: dict, stats: dict | None, row: dict, live_pnl) -> list:
     return rows
 
 
-def _monthly_pnl(equity: pl.DataFrame) -> html.Div:
-    """The Oven's monthly P&L heatmap, from the first year the signal was in the market."""
-    daily = equity.select(pl.col("ts").cast(pl.Date), "pnl_bps")
-    years = (daily.group_by(pl.col("ts").dt.year().alias("year"))
+def _active_years(equity: pl.DataFrame) -> pl.DataFrame:
+    """P&L and active days per year, from the first year the signal was in the market."""
+    years = (equity.select(pl.col("ts").cast(pl.Date), "pnl_bps")
+             .group_by(pl.col("ts").dt.year().alias("year"))
              .agg(pl.col("pnl_bps").sum(), (pl.col("pnl_bps") != 0).sum().alias("active_days")).sort("year"))
     first = years.filter(pl.col("active_days") > 0)["year"].min()
-    if first is None:
+    return years.clear() if first is None else years.filter(pl.col("year") >= first)
+
+
+def _monthly_pnl(equity: pl.DataFrame) -> html.Div:
+    """The Oven's monthly P&L heatmap, from the first year the signal was in the market."""
+    years = _active_years(equity)
+    if years.is_empty():
         return html.Div()
-    return pnl_heatmap(daily.filter(pl.col("ts").dt.year() >= first), years.filter(pl.col("year") >= first))
+    daily = equity.select(pl.col("ts").cast(pl.Date), "pnl_bps")
+    return pnl_heatmap(daily.filter(pl.col("ts").dt.year() >= years["year"].min()), years)
 
 
 def _scatters(state: dict) -> html.Div:
@@ -936,7 +953,7 @@ def _trade_mechanics(state: dict, trades: pl.DataFrame) -> html.Div:
     return html.Div(style={"marginTop": 18}, children=[
         html.Div("TRADE MECHANICS", style={"fontSize": 12, "fontWeight": "bold", "marginBottom": 6}),
         note(" · ".join(lines), "dim"),
-        table(_exit_reasons(trades).to_pandas(), title="Exit reasons · the trades that ended each way",
+        table(_exit_reasons(trades).to_pandas(), title="exit reasons",
               float_fmt=",.2f",
               headers={"avg_trade": "avg trade", "total_pnl": "total pnl", "hit_rate": "hit",
                        "avg_held": "avg held", "share_of_pnl": "share of pnl"},
@@ -1005,18 +1022,243 @@ def _now_panel(state: dict, live: dict, open_entry: dict | None) -> html.Div:
     )
 
 
-def _confidence_chart(trades) -> str | None:
-    """Realized average trade by the confidence each trade had at its own entry
-    (walk-forward): does HIGH actually beat LOW? None until there are confident trades."""
-    if trades is None or trades.is_empty() or "conf" not in trades.columns:
+CONF_LABELS = {**runner.OVEN_CONFIDENCE, **runner.BOOK_CONFIDENCE}  # feature column -> name
+
+
+def _scored_days(equity: pl.DataFrame, trades: pl.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """(dates, daily P&L) from the first entry on: the span every Sharpe here is scored over."""
+    first = trades["entry_date"].cast(pl.Date).min()
+    daily = equity.select(pl.col("ts").cast(pl.Date), "pnl_bps").filter(pl.col("ts") >= first)
+    return daily["ts"].to_numpy(), daily["pnl_bps"].to_numpy().astype(float)
+
+
+def _performance(days: np.ndarray, daily: np.ndarray, subset: pl.DataFrame, total: float) -> dict:
+    """Trades, total and average P&L, share of all P&L, hit rate, and the Sharpe of holding
+    only ``subset``: the signal's daily P&L on the days those trades were on, zero on every
+    other day (the Oven's subset Sharpe; all trades together give the signal's Sharpe)."""
+    held = np.zeros(len(days), dtype=bool)
+    for a, b in subset.select(pl.col("entry_date").cast(pl.Date), pl.col("exit_date").cast(pl.Date)).iter_rows():
+        held |= (days >= np.datetime64(a)) & (days <= np.datetime64(b))
+    marks = np.where(held, daily, 0.0)
+    pnl = subset["pnl_bps"]
+    return dict(trades=len(subset), total_pnl=float(pnl.sum()), avg_trade=pnl.mean() if len(pnl) else None,
+                hit_rate=float((pnl > 0).mean()) if len(pnl) else None,
+                sharpe=marks.mean() / marks.std() * np.sqrt(252) if len(subset) and marks.std() > 0 else None,
+                share_of_pnl=float(pnl.sum()) / total if total else None)
+
+
+def _confidence_by_tier(days, daily, trades: pl.DataFrame) -> pl.DataFrame:
+    """Performance of all trades, then of each confidence tier the trades had at entry;
+    '—' is the first trades, before enough had closed to score one."""
+    total = float(trades["pnl_bps"].sum())
+    rows = [dict(conf="all", **_performance(days, daily, trades, total), avg_score=trades["conf_score"].mean())]
+    for tier in ("HIGH", "MED", "LOW", "—"):
+        part = trades.filter(pl.col("conf") == tier)
+        if len(part):
+            rows.append(dict(conf=tier, **_performance(days, daily, part, total), avg_score=part["conf_score"].mean()))
+    return pl.DataFrame(rows, infer_schema_length=None)
+
+
+def _confidence_by_component(days, daily, trades: pl.DataFrame) -> pl.DataFrame:
+    """Performance of the scored trades by each confidence feature's tercile at entry
+    (cut on the trades closed before it), with that feature's average edge there."""
+    total = float(trades["pnl_bps"].sum())
+    rows = []
+    for col in [c.removeprefix("conf_bucket_") for c in trades.columns if c.startswith("conf_bucket_")]:
+        named = False  # the feature's name on its first row only
+        for bucket in ("low", "mid", "high"):
+            part = trades.filter(pl.col(f"conf_bucket_{col}") == bucket)
+            if len(part):
+                rows.append(dict(feature="" if named else CONF_LABELS.get(col, col), tercile=bucket,
+                                 **_performance(days, daily, part, total), avg_edge=part[f"conf_edge_{col}"].mean()))
+                named = True
+    return pl.DataFrame(rows, infer_schema_length=None)
+
+
+def _confidence_now(conf: dict) -> pl.DataFrame:
+    """Today's confidence, built up: per feature, where today's value falls among the
+    closed trades and what that tercile made; then a bottom 'score' row -- the mean
+    edge, the cuts that tier it (in the low / high columns), the tier it lands in (in
+    the tercile column) and the closed trades it is scored from."""
+    rows = [dict(feature=c["feature"], now=c["value"], low_to=c["cut_lo"], high_from=c["cut_hi"], tercile=c["bucket"],
+                 trades=c["n"], tercile_avg=c["avg"], all_avg=c["past_avg"], spread=c["spread"], weight=c["weight"],
+                 edge=c["edge"])
+            for c in conf["components"]]
+    rows.append(dict(feature="score", low_to=conf["tier_lo"], high_from=conf["tier_hi"], tercile=conf["label"],
+                     trades=conf["n_past"], edge=conf["score"]))
+    return pl.DataFrame(rows, infer_schema_length=None)
+
+
+def _subtitle(text: str) -> html.Div:
+    """The one line of explanation under a table, kept out of its title."""
+    return html.Div(text, style={"fontSize": 10, "color": DIM, "margin": "-2px 0 8px"})
+
+
+def _shown(frame: pl.DataFrame) -> pd.DataFrame:
+    """A frame for the house table, missing values blank rather than 'nan'."""
+    pdf = frame.to_pandas()
+    return pdf.astype(object).where(pdf.notna(), "")
+
+
+PERF_HEADERS = {"total_pnl": "total pnl", "avg_trade": "avg trade", "hit_rate": "hit", "share_of_pnl": "share of pnl",
+                "avg_score": "avg score", "avg_edge": "avg edge"}
+PERF_TEXT = ("conf", "feature", "tercile", "regime", "state")
+
+
+def _perf_style(frames: list[pl.DataFrame], trades: pl.DataFrame):
+    """Colours for the performance tables: Sharpe on one scale across ``frames``, the
+    average trade on the trades' own, text left, confidence tiers and today's regime
+    state marked."""
+    sharpes = pl.concat([f["sharpe"].cast(pl.Float64) for f in frames if len(f)]).drop_nulls()
+    sharpe_scale = float(sharpes.abs().max()) if len(sharpes) else 1.0
+    avg_scale = float(trades["pnl_bps"].abs().quantile(0.75) or 1.0)
+
+    def style(col, value, row):
+        if col in PERF_TEXT:
+            colour = {"color": CONF_COLOURS[value], "fontWeight": "bold"} if value in CONF_COLOURS else {}
+            return {"textAlign": "left", **colour, **({"fontWeight": "bold"} if value == "all" else {})}
+        if col == "now":
+            return {"color": ORANGE, "fontWeight": "bold"}
+        if col == "sharpe":
+            return _diverging(value, sharpe_scale)
+        if col == "avg_trade":
+            return _diverging(value, avg_scale)
         return None
-    rated = trades.filter(pl.col("conf") != "—")
-    if rated.is_empty():
-        return None
-    tiers = [t for t in ("HIGH", "MED", "LOW") if t in rated["conf"].to_list()]
-    groups = {t: rated.filter(pl.col("conf") == t)["pnl_bps"] for t in tiers}
-    return residual_bars_chart([f"{t} ·{len(groups[t])}" for t in tiers], [groups[t].mean() for t in tiers],
-                               "realized avg trade by confidence at entry", "bps")
+    return style
+
+
+def _section(title: str, blocks: list) -> html.Div:
+    return html.Div(style={"marginTop": 18}, children=[
+        html.Div(title, style={"fontSize": 12, "fontWeight": "bold", "marginBottom": 6}),
+        html.Div(blocks, style={"display": "flex", "flexWrap": "wrap", "gap": "4px 16px", "alignItems": "start"}),
+    ])
+
+
+def _confidence_section(equity: pl.DataFrame, trades: pl.DataFrame, conf: dict) -> html.Div:
+    """Confidence in tables: today's score built up feature by feature, and how past
+    trades did by the tier and by each feature's tercile they had at entry."""
+    if "conf" not in trades.columns:
+        return html.Div()
+    days, daily = _scored_days(equity, trades)
+    tiers, parts = _confidence_by_tier(days, daily, trades), _confidence_by_component(days, daily, trades)
+    perf_style = _perf_style([tiers, parts], trades)
+    blocks = [table(_shown(tiers), title="by confidence at entry", float_fmt=",.2f",
+                    headers=PERF_HEADERS, cell_style=perf_style)]
+    if len(parts):
+        blocks.append(html.Div([table(_shown(parts), title="by feature tercile at entry", float_fmt=",.2f",
+                                      headers=PERF_HEADERS, cell_style=perf_style),
+                                _subtitle("terciles cut on the trades closed before each entry")]))
+    if conf.get("components"):
+        now = _confidence_now(conf)
+        edge_scale = float(now["edge"].abs().max() or 1.0)
+
+        def now_style(col, value, row):
+            score_row = row["feature"] == "score"
+            line = {"fontWeight": "bold", "borderTop": f"1px solid {TEXT}"} if score_row else {}
+            if col == "tercile" and value in CONF_COLOURS:
+                return {"textAlign": "left", "color": CONF_COLOURS[value], **line}
+            if col in ("feature", "tercile"):
+                return {"textAlign": "left", **line}
+            if col == "edge":
+                return {**(_diverging(value, edge_scale) or {}), **line}
+            if col == "tercile_avg" and not score_row:
+                return _diverging(value - row["all_avg"], row["spread"])
+            return line or None
+
+        blocks.insert(0, html.Div([
+            table(_shown(now), title="today's score", float_fmt=",.2f", cell_style=now_style,
+                  headers={"low_to": "low ≤", "high_from": "high >", "tercile_avg": "tercile avg", "all_avg": "all avg"}),
+            _subtitle(f"edge = weight × (tercile avg − all avg) ÷ spread · weight = trades ÷ (trades + {CONF_SHRINK})"
+                      f" · score = mean edge, tiered by {conf['tier_from']}")]))
+    return _section("CONFIDENCE", blocks)
+
+
+def _regime_rule(name: str, p) -> str:
+    """One line: what a research regime reads and where its state thresholds sit (from
+    research.regimes.RegimeParams ``p``, so they match the research app)."""
+    years = f"{p.vol_rank_window / 252:g}y"
+    pct = f"low < {p.vol_low * 100:.0f}th pct, high ≥ {p.vol_high * 100:.0f}th"
+    return {
+        "policy": f"Fed moves, last 6m + priced next 6m (FF futures): cutting < −{p.cycle_threshold_bp:g}bp, "
+                  f"hiking ≥ +{p.cycle_threshold_bp:g}bp",
+        "vol": f"10y realized vol ({p.vol_window}d), ranked vs its last {years}: {pct}",
+        "implied": f"1m10y swaption normal vol, ranked vs its last {years}: {pct}",
+        "oil": f"{p.oil_window}d corr of 10y and oil daily changes: none < {p.oil_low:g}, with oil ≥ {p.oil_high:g}",
+        "inflation": f"5y inflation swap: low < {p.inflation_low_bp / 100:.2f}%, high ≥ {p.inflation_high_bp / 100:.2f}%",
+    }.get(name, "")
+
+
+def _regime_live(name: str, today: dict, col: str) -> str:
+    """A regime's value today, in its own units."""
+    value, pct = today.get(f"{col}_value"), today.get(f"{col}_pct")
+    if value is None or value != value:
+        return "—"
+    rank = f" · {pct * 100:.0f}th pct" if pct is not None and pct == pct else ""
+    return {"policy": f"{value:+.0f}bp", "vol": f"{value:.0f}bp/yr{rank}", "implied": f"{value:.0f}bp/yr{rank}",
+            "oil": f"{value:+.2f}", "inflation": f"{value / 100:.2f}%"}.get(name, f"{value:.2f}")
+
+
+def _by_regime(days, daily, trades: pl.DataFrame, states: pl.DataFrame) -> pl.DataFrame:
+    """Performance of the trades by each research regime's state on their entry day.
+
+    Each regime is scored over its own span -- from the first day it has a state --
+    so one that starts late (implied vol, 2022) is judged only on the trades and days
+    it covers: an 'all' row first (every trade entered in its span), then its states,
+    each Sharpe over the span's days and each share of P&L of the span's total. The
+    regime's first row carries when its data starts, what it reads with its
+    thresholds, and its value today; today's state is marked (a row even if no
+    trade entered in it)."""
+    from research.regimes import REGIMES, STATES, RegimeParams, regime_column
+
+    params = RegimeParams()
+    entries = (trades.with_columns(pl.col("entry_date").cast(pl.Date).alias("ts")).sort("ts")
+               .join_asof(states.sort("ts"), on="ts", strategy="backward"))
+    today = states.tail(1).to_dicts()[0]
+    rows = []
+    for name, spec in REGIMES.items():
+        col = regime_column(name)
+        start = states.filter(pl.col(col).is_not_null())["ts"].min()
+        if start is None:
+            continue
+        in_span = entries.filter(pl.col(col).is_not_null())
+        keep = days >= np.datetime64(start)
+        span_days, span_daily = days[keep], daily[keep]
+        total = float(in_span["pnl_bps"].sum())
+        rows.append(dict(regime=spec["title"], data_from=str(start), rule=_regime_rule(name, params),
+                         live=_regime_live(name, today, col), state="all", now="",
+                         **_performance(span_days, span_daily, in_span, total)))
+        for state in STATES[name]:
+            part = in_span.filter(pl.col(col) == state)
+            if not len(part) and today[col] != state:
+                continue
+            rows.append(dict(regime="", data_from="", rule="", live="", state=state,
+                             now="●" if today[col] == state else "",
+                             **_performance(span_days, span_daily, part, total)))
+    return pl.DataFrame(rows, infer_schema_length=None)
+
+
+def _regime_section(equity: pl.DataFrame, trades: pl.DataFrame, states: pl.DataFrame | None) -> html.Div:
+    """Exploratory: the trades by the macro regime they entered in (research.regimes)."""
+    from research.regimes import RegimeParams
+
+    if states is None:
+        return _section("REGIMES", [note("Regime states unavailable: click Ref to load them.", "dim")])
+    days, daily = _scored_days(equity, trades)
+    rows = _by_regime(days, daily, trades, states)
+    base = _perf_style([rows], trades)
+
+    def style(col, value, row):
+        # a rule above each regime's first row sets the groups apart
+        rule = {"borderTop": f"1.5px solid {DIM}"} if row["state"] == "all" else {}
+        if col in ("data_from", "rule", "live"):
+            return {"textAlign": "left", "color": DIM if col == "rule" else TEXT, **rule}
+        return {**(base(col, value, row) or {}), **rule} or None
+
+    return _section("REGIMES", [html.Div([
+        table(_shown(rows), title="by macro regime at entry", float_fmt=",.2f",
+              headers={**PERF_HEADERS, "data_from": "data from", "rule": "what · thresholds"}, cell_style=style),
+        _subtitle(f"state on each trade's entry day (a new state counts after {RegimeParams().confirm} days in a row)"
+                  f" · each regime scored over its own span · ● today (as of {states['ts'][-1]})")])])
 
 
 def _btn_style(primary: bool = False) -> dict:
@@ -1065,6 +1307,7 @@ def _card(row: dict) -> html.Div:
     slug = _slug(signal_id)
     summary, chart_body, trade_data, months, extra = _card_sections(signal_id)
     return html.Div(
+        className="oven-tight",  # the Oven's dense house tables (oven.css)
         style={"border": f"1px solid {BORDER}", "background": PANEL,
                "padding": "14px 18px", "marginBottom": 18},
         children=[
@@ -1140,13 +1383,12 @@ def _card(row: dict) -> html.Div:
                              children=html.Div(id=_pid("card-charts", signal_id), children=chart_body)),
                     # the trades beside the monthly P&L, as on the Oven's setup card
                     html.Div(
-                        style={"display": "grid", "gridTemplateColumns": "minmax(0, 1fr) auto",
-                               "gap": 16, "alignItems": "start"},
+                        className="oven-trades-months",
                         children=[
                             html.Div(_trade_table_section(
-                                trade_data["closed"], 0, trade_data["open"], signal_id,
+                                trade_data["closed"], 0, trade_data["open"], signal_id, trade_data["size"],
                             ) if trade_data is not None else html.Div(), style={"minWidth": 0}),
-                            html.Div(months, id=_pid("card-months", signal_id), style={"marginTop": 14}),
+                            html.Div(months, id=_pid("card-months", signal_id)),
                         ],
                     ),
                     html.Div(extra, id=_pid("card-extra", signal_id)),
@@ -1154,6 +1396,11 @@ def _card(row: dict) -> html.Div:
             ),
         ],
     )
+
+
+def _deep_card(row: dict) -> html.Div:
+    """One signal's Deep Dive card in the wrapper the dropdown shows and hides."""
+    return html.Div(id=_pid("deep-card", _row_id(row)), style={"display": "block"}, children=_card(row))
 
 
 def _registry_rows() -> list[dict]:
@@ -1230,18 +1477,10 @@ def build_app() -> dash.Dash:
                             ),
                         ],
                     ),
-                    *[
-                        html.Div(
-                            id=_pid("deep-card", _row_id(row)),
-                            style={
-                                "display": "block"
-                                if _row_id(row) == selected_signal
-                                else "none"
-                            },
-                            children=_card(row),
-                        )
-                        for row in rows
-                    ],
+                    # only the selected signal's card is built on load; the others are added
+                    # the first time they are picked (_add_deep_card) and kept after that
+                    dcc.Store(id="deep-dive-built", data=[selected_signal]),
+                    html.Div(id="deep-dive-cards", children=[_deep_card(rows[0])]),
                 ]
                 if rows
                 else [
@@ -1328,6 +1567,26 @@ def build_app() -> dash.Dash:
         ]
     )
 
+    def _add_deep_card(selected, built):
+        """Build a signal's card the first time it is picked, appended beside the ones
+        already built (they keep their state); picking one already built changes nothing
+        here, the callback above just shows it."""
+        built = built or []
+        row = REGISTRY.get(selected) if selected else None
+        if row is None or selected in built:
+            return dash.no_update, dash.no_update
+        cards = Patch()
+        cards.append(_deep_card(row))
+        return cards, [*built, selected]
+
+    app.callback(
+        Output("deep-dive-cards", "children"),
+        Output("deep-dive-built", "data"),
+        Input("deep-dive-signal", "value"),
+        State("deep-dive-built", "data"),
+        prevent_initial_call=True,
+    )(_add_deep_card)
+
     def _refresh_overview(*_clicks):
         rows = _registry_rows()
         _refresh_all_data(rows)
@@ -1355,8 +1614,8 @@ def build_app() -> dash.Dash:
                 window = kind[len("window-"):]
                 snap_range = None
                 page = 0
-            state = runner.compute_signal(signal_id)
-            trades, open_entry = runner.trade_history(signal_id, state)
+            read = runner.analysis(signal_id)  # recomputed only after a Ref rewrote the data
+            state, trades, open_entry = read["state"], read["trades"], read["open_entry"]
         except RuntimeError as exc:
             err = html.Div(str(exc), style={"color": ORANGE, "padding": "12px 0"})
             return (
@@ -1366,7 +1625,8 @@ def build_app() -> dash.Dash:
             )
 
         if kind == "snap":
-            rng = _visible_trade_range(trades, open_entry, page, state["data_asof"])
+            rng = _visible_trade_range(trades, open_entry, page, state["data_asof"],
+                                       _trade_page_size(state["equity_curve"]))
             if rng is not None:
                 snap_range = [str(rng[0]), str(rng[1])]
 
@@ -1382,6 +1642,7 @@ def build_app() -> dash.Dash:
             window=window,
             page=page,
             date_range=date_range,
+            read_live=read["live"],
         )
         btn_styles = [_btn_style(primary=(k == window)) for k in window_keys]
         if kind == "snap":
@@ -1394,8 +1655,9 @@ def build_app() -> dash.Dash:
             )
         return (
             summary, chart_body, trade_data,
-            _trade_table_block(trade_data["closed"], page, trade_data["open"]),
-            _trade_page_label(len(trade_data["closed"]), page), page,
+            _trade_table_block(trade_data["closed"], page, trade_data["open"], trade_data["size"]),
+            _trade_page_label(len(trade_data["closed"]) + (trade_data["open"] is not None), page,
+                              trade_data["size"]), page,
             window, snap_range, months, extra, *btn_styles,
         )
 
@@ -1425,22 +1687,23 @@ def build_app() -> dash.Dash:
         trade_data = trade_data or {"closed": [], "open": None}
         closed_rows = trade_data.get("closed", [])
         open_entry = trade_data.get("open")
-        n = len(closed_rows)
-        last_page = max(0, (n - 1) // TRADES_PER_PAGE * TRADES_PER_PAGE) if n else 0
+        size = trade_data.get("size", TRADES_PER_PAGE)
+        n = len(closed_rows) + (open_entry is not None)  # the open position pages in first
+        last_page = max(0, (n - 1) // size * size) if n else 0
         page = page or 0
         kind = (ctx.triggered_id or {}).get("type")
         if kind == "trades-first":
             page = 0
         elif kind == "trades-prev":
-            page = max(0, page - TRADES_PER_PAGE)
+            page = max(0, page - size)
         elif kind == "trades-next":
-            page = min(page + TRADES_PER_PAGE, last_page)
+            page = min(page + size, last_page)
         elif kind == "trades-last":
             page = last_page
         page = min(page, last_page)
         return (
-            _trade_table_block(closed_rows, page, open_entry),
-            _trade_page_label(n, page),
+            _trade_table_block(closed_rows, page, open_entry, size),
+            _trade_page_label(n, page, size),
             page,
         )
 
