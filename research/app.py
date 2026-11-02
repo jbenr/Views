@@ -2718,8 +2718,10 @@ def register_callbacks(app) -> None:
     @app.callback(*[Output(f"{name}-progress", "children") for name in ("load", "dis", "bt")],
                   Input("research-progress-poll", "n_intervals"), State("research-session", "data"))
     def _progress(_tick, session):
-        # Jobs run in worker processes, which report progress through a file.
-        return [progress_view(work.snapshot(session, name) if name == "load" else jobs.progress_of(name), caption)
+        # Jobs run in worker processes, which report progress through a file. A finished or failed job's log
+        # is not shown: on a restart it read as if that job were running again.
+        return [progress_view(work.snapshot(session, name) if name == "load"
+                              else jobs.progress_of(name) if jobs.running(name) else {}, caption)
                 for name, caption in (("load", "loading"), ("dis", "searching"), ("bt", "backtesting"))]
 
     @app.callback(Output("bt-gate-img", "src"), *[Output(f"bt-gate-window-{key}", "style") for key in WINDOW_PRESETS],

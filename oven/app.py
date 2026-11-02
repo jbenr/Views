@@ -403,10 +403,39 @@ def peer_correlations(path: str, setup: dict, by: str, min_trades: int, peers: i
     for r in best.to_dicts():
         theirs = monthly_pnl(bake_trades(path, {k: r[k] for k in engine.SETUP}))
         both = mine.join(theirs, on="month", how="full", coalesce=True, suffix="_peer").fill_null(0.0)
-        rows.append(dict(peer=f"{r['input']} · {describe(r)}",
-                         peer_sharpe=r["sharpe"], monthly_corr=both.select(pl.corr("pnl", "pnl_peer")).item(),
-                         months_both_active=int(((both["pnl"] != 0) & (both["pnl_peer"] != 0)).sum())))
+        corr = both.select(pl.corr("pnl", "pnl_peer")).item()
+        rows.append(dict(input=r["input"], best_setup=f"lb {r['lookback']} · {r['basis']} · {r['scale']} "
+                                                       f"{r['entry']:g}",
+                         sharpe=r["sharpe"], monthly_corr=corr,
+                         months_both=int(((both["pnl"] != 0) & (both["pnl_peer"] != 0)).sum()),
+                         overlap=overlap_label(corr)))
     return pl.DataFrame(rows)
+
+
+def overlap_label(corr: float | None) -> str:
+    """How much a peer's monthly P&L moves with this setup's: below 0.3 it diversifies a
+    book, above 0.6 it is the same bet."""
+    if corr is None or not np.isfinite(corr):
+        return "—"
+    return "diversifies" if corr < 0.3 else "same bet" if corr > 0.6 else "partly"
+
+
+def peers_view(peers: pl.DataFrame) -> html.Div:
+    """Overlap with other inputs' best setups, the correlation green where it diversifies
+    (low or negative) and red where it is the same bet."""
+    if peers.is_empty():
+        return note("Overlap with other inputs needs a bake with more than one input; this bake has only this one.",
+                    "dim")
+
+    def style(col, value, _row):
+        if col == "monthly_corr" and isinstance(value, float) and np.isfinite(value):
+            return _diverging(-value, 1.0)  # low correlation is the good side
+        return {"textAlign": "left"} if col in ("input", "best_setup", "overlap") else None
+
+    return table(show(peers), title="overlap with other inputs' best setups · monthly P&L correlation",
+                 float_fmt=",.2f", sortable=True, cell_style=style,
+                 headers={"best_setup": "their best setup", "monthly_corr": "monthly corr",
+                          "months_both": "months both traded"})
 
 
 TERCILES = ("low", "mid", "high")
@@ -663,7 +692,52 @@ def score_grid_view(board: pl.DataFrame, setup: dict, by: str) -> html.Div:
                  float_fmt=",.2f", cell_style=style)
 
 
-KNOB_CELLS = 10  # a knob with more values than this (gates) shows none, this setup's and the best of the rest
+KNOB_CELLS = 10  # a knob with more values than this shows none, this setup's and the best of the rest
+
+
+def gate_view(board: pl.DataFrame, setup: dict, by: str) -> html.Div:
+    """Every gate the bake tried for this setup, everything else held: one row per gate
+    condition, one column per bucket, each cell 'score · trades' coloured by the score,
+    this setup's gate outlined and no gate in the title to beat."""
+    rows = sensitivity(board, setup, by).filter(pl.col("knob") == KNOBS["gate"])
+    gated = rows.filter(pl.col("value") != engine.NO_GATE)
+    if gated.is_empty():
+        return note("The bake swept no gates for this setup.", "dim")
+    ungated = rows.filter(pl.col("value") == engine.NO_GATE)["score"].to_list()
+    gated = gated.with_columns(pl.col("value").str.split_exact(":", 1).struct.rename_fields(["condition", "bucket"])
+                               .alias("parts")).unnest("parts")
+    buckets = [b for b in engine.GATE_BUCKETS if b in gated["bucket"].to_list()]
+    buckets += [b for b in gated["bucket"].unique(maintain_order=True).to_list() if b not in buckets]
+    order = (gated.group_by("condition").agg(pl.col("score").max().alias("best"))
+             .sort("best", descending=True, nulls_last=True)["condition"].to_list())
+    scores = gated["score"].drop_nulls().drop_nans()
+    colour = _score_style(float(scores.abs().max()) if len(scores) else 1.0)
+    records = []
+    for condition in order:
+        cells = {r["bucket"]: r for r in gated.filter(pl.col("condition") == condition).to_dicts()}
+        record = {"condition": condition}
+        for i, bucket in enumerate(buckets):
+            r = cells.get(bucket)
+            ok = r is not None and r["score"] is not None and np.isfinite(r["score"])
+            record[f"c{i}"] = f"{r['score']:.2f} · {r['n_trades']}" if ok else ""
+            record[f"score_{i}"], record[f"this_{i}"] = (r["score"] if ok else None), bool(r and r["this"])
+        records.append(record)
+    frame = pd.DataFrame(records).astype(object)
+    frame = frame.where(frame.notna(), "")
+    cells = [f"c{i}" for i in range(len(buckets))]
+
+    def style(col, _value, row):
+        if col == "condition":
+            return {"textAlign": "left", "fontWeight": "bold"}
+        i = col[1:]
+        cell = colour(row.get(f"score_{i}")) or {}
+        return {**cell, **THIS} if row.get(f"this_{i}") is True else cell or None
+
+    none = f"{ungated[0]:.2f}" if ungated and ungated[0] is not None and np.isfinite(ungated[0]) else "—"
+    return table(frame, title=f"{engine.RANKS[by]} by gate · score · trades · no gate {none}, this setup outlined",
+                 columns=["condition", *cells], headers={"condition": "condition",
+                                                         **{c: b for c, b in zip(cells, buckets)}},
+                 cell_style=style)
 
 
 def sensitivity_view(board: pl.DataFrame, setup: dict, by: str) -> html.Div:
@@ -676,7 +750,7 @@ def sensitivity_view(board: pl.DataFrame, setup: dict, by: str) -> html.Div:
     records, width = [], 0
     for knob in rows["knob"].unique(maintain_order=True).to_list():
         part = rows.filter(pl.col("knob") == knob)
-        if len(part) < 2:
+        if len(part) < 2 or knob == KNOBS["gate"]:  # gates have their own table (gate_view)
             continue
         if len(part) > KNOB_CELLS:
             rest = part.filter(~pl.col("this") & (pl.col("value") != engine.NO_GATE))
@@ -1140,13 +1214,8 @@ def drivers_view(b: dict, board: pl.DataFrame, by: str, cost: float, peers: pl.D
              f"(outlined); a good setup sits among neighbours that also score.", "dim"),
         html.Div(sensitivity_view(board, setup, by), className="oven-full"),
         html.Div(className="oven-full", style={**TWO_UP, "marginTop": 12}, children=[
-            html.Div([score_grid_view(board, setup, by)], style=column),
-            html.Div([table(show(peers), title="monthly P&L correlation with other inputs' best setups · does it "
-                                               "add to a book or is it the same bet?", float_fmt=",.3f",
-                            sortable=True)
-                      if not peers.is_empty() else
-                      note("Monthly P&L correlation with other inputs' best setups needs a bake with more than one "
-                           "input; this bake has only this one.", "dim")], style=column),
+            html.Div([score_grid_view(board, setup, by), peers_view(peers)], style=column),
+            html.Div([gate_view(board, setup, by)], style=column),
         ]),
     ], style={"marginBottom": 18})
     when = html.Div([
