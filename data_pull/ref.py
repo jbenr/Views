@@ -95,6 +95,7 @@ STEPS = [
     ("swpn_vol",  "pull_swaption_vol.py",        "md.swaption_vol",           True),
     ("headline",  "build_headline.py",           "md.headline",               False),
     ("breakeven", "build_breakeven.py",          "md.breakeven",              False),
+    ("opt_expo",  "build_opt_exposure.py",       "md.opt_levels + greeks",    False),
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────

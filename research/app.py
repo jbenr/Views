@@ -31,6 +31,7 @@ from dashboard.charts import (
     regime_gate_chart,
     curve_fit_chart,
     hedge_weights_chart,
+    ladder_chart,
     level_chart,
     regime_timeline_chart,
     series_chart,
@@ -45,7 +46,7 @@ from research.term_premium import CURVE as TP_CURVE, FLY as TP_FLY, TP_WINDOWS, 
 from research.inflation_carry import BREAKEVENS, HORIZONS, carry, carry_table, load_inflation
 from research.sofr_ff import AHEADS as SF_AHEADS, LOOKBACKS as SF_LOOKBACKS, study as sofr_ff_study
 from research.cta import TENORS as CTA_TENORS, study as cta_study
-from research.gamma import CFTC_LOOKBACKS as GAMMA_CFTC_LOOKBACKS, CONVENTIONS as GAMMA_CONVENTIONS, study as gamma_study
+from research.gamma import CFTC_LOOKBACKS as GAMMA_CFTC_LOOKBACKS, study as gamma_study
 
 from research.panel import (
     BETA_LOOKBACK,
@@ -579,7 +580,7 @@ REMEMBERED = [
     "fv-pca-tenors", "fv-pca-start", "fv-pca-window", "fv-pca-factors", "tp-start", "tp-lookback",
     "infl-horizon", "infl-start",
     "sf-ahead", "sf-lookback", "sf-adjust", "sf-entry", "sf-exit", "sf-hold", "sf-cost", "cta-tenor", "cta-start",
-    "gm-start", "gm-convention", "gm-cftc-lookback",
+    "gm-start", "gm-cftc-lookback",
     "reg-start", "reg-pricing", "reg-vol-window", "reg-vol-rank", "reg-vol-bands", "reg-oil-window", "reg-oil-bands",
     "reg-infl-bands", "dis-regimes", "dis-min-episodes", "dis-regime-placebo",
     "reg-confirm",
@@ -2186,81 +2187,100 @@ def cta_view(result: dict, window: str) -> html.Div:
 
 def gamma_tab() -> html.Div:
     controls = html.Div([
-        field("options history from", dcc.Dropdown(id="gm-start", value="2024-06-01", clearable=False, options=[
+        field("history from", dcc.Dropdown(id="gm-start", value="2024-06-01", clearable=False, options=[
             {"label": "Jun 2024 (backfill start)", "value": "2024-06-01"}, {"label": "2025", "value": "2025-01-01"},
             {"label": "2026", "value": "2026-01-01"}])),
-        field("dealer side", dcc.Dropdown(id="gm-convention", value="split", clearable=False,
-                                          options=[{"label": v, "value": k} for k, v in GAMMA_CONVENTIONS.items()])),
         field("CFTC regression window (weeks)", dcc.Dropdown(id="gm-cftc-lookback", value=52, clearable=False,
                                                              options=[{"label": f"{k}", "value": k}
                                                                       for k in GAMMA_CFTC_LOOKBACKS])),
         html.Button("Update", id="gm-run", n_clicks=0, className="ref-btn",
                     style={**btn_style(primary=True), "width": "100%", "marginTop": 4, "marginBottom": 14}),
-        info("How gamma is measured",
-             "Every TY option in md.opt_eod (quarterly and serial expiries; weeklies not pulled) gets an implied vol "
-             "from its settlement -- Black-76 on its quarterly future, priced off the out-of-the-money side -- and a "
-             "gamma. Open interest x gamma, summed, is how many futures the holders' hedges change per point.",
-             "Open interest does not say who is short. 'Dealers long calls, short puts' is the usual equity "
-             "convention; 'dealers short all options' assumes customers own everything. A dealer short gamma buys "
-             "rallies and sells sell-offs, adding to moves.",
-             "The profile moves every future by the same amount with vols and expiries held. The flip is the move "
-             "where dealer gamma changes sign. Open interest for a day is published the next morning, so tests "
-             "start the day after."),
+        info("The engine",
+             "Every listed TY option in md.opt_eod -- quarterly, serial and weekly (Mon-Fri) expiries -- gets an "
+             "implied vol from its settlement (Black-76 on its quarterly future, out-of-the-money side) and its "
+             "delta, gamma, vega, vanna and charm. data_pull/build_opt_exposure.py stores them per option, per "
+             "strike (md.opt_strike_exposure) and as daily levels (md.opt_levels, md.opt_profile).",
+             "Raw positioning: open interest does not say who is long. Calls and puts are kept apart; 'net' is calls "
+             "minus puts -- the book of a holder long calls and short puts. Walls, the gamma peak and max pain do not "
+             "depend on that sign; the flip and the hedge flows do.",
+             "Flip: the futures move where net gamma changes sign, revaluing every option with vols held. Call / put "
+             "wall: the strike with the most call / put gamma x open interest. Hedge flow: futures the net holder "
+             "trades to stay delta-neutral after the move (+ buys). Open interest for a day is published the next "
+             "morning, so tests start from the following close."),
         info("CFTC estimate",
              "Futures-and-options positions minus futures-only positions is each group's delta-equivalent options "
              "position (weekly, from 2006). If dealers are long gamma, their options delta rises as yields fall: "
              "minus the rolling slope of its weekly change on the 10y yield change estimates their gamma, in "
              "contracts per bp, usable from the Friday release."),
     ], className="research-controls")
-    return _idio_layout("Options gamma", "Where dealers' delta hedging of Treasury futures options adds to or leans "
-                        "against moves, where that flips, and whether it shows up in what the market does next.",
-                        controls, "gm")
+    return _idio_layout("Options gamma", "Where options hedging in TY sits strike by strike, where it flips, and "
+                        "whether the future respects those levels.", controls, "gm")
 
 
 def gamma_view(result: dict, window: str) -> html.Div:
-    daily, conv, est = result["daily"], result["convention"], result["cftc"]
+    levels, est = result["levels"], result["cftc"]
     zero = [{"value": 0.0, "style": "solid", "color": DIM}]
-    label = GAMMA_CONVENTIONS[conv]
     parts = []
-    if not daily.is_empty():
-        now = daily.drop_nulls("px").row(-1, named=True)
-        flip_move = now[f"flip_{conv}"]
-        since = window_start(daily["ts"], window)
-        shown = daily.filter(pl.col("ts") >= since) if since is not None else daily
-        prof = result["profile"]
-        flow = now[f"flow_{conv}"]
+    if not levels.is_empty():
+        now = result["today"]
+        px, flip_level = now["px"], now["flip"]
+        marks = {"future": px, **({"flip": flip_level} if flip_level is not None else {}),
+                 "call wall": now["call_wall"], "put wall": now["put_wall"]}
+        since = window_start(levels["ts"], window)
+        shown = levels.filter(pl.col("ts") >= since) if since is not None else levels
+        prof, ladder = result["profile"], result["ladder"]
         parts += [
-            _stats_bar(stat_block("as of", str(now["ts"])), stat_block(f"{now['underlying']}", f"{now['px']:.3f}"),
-                       stat_block("dealer gamma", f"{now[f'dealer_{conv}']:+,.0f} fut / pt",
-                                  alert=now[f"dealer_{conv}"] < 0),
-                       stat_block("hedge flow, 1-sd rally", f"{flow:+,.0f} fut" if flow is not None else "—"),
-                       stat_block("share of daily volume", f"{now[f'flow_share_{conv}']:+.1%}"
-                                  if now[f"flow_share_{conv}"] is not None else "—"),
-                       stat_block("flip", f"{flip_move:+.2f} pts ({now['px'] + flip_move:.2f})"
-                                  if flip_move is not None else "none within ±4 pts"),
-                       stat_block("next expiry", str(now["next_expiry"]))),
-            _png_img(xy_chart(prof["move"].to_list(), {"calls": prof["calls"].to_list(),
-                                                       "puts": prof["puts"].to_list(),
-                                                       f"dealer net ({label})": prof[f"dealer_{conv}"].to_list()},
-                              "open-interest gamma if TY futures move · futures per point",
-                              xaxis_title="futures move (points)", yaxis_title="futures per point",
-                              vlines={"today": 0.0, **({"flip": flip_move} if flip_move is not None else {})},
-                              line_colors={"calls": C2, "puts": C0, f"dealer net ({label})": ORANGE})),
-            table(result["pins"].to_pandas(), title="strikes carrying the most gamma, next two expiries", float_fmt=",.2f"),
-            _png_img(series_chart(shown.select("ts", pl.col(f"dealer_{conv}").alias("dealer gamma"),
-                                               pl.col("px").alias("front future")),
-                                  ["dealer gamma", "front future"], f"dealer gamma ({label}) and the front future",
-                                  yaxis_title="futures per point", left=["front future"], yaxis_right_title="price",
-                                  hlines=zero, line_colors={"dealer gamma": ORANGE, "front future": "#333"})),
-            table(result["tests"].to_pandas(), title="does it show up? next-week realized vol of the front future "
-                  "and day-to-day follow-through, by third of dealer gamma", float_fmt=",.3f")
-            if not result["tests"].is_empty() else note("Too few days for the tests.", "dim"),
+            _stats_bar(stat_block("as of", str(now["ts"])), stat_block(now["underlying"], f"{px:.3f}"),
+                       stat_block("net gamma (calls - puts)", f"{now['net_gamma']:+,.0f} fut / pt",
+                                  alert=now["net_gamma"] < 0),
+                       stat_block("gross gamma", f"{now['gross_gamma']:,.0f} fut / pt"),
+                       stat_block("flip", f"{flip_level:.2f} ({now['flip_move']:+.2f})" if flip_level is not None
+                                  else "none within ±4 pts"),
+                       stat_block("call / put wall", f"{now['call_wall']:g} / {now['put_wall']:g}"),
+                       stat_block("gamma peak · max pain", f"{now['gamma_peak']:g} · {now['max_pain']:g}"),
+                       stat_block("weeklies' share of gamma", f"{now['weekly_gamma_share']:.0%}"
+                                  if now["weekly_gamma_share"] is not None else "—")),
+            _png_img(ladder_chart(ladder["strike"].to_list(),
+                                  {"calls · weekly": ladder["call_weekly"].to_list(),
+                                   "calls · standard": ladder["call_standard"].to_list()},
+                                  {"puts · weekly": ladder["put_weekly"].to_list(),
+                                   "puts · standard": ladder["put_standard"].to_list()},
+                                  "gamma x open interest by strike, all expiries (calls up, puts down)",
+                                  "futures per point", vlines=marks)),
+            _png_img(xy_chart([px + m for m in prof["move"].to_list()],
+                              {"calls": prof["call_gamma"].to_list(), "puts": prof["put_gamma"].to_list(),
+                               "net (calls - puts)": prof["net_gamma"].to_list()},
+                              "open-interest gamma if the front future were at each price · futures per point",
+                              xaxis_title="front future price", yaxis_title="futures per point", vlines=marks,
+                              line_colors={"calls": C2, "puts": C0, "net (calls - puts)": ORANGE})),
+            table(result["flows"].to_pandas(), title="hedge flow: futures the net holder trades to stay neutral "
+                  "after each move (+ buys) and as a share of 20-day average TY volume", float_fmt=",.3f"),
+            table(result["positioning"].to_pandas(), title="today's positioning: the strikes where open interest "
+                  "changed most", float_fmt=",.0f"),
+            _png_img(series_chart(shown.select("ts", pl.col("px").alias("front future"), "flip",
+                                               pl.col("call_wall").alias("call wall"),
+                                               pl.col("put_wall").alias("put wall")),
+                                  ["front future", "flip", "call wall", "put wall"],
+                                  "front future against its options levels", yaxis_title="price",
+                                  line_colors={"front future": "#333", "flip": ORANGE, "call wall": C2,
+                                               "put wall": C0})),
+            _png_img(series_chart(shown.select("ts", pl.col("net_gamma").alias("net gamma"),
+                                               pl.col("gross_gamma").alias("gross gamma")),
+                                  ["net gamma", "gross gamma"], "net and gross open-interest gamma at the day's price",
+                                  yaxis_title="futures per point", hlines=zero, fig_height=3.4,
+                                  line_colors={"net gamma": ORANGE, "gross gamma": DIM})),
+            table(result["regime"].to_pandas(), title=f"regime: the next {result['horizon']} days by where the future "
+                  "sits against the flip (moves in 20-day sd units)", float_fmt=",.3f")
+            if not result["regime"].is_empty() else note("Too few days for the regime test.", "dim"),
+            table(result["walls"].to_pandas(), title=f"walls: closes through each wall within {result['horizon']} "
+                  "days, against a placebo half a point further out", float_fmt=",.3f"),
         ]
     else:
-        parts.append(note("No options in md.opt_eod for this history. Run data_pull/pull_options.py.", "warn"))
+        parts.append(note("No levels in md.opt_levels. Run data_pull/pull_options.py, then "
+                          "data_pull/build_opt_exposure.py.", "warn"))
     if not est.is_empty():
         last = est.row(-1, named=True)
-        cftc_shown = est.filter(pl.col("ts") >= daily["ts"][0]) if window != "MAX" and not daily.is_empty() else est
+        cftc_shown = est.filter(pl.col("ts") >= levels["ts"][0]) if window != "MAX" and not levels.is_empty() else est
         parts += [
             html.Div("CFTC · WEEKLY, FROM 2006", style={**HEADING, "marginTop": 18, "marginBottom": 8}),
             _stats_bar(stat_block("report", str(last["ts"])),
@@ -2282,9 +2302,9 @@ def gamma_view(result: dict, window: str) -> html.Div:
             table(result["cftc_tests"].to_pandas(), title="10y yield vol after each release, by sign of the "
                   "estimate · compare vol change, not level: high-vol years dominate the level", float_fmt=",.2f"),
         ]
-    parts.append(note("The dealer side is assumed, not observed; compare the two conventions and the CFTC estimate "
-                      "before trusting a flip level. Weekly options and options on other futures are not loaded. "
-                      "Overlapping windows: buckets describe, they are not significance tests.", "dim"))
+    parts.append(note("Weeklies are stored from late September 2026 (backfill with pull_options.py backfill-weekly); "
+                      "earlier levels miss them. Overlapping windows: the tables describe, they are not significance "
+                      "tests.", "dim"))
     return html.Div(parts)
 
 
@@ -2914,16 +2934,15 @@ def register_callbacks(app) -> None:
 
     @app.callback(Output("gm-out", "children"), Output("gm-shown", "data"),
                   Input("gm-run", "n_clicks"), Input("bench-tabs", "value"), Input("idio-tabs", "value"),
-                  Input("gm-window", "data"), State("gm-start", "value"), State("gm-convention", "value"),
+                  Input("gm-window", "data"), State("gm-start", "value"),
                   State("gm-cftc-lookback", "value"), State("gm-shown", "data"))
-    def _gamma(clicks, tab, idio_tab, window, start, convention, lookback, shown):
+    def _gamma(clicks, tab, idio_tab, window, start, lookback, shown):
         # Runs on Update, when the Options gamma tab is first opened, and when the chart window changes.
         window = window if window in WINDOW_PRESETS else IDIO_WINDOW
         if not clicks and (tab != "idio" or idio_tab != "gamma" or shown == window):
             return no_update, no_update
         try:
-            convention = convention if convention in GAMMA_CONVENTIONS else "split"
-            result = gamma_study(start or "2024-06-01", convention, int(lookback or 52))
+            result = gamma_study(start or "2024-06-01", int(lookback or 52))
             return gamma_view(result, window), window
         except Exception as exc:
             return note(f"Options gamma failed: {type(exc).__name__}: {exc}", "bad"), no_update

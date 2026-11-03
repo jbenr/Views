@@ -665,12 +665,37 @@ def xy_chart(x: list[float], lines: dict[str, list[float]], title: str, xaxis_ti
         ax.plot(x, ys, color=(line_colors or {}).get(name, palette[i % len(palette)]), linewidth=2.0, label=name,
                 zorder=3)
     ax.axhline(0.0, color=DIM, linewidth=0.9)
-    for name, at in (vlines or {}).items():
+    for i, (name, at) in enumerate((vlines or {}).items()):  # labels stepped down so close markers stay legible
         ax.axvline(at, color="#333", linestyle=":", linewidth=1.0)
-        ax.annotate(name, (at, 1.0), xycoords=("data", "axes fraction"), textcoords="offset points", xytext=(3, -12),
-                    fontsize=8, color="#333")
+        ax.annotate(name, (at, 1.0), xycoords=("data", "axes fraction"), textcoords="offset points",
+                    xytext=(3, -12 - 11 * i), fontsize=8, color="#333")
     viz._style_ax(ax, yaxis_title=yaxis_title, xaxis_title=xaxis_title)
     ax.legend(loc="upper left", bbox_to_anchor=(0, -0.16), ncol=len(lines), fontsize=9, frameon=False)
+    fig.suptitle(title.upper(), fontsize=viz.TITLE_SIZE, fontweight="bold", color="#333", x=0.02, ha="left", y=0.98)
+    return _png(fig)
+
+
+@_one_at_a_time
+def ladder_chart(strikes: list[float], up: dict[str, list[float]], down: dict[str, list[float]], title: str,
+                 unit: str, vlines: dict[str, float] | None = None, width: float = 0.2) -> str:
+    """Stacked bars by strike: ``up`` series above zero, ``down`` series drawn below it, labelled price markers."""
+    viz = _PngViz()
+    fig, ax = plt.subplots(figsize=(12, 4.8))
+    fig.patch.set_facecolor("white")
+    x = np.asarray(strikes, dtype=float)
+    for sign, series, colours in ((1, up, [C2, "#9ecae1"]), (-1, down, [C0, "#fcae91"])):
+        base = np.zeros(len(x))
+        for i, (name, ys) in enumerate(series.items()):
+            y = np.nan_to_num(np.asarray(ys, dtype=float))
+            ax.bar(x, sign * y, width=width, bottom=sign * base, color=colours[i % 2], label=name, zorder=3)
+            base += y
+    ax.axhline(0.0, color="#333", linewidth=0.9)
+    for i, (name, at) in enumerate((vlines or {}).items()):  # labels stepped down so close markers stay legible
+        ax.axvline(at, color="#333", linestyle=":", linewidth=1.0)
+        ax.annotate(name, (at, 1.0), xycoords=("data", "axes fraction"), textcoords="offset points",
+                    xytext=(3, -12 - 11 * i), fontsize=8, color="#333")
+    viz._style_ax(ax, yaxis_title=unit, xaxis_title="strike")
+    ax.legend(loc="upper left", bbox_to_anchor=(0, -0.16), ncol=len(up) + len(down), fontsize=9, frameon=False)
     fig.suptitle(title.upper(), fontsize=viz.TITLE_SIZE, fontweight="bold", color="#333", x=0.02, ha="left", y=0.98)
     return _png(fig)
 
