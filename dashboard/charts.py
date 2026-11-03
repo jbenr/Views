@@ -654,6 +654,28 @@ def curve_fit_chart(years: list[int], actual: list[float], fair: list[float], ti
 
 
 @_one_at_a_time
+def xy_chart(x: list[float], lines: dict[str, list[float]], title: str, xaxis_title: str, yaxis_title: str,
+             vlines: dict[str, float] | None = None, line_colors: dict | None = None) -> str:
+    """Lines against a numeric x (not time), a zero line, and labelled vertical markers."""
+    viz = _PngViz()
+    fig, ax = plt.subplots(figsize=(12, 4.4))
+    fig.patch.set_facecolor("white")
+    palette = [ORANGE, C2, "#333", DIM]
+    for i, (name, ys) in enumerate(lines.items()):
+        ax.plot(x, ys, color=(line_colors or {}).get(name, palette[i % len(palette)]), linewidth=2.0, label=name,
+                zorder=3)
+    ax.axhline(0.0, color=DIM, linewidth=0.9)
+    for name, at in (vlines or {}).items():
+        ax.axvline(at, color="#333", linestyle=":", linewidth=1.0)
+        ax.annotate(name, (at, 1.0), xycoords=("data", "axes fraction"), textcoords="offset points", xytext=(3, -12),
+                    fontsize=8, color="#333")
+    viz._style_ax(ax, yaxis_title=yaxis_title, xaxis_title=xaxis_title)
+    ax.legend(loc="upper left", bbox_to_anchor=(0, -0.16), ncol=len(lines), fontsize=9, frameon=False)
+    fig.suptitle(title.upper(), fontsize=viz.TITLE_SIZE, fontweight="bold", color="#333", x=0.02, ha="left", y=0.98)
+    return _png(fig)
+
+
+@_one_at_a_time
 def residual_bars_chart(tenors: list[str], values: list[float], title: str, unit: str,
                         bands: tuple[float, ...] = (), rotate_labels: bool = False) -> str:
     """One bar per tenor, blue above zero and red below, labelled; optional ± reference lines.

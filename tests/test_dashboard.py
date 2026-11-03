@@ -5,6 +5,7 @@ import importlib
 import sys
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import polars as pl
 import pytest
@@ -503,6 +504,21 @@ def test_confidence_tables_split_sharpe_pnl_hit_and_count_by_tier_and_feature(mo
     assert set(tiers.columns) >= {"sharpe", "hit_rate", "avg_trade"}
     parts = app._confidence_by_component(d, daily, trades)
     assert parts["tercile"].to_list() == ["low", "high"] and parts["feature"].to_list() == ["|z|", ""]
+
+
+def test_a_group_of_like_trades_scores_the_sharpe_of_all_of_them_whatever_its_size(monkeypatch, tmp_path):
+    app = _load_app_module(monkeypatch, tmp_path)
+    days = pd.bdate_range("2020-01-01", periods=200)
+    # 20 trades of 5 days each, 10 days apart, every one marking +1, -0.5, +2, 0, +1; flat days between
+    pattern = [1.0, -0.5, 2.0, 0.0, 1.0]
+    daily = [pattern[i % 10] if i % 10 < 5 else 0.0 for i in range(200)]
+    trades = pl.DataFrame({"entry_date": [days[i].date() for i in range(0, 200, 10)],
+                           "exit_date": [days[i + 4].date() for i in range(0, 200, 10)], "pnl_bps": [3.5] * 20})
+    equity = pl.DataFrame({"ts": [d.date() for d in days], "pnl_bps": daily})
+    d, marks = app._scored_days(equity, trades)
+    every = app._performance(d, marks, trades, 70.0)["sharpe"]
+    three = app._performance(d, marks, trades.head(3), 70.0)["sharpe"]
+    assert three == pytest.approx(every) and every == pytest.approx(np.mean(pattern) / np.std(pattern) * np.sqrt(252))
 
 
 def test_regime_table_splits_trades_by_the_state_on_their_entry_day(monkeypatch, tmp_path):

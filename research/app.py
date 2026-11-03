@@ -36,12 +36,16 @@ from dashboard.charts import (
     series_chart,
     regression_scatter_chart,
     residual_bars_chart,
+    xy_chart,
 )
 from dataclasses import asdict
 from research.regimes import REGIMES, STATES, RegimeParams, regime_column, regimes, with_regimes
 from research.curve_pca import PCA_TENORS, PCA_WINDOWS, pca_curve
 from research.term_premium import CURVE as TP_CURVE, FLY as TP_FLY, TP_WINDOWS, term_premium
 from research.inflation_carry import BREAKEVENS, HORIZONS, carry, carry_table, load_inflation
+from research.sofr_ff import AHEADS as SF_AHEADS, LOOKBACKS as SF_LOOKBACKS, study as sofr_ff_study
+from research.cta import TENORS as CTA_TENORS, study as cta_study
+from research.gamma import CFTC_LOOKBACKS as GAMMA_CFTC_LOOKBACKS, CONVENTIONS as GAMMA_CONVENTIONS, study as gamma_study
 
 from research.panel import (
     BETA_LOOKBACK,
@@ -574,6 +578,8 @@ REMEMBERED = [
     "weighting", "beta-lb", "custom-kind", "custom-leg-1", "custom-leg-2", "custom-leg-3",
     "fv-pca-tenors", "fv-pca-start", "fv-pca-window", "fv-pca-factors", "tp-start", "tp-lookback",
     "infl-horizon", "infl-start",
+    "sf-ahead", "sf-lookback", "sf-adjust", "sf-entry", "sf-exit", "sf-hold", "sf-cost", "cta-tenor", "cta-start",
+    "gm-start", "gm-convention", "gm-cftc-lookback",
     "reg-start", "reg-pricing", "reg-vol-window", "reg-vol-rank", "reg-vol-bands", "reg-oil-window", "reg-oil-bands",
     "reg-infl-bands", "dis-regimes", "dis-min-episodes", "dis-regime-placebo",
     "reg-confirm",
@@ -1614,6 +1620,8 @@ def tabs() -> html.Div:
                     ])),
         dcc.Tab(label="Fair Value", value="fv", style=TAB_STYLE,
                 selected_style=SELECTED_TAB_STYLE, children=fair_value_tab()),
+        dcc.Tab(label="Idio", value="idio", style=TAB_STYLE,
+                selected_style=SELECTED_TAB_STYLE, children=idio_tab()),
     ])], className="research-bench")
 
 
@@ -2000,6 +2008,299 @@ def inflation_view(series: pl.DataFrame, horizon: str, window: str = INFL_WINDOW
     ])
 
 
+IDIO_WINDOW = "5Y"
+
+
+def _stats_bar(*blocks) -> html.Div:
+    return html.Div(list(blocks), style={"display": "flex", "gap": 28, "flexWrap": "wrap", "marginBottom": 14,
+                                         "paddingBottom": 12, "borderBottom": f"1px solid {BORDER}"})
+
+
+def _idio_layout(title: str, what: str, controls: html.Div, prefix: str) -> html.Div:
+    return html.Div([
+        html.Div([html.Div(title.upper(), style=HEADING), note(what, "dim")], className="research-banner",
+                 style={"display": "block"}),
+        html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)", "gap": 26,
+                        "alignItems": "start"}, children=[
+            controls,
+            html.Div([level_window_nav(IDIO_WINDOW, prefix=f"{prefix}-window"),
+                      dcc.Loading(html.Div(id=f"{prefix}-out"), type="dot")]),
+        ]),
+        dcc.Store(id=f"{prefix}-shown"),
+        dcc.Store(id=f"{prefix}-window", data=IDIO_WINDOW),
+    ])
+
+
+def sofr_ff_tab() -> html.Div:
+    controls = html.Div([
+        field("months ahead", dcc.Dropdown(id="sf-ahead", value=2, clearable=False,
+                                           options=[{"label": f"{k}", "value": k} for k in SF_AHEADS])),
+        field("range lookback (days)", dcc.Dropdown(id="sf-lookback", value=126, clearable=False,
+                                                    options=[{"label": f"{k}", "value": k} for k in SF_LOOKBACKS])),
+        field("signal", dcc.Dropdown(id="sf-adjust", value="adj", clearable=False, options=[
+            {"label": "seasonally adjusted basis", "value": "adj"}, {"label": "raw basis", "value": "raw"}])),
+        field("entry |z|", dcc.Dropdown(id="sf-entry", value=2.0, clearable=False,
+                                        options=[{"label": f"{k}", "value": k} for k in (1.0, 1.5, 2.0, 2.5, 3.0)])),
+        field("exit |z|", dcc.Dropdown(id="sf-exit", value=0.5, clearable=False,
+                                       options=[{"label": f"{k}", "value": k} for k in (0.0, 0.25, 0.5, 1.0)])),
+        field("time stop (days)", dcc.Dropdown(id="sf-hold", value=40, clearable=False,
+                                               options=[{"label": f"{k}", "value": k} for k in (10, 20, 40, 60)])),
+        field("round-trip cost (bp)", dcc.Dropdown(id="sf-cost", value=0.5, clearable=False,
+                                                   options=[{"label": f"{k}", "value": k} for k in (0.0, 0.25, 0.5, 1.0)])),
+        html.Button("Update", id="sf-run", n_clicks=0, className="ref-btn",
+                    style={**btn_style(primary=True), "width": "100%", "marginTop": 4, "marginBottom": 14}),
+        info("What the basis is",
+             "One-month SOFR (SER) and 30-day Fed Funds (FF) futures both settle to the average of a daily fixing "
+             "over the calendar month. For the same delivery month, (FF - SER) x 100 is the market's expected "
+             "SOFR - EFFR in bp. Positive: repo above fed funds (reserves scarce, collateral heavy, quarter/year-end, "
+             "tax dates). Negative: a cash glut.",
+             "Long basis = long FF, short SER: gains when SOFR rises against EFFR. FF is $41.67 a bp and SER $25, "
+             "so 3 FF : 5 SER is bp-neutral. P&L here is in bp of basis per unit."),
+        info("How the signal and backtest work",
+             "The basis for a fixed number of months ahead is stitched across month rolls. z = (value - rolling "
+             "mean) / rolling sd. The seasonal adjustment subtracts the usual premium of that delivery month "
+             "(December's year-end, May's bill paydowns) over its neighbours, averaged over strictly earlier days.",
+             "Trades fade z beyond the entry level, decided at the close and done at the next close, holding the "
+             "signalled delivery month to the end. Exit when z is back inside the exit level or crosses zero, at the "
+             "time stop, or on the first day of the contract's own delivery month."),
+    ], className="research-controls")
+    return _idio_layout("SOFR / Fed Funds basis", "SOFR minus EFFR priced for the same month, against its own "
+                        "range: fade it when funding pressure looks stretched, with seasonal turns stripped out.",
+                        controls, "sf")
+
+
+def sofr_ff_view(result: dict, window: str) -> html.Div:
+    sig, bt = result["signal"].drop_nulls("z"), result["backtest"]
+    if sig.is_empty():
+        return note("Not enough matched SOFR / FF history for this lookback.", "warn")
+    now, summary = sig.row(-1, named=True), bt["summary"]
+    since = window_start(sig["ts"], window)
+    shown = sig.filter(pl.col("ts") >= since) if since is not None else sig
+    equity = bt["equity"].filter(pl.col("ts") >= since) if since is not None else bt["equity"]
+    label = "adjusted basis" if result["adjust"] else "basis"
+    zero = [{"value": 0.0, "style": "solid", "color": DIM}]
+    trades = bt["trades"].sort("entry", descending=True)
+    return html.Div([
+        _stats_bar(stat_block("as of", str(now["ts"])), stat_block(f"{result['ahead']}m-ahead basis",
+                                                                    f"{now['basis']:+.2f} bp"),
+                   stat_block(label, f"{now['value']:+.2f} bp"), stat_block("range mean", f"{now['mean']:+.2f} bp"),
+                   stat_block("z", f"{now['z']:+.2f}", alert=abs(now["z"]) > 2),
+                   stat_block("trades", f"{summary['trades']}"),
+                   stat_block("win rate", f"{summary['win_rate']:.0%}" if summary["win_rate"] is not None else "—"),
+                   stat_block("total", f"{summary['total_bp']:+.1f} bp")),
+        table(result["today"].to_pandas(), title="today's strip · basis = (FF - SER) x 100 · turn = premium over "
+              "neighbouring months · seasonal = its usual turn so far", float_fmt=",.2f"),
+        _png_img(series_chart(shown.select("ts", pl.col("value").alias(label), pl.col("mean").alias("range mean"),
+                                           (pl.col("mean") + 2 * pl.col("sd")).alias("+2 sd"),
+                                           (pl.col("mean") - 2 * pl.col("sd")).alias("-2 sd")),
+                              [label, "range mean", "+2 sd", "-2 sd"],
+                              f"{result['ahead']}m-ahead SOFR - EFFR {label} and its {result['lookback']}d range",
+                              hlines=zero, line_colors={label: ORANGE, "range mean": "#333", "+2 sd": DIM,
+                                                        "-2 sd": DIM})),
+        _png_img(series_chart(shown.select("ts", "z"), ["z"], "z-score", yaxis_title="z", fig_height=3.2,
+                              hlines=zero + [{"value": k, "style": "dotted", "color": DIM} for k in (-2, 2)],
+                              line_colors={"z": C2})),
+        _png_img(series_chart(equity.select("ts", pl.col("equity").alias("cumulative P&L")), ["cumulative P&L"],
+                              "fade-the-range backtest · cumulative bp of basis per unit", fig_height=3.4,
+                              hlines=zero, line_colors={"cumulative P&L": "#333"})),
+        table(result["forward"].to_pandas(), title="does a stretched basis come back? average change of the "
+              "signalled contract after each z bucket (bp; positive = wider)", float_fmt=",.2f"),
+        table(result["shocks"].to_pandas(), title="after equity sell-offs (5-day S&P return below -2 sd of the "
+              "past year) vs all days · same contract, bp", float_fmt=",.2f"),
+        table(result["seasonal"].to_pandas(), title="turn premium by delivery month · whole sample, descriptive",
+              float_fmt=",.2f"),
+        table(trades.to_pandas(), title="closed trades", float_fmt=",.2f") if not trades.is_empty()
+        else note("No closed trades with these settings.", "dim"),
+        note("Overlapping forward windows: bucket averages describe, they are not significance tests. Not modelled: "
+             "the realized SOFR and EFFR fixings (not in the database yet), so the basis cannot be compared with "
+             "today's spot spread.", "dim"),
+    ])
+
+
+def cta_tab() -> html.Div:
+    controls = html.Div([
+        field("tenor", dcc.Dropdown(id="cta-tenor", value="10y", clearable=False,
+                                    options=[{"label": k, "value": k} for k in CTA_TENORS])),
+        field("history from", dcc.Dropdown(id="cta-start", value="2000-01-01", clearable=False, options=[
+            {"label": "2000", "value": "2000-01-01"}, {"label": "2010", "value": "2010-01-01"},
+            {"label": "2018", "value": "2018-01-01"}])),
+        html.Button("Update", id="cta-run", n_clicks=0, className="ref-btn",
+                    style={**btn_style(primary=True), "width": "100%", "marginTop": 4, "marginBottom": 14}),
+        info("How positioning is replicated",
+             "Each lookback (21, 63, 126, 252 days) scores the yield move over that window against the move "
+             "ordinary vol would make (63-day daily sd x sqrt of the window), clipped to +-1. Position is minus "
+             "the average: +1 is max long bonds, -1 max short.",
+             "Flip yields are known a day ahead: tomorrow each lookback compares against a fixed past day. Flow is "
+             "the change in replicated position if tomorrow's yield moved by the given amount: where it is large, "
+             "trend followers add to the move."),
+        info("CFTC check",
+             "Leveraged-fund positions from the CFTC are shown as weekly changes. Their level is dominated by the "
+             "cash-futures basis trade, so it is not a CTA position."),
+    ], className="research-controls")
+    return _idio_layout("CTA trend positioning", "How long or short trend followers likely are, the yields where "
+                        "they flip, and how much they would trade on the next move.", controls, "cta")
+
+
+def cta_view(result: dict, window: str) -> html.Div:
+    pos, tenor = result["positions"], result["tenor"]
+    if pos.is_empty():
+        return note("Not enough history for a 252-day trend.", "warn")
+    now = pos.row(-1, named=True)
+    since = window_start(pos["ts"], window)
+    shown = pos.filter(pl.col("ts") >= since) if since is not None else pos
+    zero = [{"value": 0.0, "style": "solid", "color": DIM}]
+    check = result["cftc_check"]
+    lookbacks = [c for c in pos.columns if c.startswith("s") and c[1:].isdigit()]
+    cftc = result["cftc"].filter(pl.col("ts") >= shown["ts"][0]) if "lev_pct" in result["cftc"].columns else None
+    return html.Div([
+        _stats_bar(stat_block("as of", str(now["ts"])), stat_block(f"{tenor} yield", f"{now['y'] / 100:.3f}%"),
+                   stat_block("replicated position", f"{now['position']:+.2f}", alert=abs(now["position"]) > 0.8),
+                   stat_block("5-day flow", f"{now['flow5']:+.2f}"),
+                   stat_block("daily vol", f"{now['vol']:.1f} bp"),
+                   stat_block("CFTC weekly check", f"corr {check['corr']:+.2f} over {check['weeks']} wks"
+                              if check["corr"] is not None else "—")),
+        table(result["triggers"].to_pandas(), title="per lookback · score (+ = long bonds) and the yields that flip "
+              "it or make it a full position tomorrow", float_fmt=",.3f"),
+        table(result["flow"].to_pandas(), title="if tomorrow's yield moved by ... · replicated position and the flow "
+              "(+ = buying bonds)", float_fmt=",.3f"),
+        _png_img(series_chart(shown.select("ts", (pl.col("y") / 100).alias(f"{tenor} yield %"), "position"),
+                              [f"{tenor} yield %", "position"], f"{tenor} yield and replicated trend position",
+                              yaxis_title="position", left=[f"{tenor} yield %"], yaxis_right_title="yield %",
+                              hlines=zero, line_colors={f"{tenor} yield %": "#333", "position": ORANGE})),
+        _png_img(series_chart(shown.select("ts", *[(-pl.col(c)).alias(f"{c[1:]}d") for c in lookbacks]),
+                              [f"{c[1:]}d" for c in lookbacks], "score by lookback (+ = long bonds)",
+                              yaxis_title="score", fig_height=3.4, hlines=zero)),
+        table(result["predictive"].to_pandas(), title="does trend flow come before more of the same move? bond "
+              "return = minus the yield change, bp", float_fmt=",.3f"),
+        _png_img(series_chart(cftc.select("ts", pl.col("lev_pct").alias("leveraged funds"),
+                                          pl.col("am_pct").alias("asset managers")),
+                              ["leveraged funds", "asset managers"], "CFTC net futures position, % of open interest",
+                              yaxis_title="%", fig_height=3.4, hlines=zero,
+                              line_colors={"leveraged funds": ORANGE, "asset managers": C2}))
+        if cftc is not None and not cftc.is_empty() else note("No CFTC data in this window.", "dim"),
+        note("Overlapping forward windows: correlations describe, they are not significance tests. The replication "
+             "is a generic trend model, not any fund's book; real CTAs also risk-scale by vol and trade futures "
+             "across many markets.", "dim"),
+    ])
+
+
+def gamma_tab() -> html.Div:
+    controls = html.Div([
+        field("options history from", dcc.Dropdown(id="gm-start", value="2024-06-01", clearable=False, options=[
+            {"label": "Jun 2024 (backfill start)", "value": "2024-06-01"}, {"label": "2025", "value": "2025-01-01"},
+            {"label": "2026", "value": "2026-01-01"}])),
+        field("dealer side", dcc.Dropdown(id="gm-convention", value="split", clearable=False,
+                                          options=[{"label": v, "value": k} for k, v in GAMMA_CONVENTIONS.items()])),
+        field("CFTC regression window (weeks)", dcc.Dropdown(id="gm-cftc-lookback", value=52, clearable=False,
+                                                             options=[{"label": f"{k}", "value": k}
+                                                                      for k in GAMMA_CFTC_LOOKBACKS])),
+        html.Button("Update", id="gm-run", n_clicks=0, className="ref-btn",
+                    style={**btn_style(primary=True), "width": "100%", "marginTop": 4, "marginBottom": 14}),
+        info("How gamma is measured",
+             "Every TY option in md.opt_eod (quarterly and serial expiries; weeklies not pulled) gets an implied vol "
+             "from its settlement -- Black-76 on its quarterly future, priced off the out-of-the-money side -- and a "
+             "gamma. Open interest x gamma, summed, is how many futures the holders' hedges change per point.",
+             "Open interest does not say who is short. 'Dealers long calls, short puts' is the usual equity "
+             "convention; 'dealers short all options' assumes customers own everything. A dealer short gamma buys "
+             "rallies and sells sell-offs, adding to moves.",
+             "The profile moves every future by the same amount with vols and expiries held. The flip is the move "
+             "where dealer gamma changes sign. Open interest for a day is published the next morning, so tests "
+             "start the day after."),
+        info("CFTC estimate",
+             "Futures-and-options positions minus futures-only positions is each group's delta-equivalent options "
+             "position (weekly, from 2006). If dealers are long gamma, their options delta rises as yields fall: "
+             "minus the rolling slope of its weekly change on the 10y yield change estimates their gamma, in "
+             "contracts per bp, usable from the Friday release."),
+    ], className="research-controls")
+    return _idio_layout("Options gamma", "Where dealers' delta hedging of Treasury futures options adds to or leans "
+                        "against moves, where that flips, and whether it shows up in what the market does next.",
+                        controls, "gm")
+
+
+def gamma_view(result: dict, window: str) -> html.Div:
+    daily, conv, est = result["daily"], result["convention"], result["cftc"]
+    zero = [{"value": 0.0, "style": "solid", "color": DIM}]
+    label = GAMMA_CONVENTIONS[conv]
+    parts = []
+    if not daily.is_empty():
+        now = daily.drop_nulls("px").row(-1, named=True)
+        flip_move = now[f"flip_{conv}"]
+        since = window_start(daily["ts"], window)
+        shown = daily.filter(pl.col("ts") >= since) if since is not None else daily
+        prof = result["profile"]
+        flow = now[f"flow_{conv}"]
+        parts += [
+            _stats_bar(stat_block("as of", str(now["ts"])), stat_block(f"{now['underlying']}", f"{now['px']:.3f}"),
+                       stat_block("dealer gamma", f"{now[f'dealer_{conv}']:+,.0f} fut / pt",
+                                  alert=now[f"dealer_{conv}"] < 0),
+                       stat_block("hedge flow, 1-sd rally", f"{flow:+,.0f} fut" if flow is not None else "—"),
+                       stat_block("share of daily volume", f"{now[f'flow_share_{conv}']:+.1%}"
+                                  if now[f"flow_share_{conv}"] is not None else "—"),
+                       stat_block("flip", f"{flip_move:+.2f} pts ({now['px'] + flip_move:.2f})"
+                                  if flip_move is not None else "none within ±4 pts"),
+                       stat_block("next expiry", str(now["next_expiry"]))),
+            _png_img(xy_chart(prof["move"].to_list(), {"calls": prof["calls"].to_list(),
+                                                       "puts": prof["puts"].to_list(),
+                                                       f"dealer net ({label})": prof[f"dealer_{conv}"].to_list()},
+                              "open-interest gamma if TY futures move · futures per point",
+                              xaxis_title="futures move (points)", yaxis_title="futures per point",
+                              vlines={"today": 0.0, **({"flip": flip_move} if flip_move is not None else {})},
+                              line_colors={"calls": C2, "puts": C0, f"dealer net ({label})": ORANGE})),
+            table(result["pins"].to_pandas(), title="strikes carrying the most gamma, next two expiries", float_fmt=",.2f"),
+            _png_img(series_chart(shown.select("ts", pl.col(f"dealer_{conv}").alias("dealer gamma"),
+                                               pl.col("px").alias("front future")),
+                                  ["dealer gamma", "front future"], f"dealer gamma ({label}) and the front future",
+                                  yaxis_title="futures per point", left=["front future"], yaxis_right_title="price",
+                                  hlines=zero, line_colors={"dealer gamma": ORANGE, "front future": "#333"})),
+            table(result["tests"].to_pandas(), title="does it show up? next-week realized vol of the front future "
+                  "and day-to-day follow-through, by third of dealer gamma", float_fmt=",.3f")
+            if not result["tests"].is_empty() else note("Too few days for the tests.", "dim"),
+        ]
+    else:
+        parts.append(note("No options in md.opt_eod for this history. Run data_pull/pull_options.py.", "warn"))
+    if not est.is_empty():
+        last = est.row(-1, named=True)
+        cftc_shown = est.filter(pl.col("ts") >= daily["ts"][0]) if window != "MAX" and not daily.is_empty() else est
+        parts += [
+            html.Div("CFTC · WEEKLY, FROM 2006", style={**HEADING, "marginTop": 18, "marginBottom": 8}),
+            _stats_bar(stat_block("report", str(last["ts"])),
+                       stat_block("dealer options delta", f"{last['dealer']:+,.0f} fut"),
+                       stat_block("estimated dealer gamma", f"{last['gamma_est']:+,.0f} fut / bp",
+                                  alert=last["gamma_est"] < 0),
+                       stat_block(f"fit R2 ({result['cftc_lookback']}w)", f"{last['r2']:.2f}")),
+            _png_img(series_chart(est.select("ts", pl.col("dealer").alias("dealers"),
+                                             pl.col("asset_mgr").alias("asset managers"),
+                                             pl.col("lev_money").alias("leveraged funds")),
+                                  ["dealers", "asset managers", "leveraged funds"],
+                                  "10y note options, delta-equivalent futures by trader group (CFTC)",
+                                  yaxis_title="futures", hlines=zero, fig_height=3.6,
+                                  line_colors={"dealers": ORANGE, "asset managers": C2, "leveraged funds": "#333"})),
+            _png_img(series_chart(est.select("ts", pl.col("gamma_est").alias("estimated dealer gamma")),
+                                  ["estimated dealer gamma"], f"estimated dealer gamma, {result['cftc_lookback']}-week "
+                                  "rolling (futures per bp; + = long gamma)", yaxis_title="futures / bp",
+                                  hlines=zero, fig_height=3.4, line_colors={"estimated dealer gamma": ORANGE})),
+            table(result["cftc_tests"].to_pandas(), title="10y yield vol after each release, by sign of the "
+                  "estimate · compare vol change, not level: high-vol years dominate the level", float_fmt=",.2f"),
+        ]
+    parts.append(note("The dealer side is assumed, not observed; compare the two conventions and the CFTC estimate "
+                      "before trusting a flip level. Weekly options and options on other futures are not loaded. "
+                      "Overlapping windows: buckets describe, they are not significance tests.", "dim"))
+    return html.Div(parts)
+
+
+def idio_tab() -> html.Div:
+    return remember_controls(html.Div(style={"padding": "14px 24px"}, children=[
+        dcc.Tabs(id="idio-tabs", value="sf", children=[
+            dcc.Tab(label="SOFR / FF basis", value="sf", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
+                    children=html.Div(sofr_ff_tab(), style={"paddingTop": 14})),
+            dcc.Tab(label="CTA trend", value="cta", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
+                    children=html.Div(cta_tab(), style={"paddingTop": 14})),
+            dcc.Tab(label="Options gamma", value="gamma", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
+                    children=html.Div(gamma_tab(), style={"paddingTop": 14})),
+        ]),
+    ]), load_controls())
+
+
 def fair_value_tab() -> html.Div:
     return remember_controls(html.Div(style={"padding": "14px 24px"}, children=[
         html.Div(id="fair-value-context", style={"display": "none"}),  # Setup's Fill tabs still writes here
@@ -2017,9 +2318,8 @@ def fair_value_tab() -> html.Div:
                         "extreme that is against history.",
                         ["Net positions by trader type and tenor (TU, FV, TY, UXY, US, WN), in contracts and DV01, "
                          "as z-scores and percentiles; crowding against curve and level moves."],
-                        ["md.cftc (CFTC Traders in Financial Futures) has Treasury futures only for Jul 2010 – Dec "
-                         "2012 and Feb 2026 onward; nothing in 2013–2025. Needs a backfill from the CFTC's "
-                         "historical files before z-scores mean anything.",
+                        ["md.cftc (CFTC Traders in Financial Futures, futures only) and md.cftc_combined "
+                         "(futures and options) have every weekly report from Jun 2006 (data_pull/pull_cftc.py).",
                          "Contract code 020604 is the old long bond in 2010–12 but the Ultra bond in 2026."]),
                         style={"paddingTop": 14})),
         ]),
@@ -2567,6 +2867,66 @@ def register_callbacks(app) -> None:
             return inflation_view(carry(load_inflation(start or "2004-01-01"), horizon), horizon, window), window
         except Exception as exc:
             return note(f"Inflation carry failed: {type(exc).__name__}: {exc}", "bad"), no_update
+
+    for prefix in ("sf", "cta", "gm"):
+        @app.callback(Output(f"{prefix}-window", "data"),
+                      *[Output(f"{prefix}-window-{key}", "style") for key in WINDOW_PRESETS],
+                      *[Input(f"{prefix}-window-{key}", "n_clicks") for key in WINDOW_PRESETS],
+                      prevent_initial_call=True)
+        def _idio_window(*clicks, prefix=prefix):
+            if not any(clicks):
+                return (no_update,) * (1 + len(WINDOW_PRESETS))
+            selected = ctx.triggered_id.removeprefix(f"{prefix}-window-")
+            return (selected, *[btn_style(primary=(key == selected)) for key in WINDOW_PRESETS])
+
+    @app.callback(Output("sf-out", "children"), Output("sf-shown", "data"),
+                  Input("sf-run", "n_clicks"), Input("bench-tabs", "value"), Input("idio-tabs", "value"),
+                  Input("sf-window", "data"), State("sf-ahead", "value"), State("sf-lookback", "value"),
+                  State("sf-adjust", "value"), State("sf-entry", "value"), State("sf-exit", "value"),
+                  State("sf-hold", "value"), State("sf-cost", "value"), State("sf-shown", "data"))
+    def _sofr_ff(clicks, tab, idio_tab, window, ahead, lookback, adjust, entry, exit_z, hold, cost, shown):
+        # Runs on Update, when the SOFR / FF tab is first opened, and when the chart window changes.
+        window = window if window in WINDOW_PRESETS else IDIO_WINDOW
+        if not clicks and (tab != "idio" or idio_tab != "sf" or shown == window):
+            return no_update, no_update
+        try:
+            result = sofr_ff_study(ahead=int(ahead or 2), lookback=int(lookback or 126), adjust=adjust != "raw",
+                                   entry=float(entry or 2.0), exit=float(exit_z or 0.0), max_hold=int(hold or 40),
+                                   cost=float(cost or 0.0))
+            return sofr_ff_view(result, window), window
+        except Exception as exc:
+            return note(f"SOFR / FF basis failed: {type(exc).__name__}: {exc}", "bad"), no_update
+
+    @app.callback(Output("cta-out", "children"), Output("cta-shown", "data"),
+                  Input("cta-run", "n_clicks"), Input("bench-tabs", "value"), Input("idio-tabs", "value"),
+                  Input("cta-window", "data"), State("cta-tenor", "value"), State("cta-start", "value"),
+                  State("cta-shown", "data"))
+    def _cta(clicks, tab, idio_tab, window, tenor, start, shown):
+        # Runs on Update, when the CTA tab is first opened, and when the chart window changes.
+        window = window if window in WINDOW_PRESETS else IDIO_WINDOW
+        if not clicks and (tab != "idio" or idio_tab != "cta" or shown == window):
+            return no_update, no_update
+        try:
+            tenor = tenor if tenor in CTA_TENORS else "10y"
+            return cta_view(cta_study(tenor, start or "2000-01-01"), window), window
+        except Exception as exc:
+            return note(f"CTA positioning failed: {type(exc).__name__}: {exc}", "bad"), no_update
+
+    @app.callback(Output("gm-out", "children"), Output("gm-shown", "data"),
+                  Input("gm-run", "n_clicks"), Input("bench-tabs", "value"), Input("idio-tabs", "value"),
+                  Input("gm-window", "data"), State("gm-start", "value"), State("gm-convention", "value"),
+                  State("gm-cftc-lookback", "value"), State("gm-shown", "data"))
+    def _gamma(clicks, tab, idio_tab, window, start, convention, lookback, shown):
+        # Runs on Update, when the Options gamma tab is first opened, and when the chart window changes.
+        window = window if window in WINDOW_PRESETS else IDIO_WINDOW
+        if not clicks and (tab != "idio" or idio_tab != "gamma" or shown == window):
+            return no_update, no_update
+        try:
+            convention = convention if convention in GAMMA_CONVENTIONS else "split"
+            result = gamma_study(start or "2024-06-01", convention, int(lookback or 52))
+            return gamma_view(result, window), window
+        except Exception as exc:
+            return note(f"Options gamma failed: {type(exc).__name__}: {exc}", "bad"), no_update
 
     @app.callback(Output("tp-window", "data"), *[Output(f"tp-window-{key}", "style") for key in WINDOW_PRESETS],
                   *[Input(f"tp-window-{key}", "n_clicks") for key in WINDOW_PRESETS], prevent_initial_call=True)

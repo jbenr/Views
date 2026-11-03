@@ -64,6 +64,7 @@ REGISTRY = LiveRegistry()
 LEDGER = SignalLedger()
 
 TRADES_PER_PAGE = 6  # fewest trade rows a page holds; it grows to the monthly heatmap's years
+CHART_BOX = "1260 / 767"  # width / height of the Deep Dive's grid charts: the tallest one's shape
 SNAP_LEFT_BUFFER_BDAYS = 5
 
 # the Oven's trade table: its columns, short lower-case headers and colours (oven.app)
@@ -789,12 +790,15 @@ def _card_sections(
         pnl_png = pnl_chart(state["equity_curve"], **span)
         pngs = [level_png, second, *([gate_png] if gate_png is not None else []), pnl_png,
                 return_distribution_chart(trades)]
-        img = lambda png: html.Img(  # noqa: E731
-            src=f"data:image/png;base64,{png}", style={"width": "100%", "border": f"1px solid {BORDER}"})
+        img = lambda png, **extra: html.Img(  # noqa: E731
+            src=f"data:image/png;base64,{png}", style={"width": "100%", "border": f"1px solid {BORDER}", **extra})
+        # every chart in the grid in the same box: they are drawn at slightly different
+        # shapes, so each is fitted (never stretched) into the tallest one's
+        same_box = dict(aspectRatio=CHART_BOX, objectFit="contain", background="#FFFFFF", display="block")
         chart_body = html.Div(
             style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": 10},
             children=[html.Div(img(wide), style={"gridColumn": "1 / span 2"}),
-                      *[img(png) for png in pngs if png is not None]],
+                      *[img(png, **same_box) for png in pngs if png is not None]],
         )
 
     summary = html.Div([
@@ -1033,17 +1037,19 @@ def _scored_days(equity: pl.DataFrame, trades: pl.DataFrame) -> tuple[np.ndarray
 
 
 def _performance(days: np.ndarray, daily: np.ndarray, subset: pl.DataFrame, total: float) -> dict:
-    """Trades, total and average P&L, share of all P&L, hit rate, and the Sharpe of holding
-    only ``subset``: the signal's daily P&L on the days those trades were on, zero on every
-    other day (the Oven's subset Sharpe; all trades together give the signal's Sharpe)."""
+    """Trades, total and average P&L, share of all P&L, hit rate, and the Sharpe of
+    ``subset``'s own trades: annualized, from the signal's daily P&L on only the days
+    those trades were on. Days they were not on are left out rather than counted as
+    flat, so a group with fewer trades is not marked down for being smaller, and
+    groups of any size compare directly (with all trades: their Sharpe in the market)."""
     held = np.zeros(len(days), dtype=bool)
     for a, b in subset.select(pl.col("entry_date").cast(pl.Date), pl.col("exit_date").cast(pl.Date)).iter_rows():
         held |= (days >= np.datetime64(a)) & (days <= np.datetime64(b))
-    marks = np.where(held, daily, 0.0)
+    marks = daily[held]
     pnl = subset["pnl_bps"]
     return dict(trades=len(subset), total_pnl=float(pnl.sum()), avg_trade=pnl.mean() if len(pnl) else None,
                 hit_rate=float((pnl > 0).mean()) if len(pnl) else None,
-                sharpe=marks.mean() / marks.std() * np.sqrt(252) if len(subset) and marks.std() > 0 else None,
+                sharpe=marks.mean() / marks.std() * np.sqrt(252) if len(marks) > 1 and marks.std() > 0 else None,
                 share_of_pnl=float(pnl.sum()) / total if total else None)
 
 
