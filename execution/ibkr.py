@@ -24,6 +24,8 @@ See execution/README.md for IB Gateway / TWS setup instructions.
 from __future__ import annotations
 
 import os
+import json
+from pathlib import Path
 from dataclasses import dataclass, field
 
 
@@ -40,11 +42,16 @@ class IBKRConfig:
 
     @classmethod
     def from_env(cls) -> IBKRConfig:
+        # Local connection settings survive different terminals and launchers.
+        # Read on each refresh so edits do not require a server restart.
+        store = Path(os.getenv("VIEWS_STORE_DIR", str(Path(__file__).resolve().parents[1] / "store")))
+        path = store / "ibkr.json"
+        local = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         return cls(
-            host=os.getenv("VIEWS_IB_HOST", "127.0.0.1"),
-            port=int(os.getenv("VIEWS_IB_PORT", "7497")),
-            client_id=int(os.getenv("VIEWS_IB_CLIENT_ID", "1")),
-            account=os.getenv("VIEWS_IB_ACCOUNT") or None,
+            host=os.getenv("VIEWS_IB_HOST", local.get("host", "127.0.0.1")),
+            port=int(os.getenv("VIEWS_IB_PORT", local.get("port", 7497))),
+            client_id=int(os.getenv("VIEWS_IB_CLIENT_ID", local.get("client_id", 1))),
+            account=os.getenv("VIEWS_IB_ACCOUNT", local.get("account")) or None,
         )
 
 

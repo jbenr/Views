@@ -1,12 +1,14 @@
 # Opens and arranges the 3-monitor workspace.
 #   Left monitor:  htop (left half) | claude --resume (right half)
-#   Main monitor:  VS Code (left two-thirds) | two terminals stacked (right third)
-#   Right monitor: terminal (top half) / Spotify (bottom half)
+#   Main monitor:  Zed (left two-thirds) | two terminals stacked (right third)
+#   Right monitor: terminal (top half) / Spotify (bottom half), Chrome on top of Spotify
 
 $ErrorActionPreference = 'Stop'
 $Dir = $PSScriptRoot
 $Alacritty = 'C:\Program Files\Alacritty\alacritty.exe'
 $Spotify = "$env:APPDATA\Spotify\Spotify.exe"
+$Zed = "$env:LOCALAPPDATA\Programs\Zed\bin\Zed.exe"
+$Chrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
 
 Add-Type @"
 using System;
@@ -17,7 +19,26 @@ public static class Win {
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int ht, uint flags);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    delegate bool EnumProc(IntPtr h, IntPtr p);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+
+    // Visible, titled, unowned top-level windows belonging to the given process IDs.
+    public static IntPtr[] WindowsOf(int[] pids) {
+        var set = new System.Collections.Generic.HashSet<int>(pids);
+        var list = new System.Collections.Generic.List<IntPtr>();
+        EnumWindows((h, p) => {
+            uint pid; GetWindowThreadProcessId(h, out pid);
+            if (set.Contains((int)pid) && IsWindowVisible(h) && GetWindowTextLength(h) > 0 && GetWindow(h, 4) == IntPtr.Zero)
+                list.Add(h);
+            return true;
+        }, IntPtr.Zero);
+        return list.ToArray();
+    }
 }
 "@
 [Win]::SetProcessDpiAwarenessContext([IntPtr]-4) | Out-Null   # per-monitor DPI aware -> physical pixels
@@ -67,29 +88,42 @@ $mainTop = Start-Term
 $mainBot = Start-Term
 $rightTop = Start-Term
 
-if (-not (Get-Process Code -ErrorAction SilentlyContinue | Where-Object MainWindowHandle -ne 0)) {
-    Start-Process code -ArgumentList $Dir -WindowStyle Hidden
+if (-not (Get-Process Zed -ErrorAction SilentlyContinue | Where-Object MainWindowHandle -ne 0)) {
+    Start-Process $Zed -ArgumentList $Dir -WindowStyle Hidden
 }
-$code = Wait-Window { Get-Process Code -ErrorAction SilentlyContinue | Where-Object MainWindowTitle } 60
+$zedWin = Wait-Window { Get-Process Zed -ErrorAction SilentlyContinue | Where-Object MainWindowTitle } 60
 
 if (-not (Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object MainWindowHandle -ne 0)) {
     Start-Process $Spotify
 }
 $spot = Wait-Window { Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object MainWindowTitle } 60
 
+# Chrome: open a new window and pick it out from any Chrome windows that already existed
+function Get-ChromeWindows { [Win]::WindowsOf([int[]]@(Get-Process chrome -ErrorAction SilentlyContinue).Id) }
+$chromeBefore = @(Get-ChromeWindows)
+Start-Process $Chrome -ArgumentList '--new-window'
+$deadline = (Get-Date).AddSeconds(30)
+do {
+    Start-Sleep -Milliseconds 200
+    $chromeWin = Get-ChromeWindows | Where-Object { $_ -notin $chromeBefore } | Select-Object -First 1
+} until ($chromeWin -or (Get-Date) -gt $deadline)
+if (-not $chromeWin) { throw 'Chrome window did not appear in 30 s' }
+
 # Left monitor: halves side by side
 $half = [int]($L.Width / 2)
 Place $htop   $L.X           $L.Y $half             $L.Height
 Place $claude ($L.X + $half) $L.Y ($L.Width - $half) $L.Height
 
-# Main monitor: VS Code left two-thirds, two terminals stacked in the remaining third
+# Main monitor: Zed left two-thirds, two terminals stacked in the remaining third
 $twoThirds = [int]($M.Width * 2 / 3)
 $mHalf = [int]($M.Height / 2)
-Place $code    $M.X                $M.Y            $twoThirds              $M.Height
+Place $zedWin  $M.X               $M.Y            $twoThirds              $M.Height
 Place $mainTop ($M.X + $twoThirds) $M.Y            ($M.Width - $twoThirds) $mHalf
 Place $mainBot ($M.X + $twoThirds) ($M.Y + $mHalf) ($M.Width - $twoThirds) ($M.Height - $mHalf)
 
-# Right monitor: terminal top half, Spotify bottom half
+# Right monitor: terminal top half, Spotify bottom half with Chrome on top of it
 $rHalf = [int]($R.Height / 2)
-Place $rightTop $R.X $R.Y            $R.Width $rHalf
-Place $spot     $R.X ($R.Y + $rHalf) $R.Width ($R.Height - $rHalf)
+Place $rightTop  $R.X $R.Y            $R.Width $rHalf
+Place $spot      $R.X ($R.Y + $rHalf) $R.Width ($R.Height - $rHalf)
+Place $chromeWin $R.X ($R.Y + $rHalf) $R.Width ($R.Height - $rHalf)
+[Win]::SetWindowPos($chromeWin, [IntPtr]::Zero, 0, 0, 0, 0, 0x0013) | Out-Null   # raise above Spotify (NOSIZE|NOMOVE|NOACTIVATE)

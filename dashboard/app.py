@@ -36,6 +36,7 @@ from dash import ALL, MATCH, Input, Output, Patch, State, ctx, dcc, html
 
 import utils.helpers
 from dashboard import runner
+from dashboard import portfolio
 from dashboard.charts import (
     DEFAULT_WINDOW,
     WINDOW_PRESETS,
@@ -1553,6 +1554,10 @@ def build_app() -> dash.Dash:
                     selected_style=selected_tab_style,
                     children=_deep_dive_tab(rows),
                 ),
+                dcc.Tab(
+                    label="Portfolio", value="portfolio", style=tab_style,
+                    selected_style=selected_tab_style, children=portfolio.layout(),
+                ),
             ],
         )
 
@@ -1583,6 +1588,7 @@ def build_app() -> dash.Dash:
         ])
 
     app = make_app(title="Model", sliders=[], body=_body)
+    portfolio.register_callbacks(app)
 
     app.callback(
         Output("page-body", "children"),

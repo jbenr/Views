@@ -68,6 +68,16 @@ All three follow `backtest.lab.MetricStore`'s atomic-write pattern
 
 ## Dashboard layout
 
+The **Portfolio** tab provides on-demand read-only IBKR account and position snapshots.
+See [connection setup](../execution/README.md).
+Trade submission remains disabled.
+
+Positions are grouped by their latest known execution times within a two-minute
+window (UTC). These inferred activity groups do not establish strategy ownership
+or opening dates. Positions without execution history appear under “Trade time
+unavailable.” Reported fills are retained locally across successful refreshes,
+scoped to the selected account; older trades absent from TWS history cannot be inferred.
+
 The **Live Overview** tab is the trading surface. It groups signals into one
 table per traded target and shows the exact replayed position state, current
 threshold reading, causal gate status, current signal versus its entry level,
