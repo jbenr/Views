@@ -930,15 +930,17 @@ def _scatters(state: dict) -> html.Div:
     )
 
 
-def _exit_reasons(trades: pl.DataFrame) -> pl.DataFrame:
+def _exit_reasons(equity: pl.DataFrame, trades: pl.DataFrame) -> pl.DataFrame:
     """Per exit reason, plus 'all': trades, avg and total P&L, its share of the total, hit
-    rate and bars held."""
+    rate, bars held and the Sharpe of holding only those trades (as _performance)."""
     total = trades["pnl_bps"].sum()
+    days, daily = _scored_days(equity, trades)
     groups = [("all", trades)] + [(r, trades.filter(pl.col("exit_reason") == r))
                                   for r in trades["exit_reason"].value_counts(sort=True)["exit_reason"]]
     return pl.DataFrame([dict(reason=r, trades=len(t), avg_trade=t["pnl_bps"].mean(), total_pnl=t["pnl_bps"].sum(),
                               share_of_pnl=t["pnl_bps"].sum() / total if total else None,
-                              hit_rate=(t["pnl_bps"] > 0).mean(), avg_held=t["bars_held"].mean())
+                              hit_rate=(t["pnl_bps"] > 0).mean(), avg_held=t["bars_held"].mean(),
+                              sharpe=_performance(days, daily, t, total)["sharpe"])
                          for r, t in groups])
 
 
@@ -958,7 +960,7 @@ def _trade_mechanics(state: dict, trades: pl.DataFrame) -> html.Div:
     return html.Div(style={"marginTop": 18}, children=[
         html.Div("TRADE MECHANICS", style={"fontSize": 12, "fontWeight": "bold", "marginBottom": 6}),
         note(" · ".join(lines), "dim"),
-        table(_exit_reasons(trades).to_pandas(), title="exit reasons",
+        table(_shown(_exit_reasons(state["equity_curve"], trades)), title="exit reasons",
               float_fmt=",.2f",
               headers={"avg_trade": "avg trade", "total_pnl": "total pnl", "hit_rate": "hit",
                        "avg_held": "avg held", "share_of_pnl": "share of pnl"},
@@ -1039,14 +1041,13 @@ def _scored_days(equity: pl.DataFrame, trades: pl.DataFrame) -> tuple[np.ndarray
 
 def _performance(days: np.ndarray, daily: np.ndarray, subset: pl.DataFrame, total: float) -> dict:
     """Trades, total and average P&L, share of all P&L, hit rate, and the Sharpe of
-    ``subset``'s own trades: annualized, from the signal's daily P&L on only the days
-    those trades were on. Days they were not on are left out rather than counted as
-    flat, so a group with fewer trades is not marked down for being smaller, and
-    groups of any size compare directly (with all trades: their Sharpe in the market)."""
+    holding only ``subset``'s trades: annualized over every day in ``days``, the
+    signal's daily P&L on the days those trades were on and 0 on all others (with all
+    trades: the strategy's own Sharpe)."""
     held = np.zeros(len(days), dtype=bool)
     for a, b in subset.select(pl.col("entry_date").cast(pl.Date), pl.col("exit_date").cast(pl.Date)).iter_rows():
         held |= (days >= np.datetime64(a)) & (days <= np.datetime64(b))
-    marks = daily[held]
+    marks = np.where(held, daily, 0.0)
     pnl = subset["pnl_bps"]
     return dict(trades=len(subset), total_pnl=float(pnl.sum()), avg_trade=pnl.mean() if len(pnl) else None,
                 hit_rate=float((pnl > 0).mean()) if len(pnl) else None,
@@ -1239,8 +1240,9 @@ def _by_regime(days, daily, trades: pl.DataFrame, states: pl.DataFrame) -> pl.Da
     each Sharpe over the span's days and each share of P&L of the span's total. The
     regime column names it on the first row and says what it measures on the second;
     the first row also carries when its data starts and its value today; each state
-    row says where that state sits on the measure (range). Today's state is marked
-    (a row even if no trade entered in it)."""
+    row says where that state sits on the measure (range) and the share of all days
+    since its data starts spent in it (time, whether the signal was on or not). Today's
+    state is marked; a state gets a row if it had time, trades or is today's."""
     from research.regimes import REGIMES, STATES, RegimeParams, regime_column
 
     params = RegimeParams()
@@ -1258,14 +1260,16 @@ def _by_regime(days, daily, trades: pl.DataFrame, states: pl.DataFrame) -> pl.Da
         keep = days >= np.datetime64(start)
         span_days, span_daily = days[keep], daily[keep]
         total = float(in_span["pnl_bps"].sum())
+        history = states[col].drop_nulls()
         group = [dict(regime=label, data_from=str(start), live=_regime_live(name, today, col), state="all", range="",
-                      now="", **_performance(span_days, span_daily, in_span, total))]
+                      now="", time=1.0, **_performance(span_days, span_daily, in_span, total))]
         for state in STATES[name]:
             part = in_span.filter(pl.col(col) == state)
-            if not len(part) and today[col] != state:
+            time = float((history == state).mean())
+            if not len(part) and not time and today[col] != state:
                 continue
             group.append(dict(regime="", data_from="", live="", state=state,
-                              range=ranges.get(state, ""), now="●" if today[col] == state else "",
+                              range=ranges.get(state, ""), now="●" if today[col] == state else "", time=time,
                               **_performance(span_days, span_daily, part, total)))
         group[1]["regime"] = what  # always there: today's state has a row
         rows += group
@@ -1293,9 +1297,10 @@ def _regime_section(equity: pl.DataFrame, trades: pl.DataFrame, states: pl.DataF
 
     return _section("REGIMES", [html.Div([
         table(_shown(rows), title="by macro regime at entry", float_fmt=",.2f",
-              headers={**PERF_HEADERS, "data_from": "data from"}, cell_style=style),
+              headers={**PERF_HEADERS, "data_from": "data from", "time": "share of time"}, cell_style=style),
         _subtitle(f"state on each trade's entry day (a new state counts after {RegimeParams().confirm} days in a row)"
-                  f" · each regime scored over its own span · ● today (as of {states['ts'][-1]})")])])
+                  f" · each regime scored over its own span · share of time: all days since data from"
+                  f" · sharpe: annualized, 0 on days outside the group's trades · ● today (as of {states['ts'][-1]})")])])
 
 
 def _btn_style(primary: bool = False) -> dict:

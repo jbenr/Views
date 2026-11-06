@@ -518,7 +518,25 @@ def test_a_group_of_like_trades_scores_the_sharpe_of_all_of_them_whatever_its_si
     d, marks = app._scored_days(equity, trades)
     every = app._performance(d, marks, trades, 70.0)["sharpe"]
     three = app._performance(d, marks, trades.head(3), 70.0)["sharpe"]
-    assert three == pytest.approx(every) and every == pytest.approx(np.mean(pattern) / np.std(pattern) * np.sqrt(252))
+    # all trades: the strategy's own Sharpe, flat days included
+    assert every == pytest.approx(np.mean(daily) / np.std(daily) * np.sqrt(252))
+    # three of them: the same days, 0 outside those three trades
+    only = np.where(np.arange(200) < 30, daily, 0.0)
+    assert three == pytest.approx(only.mean() / only.std() * np.sqrt(252)) and three < every
+
+
+def test_exit_reasons_carry_the_sharpe_of_each_reasons_trades(monkeypatch, tmp_path):
+    app = _load_app_module(monkeypatch, tmp_path)
+    days = pd.bdate_range("2020-01-01", periods=100)
+    trades = pl.DataFrame({"entry_date": [days[i].date() for i in (0, 20, 40)],
+                           "exit_date": [days[i].date() for i in (5, 25, 45)], "pnl_bps": [2.0, 3.0, -1.0],
+                           "exit_reason": ["revert", "revert", "half_life"], "bars_held": [5, 5, 5]})
+    equity = pl.DataFrame({"ts": [d.date() for d in days],
+                           "pnl_bps": [0.1 * ((i % 3) - 1) + 0.05 for i in range(100)]})
+    reasons = app._exit_reasons(equity, trades)
+    assert reasons["reason"].to_list() == ["all", "revert", "half_life"]
+    d, daily = app._scored_days(equity, trades)
+    assert reasons["sharpe"][1] == pytest.approx(app._performance(d, daily, trades.head(2), 4.0)["sharpe"])
 
 
 def test_regime_table_splits_trades_by_the_state_on_their_entry_day(monkeypatch, tmp_path):
@@ -545,6 +563,7 @@ def test_regime_table_splits_trades_by_the_state_on_their_entry_day(monkeypatch,
     implied = table.filter(pl.col("regime").str.starts_with("Implied"))
     assert implied["data_from"][0] == str(days[60].date()) and implied["trades"][0] == 1
     assert implied["share_of_pnl"][0] == 1.0  # of its own span's P&L, not the whole history's
+    assert policy["time"].to_list() == [1.0, 0.5, 0.5]  # of all days, signal on or not
 
 
 def test_param_summary_explains_exit_and_hard_stop(monkeypatch, tmp_path):
