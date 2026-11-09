@@ -57,7 +57,7 @@ from utils.research_app import (BORDER, C0, C1, DIM, FOLDER_TAB, FOLDER_TAB_SELE
 
 ALL_INPUTS = list(dict.fromkeys(name for names in FEATURE_GROUPS.values() for name in names))
 GRID_CONTROLS = {
-    "lookbacks": ("signal lookbacks · levels OLS (d)", [21, 63, 126, 252, 504], engine.LOOKBACKS),
+    "lookbacks": ("signal lookbacks · levels OLS (d)", [21, 42, 63, 126, 189, 252, 378, 504], engine.LOOKBACKS),
     "z_entries": ("entries · normalized z", [1.0, 1.5, 2.0, 2.5, 3.0], engine.Z_ENTRIES),
     "raw_entries": ("entries · raw bps", [2.5 * k for k in range(1, 13)], engine.RAW_ENTRIES),
     "reverts": ("exit · share of frozen residual recovered (0 = no reversion exit)", [0.0, 0.25, 0.5, 0.75, 1.0],
@@ -67,7 +67,8 @@ GRID_CONTROLS = {
     "stops": ("exit · stop, entry sigmas wider (0 = none)", [0.0, 0.5, 1.0, 2.0], engine.STOPS),
     "pnl_stops": ("exit · stop loss, bps lost on the close (0 = none)", [0.0, 2.5, 5.0, 7.5, 10.0, 15.0, 20.0],
                   engine.PNL_STOPS),
-    "hedge_lookbacks": ("hedge lookback · changes OLS (d)", [21, 63, 126, 252, 504], engine.HEDGE_LOOKBACKS),
+    "hedge_lookbacks": ("hedge lookback · changes OLS (d)", [21, 42, 63, 126, 189, 252, 378, 504],
+                        engine.HEDGE_LOOKBACKS),
 }
 SETUP_COLS = ["lookback", "hedge_lb", "basis", "scale", "entry", "revert", "max_hold", "stop", "hl_mult", "pnl_stop",
               "sizing", "fill", "rearm", "gate", "gate_mode", "need_half_life"]
@@ -98,8 +99,6 @@ DEFAULT_WINDOW = "All"
 SNAP_LEFT_BUFFER_BDAYS = 5  # as the dashboard's Snap chart to view
 ET = ZoneInfo("America/New_York")
 STATS_ROW = {"display": "flex", "gap": 28, "flexWrap": "wrap", "padding": "8px 2px 8px"}
-TWO_UP = {"display": "grid", "gridTemplateColumns": "minmax(0, 1fr) minmax(0, 1fr)", "gap": 12,
-          "alignItems": "start"}
 # every chart cell the same shape: the PNGs come out at slightly different aspect
 # ratios (each chart type has its own figure size, then tight cropping), so each is
 # fitted inside an identical frame rather than setting its own row height
@@ -1151,8 +1150,7 @@ def detail_view(path: str, picked: dict, by: str, min_trades: int, window: str) 
             stat_block("best trade share", _fmt(row["best_trade_share"], ".0%"))]),
         html.Div(window_row(window), style={"display": "flex", "gap": 8, "marginBottom": 8, "alignItems": "center",
                                             "flexWrap": "wrap"}),
-        html.Div(charts_view(b, window), id="card-charts-oven",
-                 style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": 10}),
+        html.Div(charts_view(b, window), id="card-charts-oven", className="two-up"),
         # the trades beside the monthly P&L (see oven.css)
         html.Div(className="oven-trades-months", children=[
             html.Div(style={"minWidth": 0}, children=[
@@ -1167,7 +1165,7 @@ def detail_view(path: str, picked: dict, by: str, min_trades: int, window: str) 
         html.Div(scatter_window_row(setup["lookback"], "lookback"),
                  style={"display": "flex", "gap": 8, "margin": "6px 0 8px", "alignItems": "center",
                         "flexWrap": "wrap"}),
-        html.Div(scatter_pair(b, "lookback"), id="oven-scatters", style=TWO_UP),
+        html.Div(scatter_pair(b, "lookback"), id="oven-scatters", className="two-up", style={"gap": 12}),
     ])
     mechanics = html.Div([
         heading("trade mechanics"),
@@ -1213,10 +1211,8 @@ def drivers_view(b: dict, board: pl.DataFrame, by: str, cost: float, peers: pl.D
         note(f"Is this setup a plateau or a spike? Each knob moved alone, everything else held at this setup "
              f"(outlined); a good setup sits among neighbours that also score.", "dim"),
         html.Div(sensitivity_view(board, setup, by), className="oven-full"),
-        html.Div(className="oven-full", style={**TWO_UP, "marginTop": 12}, children=[
-            html.Div([score_grid_view(board, setup, by), peers_view(peers)], style=column),
-            html.Div([gate_view(board, setup, by)], style=column),
-        ]),
+        html.Div([score_grid_view(board, setup, by), peers_view(peers), gate_view(board, setup, by)],
+                 className="oven-full", style={**column, "marginTop": 12}),
     ], style={"marginBottom": 18})
     when = html.Div([
         heading("when it works"),
@@ -1224,12 +1220,11 @@ def drivers_view(b: dict, board: pl.DataFrame, by: str, cost: float, peers: pl.D
              f"holding fewer trades: a random third of them would score about {share:.2f}. 'agrees': that lookback "
              f"was also beyond ±{HORIZON_Z:g} z the same way; 'disagrees': beyond it the other way. Small buckets "
              f"are noise.", "dim"),
-        html.Div(className="oven-full", style=TWO_UP, children=[
-            html.Div([entry_state_view(b, cost)], style=column),
-            html.Div([resolution_table(b, cost, horizon_rows) if not horizon_rows.is_empty() else
-                      note("This bake has no other horizons recorded. Re-bake with more than one signal lookback to "
-                           "see what the other horizons said at each entry.", "dim")], style=column),
-        ]),
+        html.Div([entry_state_view(b, cost),
+                  resolution_table(b, cost, horizon_rows) if not horizon_rows.is_empty() else
+                  note("This bake has no other horizons recorded. Re-bake with more than one signal lookback to "
+                       "see what the other horizons said at each entry.", "dim")],
+                 className="oven-full", style=column),
     ], style={"marginBottom": 18})
     return html.Div([robustness, when])
 

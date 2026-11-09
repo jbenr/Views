@@ -225,6 +225,8 @@ def make_app(
         # Dash retitles the tab "Updating..." during every callback; with a
         # progress poll firing every second the tab title flickered constantly.
         update_title=None,
+        # without it phones lay the page out at desktop width and the narrow-screen CSS never applies
+        meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
     )
     app.title = title
 

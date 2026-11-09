@@ -36,6 +36,7 @@ from dash import ALL, MATCH, Input, Output, Patch, State, ctx, dcc, html
 
 import utils.helpers
 from dashboard import runner
+from dashboard import markets
 from dashboard import portfolio
 from dashboard.charts import (
     DEFAULT_WINDOW,
@@ -95,6 +96,7 @@ OVERVIEW_COLUMNS = [
     # scrollbar; units (bps, %) are the dashboard's defaults and go unstated.
     # What each signal is and where it stands today; how the strategy has performed
     # lives on the Deep Dive.
+    ("target", "Target"),  # each section names it: Tenor, Curve, Fly
     ("name", "Signal"),
     ("model", "Built From"),
     ("input_now", "Input"),
@@ -259,9 +261,6 @@ def _gate_status(state: dict) -> str:
     return f"{status} {pct}{suffix}"
 
 
-CHANGE_WINDOWS = [("1D", 1), ("1W", 7), ("1M", 30)]
-
-
 LOCAL_TZ = dt.datetime.now().astimezone().tzinfo
 
 
@@ -350,85 +349,6 @@ def _short_asof(bar: str, written: str) -> str:
     when = re.sub(r"\s+[A-Z]{2,5}$", "", when)  # drop the zone
     when = re.sub(r"^\d{4}-(\d\d-\d\d)", r"\1", when)
     return f"{str(bar)[5:]} · {'db down' if written == 'db unreachable' else when}"
-
-
-def _target_snapshot(target: str, rows: list[dict]) -> dict | None:
-    """Where the traded curve itself is, and how far it has come: latest level
-    plus point changes over standard windows. Read from the freshest cached
-    frame among the target's promoted signals -- the same data the signals
-    below are computed on, so the header can never disagree with the rows."""
-    sources = []
-    for row in rows:
-        frame = runner.cached_data(_row_id(row))
-        if frame is None or target not in frame.columns:
-            continue
-        frame = frame.select("ts", pl.col(target).alias("level")).drop_nulls()
-        if not frame.is_empty():
-            sources.append((_row_id(row), frame))
-    if not sources:
-        return None
-
-    # keep the winning frame's signal_id: its tickers are what dates the level
-    signal_id, frame = max(sources, key=lambda pair: pair[1]["ts"][-1])
-    ts, level = frame["ts"][-1], float(frame["level"][-1])
-
-    def _change_since(cutoff) -> float | None:
-        earlier = frame.filter(pl.col("ts") <= cutoff)
-        return None if earlier.is_empty() else level - float(earlier["level"][-1])
-
-    changes = [
-        (label, _change_since(ts - dt.timedelta(days=days)))
-        for label, days in CHANGE_WINDOWS
-    ]
-    changes.append(("YTD", _change_since(dt.date(ts.year, 1, 1) - dt.timedelta(days=1))))
-    return {"signal_id": signal_id, "ts": ts, "level": level, "changes": changes}
-
-
-def _delta_chip(label: str, value: float | None) -> html.Div:
-    color = TEXT if value is None else (C1 if value > 0 else C0 if value < 0 else TEXT)
-    return html.Div(
-        style={"display": "flex", "alignItems": "baseline", "gap": 4},
-        children=[
-            html.Span(label, style={"fontSize": 10, "color": DIM}),
-            html.Span(
-                _fnum(value, "+.1f"),
-                style={"fontSize": 12, "fontFamily": "monospace", "color": color},
-            ),
-        ],
-    )
-
-
-def _target_header(target: str, rows: list[dict]) -> html.Div:
-    snapshot = _target_snapshot(target, rows)
-    children = [
-        html.Span(
-            target,
-            style={
-                "fontSize": 15,
-                "fontWeight": "bold",
-                "color": ORANGE,
-                "textTransform": "uppercase",
-            },
-        )
-    ]
-    if snapshot is not None:
-        bar, written, stale = _db_asof(snapshot["signal_id"], snapshot["ts"])
-        asof = f"{bar} · {written}"
-        children += [
-            html.Span(
-                f"{snapshot['level']:.1f} bps",
-                style={"fontSize": 15, "fontWeight": "bold",
-                       "fontFamily": "monospace"},
-            ),
-            html.Span(asof, style={"fontSize": 11,
-                                   "color": ORANGE if stale else DIM}),
-            *[_delta_chip(label, value) for label, value in snapshot["changes"]],
-        ]
-    return html.Div(
-        style={"display": "flex", "alignItems": "baseline", "gap": 14,
-               "marginBottom": 7},
-        children=children,
-    )
 
 
 def _overview_snapshot(row: dict) -> dict:
@@ -538,6 +458,8 @@ def _overview_cell_style(column: str, value, row: dict) -> dict | None:
     table has no filter_query equivalent, and on a trading surface direction,
     gate state and P&L sign have to read at a glance rather than be parsed.
     """
+    if column == "target":
+        return {"textAlign": "left", "fontWeight": "bold", **({"color": ORANGE} if value in markets.HELD else {})}
     if column == "position":
         for token, colour in (("LONG", C1), ("SHORT", C0), ("GATED", ORANGE)):
             if token in str(value):
@@ -559,20 +481,18 @@ OVERVIEW_KEYS = [key for key, _label in OVERVIEW_COLUMNS]
 OVERVIEW_FLOAT_FMT = ",.4g"  # ",.3f" would print sharpe 0.7 as 0.700
 
 
-def _overview_table(
-    target: str, rows: list[dict], snapshots: list[dict], widths: dict
-) -> html.Div:
-    """One target's section. Snapshots and widths are passed in rather than
-    derived here: the widths have to be measured across every section for the
-    columns to line up, and a snapshot costs a full Engine.run()."""
+def _overview_table(key: str, snapshots: list[dict], widths: dict) -> html.Div:
+    """One section's signals in a single table, the target leading each row. Snapshots
+    and widths are passed in rather than derived here: the widths have to be measured
+    across every section for the columns to line up, and a snapshot costs a full
+    Engine.run()."""
     return html.Div(
         style={"marginBottom": 22},
         children=[
-            _target_header(target, rows),
             table_div(
                 pd.DataFrame(snapshots),
                 columns=OVERVIEW_KEYS,
-                headers=dict(OVERVIEW_COLUMNS),
+                headers={**dict(OVERVIEW_COLUMNS), "target": SECTION_NOUN.get(key, "Target")},
                 max_rows=len(snapshots),
                 cell_style=_overview_cell_style,
                 float_fmt=OVERVIEW_FLOAT_FMT,
@@ -589,13 +509,94 @@ def _refresh_all_data(rows: list[dict]) -> None:
         runner.pull_data(module)
 
 
+def _held_text(direction: str | None) -> str:
+    """'LONG*' for a held position; the star marks an example (see markets.HELD)."""
+    if not direction:
+        return ""
+    return direction.upper() + ("*" if markets.HELD_IS_EXAMPLE else "")
+
+
+def _held_style(direction: str | None) -> dict:
+    return {"color": C1 if direction == "long" else C0, "fontWeight": "bold", "fontSize": 12}
+
+
+HEADLINE_COLUMNS = [("name", ""), ("last", "Last"), ("d1", "1d"), ("m1", "1m"), ("ytd", "YTD"), ("pos", "Pos")]
+
+
+def _headline_cell_style(column: str, value, row: dict) -> dict | None:
+    """Moves coloured by sign; a held line's name and position stand out."""
+    if column == "name":
+        return {"textAlign": "left", "fontWeight": "bold", **({"color": ORANGE} if row.get("pos") else {})}
+    if column == "pos" and value:
+        return _held_style("long" if value.startswith("LONG") else "short")
+    if column in ("d1", "m1", "ytd") and value != "—":
+        return {"color": C0 if value.startswith("-") else C1 if value.strip("+0.") else TEXT}
+    return None
+
+
+def _headline_table(title: str, rows: list[dict], last_fmt: str) -> html.Div:
+    frame = pd.DataFrame([{
+        "name": r["name"], "last": _fnum(r["last"], last_fmt),
+        **{k: _fnum(r[k], "+.1f") for k in ("d1", "m1", "ytd")},
+        "pos": _held_text(r["held"]),
+    } for r in rows])
+    return table_div(frame, title=title, columns=[k for k, _ in HEADLINE_COLUMNS], headers=dict(HEADLINE_COLUMNS),
+                     max_rows=len(frame), cell_style=_headline_cell_style)
+
+
+def _headline() -> html.Div:
+    """Yields, curves and flies up top: last level (yields in %, the rest in bps) and
+    the 1d, 1m and YTD moves in bps. Read from the cache the overview's Ref fills."""
+    frame, pulled = markets.cached()
+    if frame is None or frame.is_empty():
+        return html.Div("Market headline not loaded yet: click Ref.", style={"color": DIM, "marginBottom": 14})
+    lines = markets.board(frame)
+    stamp = f"bar {markets.asof(frame)} · pulled {_clock(pulled)} · changes in bps"
+    if markets.HELD_IS_EXAMPLE and markets.HELD:
+        stamp += " · * example position: no trades are wired to the dashboard yet"
+    return html.Div(style={"marginBottom": 20}, children=[
+        html.Div(style={"display": "flex", "flexWrap": "wrap", "gap": "4px 28px", "alignItems": "start"}, children=[
+            _headline_table("YIELDS (%)", lines["yields"], ".3f"),
+            _headline_table("CURVES", lines["curves"], ".1f"),
+            _headline_table("FLIES", lines["flies"], ".1f"),
+        ]),
+        html.Div(stamp, style={"fontSize": 11, "color": DIM}),
+    ])
+
+
+# the overview's sections, in order; a target that is none of these is grouped by its family
+STRUCTURES = {"outright": "OUTRIGHT DURATION", "curve": "CURVES", "fly": "FLIES"}
+SECTION_NOUN = {"outright": "Tenor", "curve": "Curve", "fly": "Fly"}  # the target column's header
+
+
+def _structure(row: dict) -> str:
+    """What a signal trades, read off its target's name: '10y' an outright, '10s30s' a
+    curve, '7s10s30s' a fly; anything else falls back to the registry family."""
+    target = row["target"]
+    if re.fullmatch(r"\d+[my]", target):
+        return "outright"
+    if re.fullmatch(r"(\d+s){2,3}", target):
+        return "curve" if target.count("s") == 2 else "fly"
+    return row.get("family") or "other"
+
+
+def _section_header(title: str, n: int) -> html.Div:
+    return html.Div(
+        style={"display": "flex", "alignItems": "baseline", "gap": 10, "margin": "6px 0 10px",
+               "borderBottom": f"1px solid {BORDER}", "paddingBottom": 4},
+        children=[html.Span(title, style={"fontSize": 13, "fontWeight": "bold"}),
+                  html.Span(f"{n} signal{'s' if n != 1 else ''}", style={"fontSize": 11, "color": DIM})],
+    )
+
+
 def _overview_content(rows: list[dict]) -> list:
     if not rows:
         return [
+            _headline(),
             html.Div(
                 "No signals promoted yet.",
                 style={"color": DIM, "padding": "24px 0"},
-            )
+            ),
         ]
     targets = sorted({row["target"] for row in rows})
     by_target = {
@@ -619,10 +620,17 @@ def _overview_content(rows: list[dict]) -> list:
         float_fmt=OVERVIEW_FLOAT_FMT,
         pad=1,  # the cells carry their own padding (see .dashboard-tight)
     )
-    return [
-        _overview_table(target, by_target[target], snapshots[target], widths)
-        for target in targets
-    ]
+    # outrights, curves, flies, then anything else, each section's targets in order
+    sections: dict[str, list[str]] = {}
+    for target in targets:
+        sections.setdefault(_structure(by_target[target][0]), []).append(target)
+    order = [*[k for k in STRUCTURES if k in sections], *sorted(k for k in sections if k not in STRUCTURES)]
+    out = [_headline()]
+    for key in order:
+        rows_in = [snap for t in sections[key] for snap in snapshots[t]]
+        out += [_section_header(STRUCTURES.get(key, key.upper()), len(rows_in)),
+                _overview_table(key, rows_in, widths)]
+    return out
 
 
 def _trade_page_label(n: int, page: int, size: int = TRADES_PER_PAGE) -> str:
@@ -797,8 +805,8 @@ def _card_sections(
         # shapes, so each is fitted (never stretched) into the tallest one's
         same_box = dict(aspectRatio=CHART_BOX, objectFit="contain", background="#FFFFFF", display="block")
         chart_body = html.Div(
-            style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": 10},
-            children=[html.Div(img(wide), style={"gridColumn": "1 / span 2"}),
+            className="two-up",
+            children=[html.Div(img(wide), className="two-up-wide"),
                       *[img(png, **same_box) for png in pngs if png is not None]],
         )
 
@@ -923,8 +931,7 @@ def _scatters(state: dict) -> html.Div:
         return html.Div()
     lookback = int(state["params"]["beta_lb"])
     return html.Div(
-        style={"display": "grid", "gridTemplateColumns": "minmax(0, 1fr) minmax(0, 1fr)", "gap": 12,
-               "alignItems": "start", "marginTop": 10},
+        className="two-up", style={"gap": 12, "marginTop": 10},
         children=[regression_scatter(state["data"], target, feature, basis, lookback, "previous")
                   for basis in ("levels", "changes")],
     )
@@ -1152,7 +1159,7 @@ def _perf_style(frames: list[pl.DataFrame], trades: pl.DataFrame):
 def _section(title: str, blocks: list) -> html.Div:
     return html.Div(style={"marginTop": 18}, children=[
         html.Div(title, style={"fontSize": 12, "fontWeight": "bold", "marginBottom": 6}),
-        html.Div(blocks, style={"display": "flex", "flexWrap": "wrap", "gap": "4px 16px", "alignItems": "start"}),
+        html.Div(blocks, style={"display": "flex", "flexDirection": "column", "gap": 4, "alignItems": "start"}),
     ])
 
 
@@ -1637,6 +1644,10 @@ def build_app() -> dash.Dash:
     def _refresh_overview(*_clicks):
         rows = _registry_rows()
         _refresh_all_data(rows)
+        try:
+            markets.pull()
+        except Exception:  # db down: the headline keeps its last pull, as the signals do
+            pass
         return _overview_content(rows)
 
     app.callback(

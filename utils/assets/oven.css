@@ -46,3 +46,23 @@
     max-height: none !important;
     overflow-y: visible !important;
 }
+/* chart pairs, two to a row; .two-up-wide spans the row */
+.two-up {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 10px;
+    align-items: start;
+}
+.two-up > .two-up-wide {
+    grid-column: 1 / span 2;
+}
+/* phones: one chart per row, and the trades above the monthly P&L */
+@media (max-width: 800px) {
+    .two-up,
+    .oven-tight .oven-trades-months {
+        grid-template-columns: minmax(0, 1fr);
+    }
+    .two-up > .two-up-wide {
+        grid-column: auto;
+    }
+}
