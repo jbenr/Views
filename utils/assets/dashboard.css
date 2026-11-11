@@ -297,14 +297,27 @@
 
 /* ---- phones ------------------------------------------------------------------- */
 @media (max-width: 700px) {
-    .sd-page { padding: 10px 10px; }
+    .sd-page { padding: 8px 4px; }
     .sd-picker { width: 100%; }
 
-    /* the same table, tighter: position to confidence fit the screen, the rest scrolls */
+    /* the same table, tighter. dashboard.js fits each column to its widest cell;
+       these widths only hold until it runs */
+    .sd-signal-section {
+        --sd-columns: 14px 91px 100px 101px 48px 35px 84px 188px;
+        width: max-content;
+    }
     .sd-sheet { font-size: 11px; }
     .sd-row-head > span,
-    .sd-row-legend > span { padding: 3px 5px; }
+    .sd-row-legend > span { padding: 2px 3px; }
+    .sd-detail-cell { padding: 2px 3px; }
     .sd-n { overflow-wrap: anywhere; }
+
+    /* every other table and label | value range: cells no wider than their text */
+    .sd-page .viz-table th,
+    .sd-page .viz-table td,
+    .sd-grid .viz-table th,
+    .sd-grid .viz-table td { padding: 2px 4px !important; font-size: 11px !important; }
+    .sd-kv > div > span { padding: 2px 4px; }
 
     /* the folder tabs stay side by side */
     #dashboard-tabs { padding: 8px 10px 0 !important; }

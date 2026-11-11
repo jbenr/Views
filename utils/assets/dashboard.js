@@ -52,4 +52,44 @@
     });
     rows.forEach((row, index) => { row.style.order = index; });
   });
+
+  /* On a phone, size each signal column to its widest cell so nothing is cut off and
+     no space is wasted. Each row is its own grid, so the widths are measured across
+     every row and section and set once, keeping the columns lined up. */
+  const phone = window.matchMedia("(max-width: 700px)");
+  const MARKER = "14px";  // the +/- column: a pseudo-element, so it can't be measured
+  let pending = false;
+  function fitColumns() {
+    pending = false;
+    const sections = document.querySelectorAll(".sd-signal-section");
+    if (!phone.matches) {
+      sections.forEach((s) => s.style.removeProperty("--sd-columns"));
+      return;
+    }
+    if (!sections.length) return;
+    sections.forEach((s) => s.style.setProperty("--sd-columns", `${MARKER} repeat(7, max-content)`));
+    const widest = new Array(7).fill(0);
+    document.querySelectorAll(".sd-signal-section :is(.sd-row-head, .sd-row-legend)").forEach((row) => {
+      const cells = Array.from(row.children);
+      const offset = row.matches(".sd-row-legend") ? 1 : 0;  // the legend has a real marker cell
+      cells.slice(offset, offset + 7).forEach((cell, i) => {
+        widest[i] = Math.max(widest[i], Math.ceil(cell.getBoundingClientRect().width));
+      });
+    });
+    const columns = `${MARKER} ${widest.map((w) => `${w}px`).join(" ")}`;
+    sections.forEach((s) => s.style.setProperty("--sd-columns", columns));
+  }
+  function scheduleFit() {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(fitColumns);
+  }
+  function startFitting() {
+    new MutationObserver(scheduleFit).observe(document.body, { childList: true, subtree: true, characterData: true });
+    phone.addEventListener("change", scheduleFit);
+    if (document.fonts) document.fonts.ready.then(scheduleFit);
+    scheduleFit();
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", startFitting);
+  else startFitting();
 }());

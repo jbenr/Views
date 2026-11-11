@@ -1,6 +1,6 @@
 # Opens and arranges the 3-monitor workspace.
 #   Left monitor:  htop (left half) | claude --resume (right half)
-#   Main monitor:  Zed (left two-thirds) | two terminals stacked (right third)
+#   Main monitor:  Zed (left two-thirds) | two terminals stacked (right third), bottom one attached to tmux "views"
 #   Right monitor: terminal (top half) / Spotify (bottom half), Chrome on top of Spotify
 
 $ErrorActionPreference = 'Stop'
@@ -78,14 +78,38 @@ function Start-Term([string]$command) {
     if ($command) { $argList += @('-e', 'pwsh.exe', '-NoLogo', '-NoExit', '-Command', $command) }
     $p = Start-Process $Alacritty -ArgumentList $argList -PassThru
     $termId = $p.Id
-    Wait-Window { Get-Process -Id $termId -ErrorAction SilentlyContinue }.GetNewClosure()
+    # Alacritty briefly shows an untitled placeholder window at startup; wait for the real (titled) one
+    Wait-Window { Get-Process -Id $termId -ErrorAction SilentlyContinue | Where-Object MainWindowTitle }.GetNewClosure()
+}
+
+# Kill whatever listens on a port, plus its whole process tree (so a --reload watcher can't respawn it)
+function Stop-Port([int]$port) {
+    $pids = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique
+    foreach ($id in $pids) {
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$id"
+        $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.ParentProcessId)"
+        if ($parent.Name -eq 'python.exe') { $id = $parent.ProcessId }   # walk up to the reloader
+        taskkill /T /F /PID $id | Out-Null
+    }
+}
+
+# tmux session "views": create it if missing (signal / oven / plain window).
+# Commands are passed as separate words: psmux's new-window silently drops a single quoted command string.
+tmux has-session -t views 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Stop-Port 8052
+    Stop-Port 8053
+    tmux new-session -d -s views -n signal -c $Dir pwsh -NoLogo -NoExit -Command "python -m dashboard.app --host raptor --reload"
+    tmux new-window -t views: -n oven -c $Dir pwsh -NoLogo -NoExit -Command "python -m oven --host raptor --port 8053"
+    tmux new-window -t views: -c $Dir
 }
 
 # Launch everything
 $htop    = Start-Term 'htop'
 $claude  = Start-Term 'claude --resume'
 $mainTop = Start-Term
-$mainBot = Start-Term
+$mainBot = Start-Term 'tmux attach -t views'
 $rightTop = Start-Term
 
 if (-not (Get-Process Zed -ErrorAction SilentlyContinue | Where-Object MainWindowHandle -ne 0)) {
