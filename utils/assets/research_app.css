@@ -34,8 +34,31 @@ body .dash-dropdown-content {
     box-shadow: 0 3px 10px rgba(0, 0, 0, 0.10);
     background: #fff;
 }
-body .dash-dropdown-search-container { border-radius: 2px; }
-body .dash-dropdown-option { padding: 6px 8px; }
+/* Only the option list scrolls, so nothing slides behind the search box. */
+body .dash-dropdown-content {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+body .dash-dropdown-content > * { flex-shrink: 0; }
+body .dash-dropdown-content > .dash-dropdown-options {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+}
+body .dash-dropdown-search-container {
+    position: static;
+    margin: 6px;
+    padding: 3px 6px;
+    border-radius: 2px;
+}
+body .dash-dropdown-actions { padding: 3px 10px; }
+/* Rows match the viz tables: 4px 10px cells, thin grey rule. */
+body .dash-dropdown-option {
+    padding: 4px 10px;
+    line-height: 16px;
+    box-shadow: 0 -1px 0 0 #E8E8E8 inset;
+}
 body .dash-dropdown-options.viz-numeric-options { display: flex; flex-direction: column; }
 body .viz-numeric-options > .dash-dropdown-option { flex-shrink: 0; }
 body .dash-dropdown-option:hover { background: #F3F3F3; }

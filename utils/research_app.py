@@ -196,6 +196,8 @@ def make_app(
     subtitle: str = "",
     data_info: str = "",
     debug: bool = True,
+    class_name: str = "",
+    header_controls: list | None = None,
 ) -> Dash:
     """
     Build a Dash app with a standard header + slider row(s) + body area.
@@ -246,16 +248,17 @@ def make_app(
 
     def _layout():
         return html.Div(
+            className=class_name,
             style={"background": BG, "minHeight": "100vh", "paddingBottom": 64,
                    "fontFamily": "Arial, Helvetica, sans-serif", "color": TEXT},
             children=[
                 # header bar
-                html.Div(style={
+                html.Div(className="research-app-header", style={
                     "background": PANEL, "borderBottom": f"2px solid {BORDER}",
                     "padding": "10px 24px", "display": "flex",
                     "alignItems": "center", "gap": 14,
                 }, children=[
-                    html.Span(title, style={"fontSize": 18, "fontWeight": "bold",
+                    html.Span(title, className="research-app-title", style={"fontSize": 18, "fontWeight": "bold",
                                              "color": ORANGE, "letterSpacing": 3}),
                     *([html.Span(subtitle, style={"fontSize": 12, "color": DIM})]
                       if subtitle else []),
@@ -263,6 +266,7 @@ def make_app(
                                  style={"marginLeft": "auto", "fontSize": 11,
                                         "color": DIM, "fontStyle": "italic"})]
                       if data_info else []),
+                    *(header_controls or []),
                 ]),
                 # slider rows (none: no empty strip under the header)
                 *([html.Div(
@@ -293,4 +297,5 @@ def run(app: Dash, port: int = 8050, host: str = "127.0.0.1", reload: bool = Fal
     """
     debug = getattr(app, "_ra_debug", True)
     print(f"  {app.title}  →  http://{host}:{port}  (debug={debug}, reload={reload})")
-    app.run(host=host, port=port, debug=debug, use_reloader=reload)
+    app.run(host=host, port=port, debug=debug, use_reloader=reload,
+            dev_tools_hot_reload=True if reload else None)

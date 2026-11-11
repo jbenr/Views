@@ -22,6 +22,36 @@ from dashboard.registry import LiveRegistry
 from tests import synthetic as syn
 
 
+def test_dark_charts_render_both_palettes_without_changing_signal_hues():
+    from io import BytesIO
+    from PIL import Image
+    from matplotlib.colors import to_hex
+
+    fig, ax = plt.subplots(figsize=(3, 2))
+    line, = ax.plot([0, 1], [1, 2], color="#E74C3C")
+    ax.set_title("Signal")
+    charts._dark_figure(fig)
+    assert to_hex(ax.get_facecolor()) == "#202329"
+    assert to_hex(ax.title.get_color()) == "#dcdfe4"
+    assert line.get_color() == "#E74C3C"
+    plt.close(fig)
+
+    @charts.dual_theme_charts
+    def draw():
+        figure, axis = plt.subplots(figsize=(3, 2))
+        axis.plot([0, 1], [1, 2])
+        return charts._png(figure)
+
+    png = draw()
+    light = Image.open(BytesIO(base64.b64decode(png))).convert("RGB")
+    dark = Image.open(BytesIO(base64.b64decode(png.dark))).convert("RGB")
+    assert light.getpixel((0, 0)) == (255, 255, 255)
+    assert dark.getpixel((0, 0)) == (23, 25, 29)
+    assert not charts._DUAL_THEME.get()
+    component = charts.chart_image(png).to_plotly_json()["props"]
+    assert component["data-chart-dark"].endswith(png.dark)
+
+
 def test_overview_distinguishes_traded_hedge_from_model_input(monkeypatch, tmp_path):
     app = _load_app_module(monkeypatch, tmp_path)
     row = {"target": "10s30s", "feature": "10y"}
@@ -629,8 +659,11 @@ def test_regime_table_splits_trades_by_the_state_on_their_entry_day(monkeypatch,
     assert policy["time"].to_list() == [1.0, 0.5, 0.5]  # of all days, signal on or not
 
 
-def test_param_summary_explains_exit_and_hard_stop(monkeypatch, tmp_path):
-    app = _load_app_module(monkeypatch, tmp_path)
+def test_setting_rows_one_short_pair_per_setting():
+    import json
+
+    from dashboard.params import setting_rows
+
     row = {
         "entry_signal": "residual",
         "beta_lb": 90,
@@ -642,13 +675,17 @@ def test_param_summary_explains_exit_and_hard_stop(monkeypatch, tmp_path):
         "gate": "('beta_cv', 'tails_25_75')",
     }
 
-    summary = app._param_summary(row)
+    rows = dict(setting_rows(row))
+    assert rows["exit"] == "revert 100%"
+    assert rows["loss stop"] == "25bp"
+    assert rows["gate"] == "beta_cv · tails_25_75 · expanding"
 
-    assert (
-        "exit=revert_frac=1 "
-        "(after 100% of entry signal reverts toward zero)"
-    ) in summary
-    assert "hard stop=25bps" in summary
+    setup = {"lookback": 63, "hedge_lb": 189, "basis": "portfolio", "scale": "raw", "entry": 4, "revert": 0.5,
+             "hl_mult": 1, "max_hold": 40, "stop": 1, "pnl_stop": 7.5, "sizing": "exp_sharpe",
+             "fill": "same", "rearm": "mean"}
+    oven = setting_rows({"kind": "oven", "oven_setup": json.dumps(setup)})
+    assert dict(oven)["entry"] == "raw > 4bps" and dict(oven)["loss stop"] == "7.5bp"
+    assert all(len(value) <= 25 for _, value in oven)  # short enough to stack on a phone
 
 
 def test_gate_chart_renders_png():

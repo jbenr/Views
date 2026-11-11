@@ -30,8 +30,8 @@ python -m dashboard.registry --remove book.curve.twos_10s30s::ou430_e09
 mamba run -n 2s10s python -m dashboard.app
 # http://127.0.0.1:8052
 
-# while working on the dashboard itself: restart on every saved source file,
-# so a browser refresh shows the new code (stylesheets need no restart)
+# while working on the dashboard: automatically restart and refresh the browser
+# when Python, CSS, or JavaScript changes
 python -m dashboard.app --host raptor --reload
 ```
 

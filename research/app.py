@@ -25,6 +25,7 @@ from stats import fit_lr
 from dash import ALL, Input, Output, State, ctx, dcc, html, no_update
 
 from dashboard.charts import (
+    chart_image,
     WINDOW_PRESETS,
     coverage_chart,
     gate_chart,
@@ -905,7 +906,7 @@ def regression_scatter(data: pl.DataFrame, target: str, feature: str, basis: str
     if np.isfinite(fits["past"]["beta"]):
         summary += f" β moved {fits['past']['beta']:.3f} → {fits['latest']['beta']:.3f} from the past to the latest window."
     return html.Div([
-        html.Img(src=f"data:image/png;base64,{png}", style={"width": "100%", "border": f"1px solid {BORDER}"}),
+        chart_image(png, style={"width": "100%", "border": f"1px solid {BORDER}"}),
         note(periods, "dim"),
         note(summary, "dim"),
     ])

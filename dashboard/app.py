@@ -40,6 +40,8 @@ from dashboard import runner
 from dashboard import markets
 from dashboard import portfolio
 from dashboard.charts import (
+    chart_image,
+    dual_theme_charts,
     DEFAULT_WINDOW,
     WINDOW_PRESETS,
     gate_chart,
@@ -51,7 +53,7 @@ from dashboard.charts import (
 )
 from dashboard.ledger import SignalLedger
 from dashboard.params import (
-    exit_label, gate_short as _gate_rule, input_label, short_label,
+    exit_short, gate_short as _gate_rule, input_label, setting_rows, short_label,
     signal_label as _display_name,
 )
 from dashboard.registry import LiveRegistry
@@ -112,23 +114,6 @@ def _pid(kind: str, signal_id) -> dict:
 def _row_id(row: dict) -> str:
     """Registry identity, with module fallback for legacy/test rows."""
     return row.get("signal_id") or row["module"]
-
-
-def _exit_summary(row: dict) -> str:
-    return f"exit={exit_label(row)}"
-
-
-def _param_summary(row: dict) -> str:
-    bits = [f"{row['entry_signal']} beta_lb={row['beta_lb']}"]
-    if row.get("ou_lb"):
-        bits.append(f"ou_lb={row['ou_lb']}")
-    bits.append(f"entry={row['entry_threshold']:g}")
-    bits.append(_exit_summary(row))
-    if row.get("stop_loss_bps") is not None:
-        bits.append(f"hard stop={float(row['stop_loss_bps']):g}bps")
-    if row.get("gate") and row["gate"] != "(none)":
-        bits.append(f"gate={row['gate']}")
-    return "  ·  ".join(bits)
 
 
 def _fnum(value, fmt: str, suffix: str = "") -> str:
@@ -859,6 +844,7 @@ def _trade_table_section(
     ])
 
 
+@dual_theme_charts
 def _card_sections(
     signal_id: str,
     state: dict | None = None,
@@ -956,7 +942,7 @@ def _card_sections(
         chart_body = html.Div(
             className="sd-charts",
             children=[html.Div([
-                html.Img(src=f"data:image/png;base64,{png}") for png in pngs if png is not None
+                chart_image(png) for png in pngs if png is not None
             ], className=f"sd-charts sd-deep-view sd-deep-{view}") for view, pngs in (
                 ("signal", [signal_png, level_png, second, gate_png]),
                 ("performance", [pnl_png, return_distribution_chart(trades, size=span["size"])]))],
@@ -1095,11 +1081,7 @@ def _details_panel(row: dict) -> html.Div:
         _kv("source", row.get("selection_source") or "—"),
         _kv("rationale", row.get("rationale") or "not recorded"),
         _kv("target", row["target"]), _kv("model input", row["feature"]),
-        _kv("entry", f"{row['entry_signal']} · ±{row['entry_threshold']:g}"),
-        _kv("model lookbacks", f"β {row.get('beta_lb', '—')} · OU {row.get('ou_lb') or '—'} bars"),
-        _kv("exit", _exit_summary(row)),
-        _kv("loss stop", _fnum(row.get("stop_loss_bps"), "g", "bp")),
-        _kv("configuration", _param_summary(row)),
+        *[_kv(label, value) for label, value in setting_rows(row)],
         _kv("module", row["module"]),
     ])
 
@@ -1220,7 +1202,7 @@ def _now_panel(state: dict, live: dict, open_entry: dict | None, live_pnl: float
         _kv("level / fair", f"{live['level']:.1f} / {live['fair']:.1f}",
             f"resid {live['resid']:+.1f} bp · z {live['z']:+.2f}"),
         _kv("half-life", f"{live['half_life']:.1f}d"),
-        _kv("exit", exit_label(params)),
+        _kv("exit", exit_short(params), "every setting under Details"),
         _kv("loss stop", _fnum(params.get("stop_loss_bps"), "g", "bp")),
         _kv("confidence", conf["label"],
             f"from {conf['n_past']} closed trades",
@@ -1785,7 +1767,10 @@ def build_app() -> dash.Dash:
             ),
         ])
 
-    app = make_app(title="Model", sliders=[], body=_body)
+    app = make_app(title="Model", sliders=[], body=_body, class_name="sd-app", header_controls=[
+        html.Button("Dark mode", id="sd-theme-toggle", type="button", className="sd-theme-toggle",
+                    **{"aria-pressed": "false", "aria-label": "Toggle dark mode"}),
+    ])
     portfolio.register_callbacks(app)
 
     app.clientside_callback(
@@ -2017,16 +2002,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Flask reloader + in-browser tracebacks. Off by default: the "
-             "reloader runs this module in two processes, so every DB probe "
-             "and every render happens twice.",
+        help="Enable Dash debug tools and in-browser tracebacks. Use --reload "
+             "as well to restart the server when Python code changes.",
     )
     parser.add_argument(
         "--reload",
         action="store_true",
-        help="Dev mode: restart the server whenever a source file is saved, so "
-             "a browser refresh shows the new code. Stylesheets in utils/assets "
-             "are read from disk on every refresh either way.",
+        help="Dev mode: automatically restart on source changes and refresh "
+             "the browser when Python, CSS, or JavaScript changes.",
     )
     args = parser.parse_args()
     # This server outlives the WSL VM's idle timeout, and postgres dies with

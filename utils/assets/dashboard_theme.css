@@ -1,0 +1,91 @@
+/* Only the signal dashboard opts into this theme. Light styles remain intact. */
+@font-face {
+    font-family: "Model Script";
+    src: url("fonts/Lobster-Regular.ttf") format("truetype");
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+}
+.sd-app .research-app-title {
+    color: #773141 !important;
+    font-family: "Model Script", cursive;
+    font-style: normal;
+    font-weight: 400 !important;
+    font-size: 30px !important;
+    letter-spacing: 0 !important;
+}
+.sd-theme-toggle {
+    margin-left: auto;
+    border: 1px solid #bbb;
+    border-radius: 3px;
+    padding: 4px 9px;
+    background: #fff;
+    color: #444;
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+html[data-sd-theme="dark"] { color-scheme: dark; background: #17191d; }
+html[data-sd-theme="dark"] .sd-app {
+    background: #17191d !important;
+    color: #dcdfe4 !important;
+}
+html[data-sd-theme="dark"] .sd-app .research-app-header {
+    background: #22252b !important;
+    border-color: #454951 !important;
+}
+html[data-sd-theme="dark"] .sd-app .research-app-title {
+    /* A fine gold edge keeps the burgundy lettering clear without a badge. */
+    -webkit-text-stroke: 0.4px #edc773;
+    paint-order: stroke fill;
+}
+html[data-sd-theme="dark"] .sd-app .shimmer-loader__mark {
+    background-image: linear-gradient(100deg,
+        #62666e 0%, #62666e 40%, #ffcc33 47%, #9b2948 53%, #62666e 60%, #62666e 100%);
+}
+html[data-sd-theme="dark"] .sd-app .sd-charts img { border-color: #454951; }
+@media (prefers-reduced-motion: reduce) {
+    html[data-sd-theme="dark"] .sd-app .shimmer-loader__mark { background-image: linear-gradient(#62666e, #62666e); }
+}
+html[data-sd-theme="dark"] .sd-app :is(.sd-row-legend, .sd-k, .sd-deep-tab, .tab, .viz-table th) {
+    background: #292d34 !important;
+    color: #dcdfe4 !important;
+}
+html[data-sd-theme="dark"] .sd-app :is(.sd-kv, .sd-row-body, .sd-theme-toggle, button:not(.sd-sort), .tab--selected) {
+    background: #202329 !important;
+    color: #dcdfe4 !important;
+}
+html[data-sd-theme="dark"] .sd-app :is(.sd-sheet, .sd-row, .sd-row-body, .sd-row-legend, .sd-kv, .sd-kv span, .sd-detail-cell, .sd-row-head > span, .sd-row-head::before, .sd-row-legend > span, .sd-h, .sd-fold, .sd-deep-tabs, .sd-deep-tab, button, .tab, .viz-table, .viz-table th, .viz-table td) {
+    border-color: #454951 !important;
+}
+html[data-sd-theme="dark"] .sd-app :is(.sd-note, .sd-h-note, .sd-detail-label, .sd-n, .sd-pos--quiet, .sd-stamp span span) { color: #a4abb5; }
+html[data-sd-theme="dark"] .sd-app .sd-row-head:hover { background: #292e37; }
+html[data-sd-theme="dark"] .sd-app .sd-reading--active { background: #304657; color: #c4dff1; }
+html[data-sd-theme="dark"] .sd-app .sd-deep-tab[aria-pressed="true"] { color: #f0b83c !important; }
+/* Neutral inline colours from the shared table renderer; signal colours are retained. */
+html[data-sd-theme="dark"] .sd-app [style*="color: rgb(51, 51, 51)"],
+html[data-sd-theme="dark"] .sd-app [style*="color: rgb(68, 68, 68)"] { color: #dcdfe4 !important; }
+html[data-sd-theme="dark"] .sd-app [style*="background: rgb(255, 255, 255)"],
+html[data-sd-theme="dark"] .sd-app [style*="background-color: rgb(255, 255, 255)"],
+html[data-sd-theme="dark"] .sd-app [style*="background: rgb(245, 245, 245)"],
+html[data-sd-theme="dark"] .sd-app [style*="background-color: rgb(245, 245, 245)"] { background: #202329 !important; }
+html[data-sd-theme="dark"] .sd-app .viz-table tbody tr:hover > td { background: #303640 !important; }
+/* Heatmap cells keep their existing fill/ink pairing, including pale P&L fills. */
+html[data-sd-theme="dark"] .sd-app .viz-table td[style*="background: rgb("][style*="color: rgb(51, 51, 51)"]:not([style*="background: rgb(255, 255, 255)"]) { color: #333333 !important; }
+html[data-sd-theme="dark"] .sd-app .viz-table tbody tr:hover > td[style*="background: rgb("][style*="color: rgb(51, 51, 51)"] { color: #dcdfe4 !important; }
+/* Dash dropdown menus can be portalled outside the app wrapper. */
+html[data-sd-theme="dark"] body :is(.dash-dropdown, .dash-dropdown-content) {
+    --Dash-Fill-Inverse-Strong: #202329;
+    --Dash-Fill-Interactive-Weak: #40372a;
+    --Dash-Text-Strong: #dcdfe4;
+    --Dash-Text-Weak: #a4abb5;
+    --Dash-Stroke-Strong: #454951;
+    background: #202329;
+    color: #dcdfe4;
+    border-color: #454951;
+}
+/* The line the folder tabs sit on is an inline light border. */
+html[data-sd-theme="dark"] .sd-app #dashboard-tabs { border-bottom-color: #454951 !important; }
+html[data-sd-theme="dark"] body .dash-dropdown-option { box-shadow: 0 -1px 0 0 #2c3038 inset; }
+html[data-sd-theme="dark"] body .dash-dropdown-option:hover { background: #303640; }
+html[data-sd-theme="dark"] body .dash-dropdown-option:has(input:checked) { background: #40372a; }

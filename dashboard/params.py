@@ -140,6 +140,42 @@ def gate_label(params: dict) -> str:
     return f"{condition} · {bucket} · {basis}"
 
 
+def setting_rows(row: dict) -> list[tuple[str, str]]:
+    """Every frozen setting as (label, value), one short pair each, so a long setup
+    stacks into rows instead of widening a line. Oven signals read their setup;
+    book signals their param columns."""
+    if row.get("kind") == "oven":
+        from oven.engine import LEGACY_RULES  # oven setups from before a knob existed ran on these
+
+        s = {**LEGACY_RULES, **json.loads(row["oven_setup"])}
+        units = "bps" if s["scale"] == "raw" else "z"
+        gate = "none" if s["gate"] == LEGACY_RULES["gate"] else (
+            s["gate"] + (" · point in time" if s["gate_mode"] == "causal" else ""))
+        return [
+            ("signal lookback", f"{s['lookback']}d"),
+            ("hedge lookback", f"{s['hedge_lb']}d"),
+            ("basis", s["basis"]),
+            ("entry", f"{s['scale']} > {float(s['entry']):g}{units}"),
+            ("revert", f"{float(s['revert']):g}" if s["revert"] else "off"),
+            ("half-life stop", f"{float(s['hl_mult']):g}× half-life" if s["hl_mult"] else "off"),
+            ("max hold", f"{s['max_hold']}d"),
+            ("signal stop", f"{float(s['stop']):g}σ past entry" if s["stop"] else "off"),
+            ("loss stop", f"{float(s['pnl_stop']):g}bp" if s.get("pnl_stop") else "off"),
+            ("sizing", s.get("sizing", "flat")),
+            ("fill", s["fill"]),
+            ("re-arm", s["rearm"]),
+            ("gate", gate),
+            ("needs half-life", "yes" if s["need_half_life"] else "no"),
+        ]
+    rows = [("entry signal", row["entry_signal"]), ("beta lookback", f"{int(row['beta_lb'])}d")]
+    if row.get("ou_lb"):
+        rows.append(("OU lookback", f"{int(row['ou_lb'])}d"))
+    rows += [("entry", entry_short(row)), ("exit", exit_short(row)),
+             ("loss stop", f"{float(row['stop_loss_bps']):g}bp" if row.get("stop_loss_bps") is not None else "off"),
+             ("gate", gate_label({**row, "gate": unpack_gate(row.get("gate"))}))]
+    return rows
+
+
 # ── compact labels ───────────────────────────────────────────────────────────
 # Same facts as the labels above, sized for a table cell rather than a line of
 # its own. The verbose forms stay because a single promoted signal is a record

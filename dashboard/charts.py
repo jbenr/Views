@@ -13,6 +13,7 @@ import base64
 import functools
 import threading
 from io import BytesIO
+from contextvars import ContextVar
 
 import matplotlib
 
@@ -38,6 +39,69 @@ from utils.viz import Viz
 # pyplot keeps one process-wide figure registry and is not thread-safe: two
 # requests drawing at once can corrupt it. One chart renders at a time.
 _RENDER_LOCK = threading.RLock()
+_DUAL_THEME = ContextVar("dashboard_dual_chart_theme", default=False)
+
+
+def dual_theme_charts(render):
+    """Opt a dashboard render into both palettes without affecting other apps/threads."""
+    @functools.wraps(render)
+    def wrapper(*args, **kwargs):
+        token = _DUAL_THEME.set(True)
+        try:
+            return render(*args, **kwargs)
+        finally:
+            _DUAL_THEME.reset(token)
+    return wrapper
+
+
+class _ThemedPng(str):
+    """Light PNG remains a normal string for existing consumers."""
+    def __new__(cls, light, dark):
+        value = super().__new__(cls, light)
+        value.dark = dark
+        return value
+
+
+def chart_image(png, **kwargs):
+    from dash import html
+    light = f"data:image/png;base64,{png}"
+    variants = {"data-chart-light": light, "data-chart-dark": f"data:image/png;base64,{png.dark}"} if isinstance(png, _ThemedPng) else {}
+    return html.Img(src=light, **variants, **kwargs)
+
+
+def _dark_figure(fig):
+    """Restyle neutral canvas, axes and ink; keep the data's semantic hues."""
+    from matplotlib.colors import to_rgba
+    from matplotlib.text import Text
+
+    def neutral(color):
+        try:
+            r, g, b, a = to_rgba(color)
+            return a > 0 and max(r, g, b) - min(r, g, b) < 0.04
+        except (ValueError, TypeError):
+            return False
+
+    fig.set_facecolor("#17191d")
+    for ax in fig.axes:
+        ax.set_facecolor("#202329")
+        ax.tick_params(colors="#b5bdc8")
+        for spine in ax.spines.values():
+            spine.set_color("#68717f")
+        for line in ax.lines:
+            if neutral(line.get_color()):
+                line.set_color("#a4abb5")
+        for line in [*ax.get_xgridlines(), *ax.get_ygridlines()]:
+            line.set_color("#3d444f")
+        legend = ax.get_legend()
+        if legend:
+            legend.get_frame().set_facecolor("#202329")
+            legend.get_frame().set_edgecolor("#68717f")
+    for text in fig.findobj(match=Text):
+        if neutral(text.get_color()):
+            text.set_color("#dcdfe4")
+        box = text.get_bbox_patch()
+        if box is not None and neutral(box.get_facecolor()):
+            box.set_facecolor("#303640")
 
 
 def _one_at_a_time(render):
@@ -87,11 +151,7 @@ class _PngViz(Viz):
         if title:
             fig.suptitle(title.upper(), fontsize=self.TITLE_SIZE, fontweight="bold",
                          color="#333", x=0.02, ha="left", y=0.98)
-        buf = BytesIO()
-        fig.savefig(buf, format="png", dpi=140, bbox_inches="tight",
-                    facecolor="white", edgecolor="white")
-        plt.close(fig)
-        return base64.b64encode(buf.getvalue()).decode("ascii")
+        return _png(fig)
 
 
 def _viz(size: tuple[float, float] | None = None, fig_height: float | None = None) -> _PngViz:
@@ -287,11 +347,7 @@ def coverage_chart(coverage: pl.DataFrame) -> str:
         ax.spines[spine].set_linewidth(1.1)
     fig.suptitle("SERIES COVERAGE", fontsize=11, fontweight="bold",
                  color="#333", x=0.02, ha="left", y=0.98)
-    buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight",
-                facecolor="white", edgecolor="white")
-    plt.close(fig)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+    return _png(fig)
 
 
 @_one_at_a_time
@@ -576,11 +632,7 @@ def return_distribution_chart(trades: pl.DataFrame | None, bins: int | None = No
     ax.xaxis.set_major_formatter(StrMethodFormatter("{x:.1f}"))
     fig.suptitle(title.upper(), fontsize=viz.TITLE_SIZE, fontweight="bold",
                  color="#333", x=0.02, ha="left", y=0.98)
-    buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight",
-                facecolor="white", edgecolor="white")
-    plt.close(fig)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+    return _png(fig)
 
 
 @_one_at_a_time
@@ -632,18 +684,22 @@ def regression_scatter_chart(
               handlelength=1.6, handletextpad=0.4, columnspacing=1.0)
     fig.suptitle(title.upper(), fontsize=viz.TITLE_SIZE, fontweight="bold",
                  color="#333", x=0.02, ha="left", y=0.98)
-    buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight",
-                facecolor="white", edgecolor="white")
-    plt.close(fig)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+    return _png(fig)
 
 
 def _png(fig) -> str:
-    buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight", facecolor="white", edgecolor="white")
-    plt.close(fig)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+    def encode(background):
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=140, bbox_inches="tight", facecolor=background, edgecolor=background)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    try:
+        light = encode("white")
+        if not _DUAL_THEME.get():
+            return light
+        _dark_figure(fig)
+        return _ThemedPng(light, encode("#17191d"))
+    finally:
+        plt.close(fig)
 
 
 @_one_at_a_time

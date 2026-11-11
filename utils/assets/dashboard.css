@@ -6,6 +6,8 @@
    sideways in its own box. */
 
 .sd-page {
+    /* Eight columns (974px) plus the sheet's left border. */
+    --sd-signal-width: 975px;
     padding: 14px 24px;
     font-size: 12px;
     font-variant-numeric: tabular-nums;
@@ -19,7 +21,7 @@
 }
 .sd-bar-title { font-size: 13px; font-weight: bold; }
 .sd-bar .sd-close-all { margin-left: auto; margin-top: 0; }
-.sd-bar:has(.sd-close-all) { width: 1075px; max-width: 100%; }
+.sd-bar:has(.sd-close-all) { width: var(--sd-signal-width); max-width: 100%; }
 .sd-picker { width: 360px; max-width: 100%; font-size: 12px; }
 
 /* section heading: bold caps on a rule, a quiet note beside it */
@@ -63,7 +65,7 @@
 /* Keep section rules aligned with the eight signal columns and their left border. */
 .sd-signal-section {
     --sd-columns: 18px 112px 180px 146px 100px 64px 104px 250px;
-    width: 1075px;
+    width: var(--sd-signal-width);
     max-width: 100%;
 }
 .sd-signal-section .sd-sheet { width: 100%; box-sizing: border-box; }
