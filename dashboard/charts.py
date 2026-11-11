@@ -79,6 +79,11 @@ class _PngViz(Viz):
         fig.patch.set_facecolor("white")
         fig.subplots_adjust(left=0.04, right=0.94, top=0.88, bottom=0.16)
         render_fn(fig, axes, df.index.min(), df.index.max())
+        if self.fig_width < 7:  # a phone-sized canvas: the house tick density overprints its labels
+            for ax in np.atleast_1d(axes):
+                locator = mdates.AutoDateLocator(minticks=3, maxticks=6)
+                ax.xaxis.set_major_locator(locator)
+                ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
         if title:
             fig.suptitle(title.upper(), fontsize=self.TITLE_SIZE, fontweight="bold",
                          color="#333", x=0.02, ha="left", y=0.98)
@@ -87,6 +92,12 @@ class _PngViz(Viz):
                     facecolor="white", edgecolor="white")
         plt.close(fig)
         return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _viz(size: tuple[float, float] | None = None, fig_height: float | None = None) -> _PngViz:
+    """The chart canvas: ``size`` is (width, height) in inches, for a caller that lays
+    charts out at another shape than the standard half-width one."""
+    return _PngViz(fig_width=size[0], fig_height=size[1]) if size else _PngViz(fig_height=fig_height)
 
 
 def _pandas_indexed(data: pl.DataFrame, cols: list[str]) -> pd.DataFrame:
@@ -158,6 +169,7 @@ def level_chart(
     invert_features: bool = False,
     fig_height: float | None = None,
     overlays: list[str] | None = None,
+    size: tuple[float, float] | None = None,
 ) -> str:
     """Tradable level with optional research inputs.
 
@@ -191,7 +203,7 @@ def level_chart(
         },
     }
     feature_title = display_features[0] if len(display_features) == 1 else "features"
-    return _PngViz(fig_height=fig_height).line(
+    return _viz(size, fig_height).line(
         frame, cols=cols, title=target, yaxis_title="bps",
         yaxis_right_title=feature_title, left=display_features,
         markers=markers, line_colors=colors,
@@ -288,6 +300,7 @@ def input_chart(
     feature: str,
     window_bars: int | None = WINDOW_PRESETS[DEFAULT_WINDOW],
     date_range: tuple | None = None,
+    size: tuple[float, float] | None = None,
 ) -> str:
     """The model's X/input series, paired beside the traded target chart.
 
@@ -298,7 +311,7 @@ def input_chart(
     """
     frame = _pandas_indexed(data, [feature])
     frame = _slice_window(frame, window_bars, date_range)
-    return _PngViz().line(
+    return _viz(size).line(
         frame,
         cols=[feature],
         title=f"input · {feature}",
@@ -316,12 +329,12 @@ def signal_chart(
     window_bars: int | None = WINDOW_PRESETS[DEFAULT_WINDOW],
     date_range: tuple | None = None,
     fired: str = "flat",
-    wide: bool = False,
+    size: tuple[float, float] | None = None,
 ) -> str:
     """Residual/OU-z chart with entry threshold bands and the current
     reading flagged -- base64 PNG. Line is colored red while a sell (short)
-    signal is firing, green while a buy (long) signal is firing. ``wide`` draws
-    it for a slot spanning the whole card (the dashboard's Deep Dive); otherwise
+    signal is firing, green while a buy (long) signal is firing. ``size`` draws
+    it at another shape (the dashboard's Deep Dive, one chart to a row); otherwise
     it is the standard half-width chart (the Oven's chart grid)."""
     col = "resid" if entry_signal == "residual" else "ou_z"
     combined = data.select("ts").with_columns(sig_frame[col].alias(col))
@@ -333,10 +346,7 @@ def signal_chart(
         line_colors = {col: C0}
     elif fired == "long":
         line_colors = {col: C1}
-    # spanning the whole card, it is drawn on a wide, short canvas so it isn't a
-    # half-width chart stretched up (soft, oversized text and lines, too tall)
-    viz = _PngViz(fig_width=18, fig_height=4.2) if wide else _PngViz()
-    return viz.line(
+    return _viz(size).line(
         frame, cols=[col],
         title=f"{entry_signal} vs entry ({entry_threshold:g} {units})",
         yaxis_title=units,
@@ -368,6 +378,7 @@ def gate_chart(
     window_bars: int | None = WINDOW_PRESETS[DEFAULT_WINDOW],
     date_range: tuple | None = None,
     gate_window: int | None = None,
+    size: tuple[float, float] | None = None,
 ) -> str | None:
     """Causal historical percentile of the promoted gate condition.
 
@@ -401,7 +412,7 @@ def gate_chart(
         f"gate: {name} · {_gate_bucket_description(kind, qs)} ({basis}) · "
         f"{state}{current}"
     )
-    viz = _PngViz()
+    viz = _viz(size)
 
     def render(fig, ax, start, end):
         subset = frame.loc[start:end]
@@ -465,12 +476,13 @@ def pnl_chart(
     equity_curve: pl.DataFrame,
     window_bars: int | None = WINDOW_PRESETS[DEFAULT_WINDOW],
     date_range: tuple | None = None,
+    size: tuple[float, float] | None = None,
 ) -> str:
     """Exact-engine marked-to-market PnL, rebased at the visible window."""
     frame = _window_pnl_frame(equity_curve, window_bars, date_range)
     latest = frame["cumulative_pnl"].dropna()
     color = C1 if latest.empty or latest.iloc[-1] >= 0 else C0
-    return _PngViz().line(
+    return _viz(size).line(
         frame,
         cols=["cumulative_pnl"],
         title="cumulative pnl · window reset",
@@ -488,7 +500,8 @@ def pnl_chart(
 
 
 @_one_at_a_time
-def return_distribution_chart(trades: pl.DataFrame | None, bins: int | None = None, density: bool = False) -> str:
+def return_distribution_chart(trades: pl.DataFrame | None, bins: int | None = None, density: bool = False,
+                              size: tuple[float, float] | None = None) -> str:
     """Histogram of realized, net closed-trade returns in basis points.
 
     This is deliberately strategy-wide rather than windowed: the histogram is
@@ -506,7 +519,7 @@ def return_distribution_chart(trades: pl.DataFrame | None, bins: int | None = No
         values = values[np.isfinite(values)]
 
     viz = _PngViz()
-    fig, ax = plt.subplots(figsize=(9, 5.4))
+    fig, ax = plt.subplots(figsize=size or (9, 5.4))
     fig.patch.set_facecolor("white")
     fig.subplots_adjust(left=0.06, right=0.94, top=0.84, bottom=0.20)
 

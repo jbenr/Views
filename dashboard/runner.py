@@ -202,8 +202,8 @@ _analysis_lock = threading.Lock()
 
 
 def analysis(signal_id: str) -> dict:
-    """compute_signal, trade_history and live_read for one signal -- {state, trades,
-    open_entry, live} -- computed once and reused until the signal's cached data is
+    """compute_signal, trade_history, live_read and exit_status for one signal -- {state,
+    trades, open_entry, live, exits} -- computed once and reused until the signal's cached data is
     rewritten (a Ref pulls it) or its registry row changes. The overview and the
     Deep Dive both read a signal on every page load; this is what keeps them from
     each recomputing it. Raises RuntimeError as compute_signal does."""
@@ -220,7 +220,11 @@ def analysis(signal_id: str) -> dict:
             live = live_read(state, trades, open_entry)
         except (KeyError, AttributeError):  # a signal whose state lacks what the live read needs
             live = None
-        out = dict(state=state, trades=trades, open_entry=open_entry, live=live)
+        try:
+            exits = exit_status(state, open_entry)
+        except (KeyError, AttributeError):  # as above: a state without what the exit read needs
+            exits = []
+        out = dict(state=state, trades=trades, open_entry=open_entry, live=live, exits=exits)
         _analysis_cache[signal_id] = (key, out)
         return out
 
@@ -324,9 +328,95 @@ def trade_history(signal_id: str, state: dict | None = None) -> tuple[pl.DataFra
             "entry_half_life": pos.entry_extras.get("half_life"),
             "bars_held": pos.bars_held,
             "exit_reason": "active",
+            # what exit_status measures the trade's exits from
+            "entry_signal": pos.entry_signal,
+            "time_stop_bars": pos.dynamic_time_stop,
         }
 
     return log, open_entry
+
+
+def _exit_rule(rule: str, now: str, exits_at: str, progress: float) -> dict:
+    """One exit rule of an open trade: where it stands, where it fires, and how far
+    along it is (0 at entry, 1 when it fires; below 0 if it has moved away)."""
+    return dict(rule=rule, now=now, exits_at=exits_at, progress=float(progress))
+
+
+def _toward(start: float, now: float, end: float) -> float:
+    """How far ``now`` has come from ``start`` to ``end``, as a share of the way."""
+    return (now - start) / (end - start) if end != start else 1.0
+
+
+def exit_status(state: dict, open_entry: dict | None) -> list[dict]:
+    """How close the open trade is to each of its exit rules, read with the rules the
+    engine that walked it applies: [{rule, now, exits_at, progress}], empty when flat.
+
+    A book signal exits on its signal (inside a band, or after a share of the entry
+    signal has reverted), on a time stop at a multiple of the entry half-life, and on
+    the hard stop loss. An oven signal's model is frozen at entry: it exits when the
+    frozen residual has recovered its target share, widens to its stop, loses its
+    stop-loss in P&L, or runs out of bars -- read off the exact walk's open trade."""
+    if open_entry is None:
+        return []
+    strategy, data, params = state["strategy"], state["data"], state["params"]
+    pnl = float(open_entry["pnl_bps"])
+    rules = []
+    if hasattr(strategy, "history"):  # oven: the exact walk's own open trade
+        from backtest import engine as core
+        from oven.engine import setup_model
+
+        setup = strategy.setup
+        model, config, hedge, gate = setup_model(strategy.model_frame(data), strategy.target, setup,
+                                                 strategy.gate_edges)
+        trades, _ = core.walk_exact(model, config, hedge=hedge, cost=strategy.cost, gate=gate)
+        if not trades or trades[-1]["reason"] != "open":
+            return []
+        pos = trades[-1]
+        m = {k: np.asarray(model[k], dtype=float) for k in ("y", "x", "alpha", "beta", "center", "sigma", "half_life")}
+        y, x, d, last = m["y"], m["x"], pos["decided"], len(m["y"]) - 1
+
+        def frozen(t: int) -> float:  # the entry-day model's residual, as walk_exact holds it
+            return float(y[t] - m["alpha"][d] - m["beta"][d] * x[t] - m["center"][d])
+
+        sign0 = 1.0 if frozen(d) > 0 else -1.0
+        r0, now = abs(frozen(d)), sign0 * frozen(last)  # positive on the entry's side
+        if setup["revert"] > 0:
+            goal = (1.0 - setup["revert"]) * r0
+            rules.append(_exit_rule(f"revert {setup['revert']:.0%}", f"resid {now:.2f}bp (entry {r0:.2f})",
+                                    f"{goal:.2f}bp", _toward(r0, now, goal)))
+        if setup["stop"] > 0:
+            limit = r0 + setup["stop"] * float(m["sigma"][d])
+            rules.append(_exit_rule(f"stop {setup['stop']:g}σ wider", f"resid {now:.2f}bp (entry {r0:.2f})",
+                                    f"{limit:.2f}bp", _toward(r0, now, limit)))
+        if setup.get("pnl_stop"):  # on the unsized trade, as the walk checks it
+            f0 = pos["entry_fill"]
+            pnl = float(pos["side"] * ((y[last] - y[f0]) - pos["hedge_ratio"] * (x[last] - x[f0])))
+            rules.append(_exit_rule("stop loss", f"P&L {pnl:+.1f}bp", f"{-setup['pnl_stop']:+.1f}bp",
+                                    -pnl / setup["pnl_stop"]))
+        bars, timeout = core.horizon(int(setup["max_hold"]), float(setup["hl_mult"]), float(m["half_life"][d]))
+        label = "time: half-life" if core.EXIT_REASONS[timeout] == "half_life" else "time: max hold"
+        rules.append(_exit_rule(label, f"day {last - d}", f"day {bars}", (last - d) / bars))
+        return rules
+
+    units = "bps" if params["entry_signal"] == "residual" else "z"
+    side = 1.0 if open_entry["direction"] == "long" else -1.0  # a long entered on a negative signal
+    signal, entry = _num(state["last"].get("signal")), _num(open_entry.get("entry_signal"))
+    style, param = params["exit_style"], float(params["exit_param"])
+    if style in ("band", "revert_frac") and signal == signal and entry == entry:
+        # the signal's distance from zero on the entry's side: it exits once that is small enough
+        out_now, out_entry = -side * signal, -side * entry
+        out_exit = param if style == "band" else out_entry * (1.0 - param)
+        name = f"band {param:g}{units}" if style == "band" else f"revert {param:.0%}"
+        rules.append(_exit_rule(name, f"signal {signal:+.2f}{units} (entry {entry:+.2f})",
+                                f"{-side * out_exit:+.2f}{units}", _toward(out_entry, out_now, out_exit)))
+    stop_bars = open_entry.get("time_stop_bars")
+    if stop_bars:
+        rules.append(_exit_rule("time: half-life", f"day {open_entry['bars_held']}", f"day {int(stop_bars)}",
+                                open_entry["bars_held"] / stop_bars))
+    if params.get("stop_loss_bps"):
+        stop = float(params["stop_loss_bps"])
+        rules.append(_exit_rule("stop loss", f"P&L {pnl:+.1f}bp", f"{-stop:+.1f}bp", -pnl / stop))
+    return rules
 
 
 # entry-state features confidence reads, per kind of signal: trade-log column -> label.

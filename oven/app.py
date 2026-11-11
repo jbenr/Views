@@ -59,7 +59,8 @@ ALL_INPUTS = list(dict.fromkeys(name for names in FEATURE_GROUPS.values() for na
 GRID_CONTROLS = {
     "lookbacks": ("signal lookbacks · levels OLS (d)", [21, 42, 63, 126, 189, 252, 378, 504], engine.LOOKBACKS),
     "z_entries": ("entries · normalized z", [1.0, 1.5, 2.0, 2.5, 3.0], engine.Z_ENTRIES),
-    "raw_entries": ("entries · raw bps", [2.5 * k for k in range(1, 13)], engine.RAW_ENTRIES),
+    "raw_entries": ("entries · raw bps", [*[float(k) for k in range(1, 31)], 35.0, 40.0, 50.0],
+                    engine.RAW_ENTRIES),
     "reverts": ("exit · share of frozen residual recovered (0 = no reversion exit)", [0.0, 0.25, 0.5, 0.75, 1.0],
                 engine.REVERTS),
     "hl_mults": ("exit · time stop at × entry half-life (0 = off)", [0.0, 0.5, 1.0, 2.0, 3.0], engine.HL_MULTS),

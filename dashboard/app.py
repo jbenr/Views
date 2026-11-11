@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import re
 
 import dash
@@ -54,19 +55,29 @@ from dashboard.params import (
     signal_label as _display_name,
 )
 from dashboard.registry import LiveRegistry
+from dashboard.sheet import grid_table as _grid_table, heading as _heading, kv as _kv, kv_range as _range, usd as _usd
 from stats import CONF_SHRINK
 from research.app import _diverging, note, pnl_heatmap, regression_scatter, table
-from utils.viz import column_widths, table_div
+from utils.viz import table_div
 from utils.research_app import (
-    BORDER, C0, C1, DIM, FOLDER_TAB, FOLDER_TAB_SELECTED, FOLDER_TABS, ORANGE, PANEL, TEXT, make_app, run,
-    shimmer_loader, stat_block,
+    BORDER, C0, C1, DIM, FOLDER_TAB, FOLDER_TAB_SELECTED, FOLDER_TABS, ORANGE, TEXT, make_app, run,
+    shimmer_loader,
 )
 
 REGISTRY = LiveRegistry()
 LEDGER = SignalLedger()
 
 TRADES_PER_PAGE = 6  # fewest trade rows a page holds; it grows to the monthly heatmap's years
-CHART_BOX = "1260 / 767"  # width / height of the Deep Dive's grid charts: the tallest one's shape
+# the Deep Dive's charts stand one to a row, so each is drawn (width, height in inches)
+# for the row it fills: wide and short on a desktop, near square on a phone, where a
+# wide chart scaled down to the screen leaves its text too small to read
+WIDE_CHART = (18, 4.2)
+PHONE_CHART = (5.6, 3.9)
+PHONE_MAX_WIDTH = 900  # px; narrower viewports get PHONE_CHART
+# Dollars per basis point of a signal's P&L: the size every signal is assumed to trade
+# at, since no trade is wired to a signal yet. An assumption, not a measurement: about
+# what the account's 10s30s steepener (8 TN against 4 UB) carried per bp when it was set.
+USD_PER_BP = 750.0
 SNAP_LEFT_BUFFER_BDAYS = 5
 
 # the Oven's trade table: its columns, short lower-case headers and colours (oven.app)
@@ -87,28 +98,6 @@ TRADE_TABLE_ROUND = {
     "pnl_bps": 2, "conf_score": 2, "entry_half_life": 1,
 }
 TRADE_TEXT_COLS = {"entry_date", "exit_date", "exit_reason"}
-
-OVERVIEW_COLUMNS = [
-    # Feature is dropped: the Signal name already leads with it. Position folds
-    # in the old "Latest Reading", and Reading pairs the live value with the
-    # threshold it is being judged against, so the four state columns become two.
-    # Headers and cells are kept short so the table fits the page without a
-    # scrollbar; units (bps, %) are the dashboard's defaults and go unstated.
-    # What each signal is and where it stands today; how the strategy has performed
-    # lives on the Deep Dive.
-    ("target", "Target"),  # each section names it: Tenor, Curve, Fly
-    ("name", "Signal"),
-    ("model", "Built From"),
-    ("input_now", "Input"),
-    ("fair", "Fair"),
-    ("reading", "Reading"),
-    ("position", "Position"),
-    ("conf", "Conf"),
-    ("gate_rule", "Gate"),
-    ("gate_status", "Gate Now"),
-    ("data_asof", "As Of"),
-]
-
 
 def _slug(signal_id: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", signal_id.lower()).strip("-")
@@ -157,7 +146,7 @@ def _fnum(value, fmt: str, suffix: str = "") -> str:
 
 def _live_pnl_bps(trades, open_entry: dict | None) -> float:
     """Realized PnL from closed trades plus unrealized PnL from the open
-    position, if any -- the running live total since promotion."""
+    position, if any, over the full model history."""
     total = 0.0
     if trades is not None and not trades.is_empty():
         total += float(trades["pnl_bps"].sum())
@@ -363,12 +352,18 @@ def _overview_snapshot(row: dict) -> dict:
         "input_now": "—",
         "fair": "—",
         "conf": "—",
+        "exp_usd": "—",
+        "exp_work": "",
         "reading": "—",
         "gate_rule": "—",
         "gate_status": "—",
         "live_pnl_bps": None,
         "data_asof": "—",
         "data_stale": 0,
+        "details": {},
+        "reading_active": False,
+        "reading_value": None,
+        "exp_value": None,
     }
     try:
         signal_id = _row_id(row)
@@ -390,6 +385,10 @@ def _overview_snapshot(row: dict) -> dict:
     return {
         **base,
         **_signal_facts(row, state, read["live"]),
+        "target": _trade_target(row, state),
+        "details": _overview_details(row, state, read["live"], open_entry),
+        "reading_active": bool(signal_value is not None and abs(float(signal_value)) >= threshold),
+        "reading_value": float(signal_value) if signal_value is not None and np.isfinite(signal_value) else None,
         "position": _position_label(state, open_entry),
         "reading": reading_str,
         "gate_rule": _gate_rule(params),
@@ -417,17 +416,81 @@ def _model_text(row: dict, state: dict) -> str:
     return f"~ {beta}×{feature} · {kind}"
 
 
+def _trade_target(row: dict, state: dict) -> str:
+    """Name the traded package, keeping a model input distinct from an actual hedge."""
+    from oven.engine import hedgeable
+
+    target = row["target"]
+    strategy = state.get("strategy")
+    if hasattr(strategy, "setup") and hedgeable(strategy.feature):
+        return f"{target} − β×{strategy.feature}"
+    return target
+
+
+def _overview_details(row: dict, state: dict, live: dict | None, held: dict | None) -> dict:
+    """Short label/value pairs grouped under the overview's seven columns."""
+    from research.panel import CATALOG
+
+    params, strategy = state["params"], state.get("strategy")
+    setup = getattr(strategy, "setup", {})
+    target = CATALOG.get(row["target"])
+    legs = " ".join(f"{weight:+g}×{leg}" for leg, weight in target.legs.items()) if target else row["target"]
+    position = [("held", f"{held.get('bars_held', '—')} bars"),
+                ("since", str(held.get("entry_date", "—"))[:10]),
+                ("P&L", _fnum(held.get("pnl_bps"), "+.1f", "bp"))] if held else [("held", "none")]
+    construction = [("legs", legs)]
+    if setup:
+        from oven.engine import hedgeable
+        hedged = hedgeable(strategy.feature)
+        construction += [("hedge", f"β×{strategy.feature}" if hedged else "none"),
+                         ("β fit", f"Δ · {setup['hedge_lb']} bars") if hedged else ("input", strategy.feature),
+                         ("signal", f"{setup['basis']} · {setup['lookback']} bars")]
+        data = state.get("data")
+        if hedged and data is not None and "beta_changes" in data.columns:
+            construction.insert(2, ("β now", _fnum(data["beta_changes"][-1], "+.2f")))
+        exits = [("revert", f"{setup['revert']:.0%}")] if setup.get("revert") else []
+        exits += [("max hold", f"{setup['max_hold']} bars")]
+        if setup.get("hl_mult"):
+            exits.append(("time", f"{setup['hl_mult']:g}× HL"))
+        if setup.get("stop"):
+            exits.append(("stop", f"+{setup['stop']:g}σ"))
+    else:
+        construction += [("hedge", "none"), ("model input", row.get("feature", "—"))]
+        style, value = params.get("exit_style"), params.get("exit_param")
+        exits = []
+        if value is not None:
+            value = float(value)
+            exits = [("exit", f"revert {value:.0%}" if style == "revert_frac" else
+                      f"{value:g}× HL" if style == "half_life_frac" else
+                      f"±{value:g}{'bp' if params['entry_signal'] == 'residual' else 'z'}" if style == "band" else str(style))]
+    if params.get("stop_loss_bps"):
+        exits.append(("loss stop", f"{params['stop_loss_bps']:g}bp"))
+    expected = _expected(state, live) if live else None
+    estimate = [("net", _fnum(expected["bps"], "+.2f", "bp")),
+                ("horizon", _fnum(live.get("exp_bars"), ".0f", " bars") if setup else "OU mean"),
+                ("cost", f"{getattr(strategy, 'transaction_cost_bps', 0):g}bp")] if expected else [("net", "—")]
+    if expected and setup:
+        resid = abs(float(live["resid"]))
+        gross = expected["bps"] + float(getattr(strategy, "transaction_cost_bps", 0))
+        estimate.insert(1, ("recovery", f"{gross / resid:.0%} of {resid:.2f}bp" if resid else "—"))
+    conf = (live or {}).get("confidence", {})
+    return dict(position=position, target=construction, reading=exits or [("exit", "—")],
+                expected=estimate, confidence=[("trades", str(conf.get("n_past", "—")))])
+
+
 def _signal_facts(row: dict, state: dict, live: dict | None) -> dict:
     """An overview row's what-it-is and where-it-stands cells: model, the input's value
     now, the target's fair value and today's confidence (``live``, runner.live_read's).
     '—' where the signal's state lacks them -- a decoration on the row must never break it."""
     try:
         feature = state["strategy"].feature
+        expected = _expected(state, live)
         return {
             "model": _model_text(row, state),
             "input_now": f"{float(state['data'][feature][-1]):.1f}",  # the input is named in Built From
             "fair": f"{live['fair']:.1f}" if live["fair"] == live["fair"] else "—",
             "conf": live["confidence"]["label"],
+            **({"exp_usd": _usd(expected["usd"]), "exp_value": expected["usd"], "exp_work": expected["work"]} if expected else {}),
         }
     except (KeyError, AttributeError, TypeError):  # TypeError: no live read (None)
         return {}
@@ -451,55 +514,95 @@ def _trade_cell_style(pnl_scale: float):
     return style
 
 
-def _overview_cell_style(column: str, value, row: dict) -> dict | None:
-    """Semantic colour for one overview cell.
-
-    Replaces the DataTable's style_data_conditional rules one for one. A static
-    table has no filter_query equivalent, and on a trading surface direction,
-    gate state and P&L sign have to read at a glance rather than be parsed.
-    """
-    if column == "target":
-        return {"textAlign": "left", "fontWeight": "bold", **({"color": ORANGE} if value in markets.HELD else {})}
-    if column == "position":
-        for token, colour in (("LONG", C1), ("SHORT", C0), ("GATED", ORANGE)):
-            if token in str(value):
-                return {"color": colour, "fontWeight": "bold"}
-    elif column == "conf" and value in CONF_COLOURS:
-        return {"color": CONF_COLOURS[value], "fontWeight": "bold"}
-    elif column == "gate_status":
-        if "CLOSED" in str(value):
-            return {"color": C0}
-        if "OPEN" in str(value):
-            return {"color": C1}
-    elif column == "data_asof" and row.get("data_stale"):
-        # the db holds a newer bar, or has rewritten this one, since the pull
-        return {"color": ORANGE, "fontWeight": "bold"}
-    return None
+def _tone(position: str) -> str:
+    """A position label's colour family: 'long' or 'short' for a trade that is open or
+    called for, 'gated' for one the gate is holding back, 'quiet' for everything else
+    (flat, warming up, unavailable)."""
+    for token, tone in (("GATED", "gated"), ("LONG", "long"), ("SHORT", "short")):
+        if token in position:
+            return tone
+    return "quiet"
 
 
-OVERVIEW_KEYS = [key for key, _label in OVERVIEW_COLUMNS]
-OVERVIEW_FLOAT_FMT = ",.4g"  # ",.3f" would print sharpe 0.7 as 0.700
+def _gate_colour(status: str) -> str:
+    status = status.upper()
+    return C0 if "CLOSED" in status else C1 if "OPEN" in status else DIM
 
 
-def _overview_table(key: str, snapshots: list[dict], widths: dict) -> html.Div:
-    """One section's signals in a single table, the target leading each row. Snapshots
-    and widths are passed in rather than derived here: the widths have to be measured
-    across every section for the columns to line up, and a snapshot costs a full
-    Engine.run()."""
-    return html.Div(
-        style={"marginBottom": 22},
-        children=[
-            table_div(
-                pd.DataFrame(snapshots),
-                columns=OVERVIEW_KEYS,
-                headers={**dict(OVERVIEW_COLUMNS), "target": SECTION_NOUN.get(key, "Target")},
-                max_rows=len(snapshots),
-                cell_style=_overview_cell_style,
-                float_fmt=OVERVIEW_FLOAT_FMT,
-                col_widths=widths,
-            ),
-        ],
-    )
+def _expected(state: dict, live: dict | None) -> dict | None:
+    """What an entry at today's reading is expected to make: {bps, usd, work}, or None
+    when the model has no expectation yet. ``bps`` is runner.live_read's, net of cost;
+    ``usd`` is that at USD_PER_BP; ``work`` spells the arithmetic out.
+
+    An oven signal expects an OU recovery of its residual at the entry half-life, up to
+    its expected exit day; a book signal expects the residual all the way back to its
+    OU mean, with no clock on it."""
+    if live is None or live["exp_return"] != live["exp_return"]:
+        return None
+    bps = float(live["exp_return"])
+    cost = float(getattr(state["strategy"], "transaction_cost_bps", 0.0))
+    gross, resid = bps + cost, abs(float(live["resid"]))
+    if hasattr(state["strategy"], "setup"):
+        share = gross / resid if resid else float("nan")
+        work = (f"|resid| {resid:.2f}bp × {share:.0%} recovered by day {live['exp_bars']:.0f} "
+                f"(half-life {live['half_life']:.1f}d) − {cost:g}bp cost")
+    else:
+        work = f"|OU mean − resid| {gross:.2f}bp, all the way back − {cost:g}bp cost"
+    return dict(bps=bps, usd=bps * USD_PER_BP,
+                work=f"{work} = {bps:+.2f}bp × ${USD_PER_BP:,.0f}/bp = {_usd(bps * USD_PER_BP)}")
+
+
+def _signal_row(snap: dict) -> html.Details:
+    """An expandable signal with compact details aligned under each sortable column."""
+    tone = _tone(snap["position"])
+    stale = bool(snap["data_stale"])  # the db holds a newer bar, or has rewritten this one, since the pull
+    reading, separator, threshold = snap["reading"].partition(" / ")
+    head = html.Summary(className="sd-row-head", children=[
+        html.Span(snap["position"], className=f"sd-pos sd-pos--{tone}"),
+        html.Span(snap["target"], className="sd-target", title=snap["target"]),
+        html.Span([
+            html.Span(reading, className="sd-reading--active" if snap.get("reading_active") else ""),
+            separator + threshold,
+        ], className="sd-reading"),
+        html.Span(snap["exp_usd"], className="sd-reading"),
+        html.Span(snap["conf"], className="sd-conf", style={"color": CONF_COLOURS.get(snap["conf"], TEXT)}),
+        html.Span(snap["gate_status"], className="sd-gate", style={"color": _gate_colour(snap["gate_status"])}),
+        html.Span([snap["name"], *([html.Span("STALE", className="sd-stale")] if stale else [])],
+                  className="sd-name"),
+    ])
+    detail = snap.get("details", {})
+
+    def cell(pairs):
+        return html.Div([html.Div([html.Span(label, className="sd-detail-label"), html.Span(value)])
+                         for label, value in pairs], className="sd-detail-cell")
+
+    body = html.Div(className="sd-row-body sd-row-columns", children=[
+        html.Div(),
+        cell(detail.get("position", [])),
+        cell(detail.get("target", [])),
+        cell(detail.get("reading", [])),
+        cell(detail.get("expected", [])),
+        cell(detail.get("confidence", [])),
+        cell([("rule", snap["gate_rule"])]),
+        html.Div([
+            cell([("as of", snap["data_asof"]), *([("data", "stale · click Ref")] if stale else [])]),
+            html.Button("Deep Dive →", id=_pid("open-deep", snap["signal_id"]), className="ref-btn sd-btn"),
+        ], className="sd-detail-cell"),
+    ])
+    sort_values = [snap["position"], snap["target"], snap.get("reading_value"), snap.get("exp_value"),
+                   {"LOW": 0, "MED": 1, "HIGH": 2}.get(snap["conf"]), snap["gate_status"], snap["name"]]
+    return html.Details([head, body], className="sd-row", **{"data-sort-values": json.dumps(sort_values)})
+
+
+def _row_legend(key: str) -> html.Div:
+    """The header row over a section's signals; its first cell sits over the rows' +/- marker."""
+    labels = ["Position", "Target", "Reading / entry", "Exp $", "Conf", "Gate now", "Signal"]
+    return html.Div([html.Span(), *[
+        html.Span(html.Button([label, html.Span(className="viz-sort-arrow", **{"aria-hidden": "true"})],
+                             className="sd-sort", **{"data-sort-column": str(i)}),
+                  role="columnheader", **{"aria-sort": "none"})
+        for i, label in enumerate(labels)
+    ]], className="sd-row-legend")
 
 
 def _refresh_all_data(rows: list[dict]) -> None:
@@ -520,48 +623,45 @@ def _held_style(direction: str | None) -> dict:
     return {"color": C1 if direction == "long" else C0, "fontWeight": "bold", "fontSize": 12}
 
 
-HEADLINE_COLUMNS = [("name", ""), ("last", "Last"), ("d1", "1d"), ("m1", "1m"), ("ytd", "YTD"), ("pos", "Pos")]
+HEADLINE_COLUMNS = [("group", ""), ("name", ""), ("last", "Last"), ("d1", "1d"), ("m1", "1m"), ("ytd", "YTD"),
+                    ("pos", "Pos")]
 
 
 def _headline_cell_style(column: str, value, row: dict) -> dict | None:
-    """Moves coloured by sign; a held line's name and position stand out."""
-    if column == "name":
-        return {"textAlign": "left", "fontWeight": "bold", **({"color": ORANGE} if row.get("pos") else {})}
+    """Moves coloured by sign; a held line's name and position stand out; a rule over
+    each group's first row."""
+    rule = {"borderTop": f"1px solid {TEXT}"} if row["group"] else {}
+    if column in ("group", "name"):
+        return {"textAlign": "left", "fontWeight": "bold", **rule,
+                **({"color": ORANGE} if column == "name" and row.get("pos") else {})}
     if column == "pos" and value:
-        return _held_style("long" if value.startswith("LONG") else "short")
+        return {**_held_style("long" if value.startswith("LONG") else "short"), **rule}
     if column in ("d1", "m1", "ytd") and value != "—":
-        return {"color": C0 if value.startswith("-") else C1 if value.strip("+0.") else TEXT}
-    return None
+        return {"color": C0 if value.startswith("-") else C1 if value.strip("+0.") else TEXT, **rule}
+    return rule or None
 
 
-def _headline_table(title: str, rows: list[dict], last_fmt: str) -> html.Div:
-    frame = pd.DataFrame([{
-        "name": r["name"], "last": _fnum(r["last"], last_fmt),
-        **{k: _fnum(r[k], "+.1f") for k in ("d1", "m1", "ytd")},
-        "pos": _held_text(r["held"]),
-    } for r in rows])
-    return table_div(frame, title=title, columns=[k for k, _ in HEADLINE_COLUMNS], headers=dict(HEADLINE_COLUMNS),
-                     max_rows=len(frame), cell_style=_headline_cell_style)
-
-
-def _headline() -> html.Div:
-    """Yields, curves and flies up top: last level (yields in %, the rest in bps) and
-    the 1d, 1m and YTD moves in bps. Read from the cache the overview's Ref fills."""
+def _market_content() -> list:
+    """Yields, curves and flies as one table: last level (yields in %, the rest in bps)
+    and the 1d, 1m and YTD moves in bps. Read from the cache a Ref fills."""
     frame, pulled = markets.cached()
     if frame is None or frame.is_empty():
-        return html.Div("Market headline not loaded yet: click Ref.", style={"color": DIM, "marginBottom": 14})
+        return [html.Div("Market data not loaded yet: click Ref.", className="sd-note")]
     lines = markets.board(frame)
+    rows = []
+    for title, key, last_fmt in (("YIELDS (%)", "yields", ".3f"), ("CURVES", "curves", ".1f"),
+                                 ("FLIES", "flies", ".1f")):
+        rows += [{"group": title if i == 0 else "", "name": r["name"], "last": _fnum(r["last"], last_fmt),
+                  **{k: _fnum(r[k], "+.1f") for k in ("d1", "m1", "ytd")}, "pos": _held_text(r["held"])}
+                 for i, r in enumerate(lines[key])]
     stamp = f"bar {markets.asof(frame)} · pulled {_clock(pulled)} · changes in bps"
     if markets.HELD_IS_EXAMPLE and markets.HELD:
         stamp += " · * example position: no trades are wired to the dashboard yet"
-    return html.Div(style={"marginBottom": 20}, children=[
-        html.Div(style={"display": "flex", "flexWrap": "wrap", "gap": "4px 28px", "alignItems": "start"}, children=[
-            _headline_table("YIELDS (%)", lines["yields"], ".3f"),
-            _headline_table("CURVES", lines["curves"], ".1f"),
-            _headline_table("FLIES", lines["flies"], ".1f"),
-        ]),
-        html.Div(stamp, style={"fontSize": 11, "color": DIM}),
-    ])
+    return [
+        _grid_table(pd.DataFrame(rows), columns=[k for k, _ in HEADLINE_COLUMNS], headers=dict(HEADLINE_COLUMNS),
+                    cell_style=_headline_cell_style),
+        html.Div(stamp, className="sd-note", style={"marginTop": 6}),
+    ]
 
 
 # the overview's sections, in order; a target that is none of these is grouped by its family
@@ -580,19 +680,10 @@ def _structure(row: dict) -> str:
     return row.get("family") or "other"
 
 
-def _section_header(title: str, n: int) -> html.Div:
-    return html.Div(
-        style={"display": "flex", "alignItems": "baseline", "gap": 10, "margin": "6px 0 10px",
-               "borderBottom": f"1px solid {BORDER}", "paddingBottom": 4},
-        children=[html.Span(title, style={"fontSize": 13, "fontWeight": "bold"}),
-                  html.Span(f"{n} signal{'s' if n != 1 else ''}", style={"fontSize": 11, "color": DIM})],
-    )
-
-
 def _overview_content(rows: list[dict]) -> list:
+    """Each section's signals as one table."""
     if not rows:
         return [
-            _headline(),
             html.Div(
                 "No signals promoted yet.",
                 style={"color": DIM, "padding": "24px 0"},
@@ -606,31 +697,93 @@ def _overview_content(rows: list[dict]) -> list:
         for target in targets
     }
     runner.prime_freshness([_row_id(row) for row in rows])  # every signal's db stamp in one query
-    # snapshot everything first: the column widths have to be measured over
-    # every section at once, or each table sizes itself and the page reads as
-    # a stack of unrelated grids
     snapshots = {
         target: [_overview_snapshot(row) for row in group]
         for target, group in by_target.items()
     }
-    widths = column_widths(
-        [snap for group in snapshots.values() for snap in group],
-        columns=OVERVIEW_KEYS,
-        headers=dict(OVERVIEW_COLUMNS),
-        float_fmt=OVERVIEW_FLOAT_FMT,
-        pad=1,  # the cells carry their own padding (see .dashboard-tight)
-    )
     # outrights, curves, flies, then anything else, each section's targets in order
     sections: dict[str, list[str]] = {}
     for target in targets:
         sections.setdefault(_structure(by_target[target][0]), []).append(target)
     order = [*[k for k in STRUCTURES if k in sections], *sorted(k for k in sections if k not in STRUCTURES)]
-    out = [_headline()]
+    out = []
     for key in order:
         rows_in = [snap for t in sections[key] for snap in snapshots[t]]
-        out += [_section_header(STRUCTURES.get(key, key.upper()), len(rows_in)),
-                _overview_table(key, rows_in, widths)]
-    return out
+        firing = sum(_tone(snap["position"]) != "quiet" for snap in rows_in)
+        out.append(html.Div([
+            _heading(STRUCTURES.get(key, key.upper()), f"{firing} of {len(rows_in)} on"),
+            html.Div([_row_legend(key), *[_signal_row(snap) for snap in rows_in]], className="sd-sheet"),
+        ], className="sd-signal-section"))
+    return [*out, html.Div(f"Exp $: new entry, net of cost · assumed ${USD_PER_BP:,.0f}/bp · "
+                           "β: input hedge, fixed at entry · holding periods in trading bars.",
+                           className="sd-note", style={"marginTop": 8})]
+
+
+EXIT_HEADERS = {"target": "Target", "signal": "Signal", "rule": "Exit rule", "now": "Now", "exits_at": "Exits at",
+                "progress": "Of the way"}
+POSITION_HEADERS = {"target": "Target", "signal": "Signal", "dir": "Dir", "since": "Since", "held": "Days",
+                    "pnl_bps": "P&L bp", "pnl_usd": "P&L $", "exp_bps": "Exp bp", "exp_usd": "Exp $",
+                    "captured": "Captured", "nearest": "Nearest exit"}
+NEAR_EXIT = 0.75  # an exit rule this far along is flagged
+
+
+def _model_positions(rows: list[dict]) -> list:
+    """The trades the signals are in, and how close each is to getting out.
+
+    Two tables. Positions: one row per signal in a trade -- P&L in bps and in dollars at
+    USD_PER_BP, what the trade expected at entry, the share of that captured, and its
+    nearest exit. Exits: one row per exit rule of each -- where it stands, where it
+    fires, and how far along it is (runner.exit_status)."""
+    positions, exits = [], []
+    for row in rows:
+        try:
+            read = runner.analysis(_row_id(row))
+        except RuntimeError:
+            continue
+        held = read["open_entry"]
+        if held is None:
+            continue
+        name = {"target": _trade_target(row, read["state"]), "signal": _display_name(row)}
+        pnl, expected = float(held["pnl_bps"]), held.get("expected_return_bps")
+        rules = read.get("exits") or []
+        nearest = max(rules, key=lambda r: r["progress"], default=None)
+        positions.append({
+            **name, "dir": held["direction"], "since": str(held["entry_date"]), "held": str(held["bars_held"]),
+            "pnl_bps": f"{pnl:+.1f}", "pnl_usd": _usd(pnl * USD_PER_BP),
+            "exp_bps": _fnum(expected, "+.1f"), "exp_usd": _usd(None if expected is None else expected * USD_PER_BP),
+            "captured": f"{pnl / expected:.0%}" if expected else "—",
+            "nearest": f"{nearest['rule']} · {max(nearest['progress'], 0.0):.0%}" if nearest else "—",
+            "_near": bool(nearest and nearest["progress"] >= NEAR_EXIT), "_pnl": pnl,
+        })
+        exits += [{**name, "rule": r["rule"], "now": r["now"], "exits_at": r["exits_at"],
+                   "progress": f"{max(r['progress'], 0.0):.0%}", "_near": r["progress"] >= NEAR_EXIT} for r in rules]
+    if not positions:
+        return [_heading("MODEL POSITIONS"), html.Div("No signal is in a trade.", className="sd-note")]
+
+    def style(column, value, record):
+        if column in ("target", "signal", "rule", "now", "nearest", "since"):
+            flag = {"color": ORANGE, "fontWeight": "bold"} if column in ("nearest", "rule") and record["_near"] else {}
+            return {"textAlign": "left", **({"fontWeight": "bold"} if column == "target" else {}), **flag}
+        if column == "dir":
+            return {"textAlign": "left", "color": C1 if value == "long" else C0, "fontWeight": "bold"}
+        if column in ("pnl_bps", "pnl_usd"):
+            return {"color": C1 if record["_pnl"] >= 0 else C0, "fontWeight": "bold"}
+        if column == "progress" and record["_near"]:
+            return {"color": ORANGE, "fontWeight": "bold"}
+        return None
+
+    total = sum(p["_pnl"] for p in positions)
+    return [
+        _heading("MODEL POSITIONS", f"{len(positions)} signals in a trade · P&L {total:+.1f}bp · "
+                                    f"{_usd(total * USD_PER_BP)} at ${USD_PER_BP:,.0f} per bp (assumed size)"),
+        _grid_table(pd.DataFrame(positions), columns=list(POSITION_HEADERS), headers=POSITION_HEADERS,
+                    cell_style=style),
+        _heading("HOW CLOSE TO EXIT", f"each rule of each open trade · 0% at entry, 100% when it fires · "
+                                      f"orange from {NEAR_EXIT:.0%}"),
+        _grid_table(pd.DataFrame(exits), columns=list(EXIT_HEADERS), headers=EXIT_HEADERS, cell_style=style),
+        html.Div("Exp bp is what the trade expected at its entry; Captured is P&L as a share of it. These are the "
+                 "signals' own trades, not the broker's fills.", className="sd-note", style={"marginTop": 6}),
+    ]
 
 
 def _trade_page_label(n: int, page: int, size: int = TRADES_PER_PAGE) -> str:
@@ -667,7 +820,7 @@ def _trade_table_block(
     rows = rows[page:page + size]
     frame = pd.DataFrame(rows).reindex(columns=columns)
     frame = frame.astype(object).where(frame.notna(), "")
-    return table(frame, title="trades",
+    return table(frame,  # untitled: the card's TRADES heading stands over it
                  columns=columns, headers=TRADE_TABLE_HEADERS, max_rows=len(rows), float_fmt=",.2f",
                  cell_style=_trade_cell_style(scale))
 
@@ -715,6 +868,7 @@ def _card_sections(
     page: int = 0,
     date_range: tuple | None = None,
     read_live: dict | None = None,
+    phone: bool = False,
 ) -> tuple[html.Div, html.Div, dict | None, html.Div, html.Div]:
     row = REGISTRY.get(signal_id)
     if row is None:
@@ -751,17 +905,14 @@ def _card_sections(
         _db_asof(signal_id, state["data_asof"]) if state else ("—", "", False)
     )
     small = lambda label, value, alert=False: html.Span(  # noqa: E731 -- one-line meta facts
-        [html.Span(f"{label} ", style={"color": DIM}), value],
-        style={"color": ORANGE if alert else TEXT})
-    meta = [
+        [html.Span(f"{label} "), value], style={"color": ORANGE if alert else TEXT})
+    stamp = html.Div(className="sd-stamp", children=[
         small("data", f"{asof_bar} · {asof_written}", asof_stale),
         small("last run", _clock(ledger_row["run_ts"], always_date=True) if ledger_row else "never"),
-        *([small("gate", _gate_status(state))] if state and state["params"].get("gate") is not None else []),
-        small("params", _param_summary(row)),
-    ]
-    # how the strategy has done: live since promotion, and its backtest on today's history
+    ])
+    # how the strategy has done: its backtest on today's history
     stats = _backtest_stats(state["equity_curve"], trades) if state and not error else None
-    performance = _stats_rows(state if not error else None, stats, row, live_pnl)
+    record = _track_record(state if not error else None, stats, row, trades)
 
     if error:
         now_panel = html.Div()
@@ -770,24 +921,27 @@ def _card_sections(
     else:
         months = _monthly_pnl(state["equity_curve"])
         closed = trades is not None and not trades.is_empty()
-        extra = html.Div([_scatters(state),
-                          *([_trade_mechanics(state, trades)] if closed else []),
-                          *([_confidence_section(state["equity_curve"], trades, live["confidence"])]
-                            if closed and live is not None else []),
-                          *([_regime_section(state["equity_curve"], trades, runner.regime_states())]
-                            if closed else [])])
-        now_panel = _now_panel(state, live, open_entry)
+        extra = html.Div([
+            html.Div([_scatters(state)], className="sd-deep-view sd-deep-signal"),
+            html.Div([
+                *([_trade_mechanics(state, trades)] if closed else []),
+                *([_confidence_section(state["equity_curve"], trades, live["confidence"])]
+                  if closed and live is not None else []),
+                *([_regime_section(state["equity_curve"], trades, runner.regime_states())] if closed else []),
+            ], className="sd-deep-view sd-deep-performance"),
+        ])
+        now_panel = _now_panel(state, live, open_entry, live_pnl)
         window_bars = WINDOW_PRESETS.get(window, WINDOW_PRESETS[DEFAULT_WINDOW])
-        span = dict(window_bars=window_bars, date_range=date_range)
+        span = dict(window_bars=window_bars, date_range=date_range, size=PHONE_CHART if phone else WIDE_CHART)
         target = state["strategy"].target
         # chart what the signal is built on: the hedged portfolio for a portfolio-basis
         # signal, else the outright target -- and beside it, always the input
         traded = "portfolio" if getattr(state["strategy"], "setup", {}).get("basis") == "portfolio" else target
         data = state["data"].with_columns(pl.Series("fair", _fair_series(state, traded)))
-        wide = signal_chart(
+        signal_png = signal_chart(
             state["data"], state["signal_frame"],
             state["params"]["entry_signal"], state["params"]["entry_threshold"],
-            fired=state["fired"], wide=True, **span,
+            fired=state["fired"], **span,
         )
         marks, held_mark = _on_series(trades, open_entry, state["data"], traded) if traded != target             else (trades, open_entry)
         level_png = level_chart(data, traded, trades=marks, open_entry=held_mark, overlays=["fair"], **span)
@@ -797,24 +951,23 @@ def _card_sections(
             gate_window=state["params"].get("gate_window"), **span,
         )
         pnl_png = pnl_chart(state["equity_curve"], **span)
-        pngs = [level_png, second, *([gate_png] if gate_png is not None else []), pnl_png,
-                return_distribution_chart(trades)]
-        img = lambda png, **extra: html.Img(  # noqa: E731
-            src=f"data:image/png;base64,{png}", style={"width": "100%", "border": f"1px solid {BORDER}", **extra})
-        # every chart in the grid in the same box: they are drawn at slightly different
-        # shapes, so each is fitted (never stretched) into the tallest one's
-        same_box = dict(aspectRatio=CHART_BOX, objectFit="contain", background="#FFFFFF", display="block")
+        # one to a row, in the order the trade is read: the signal, what it trades against
+        # fair value, its input, its gate, then what it has made
         chart_body = html.Div(
-            className="two-up",
-            children=[html.Div(img(wide), className="two-up-wide"),
-                      *[img(png, **same_box) for png in pngs if png is not None]],
+            className="sd-charts",
+            children=[html.Div([
+                html.Img(src=f"data:image/png;base64,{png}") for png in pngs if png is not None
+            ], className=f"sd-charts sd-deep-view sd-deep-{view}") for view, pngs in (
+                ("signal", [signal_png, level_png, second, gate_png]),
+                ("performance", [pnl_png, return_distribution_chart(trades, size=span["size"])]))],
         )
 
     summary = html.Div([
-        now_panel,
-        *performance,
-        html.Div(meta, style={"display": "flex", "gap": 18, "flexWrap": "wrap", "fontSize": 11,
-                              "padding": "4px 2px 10px"}),
+        stamp,
+        html.Div([_heading("SIGNAL"), now_panel], className="sd-deep-view sd-deep-signal"),
+        html.Div([_heading("PERFORMANCE", "model replay on current cached history"), *record],
+                 className="sd-deep-view sd-deep-performance"),
+        html.Div([_heading("DETAILS"), _details_panel(row)], className="sd-deep-view sd-deep-details"),
     ])
     return summary, chart_body, trade_data, months, extra
 
@@ -843,13 +996,26 @@ def _on_series(trades, open_entry: dict | None, data: pl.DataFrame, series: str)
     return trades, open_entry
 
 
-def _backtest_stats(equity: pl.DataFrame, trades: pl.DataFrame | None) -> dict | None:
+def _backtest_stats(equity: pl.DataFrame, trades: pl.DataFrame | None, *, after: dt.date | None = None) -> dict | None:
     """The Oven's strategy stats from this signal's own daily P&L and closed trades on
     the cached history, scored from its first entry (the warm-up before says nothing);
     the halves split those days down the middle."""
-    if trades is None or trades.is_empty() or equity.is_empty():
+    if equity.is_empty():
         return None
-    scored = equity.with_columns(pl.col("ts").cast(pl.Date)).filter(pl.col("ts") >= trades["entry_date"].min())
+    scored = equity.with_columns(pl.col("ts").cast(pl.Date)).sort("ts")
+    if after is not None:
+        scored = scored.filter(pl.col("ts") > after)
+        if trades is not None and not trades.is_empty():
+            trades = trades.filter(pl.col("entry_date").cast(pl.Date) > after)
+    elif trades is not None and not trades.is_empty():
+        scored = scored.filter(pl.col("ts") >= trades["entry_date"].cast(pl.Date).min())
+    else:
+        active = scored.filter(pl.col("pnl_bps") != 0)
+        if active.is_empty():
+            return None
+        scored = scored.filter(pl.col("ts") >= active["ts"].min())
+    if scored.is_empty():
+        return None
     daily = scored["pnl_bps"].to_numpy().astype(float)
 
     def sharpe(d):
@@ -858,51 +1024,84 @@ def _backtest_stats(equity: pl.DataFrame, trades: pl.DataFrame | None) -> dict |
     half = len(daily) // 2
     cum = np.cumsum(daily)
     total = float(cum[-1])
-    max_dd = float((cum - np.maximum.accumulate(cum)).min())
+    max_dd = float((cum - np.maximum.accumulate(np.r_[0.0, cum])[1:]).min())
     years = len(daily) / 252
-    pnl = trades["pnl_bps"]
+    pnl = trades["pnl_bps"] if trades is not None and not trades.is_empty() else pl.Series([], dtype=pl.Float64)
     losses = float(pnl.filter(pnl <= 0).sum())
     return dict(
         sharpe=sharpe(daily), sharpe_h1=sharpe(daily[:half]), sharpe_h2=sharpe(daily[half:]),
         split=scored["ts"][half], total_pnl=total, pnl_per_year=total / years, n_trades=len(pnl),
-        trades_per_year=len(pnl) / years, hit_rate=float((pnl > 0).mean()), avg_trade=float(pnl.mean()),
-        median_trade=float(pnl.median()),
+        trades_per_year=len(pnl) / years, hit_rate=float((pnl > 0).mean()) if len(pnl) else np.nan,
+        avg_trade=float(pnl.mean()) if len(pnl) else np.nan,
+        median_trade=float(pnl.median()) if len(pnl) else np.nan,
         profit_factor=float(pnl.filter(pnl > 0).sum()) / abs(losses) if losses else np.nan,
-        max_drawdown=max_dd, calmar=total / abs(max_dd) if max_dd else np.nan,
+        max_drawdown=max_dd, calmar=(total / years) / abs(max_dd) if max_dd else np.nan,
         time_in_market=float((daily != 0).mean()),
-        best_trade_share=float(pnl.max()) / total if total > 0 else np.nan,
+        best_trade_share=float(pnl.max()) / total if total > 0 and len(pnl) else np.nan,
+        first=scored["ts"][0], last=scored["ts"][-1], bars=len(daily),
     )
 
 
-def _stats_rows(state: dict, stats: dict | None, row: dict, live_pnl) -> list:
-    """The Oven card's two stat rows: the model as it stands, then the backtest."""
-    stats_row = {"display": "flex", "gap": 28, "flexWrap": "wrap", "padding": "8px 2px 8px"}
-    last = state["last"] if state else {}
-    model = [
-        stat_block("live pnl", _fnum(live_pnl, "+.1f", " bps"), alert=bool(live_pnl and live_pnl < 0)),
-        stat_block("β now", _fnum(last.get("beta"), "+.3f")),
-        stat_block("r² now", _fnum(last.get("r2"), ".2f")),
-        stat_block("sharpe at promotion", _fnum(row.get("sharpe"), ".2f")),
-        *([stat_block("halves split", str(stats["split"]))] if stats else []),
+def _promotion_day(row: dict) -> dt.date | None:
+    value = row.get("promoted_at")
+    if not value:
+        return None
+    stamp = pd.Timestamp(value)
+    if pd.isna(stamp):
+        return None
+    if stamp.tzinfo is not None:
+        stamp = stamp.tz_convert("America/New_York")
+    return stamp.date()
+
+
+def _track_record(state: dict | None, stats: dict | None, row: dict, trades=None) -> list:
+    """Compare replay periods with the frozen promotion snapshot."""
+    promoted = _promotion_day(row)
+    since = _backtest_stats(state["equity_curve"], trades, after=promoted) if state and promoted else None
+    frozen = {**row, "max_drawdown": row.get("max_drawdown_bps")}
+    metrics = [
+        ("Sharpe", "sharpe", ".2f", ""), ("P&L", "total_pnl", "+,.2f", " bp"),
+        ("P&L / year", "pnl_per_year", "+,.2f", " bp"), ("Closed trades", "n_trades", ".0f", ""),
+        ("Hit rate", "hit_rate", ".0%", ""), ("Avg trade", "avg_trade", "+.2f", " bp"),
+        ("Median trade", "median_trade", "+.2f", " bp"), ("Max drawdown", "max_drawdown", ".2f", " bp"),
+        ("Profit factor", "profit_factor", ".2f", ""), ("Calmar", "calmar", ".2f", ""),
+        ("Trades / year", "trades_per_year", ".1f", ""),
+        ("Sharpe · first half", "sharpe_h1", ".2f", ""),
+        ("Sharpe · second half", "sharpe_h2", ".2f", ""),
+        ("Best trade / total P&L", "best_trade_share", ".0%", ""),
+        ("Days with P&L", "time_in_market", ".0%", ""),
     ]
-    rows = [html.Div(model, style=stats_row)]
-    if stats:
-        s = stats
-        rows.append(html.Div(style={**stats_row, "borderTop": f"1px solid {BORDER}", "marginTop": 4}, children=[
-            stat_block("sharpe", _fnum(s["sharpe"], ".2f")),
-            stat_block("halves", f"{_fnum(s['sharpe_h1'], '.2f')} / {_fnum(s['sharpe_h2'], '.2f')}"),
-            stat_block("total pnl", f"{s['total_pnl']:+,.0f} bps"),
-            stat_block("per year", f"{s['pnl_per_year']:+,.1f} bps"),
-            stat_block("n trades", f"{s['n_trades']} · {s['trades_per_year']:.1f}/yr"),
-            stat_block("hit rate", f"{s['hit_rate']:.0%}"),
-            stat_block("avg / median", f"{s['avg_trade']:+.2f} / {s['median_trade']:+.2f}"),
-            stat_block("profit factor", _fnum(s["profit_factor"], ".2f")),
-            stat_block("max drawdown", f"{s['max_drawdown']:+,.1f} bps"),
-            stat_block("calmar", _fnum(s["calmar"], ".2f")),
-            stat_block("time in market", f"{s['time_in_market']:.0%}"),
-            stat_block("best trade share", _fnum(s["best_trade_share"], ".0%")),
-        ]))
-    return rows
+    records = [dict(metric=label,
+                    history=_fnum((stats or {}).get(key), fmt, suffix),
+                    since=_fnum((since or {}).get(key), fmt, suffix),
+                    promotion=_fnum(frozen.get(key), fmt, suffix)) for label, key, fmt, suffix in metrics]
+    period = lambda s: f"{s['first']} – {s['last']} ({s['bars']} bars)" if s else "—"
+    return [
+        _grid_table(pd.DataFrame(records), columns=["metric", "history", "since", "promotion"],
+                    headers={"metric": "Metric", "history": "Full history", "since": "Since promotion",
+                             "promotion": "At promotion"}),
+        html.Div(f"Full history: {period(stats)} · Since promotion: {period(since)}", className="sd-note"),
+        html.Div(f"Promotion: {promoted or 'not recorded'}. Since-promotion P&L starts on the next trading bar "
+                 "and includes carried positions; trade statistics count only trades entered afterward and closed. "
+                 "Both periods are model replays, not broker returns. At promotion is the saved backtest snapshot.",
+                 className="sd-note", style={"maxWidth": 850, "marginTop": 4}),
+    ]
+
+
+def _details_panel(row: dict) -> html.Div:
+    """Provenance and frozen settings, separate from today's signal and outcomes."""
+    return _range([
+        _kv("promoted", _clock(row["promoted_at"], always_date=True) if row.get("promoted_at") else "not recorded"),
+        _kv("source", row.get("selection_source") or "—"),
+        _kv("rationale", row.get("rationale") or "not recorded"),
+        _kv("target", row["target"]), _kv("model input", row["feature"]),
+        _kv("entry", f"{row['entry_signal']} · ±{row['entry_threshold']:g}"),
+        _kv("model lookbacks", f"β {row.get('beta_lb', '—')} · OU {row.get('ou_lb') or '—'} bars"),
+        _kv("exit", _exit_summary(row)),
+        _kv("loss stop", _fnum(row.get("stop_loss_bps"), "g", "bp")),
+        _kv("configuration", _param_summary(row)),
+        _kv("module", row["module"]),
+    ])
 
 
 def _active_years(equity: pl.DataFrame) -> pl.DataFrame:
@@ -930,11 +1129,11 @@ def _scatters(state: dict) -> html.Div:
     if feature not in state["data"].columns:
         return html.Div()
     lookback = int(state["params"]["beta_lb"])
-    return html.Div(
-        className="two-up", style={"gap": 12, "marginTop": 10},
+    return _section("REGRESSION FIT", [html.Div(
+        className="sd-charts sd-charts--narrow",
         children=[regression_scatter(state["data"], target, feature, basis, lookback, "previous")
                   for basis in ("levels", "changes")],
-    )
+    )], f"{target} on {feature}: levels and daily changes")
 
 
 def _exit_reasons(equity: pl.DataFrame, trades: pl.DataFrame) -> pl.DataFrame:
@@ -964,8 +1163,7 @@ def _trade_mechanics(state: dict, trades: pl.DataFrame) -> html.Div:
         target_leg = legs["target_leg"].sum()
         lines.append(f"of total P&L, the target leg made {target_leg:+,.1f} bps and the hedge leg and costs "
                      f"{trades['pnl_bps'].sum() - target_leg:+,.1f} bps")
-    return html.Div(style={"marginTop": 18}, children=[
-        html.Div("TRADE MECHANICS", style={"fontSize": 12, "fontWeight": "bold", "marginBottom": 6}),
+    return _section("TRADE MECHANICS", [
         note(" · ".join(lines), "dim"),
         table(_shown(_exit_reasons(state["equity_curve"], trades)), title="exit reasons",
               float_fmt=",.2f",
@@ -974,66 +1172,67 @@ def _trade_mechanics(state: dict, trades: pl.DataFrame) -> html.Div:
               cell_style=lambda col, value, row: (
                   {"textAlign": "left", **({"fontWeight": "bold"} if value == "all" else {})}
                   if col == "reason" else None)),
-    ])
+    ], "where the P&L came from, by how each trade ended")
 
 
 CONF_COLOURS = {"HIGH": C1, "LOW": C0, "MED": TEXT, "—": DIM}
 
 
-def _now_panel(state: dict, live: dict, open_entry: dict | None) -> html.Div:
-    """Today, at a glance: what the book holds or the signal calls for, the reading
-    against its threshold and fair value, what an entry now is expected to make,
-    walk-forward confidence and why, and the open position's progress."""
+def _now_panel(state: dict, live: dict, open_entry: dict | None, live_pnl: float | None) -> html.Div:
+    """Today, as one label | value | note range, in the order it is read: what the book
+    holds or the signal calls for, the reading against its entry threshold, the open
+    position, what an entry now is expected to make, level against fair value,
+    half-life, walk-forward confidence and what drives it, and the gate."""
     params = state["params"]
     units = "bps" if params["entry_signal"] == "residual" else "z"
     reading = live["resid"] if units == "bps" else live["z"]
     position = _position_label(state, open_entry)
+    tone_colour = {"long": C1, "short": C0, "gated": ORANGE}.get(_tone(position))
     conf = live["confidence"]
-    bold = {"fontWeight": "bold"}
-    dim = {"color": DIM}
 
-    def line(*parts):
-        return html.Div(parts, style={"display": "flex", "gap": 18, "flexWrap": "wrap", "alignItems": "baseline"})
-
-    expected = (
-        [html.Span("if entered now", style=dim),
-         html.Span(f"{live['exp_return']:+.1f} bp", style=bold),
-         *([html.Span(f"over ~{live['exp_bars']:.0f}d ({live['bps_per_day']:+.2f} bp/day)")]
-           if live["exp_bars"] == live["exp_bars"] else [html.Span("to its OU mean")]),
-         *([html.Span(f"risk {live['exp_risk']:.1f} bp", style=dim)] if live["exp_risk"] == live["exp_risk"] else [])]
-        if live["exp_return"] == live["exp_return"] else
-        [html.Span("if entered now", style=dim), html.Span("— (no half-life yet)", style=dim)])
     if open_entry is not None:
         held = open_entry
-        progress = f"{held['bars_held']}d" + (f" of ~{held['expected_bars']:.0f}" if held.get("expected_bars") else "")
-        position_line = [html.Span("open", style=dim),
-                         html.Span(f"{held['direction']} since {held['entry_date']}", style=bold),
-                         html.Span(f"{held['pnl_bps']:+.1f} bp", style={"color": C1 if held["pnl_bps"] >= 0 else C0,
-                                                                         **bold}),
-                         html.Span(progress),
-                         *([html.Span(f"expected {held['expected_return_bps']:+.1f} bp at entry", style=dim)]
-                           if held.get("expected_return_bps") is not None else [])]
+        progress = f"{held['bars_held']}d" + (f" of ~{held['expected_bars']:.0f}d" if held.get("expected_bars") else "")
+        expected = (f" · expected {held['expected_return_bps']:+.1f} bp at entry"
+                    if held.get("expected_return_bps") is not None else "")
+        position_row = _kv("open position", f"{held['pnl_bps']:+.1f} bp",
+                           f"{held['direction']} since {held['entry_date']} · held {progress}{expected}",
+                           C1 if held["pnl_bps"] >= 0 else C0)
     else:
-        position_line = [html.Span("open", style=dim), html.Span("no position")]
-    return html.Div(
-        style={"border": f"1px solid {BORDER}", "background": "#FFFFFF", "padding": "10px 14px",
-               "margin": "6px 0 4px", "fontFamily": "monospace", "fontSize": 13,
-               "display": "flex", "flexDirection": "column", "gap": 6},
-        children=[
-            line(html.Span(position, style={"fontSize": 15, **bold, "color": C1 if "LONG" in position
-                                            else C0 if "SHORT" in position else TEXT}),
-                 html.Span(f"{reading:+.2f}{units} vs ±{float(params['entry_threshold']):g}{units}", style=bold),
-                 html.Span(f"resid {live['resid']:+.1f} bp · z {live['z']:+.2f}", style=dim),
-                 html.Span(f"level {live['level']:.1f} · fair {live['fair']:.1f}"),
-                 html.Span(f"half-life {live['half_life']:.1f}d", style=dim)),
-            line(*expected),
-            line(html.Span("confidence", style=dim),
-                 html.Span(conf["label"], style={**bold, "color": CONF_COLOURS.get(conf["label"], TEXT)}),
-                 html.Span(conf["drivers"] or ("needs more closed trades" if conf["label"] == "—" else "")),
-                 html.Span(f"from {conf['n_past']} closed trades", style=dim)),
-            line(*position_line),
-        ],
-    )
+        position_row = _kv("open position", "none")
+    if live["exp_return"] == live["exp_return"]:
+        over = (f"over ~{live['exp_bars']:.0f}d · {live['bps_per_day']:+.2f} bp/day"
+                if live["exp_bars"] == live["exp_bars"] else "to its OU mean")
+        risk = f" · risk {live['exp_risk']:.1f} bp" if live["exp_risk"] == live["exp_risk"] else ""
+        entry_row = _kv("if entered now", f"{live['exp_return']:+.1f} bp · {_usd(live['exp_return'] * USD_PER_BP)}",
+                        f"{over}{risk} · at ${USD_PER_BP:,.0f} per bp")
+    else:
+        entry_row = _kv("if entered now", "—", "no half-life yet")
+    gate = _gate_status(state)
+    drivers = conf["drivers"] or ("needs more closed trades" if conf["label"] == "—" else "")
+    expected = _expected(state, live)
+    return html.Div([_range([
+        _kv("position", position, colour=tone_colour),
+        _kv("reading", f"{reading:+.2f}{units}", f"entry at ±{float(params['entry_threshold']):g}{units}"),
+        position_row,
+        _kv("β now", _fnum(state["last"].get("beta"), "+.3f"), "signal model coefficient"),
+        _kv("R² now", _fnum(state["last"].get("r2"), ".2f")),
+        _kv("level / fair", f"{live['level']:.1f} / {live['fair']:.1f}",
+            f"resid {live['resid']:+.1f} bp · z {live['z']:+.2f}"),
+        _kv("half-life", f"{live['half_life']:.1f}d"),
+        _kv("exit", exit_label(params)),
+        _kv("loss stop", _fnum(params.get("stop_loss_bps"), "g", "bp")),
+        _kv("confidence", conf["label"],
+            f"from {conf['n_past']} closed trades",
+            CONF_COLOURS.get(conf["label"])),
+        *([_kv("gate", gate, _gate_rule(params), _gate_colour(gate))] if params.get("gate") is not None else []),
+    ]),
+        _section("ENTRY ESTIMATE", [_range([
+            entry_row,
+            *([_kv("calculation", expected["work"])] if expected else []),
+        ])], "hypothetical entry now · net of cost"),
+        _section("CONFIDENCE DRIVERS", [html.Div(drivers, className="sd-note")]),
+    ])
 
 
 CONF_LABELS = {**runner.OVEN_CONFIDENCE, **runner.BOOK_CONFIDENCE}  # feature column -> name
@@ -1156,10 +1355,12 @@ def _perf_style(frames: list[pl.DataFrame], trades: pl.DataFrame):
     return style
 
 
-def _section(title: str, blocks: list) -> html.Div:
-    return html.Div(style={"marginTop": 18}, children=[
-        html.Div(title, style={"fontSize": 12, "fontWeight": "bold", "marginBottom": 6}),
-        html.Div(blocks, style={"display": "flex", "flexDirection": "column", "gap": 4, "alignItems": "start"}),
+def _section(title: str, blocks: list, hint: str = "", quiet: bool = False) -> html.Details:
+    """Detail folded behind its title: one line on the card until it is opened. ``hint``
+    says what is inside; ``quiet`` drops the box, for a footnote under a panel."""
+    return html.Details(className="sd-fold sd-fold--quiet" if quiet else "sd-fold", children=[
+        html.Summary([title, *([html.Span(hint, className="sd-h-note")] if hint else [])]),
+        html.Div(blocks, className="sd-fold-body"),
     ])
 
 
@@ -1202,7 +1403,7 @@ def _confidence_section(equity: pl.DataFrame, trades: pl.DataFrame, conf: dict) 
                            "tercile_sharpe": "tercile sharpe", "all_sharpe": "all sharpe"}),
             _subtitle(f"edge = weight × (tercile avg − all avg) ÷ spread · weight = trades ÷ (trades + {CONF_SHRINK})"
                       f" · score = mean edge, tiered by {conf['tier_from']} · sharpes shown, not scored")]))
-    return _section("CONFIDENCE", blocks)
+    return _section("CONFIDENCE", blocks, "today's score, and how past trades did by tier and feature")
 
 
 def _regime_rule(name: str, p) -> tuple[str, str, dict]:
@@ -1307,7 +1508,8 @@ def _regime_section(equity: pl.DataFrame, trades: pl.DataFrame, states: pl.DataF
               headers={**PERF_HEADERS, "data_from": "data from", "time": "share of time"}, cell_style=style),
         _subtitle(f"state on each trade's entry day (a new state counts after {RegimeParams().confirm} days in a row)"
                   f" · each regime scored over its own span · share of time: all days since data from"
-                  f" · sharpe: annualized, 0 on days outside the group's trades · ● today (as of {states['ts'][-1]})")])])
+                  f" · sharpe: annualized, 0 on days outside the group's trades · ● today (as of {states['ts'][-1]})")])],
+        "the trades by the macro regime they entered in")
 
 
 def _btn_style(primary: bool = False) -> dict:
@@ -1350,32 +1552,22 @@ def _dropdown_options(rows: list[dict]) -> list[dict]:
     return options
 
 
-def _card(row: dict) -> html.Div:
-    module = row["module"]
+def _card(row: dict, phone: bool = False) -> html.Div:
+    """Signal, Performance and Details views sharing one refreshed model read.
+
+    Views stay mounted so window controls, paging and callback targets survive switches.
+    """
     signal_id = _row_id(row)
     slug = _slug(signal_id)
-    summary, chart_body, trade_data, months, extra = _card_sections(signal_id)
+    summary, chart_body, trade_data, months, extra = _card_sections(signal_id, phone=phone)
     return html.Div(
-        className="oven-tight",  # the Oven's dense house tables (oven.css)
-        style={"border": f"1px solid {BORDER}", "background": PANEL,
-               "padding": "14px 18px", "marginBottom": 18},
+        className="oven-tight sd-card",  # the Oven's dense house tables (oven.css)
+        **{"data-deep-tab": "signal"},
         children=[
             html.Div(
-                style={"display": "flex", "alignItems": "baseline", "gap": 12,
-                       "marginBottom": 4},
+                className="sd-card-head",
                 children=[
-                    html.Span(_display_name(row), style={"fontSize": 15, "fontWeight": "bold",
-                                                         "color": ORANGE}),
-                    html.Span(f"{row['target']} ~ {row['feature']}",
-                              style={"fontSize": 12, "color": DIM}),
-                    html.Span(module, style={"fontSize": 11, "color": DIM,
-                                              "marginLeft": "auto", "fontStyle": "italic"}),
-                ],
-            ),
-            html.Div(
-                style={"display": "flex", "gap": 8, "marginBottom": 4,
-                       "alignItems": "center", "flexWrap": "wrap"},
-                children=[
+                    html.Span(_display_name(row), className="sd-card-name"),
                     html.Button("Ref", id=_pid("ref", signal_id), n_clicks=0,
                                 className="ref-btn",
                                 style=_btn_style(primary=True)),
@@ -1385,25 +1577,16 @@ def _card(row: dict) -> html.Div:
                     dcc.Store(id=_pid("trades-data", signal_id), data=trade_data),
                 ],
             ),
+            html.Div([
+                html.Button(label, type="button", className="sd-deep-tab",
+                            **{"data-deep-view": view, "aria-pressed": "true" if view == "signal" else "false"})
+                for view, label in (("signal", "Signal"), ("performance", "Performance"), ("details", "Details"))
+            ], className="sd-deep-tabs", role="group", **{"aria-label": "Deep Dive view"}),
             html.Div(id=_pid("card-summary", signal_id), children=summary),
+            html.Div(_heading("CHARTS"), className="sd-chart-tools"),
             html.Div(
-                style={
-                    "display": "flex",
-                    "gap": 8,
-                    "marginBottom": 8,
-                    "alignItems": "center",
-                    "flexWrap": "wrap",
-                },
+                className="sd-windows sd-chart-tools",
                 children=[
-                    html.Span(
-                        "Chart window",
-                        style={
-                            "fontSize": 10,
-                            "color": DIM,
-                            "textTransform": "uppercase",
-                            "marginRight": 2,
-                        },
-                    ),
                     *[
                         html.Button(key, id=_pid(f"window-{key}", signal_id), n_clicks=0,
                                     style=_btn_style(primary=(key == DEFAULT_WINDOW)))
@@ -1415,31 +1598,27 @@ def _card(row: dict) -> html.Div:
                         n_clicks=0,
                         className="ref-btn copy-charts-btn",
                         title="Copy all visible charts as one image",
-                        style={**_btn_style(), "marginLeft": "auto"},
+                        style=_btn_style(),
                     ),
                     html.Span(
                         id=f"copy-status-{slug}",
-                        style={"fontSize": 11, "color": DIM, "minWidth": 42},
+                        style={"fontSize": 11, "color": DIM},
                     ),
                 ],
             ),
             html.Div(
                 id=f"card-analysis-{slug}",
                 children=[
-                    # the plain id is what research_app.js's Copy reads the images from;
-                    # the callbacks fill the pattern-id div inside it
-                    html.Div(id=f"card-charts-{slug}",
+                    # the plain id is what research_app.js's Copy reads the images from (one
+                    # to a row, as they stand here); the callbacks fill the pattern-id div inside it
+                    html.Div(id=f"card-charts-{slug}", **{"data-copy-columns": "1"},
                              children=html.Div(id=_pid("card-charts", signal_id), children=chart_body)),
-                    # the trades beside the monthly P&L, as on the Oven's setup card
-                    html.Div(
-                        className="oven-trades-months",
-                        children=[
-                            html.Div(_trade_table_section(
-                                trade_data["closed"], 0, trade_data["open"], signal_id, trade_data["size"],
-                            ) if trade_data is not None else html.Div(), style={"minWidth": 0}),
-                            html.Div(months, id=_pid("card-months", signal_id)),
-                        ],
-                    ),
+                    html.Div([_heading("TRADES", "full model history · newest first"),
+                    _trade_table_section(
+                        trade_data["closed"], 0, trade_data["open"], signal_id, trade_data["size"],
+                    ) if trade_data is not None else html.Div()], className="sd-deep-view sd-deep-performance"),
+                    html.Div(months, id=_pid("card-months", signal_id), style={"marginTop": 14},
+                             className="sd-deep-view sd-deep-performance"),
                     html.Div(extra, id=_pid("card-extra", signal_id)),
                 ],
             ),
@@ -1447,9 +1626,9 @@ def _card(row: dict) -> html.Div:
     )
 
 
-def _deep_card(row: dict) -> html.Div:
+def _deep_card(row: dict, phone: bool = False) -> html.Div:
     """One signal's Deep Dive card in the wrapper the dropdown shows and hides."""
-    return html.Div(id=_pid("deep-card", _row_id(row)), style={"display": "block"}, children=_card(row))
+    return html.Div(id=_pid("deep-card", _row_id(row)), style={"display": "block"}, children=_card(row, phone))
 
 
 def _registry_rows() -> list[dict]:
@@ -1465,20 +1644,12 @@ def build_app() -> dash.Dash:
 
     def _overview_tab(rows):
         return html.Div(
-            style={"padding": "18px 24px"},
+            className="sd-page",
             children=[
                 html.Div(
-                    style={
-                        "display": "flex",
-                        "alignItems": "center",
-                        "gap": 12,
-                        "marginBottom": 14,
-                    },
+                    className="sd-bar",
                     children=[
-                        html.Div(
-                            "LIVE TRADING OVERVIEW",
-                            style={"fontSize": 14, "fontWeight": "bold"},
-                        ),
+                        html.Div("LIVE SIGNALS", className="sd-bar-title"),
                         html.Button(
                             "Ref",
                             id="refresh-overview",
@@ -1486,50 +1657,43 @@ def build_app() -> dash.Dash:
                             className="ref-btn",
                             style=_btn_style(primary=True),
                         ),
+                        html.Button("Close all", type="button", className="sd-btn sd-close-all",
+                                    title="Collapse all strategy details"),
                     ],
                 ),
                 dcc.Loading(
                     html.Div(id="overview-content", children=_overview_content(rows)),
-                    custom_spinner=shimmer_loader(image="guy.png", caption="loading"),
-                    # keep the stale table visible and dimmed underneath rather
-                    # than blanking it: a Ref is a refresh, not a page change
-                    overlay_style={"visibility": "visible", "opacity": 0.35},
+                    custom_spinner=shimmer_loader(image="guy.png"),
+                    # Keep the table visible beneath the spinner's blurred backdrop.
+                    overlay_style={"visibility": "visible"},
                     parent_className="dashboard-overview-loader",
                 ),
             ],
         )
 
-    def _deep_dive_tab(rows):
+    def _deep_dive_tab(rows, phone):
         selected_signal = _row_id(rows[0]) if rows else None
         return html.Div(
-            style={"padding": "18px 24px"},
+            className="sd-page",
             children=(
                 [
                     html.Div(
-                        style={
-                            "display": "flex",
-                            "alignItems": "center",
-                            "gap": 14,
-                            "marginBottom": 14,
-                        },
+                        className="sd-bar",
                         children=[
-                            html.Div(
-                                "SIGNAL DEEP DIVE",
-                                style={"fontSize": 14, "fontWeight": "bold"},
-                            ),
+                            html.Div("SIGNAL DEEP DIVE", className="sd-bar-title"),
                             dcc.Dropdown(
                                 id="deep-dive-signal",
                                 options=_dropdown_options(rows),
                                 value=selected_signal,
                                 clearable=False,
-                                style={"width": 360, "marginLeft": "auto", "fontSize": 12},
+                                className="sd-picker",
                             ),
                         ],
                     ),
                     # only the selected signal's card is built on load; the others are added
                     # the first time they are picked (_add_deep_card) and kept after that
                     dcc.Store(id="deep-dive-built", data=[selected_signal]),
-                    html.Div(id="deep-dive-cards", children=[_deep_card(rows[0])]),
+                    html.Div(id="deep-dive-cards", children=[_deep_card(rows[0], phone)]),
                 ]
                 if rows
                 else [
@@ -1542,14 +1706,16 @@ def build_app() -> dash.Dash:
             ),
         )
 
-    def _tabs():
+    def _tabs(phone=False):
         """The real page. Costs one Engine.run() per promoted signal, so it is
-        built in a callback rather than in the layout -- see _body."""
+        built in a callback rather than in the layout -- see _body. ``phone``
+        draws the Deep Dive's charts for a narrow screen."""
         rows = _registry_rows()
         return dcc.Tabs(
             id="dashboard-tabs",
             className="dashboard-tight",
             style=FOLDER_TABS,  # the line the folder tabs sit on
+            mobile_breakpoint=0,  # side by side on a phone too, never stacked
             value="live-overview",
             children=[
                 dcc.Tab(
@@ -1560,15 +1726,30 @@ def build_app() -> dash.Dash:
                     children=_overview_tab(rows),
                 ),
                 dcc.Tab(
+                    label="Market", value="market", style=tab_style, selected_style=selected_tab_style,
+                    children=html.Div(className="sd-page", children=[
+                        html.Div(className="sd-bar", children=[
+                            html.Div("TREASURY MARKET", className="sd-bar-title"),
+                            html.Button("Ref", id="refresh-market", n_clicks=0, className="ref-btn",
+                                        style=_btn_style(primary=True)),
+                        ]),
+                        html.Div(id="market-content", children=_market_content()),
+                    ]),
+                ),
+                dcc.Tab(
                     label="Deep Dive",
                     value="signal-deep-dive",
                     style=tab_style,
                     selected_style=selected_tab_style,
-                    children=_deep_dive_tab(rows),
+                    children=_deep_dive_tab(rows, phone),
                 ),
                 dcc.Tab(
-                    label="Portfolio", value="portfolio", style=tab_style,
-                    selected_style=selected_tab_style, children=portfolio.layout(),
+                    label="Portfolio", value="portfolio", style=tab_style, selected_style=selected_tab_style,
+                    # what the signals hold and how close each is to its exit, then the broker's account
+                    children=html.Div(className="sd-page", children=[
+                        html.Div(id="model-positions", children=_model_positions(rows)),
+                        portfolio.layout(),
+                    ]),
                 ),
             ],
         )
@@ -1588,12 +1769,17 @@ def build_app() -> dash.Dash:
         callbacks below serve cards for signals promoted after startup. Those
         callbacks reference ids that do not exist until this fills, which is
         legal only because make_app sets suppress_callback_exceptions.
+
+        The boot tick first reports the browser's width ("phone" or "desktop")
+        into the viewport store, and that is what triggers the fill: the Deep
+        Dive's charts are images, so the server has to know which shape to draw.
         """
         return html.Div([
             dcc.Interval(id="page-boot", interval=60, max_intervals=1),
+            dcc.Store(id="viewport"),
             dcc.Loading(
                 html.Div(id="page-body"),
-                custom_spinner=shimmer_loader(image="guy.png", caption="loading"),
+                custom_spinner=shimmer_loader(image="guy.png"),
                 overlay_style={"visibility": "visible"},
                 parent_className="dashboard-page-loader",
             ),
@@ -1602,10 +1788,30 @@ def build_app() -> dash.Dash:
     app = make_app(title="Model", sliders=[], body=_body)
     portfolio.register_callbacks(app)
 
+    app.clientside_callback(
+        f"function(_n) {{ return window.innerWidth < {PHONE_MAX_WIDTH} ? 'phone' : 'desktop'; }}",
+        Output("viewport", "data"),
+        Input("page-boot", "n_intervals"),
+        prevent_initial_call=True,
+    )
     app.callback(
         Output("page-body", "children"),
-        Input("page-boot", "n_intervals"),
-    )(lambda _n: _tabs())
+        Input("viewport", "data"),
+        prevent_initial_call=True,
+    )(lambda viewport: _tabs(phone=viewport == "phone"))
+
+    def _open_deep(clicks):
+        """An overview row's Deep Dive button: switch tabs and pick that signal."""
+        if not any(clicks):  # the rows were (re)drawn, nothing was clicked
+            return dash.no_update, dash.no_update
+        return "signal-deep-dive", ctx.triggered_id["sid"]
+
+    app.callback(
+        Output("dashboard-tabs", "value"),
+        Output("deep-dive-signal", "value"),
+        Input(_pid("open-deep", ALL), "n_clicks"),
+        prevent_initial_call=True,
+    )(_open_deep)
 
     window_keys = list(WINDOW_PRESETS)
 
@@ -1621,7 +1827,7 @@ def build_app() -> dash.Dash:
         ]
     )
 
-    def _add_deep_card(selected, built):
+    def _add_deep_card(selected, built, viewport):
         """Build a signal's card the first time it is picked, appended beside the ones
         already built (they keep their state); picking one already built changes nothing
         here, the callback above just shows it."""
@@ -1630,7 +1836,7 @@ def build_app() -> dash.Dash:
         if row is None or selected in built:
             return dash.no_update, dash.no_update
         cards = Patch()
-        cards.append(_deep_card(row))
+        cards.append(_deep_card(row, viewport == "phone"))
         return cards, [*built, selected]
 
     app.callback(
@@ -1638,6 +1844,7 @@ def build_app() -> dash.Dash:
         Output("deep-dive-built", "data"),
         Input("deep-dive-signal", "value"),
         State("deep-dive-built", "data"),
+        State("viewport", "data"),
         prevent_initial_call=True,
     )(_add_deep_card)
 
@@ -1646,18 +1853,35 @@ def build_app() -> dash.Dash:
         _refresh_all_data(rows)
         try:
             markets.pull()
-        except Exception:  # db down: the headline keeps its last pull, as the signals do
+        except Exception:  # db down: the market keeps its last pull, as the signals do
             pass
-        return _overview_content(rows)
+        # the Market and Portfolio tabs read the same pull, so one Ref brings all three up to date
+        return _overview_content(rows), _market_content(), _model_positions(rows)
 
     app.callback(
         Output("overview-content", "children"),
+        Output("market-content", "children"),
+        Output("model-positions", "children"),
         Input("refresh-overview", "n_clicks"),
         prevent_initial_call=True,
     )(_refresh_overview)
 
+    def _refresh_market(_clicks):
+        """The Market tab's own Ref: just the yields and curves, which is quick."""
+        try:
+            markets.pull()
+        except Exception:
+            pass
+        return _market_content()
+
+    app.callback(
+        Output("market-content", "children", allow_duplicate=True),
+        Input("refresh-market", "n_clicks"),
+        prevent_initial_call=True,
+    )(_refresh_market)
+
     def _update(_ref, *rest):
-        *_window_clicks, _snap, window, snap_range, page = rest
+        *_window_clicks, _snap, window, snap_range, page, viewport = rest
         trigger = ctx.triggered_id or {}
         kind = trigger.get("type", "")
         signal_id = ctx.outputs_list[0]["id"]["sid"]
@@ -1701,6 +1925,7 @@ def build_app() -> dash.Dash:
             page=page,
             date_range=date_range,
             read_live=read["live"],
+            phone=viewport == "phone",
         )
         btn_styles = [_btn_style(primary=(k == window)) for k in window_keys]
         if kind == "snap":
@@ -1737,6 +1962,7 @@ def build_app() -> dash.Dash:
         State(_pid("window", MATCH), "data"),
         State(_pid("snap-range", MATCH), "data"),
         State(_pid("trades-page", MATCH), "data"),
+        State("viewport", "data"),
         prevent_initial_call=True,
     )(_update)
 
@@ -1795,9 +2021,16 @@ if __name__ == "__main__":
              "reloader runs this module in two processes, so every DB probe "
              "and every render happens twice.",
     )
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="Dev mode: restart the server whenever a source file is saved, so "
+             "a browser refresh shows the new code. Stylesheets in utils/assets "
+             "are read from disk on every refresh either way.",
+    )
     args = parser.parse_args()
     # This server outlives the WSL VM's idle timeout, and postgres dies with
     # the VM. Hold it up for as long as the dashboard runs; released at exit.
     utils.helpers.hold_wsl()
     app._ra_debug = args.debug
-    run(app, port=args.port, host=args.host)
+    run(app, port=args.port, host=args.host, reload=args.reload)

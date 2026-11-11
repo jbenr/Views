@@ -29,6 +29,10 @@ python -m dashboard.registry --remove book.curve.twos_10s30s::ou430_e09
 # 3. open the dashboard
 mamba run -n 2s10s python -m dashboard.app
 # http://127.0.0.1:8052
+
+# while working on the dashboard itself: restart on every saved source file,
+# so a browser refresh shows the new code (stylesheets need no restart)
+python -m dashboard.app --host raptor --reload
 ```
 
 ## What the two buttons do
@@ -78,26 +82,41 @@ or opening dates. Positions without execution history appear under “Trade time
 unavailable.” Reported fills are retained locally across successful refreshes,
 scoped to the selected account; older trades absent from TWS history cannot be inferred.
 
-The **Live Overview** tab is the trading surface. It groups signals into one
-table per traded target and shows the exact replayed position state, current
-threshold reading, causal gate status, current signal versus its entry level,
-net PnL, frozen backtest statistics, and data timestamp. Use **Refresh live
-status** to re-pull each promoted module's data from the DB (deduped, so
-named variants of the same module only pull once) and recompute those rows.
+The page is styled as a spreadsheet: plain gridded ranges on white, colour only
+as font colour.
 
-The **Signal Deep Dive** tab has a signal selector and renders the complete
-research card for just that strategy:
+The **Signal** tab is the trading surface. Up top, one line counting the
+signals that are open, calling for a new trade, gated, or flat. Under it, one
+row of cells per signal, grouped into outrights, curves and flies: position
+(green/red text when it is on, grey when flat), target, name, reading
+against its entry threshold, confidence and gate. Click a row for what it is
+built from, fair value, the gate rule, live PnL and its data stamp, and a
+**Deep Dive →** button that opens that signal's card. The market board (yields,
+curves, flies) sits under the signals. **Ref** re-pulls each promoted module's
+data from the DB (deduped, so named variants of the same module only pull
+once) and recomputes the rows.
 
-Name / pair / module, a stat row (data as-of, last analysis run, current
-reading, gate state, and an explanatory param summary), then paired charts of
-the traded target and its X/input series. They are followed by the entry
-signal (residual or OU z-score) with `±entry_threshold` bands and the current
-reading flagged, plus a compact causal-percentile gate chart where applicable.
-The bottom row contains cumulative marked-to-market PnL for the selected
-window and the strategy-wide distribution of realized closed-trade returns;
-the latter colours gains and losses separately and marks zero plus the average
-return. The chart-window controls sit
-immediately above the chart grid. "Snap chart to view" includes five
+The **Deep Dive** tab has a signal selector and renders one card for that
+strategy, in a single column, in the order a trade is judged:
+
+1. **Now** -- a label | value | note range: position, the reading against its
+   entry threshold, the open position, what an entry now is expected to make,
+   level against fair value, half-life, confidence, the gate and live PnL.
+2. **Track record** -- the same kind of range with six backtest figures (Sharpe,
+   total PnL, trades, hit rate, max drawdown, profit factor), each with the
+   number that qualifies it in the note column;
+   the rest sit behind *More stats*, the frozen params behind *Config*.
+3. **Charts** -- one to a row: the entry signal with its `±entry_threshold`
+   bands, the traded target against fair value with trade markers, the input,
+   the causal-percentile gate where there is one, cumulative PnL for the
+   window, and the distribution of closed-trade returns.
+4. **Trades** -- the paged trade table, then the monthly PnL heatmap.
+5. **Diagnostics** -- regression fit, trade mechanics, confidence and regimes,
+   each folded shut until opened.
+
+Tables wider than the screen scroll sideways in their own box. On a phone the
+charts are drawn at a narrower shape (the browser reports its width on load) so
+their text stays legible. "Snap chart to view" includes five
 business days before the earliest visible entry. Trade-table directions
 are green for long and red for short. Charts are rendered through `utils.viz.Viz`
 (`dashboard/charts.py`'s `_PngViz` renders straight to a PNG instead of

@@ -3,6 +3,7 @@
 import base64
 import importlib
 import sys
+from types import SimpleNamespace
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,6 +20,68 @@ from dashboard.charts import (
 from dashboard.params import params_from_row
 from dashboard.registry import LiveRegistry
 from tests import synthetic as syn
+
+
+def test_overview_distinguishes_traded_hedge_from_model_input(monkeypatch, tmp_path):
+    app = _load_app_module(monkeypatch, tmp_path)
+    row = {"target": "10s30s", "feature": "10y"}
+    assert app._trade_target(row, {"strategy": SimpleNamespace(feature="10y")}) == "10s30s"
+    oven = SimpleNamespace(feature="10y", setup={})
+    assert app._trade_target(row, {"strategy": oven}) == "10s30s − β×10y"
+    oven.feature = "not_a_tradable_input"
+    assert app._trade_target(row, {"strategy": oven}) == "10s30s"
+
+
+def test_overview_details_tabularize_return_and_holding_period(monkeypatch, tmp_path):
+    app = _load_app_module(monkeypatch, tmp_path)
+    setup = dict(hedge_lb=126, basis="portfolio", lookback=63, revert=0.5, max_hold=30, hl_mult=0.4, stop=0)
+    strategy = SimpleNamespace(feature="10y", setup=setup, transaction_cost_bps=0.1)
+    state = {"strategy": strategy, "params": {"stop_loss_bps": 5}}
+    live = dict(exp_return=1.25, resid=5.38, exp_bars=11, half_life=26.5,
+                confidence={"n_past": 42})
+    detail = app._overview_details({"target": "10s30s"}, state, live,
+                                  dict(bars_held=3, entry_date="2026-11-06", pnl_bps=0.7))
+    assert dict(detail["position"])["held"] == "3 bars"
+    assert dict(detail["expected"]) == {"net": "+1.25bp", "recovery": "25% of 5.38bp", "horizon": "11 bars", "cost": "0.1bp"}
+    assert dict(detail["target"])["hedge"] == "β×10y"
+    assert dict(detail["reading"])["loss stop"] == "5bp"
+    assert dict(detail["confidence"])["trades"] == "42"
+
+
+def test_since_promotion_stats_cut_daily_pnl_and_new_trade_cohort(monkeypatch, tmp_path):
+    app = _load_app_module(monkeypatch, tmp_path)
+    days = pd.date_range("2026-11-05", periods=5).date.tolist()
+    equity = pl.DataFrame({"ts": days, "pnl_bps": [100.0, 50.0, -2.0, 1.0, 3.0]})
+    trades = pl.DataFrame({"entry_date": [days[0], days[2]], "exit_date": [days[3], days[4]],
+                           "pnl_bps": [151.0, -1.0]})
+    stats = app._backtest_stats(equity, trades, after=days[1])
+    assert stats["total_pnl"] == 2.0
+    assert stats["bars"] == 3
+    assert stats["n_trades"] == 1
+    assert stats["hit_rate"] == 0.0
+    assert stats["max_drawdown"] == -2.0  # includes the first loss from zero
+    assert app._backtest_stats(equity, trades, after=days[-1]) is None
+    # A carried position can produce P&L even with no new closed trades.
+    carried = app._backtest_stats(equity, trades.head(1), after=days[1])
+    assert carried["total_pnl"] == 2.0
+    assert carried["n_trades"] == 0
+    assert np.isnan(carried["hit_rate"])
+    assert app._promotion_day({"promoted_at": "2026-11-07T01:00:00Z"}) == days[1]
+
+
+def test_signal_panel_keeps_model_state_out_of_performance(monkeypatch, tmp_path):
+    app = _load_app_module(monkeypatch, tmp_path)
+    state = dict(strategy=SimpleNamespace(transaction_cost_bps=0.1),
+                 params=dict(entry_signal="ou_z", entry_threshold=1.7, exit_style="band", exit_param=1.5,
+                             stop_loss_bps=15, gate=None),
+                 last=dict(signal=-0.01, beta=-0.125, r2=0.52), fired="flat")
+    live = dict(resid=-0.7, z=-0.01, exp_return=-0.03, exp_bars=np.nan, exp_risk=np.nan,
+                level=35.9, fair=35.9, half_life=7.2,
+                confidence=dict(label="LOW", n_past=68, drivers="test drivers"))
+    panel = str(app._now_panel(state, live, None, 43.8))
+    assert "β now" in panel and "R² now" in panel
+    assert "live pnl" not in panel and "since promotion" not in panel
+    assert "ENTRY ESTIMATE" in panel and "CONFIDENCE DRIVERS" in panel
 
 
 def _load_app_module(monkeypatch, tmp_path):
@@ -84,9 +147,9 @@ def test_dashboard_has_live_overview_and_selectable_deep_dive(monkeypatch, tmp_p
             "output": "page-body.children",
             "outputs": {"id": "page-body", "property": "children"},
             "inputs": [
-                {"id": "page-boot", "property": "n_intervals", "value": 1}
+                {"id": "viewport", "property": "data", "value": "desktop"}
             ],
-            "changedPropIds": ["page-boot.n_intervals"],
+            "changedPropIds": ["viewport.data"],
         },
         headers={"Content-Type": "application/json"},
     )
@@ -111,8 +174,8 @@ def _boot_page(app_module) -> str:
         json={
             "output": "page-body.children",
             "outputs": {"id": "page-body", "property": "children"},
-            "inputs": [{"id": "page-boot", "property": "n_intervals", "value": 1}],
-            "changedPropIds": ["page-boot.n_intervals"],
+            "inputs": [{"id": "viewport", "property": "data", "value": "desktop"}],
+            "changedPropIds": ["viewport.data"],
         },
         headers={"Content-Type": "application/json"},
     )
@@ -181,7 +244,7 @@ def test_overview_snapshot_uses_exact_open_position(monkeypatch, tmp_path):
     assert snapshot["gate_rule"] == "none"
     assert snapshot["live_pnl_bps"] == 5.5
     # Feature is gone: the Signal name already leads with it
-    assert "feature" not in {key for key, _ in app.OVERVIEW_COLUMNS}
+    assert "feature" not in snapshot
     assert snapshot["name"].startswith("2y_10s30s")
 
 

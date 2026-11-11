@@ -264,11 +264,11 @@ def make_app(
                                         "color": DIM, "fontStyle": "italic"})]
                       if data_info else []),
                 ]),
-                # slider rows
-                html.Div(
+                # slider rows (none: no empty strip under the header)
+                *([html.Div(
                     style={"borderBottom": f"1px solid {BORDER}", "paddingTop": 4},
                     children=slider_row_divs,
-                ),
+                )] if sliders else []),
                 # body
                 body() if callable(body) else body,
             ],

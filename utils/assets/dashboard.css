@@ -1,0 +1,310 @@
+/* Signal dashboard (dashboard.app) only: every class is .sd-*, so the Oven and the
+   research app, which load this same assets folder, are untouched.
+
+   A spreadsheet, not an app: plain gridded ranges on a white page, colour only as
+   font colour. One column throughout; a table too wide for the screen scrolls
+   sideways in its own box. */
+
+.sd-page {
+    padding: 14px 24px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+}
+.sd-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 14px;
+    margin-bottom: 10px;
+}
+.sd-bar-title { font-size: 13px; font-weight: bold; }
+.sd-bar .sd-close-all { margin-left: auto; margin-top: 0; }
+.sd-bar:has(.sd-close-all) { width: 1075px; max-width: 100%; }
+.sd-picker { width: 360px; max-width: 100%; font-size: 12px; }
+
+/* section heading: bold caps on a rule, a quiet note beside it */
+.sd-h {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 10px;
+    margin: 18px 0 6px;
+    padding-bottom: 2px;
+    border-bottom: 2px solid #333333;  /* one bold rule a section */
+    font-size: 11px;
+    font-weight: bold;
+    letter-spacing: 0.04em;
+}
+/* Put the heading rule on the range itself so it stops at the last column. */
+.sd-h:has(+ .sd-sheet),
+.sd-h:has(+ .sd-kv),
+.sd-h:has(+ .sd-grid) {
+    margin-bottom: 0;
+    border-bottom: none;
+}
+.sd-h + .sd-sheet,
+.sd-h + .sd-kv,
+.sd-h + .sd-grid .viz-table { border-top: 2px solid #333333; }
+.sd-h-note,
+.sd-note {
+    font-size: 11px;
+    font-weight: normal;
+    letter-spacing: 0;
+    color: #888888;
+}
+
+/* position text: font colour only */
+.sd-pos { font-weight: bold; white-space: nowrap; }
+.sd-pos--long  { color: #27AE60; }
+.sd-pos--short { color: #E74C3C; }
+.sd-pos--gated { color: #D35400; }
+.sd-pos--quiet { color: #888888; font-weight: normal; }
+
+/* Keep section rules aligned with the eight signal columns and their left border. */
+.sd-signal-section {
+    --sd-columns: 18px 112px 180px 146px 100px 64px 104px 250px;
+    width: 1075px;
+    max-width: 100%;
+}
+.sd-signal-section .sd-sheet { width: 100%; box-sizing: border-box; }
+
+/* A faint page tint with a soft local blur behind the crisp loading logo. */
+.dashboard-page-loader .shimmer-loader.shimmer-loader,
+.dashboard-overview-loader .shimmer-loader.shimmer-loader {
+    inset: 0;
+    transform: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.035);
+    pointer-events: none;
+}
+.dashboard-page-loader .shimmer-loader::before,
+.dashboard-overview-loader .shimmer-loader::before {
+    content: "";
+    position: absolute;
+    width: 240px;
+    height: 240px;
+    border-radius: 50%;
+    -webkit-backdrop-filter: blur(0.7px);
+    backdrop-filter: blur(0.7px);
+    -webkit-mask-image: radial-gradient(circle, #000 0%, #000 20%, transparent 70%);
+    mask-image: radial-gradient(circle, #000 0%, #000 20%, transparent 70%);
+}
+.dashboard-page-loader .shimmer-loader__mark,
+.dashboard-overview-loader .shimmer-loader__mark {
+    position: relative;
+}
+
+/* Preserve the 1.43s sweep, shortening only the rest between sweeps. */
+.dashboard-page-loader .shimmer-loader__mark,
+.dashboard-overview-loader .shimmer-loader__mark {
+    animation-name: sd-shimmer-sweep;
+    animation-duration: 2.35s;
+}
+@keyframes sd-shimmer-sweep {
+    0% { background-position: 100% 0; }
+    60.851% { background-position: 0% 0; }
+    100% { background-position: 0% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .dashboard-page-loader .shimmer-loader__mark,
+    .dashboard-overview-loader .shimmer-loader__mark { animation: none; }
+}
+
+/* ---- Signal tab: a gridded range, one row per signal, opened for its details ---- */
+.sd-sheet {
+    display: flex;
+    flex-direction: column;
+    width: fit-content;
+    max-width: 100%;
+    overflow-x: auto;  /* one row a signal at any width: a narrow screen scrolls it sideways */
+    border-top: 1px solid #D4D4D4;
+    border-left: 1px solid #D4D4D4;
+}
+.sd-row { border-bottom: 1px solid #D4D4D4; }
+.sd-row,
+.sd-row-legend { min-width: max-content; }
+/* the state columns lead, so they are on screen before any scrolling */
+.sd-row-head,
+.sd-row-legend,
+.sd-row-columns {
+    display: grid;
+    grid-template-columns: var(--sd-columns);
+}
+.sd-row-legend { order: -1; }
+.sd-sort { border: 0; padding: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+.sd-sort:focus-visible { outline: 2px solid #773141; outline-offset: 1px; }
+.sd-reading--active { background: #edf3f7; color: #496b82; }
+.sd-detail-cell { padding: 5px 8px; border-right: 1px solid #D4D4D4; min-width: 0; overflow-wrap: anywhere; }
+.sd-detail-cell > div { margin-bottom: 4px; }
+.sd-detail-cell .sd-detail-cell { padding: 0; border: 0; }
+.sd-detail-label { display: block; font-size: 10px; color: #888888; }
+.sd-row-head > span,
+.sd-row-legend > span,
+.sd-row-head::before {
+    padding: 3px 8px;
+    border-right: 1px solid #D4D4D4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.sd-row-legend {
+    background: #F2F2F2;
+    border-bottom: 2px solid #333333;
+    font-weight: bold;
+}
+.sd-row-head { cursor: pointer; list-style: none; }
+.sd-row-head::-webkit-details-marker { display: none; }
+.sd-row-head::before { content: "+"; color: #999999; padding: 3px 0; text-align: center; }
+.sd-row[open] > .sd-row-head::before { content: "\2212"; }  /* − */
+.sd-row-head:hover { background: #F7F7F7; }
+.sd-target { font-weight: bold; }
+.sd-reading { text-align: right; }
+.sd-conf { font-weight: bold; }
+.sd-stale { color: #D35400; font-weight: bold; margin-left: 6px; }
+
+.sd-row-body {
+    padding: 0;
+    border-top: 1px solid #D4D4D4;
+    background: #FAFAFA;
+}
+.sd-btn {
+    margin-top: 6px;
+    padding: 2px 8px;
+    border: 1px solid #BBBBBB;
+    border-radius: 0;
+    background: #FFFFFF;
+    color: #333333;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+/* ---- label | value | note ranges (row details, NOW, TRACK RECORD) ---------------- */
+.sd-kv {
+    display: grid;
+    grid-template-columns: max-content max-content minmax(0, max-content);
+    width: fit-content;
+    max-width: 100%;
+    border-top: 1px solid #D4D4D4;
+    border-left: 1px solid #D4D4D4;
+    background: #FFFFFF;
+}
+.sd-kv > div { display: contents; }
+.sd-kv > div > span {
+    padding: 3px 10px;
+    border-right: 1px solid #D4D4D4;
+    border-bottom: 1px solid #D4D4D4;
+}
+.sd-k { grid-column: 1; background: #F2F2F2; white-space: nowrap; }
+.sd-v { grid-column: 2; text-align: right; font-weight: bold; white-space: nowrap; }
+.sd-n { grid-column: 3; color: #777777; }
+
+/* ---- Deep Dive card ----------------------------------------------------------- */
+.sd-deep-tabs { display: flex; gap: 4px; margin-top: 12px; border-bottom: 1px solid #D4D4D4; }
+.sd-deep-tab { padding: 6px 12px; background: #F7F7F7; border: 1px solid #D4D4D4; border-bottom: 0; cursor: pointer; font: inherit; }
+.sd-deep-tab[aria-pressed="true"] { background: #FFFFFF; color: #773141; font-weight: bold; }
+.sd-card[data-deep-tab="signal"] .sd-deep-view:not(.sd-deep-signal),
+.sd-card[data-deep-tab="performance"] .sd-deep-view:not(.sd-deep-performance),
+.sd-card[data-deep-tab="details"] .sd-deep-view:not(.sd-deep-details),
+.sd-card[data-deep-tab="details"] .sd-chart-tools { display: none; }
+.sd-deep-details .sd-kv { max-width: 900px; }
+.sd-deep-details .sd-v { white-space: normal; overflow-wrap: anywhere; text-align: left; }
+.sd-deep-details .sd-kv { grid-template-columns: max-content minmax(0, 1fr) minmax(0, max-content); }
+.sd-card-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 12px;
+}
+.sd-card-name { font-size: 14px; font-weight: bold; color: #D35400; }
+.sd-stamp {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 18px;
+    margin-top: 4px;
+    font-size: 11px;
+}
+.sd-stamp span span { color: #888888; }
+
+/* folded detail: one line until opened */
+.sd-fold { border-bottom: 1px solid #E0E0E0; }
+.sd-fold > summary {
+    cursor: pointer;
+    padding: 5px 0;
+    font-size: 11px;
+    font-weight: bold;
+    letter-spacing: 0.04em;
+}
+.sd-fold > summary .sd-h-note { margin-left: 10px; }
+.sd-fold-body { padding: 0 0 10px; }
+.sd-fold-body > * { margin-top: 8px; }
+.sd-fold--quiet { border-bottom: none; }
+.sd-fold--quiet > summary { font-weight: normal; color: #888888; }
+
+/* charts: one to a row, whole width */
+.sd-charts {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.sd-charts img {
+    display: block;
+    width: 100%;
+    border: 1px solid #D4D4D4;
+}
+.sd-charts--narrow { max-width: 820px; }
+.sd-windows {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    margin-bottom: 8px;
+}
+
+/* tables: as wide as their content, scrolling sideways in their own box, never
+   scrolling vertically inside the page (table_div sets these inline) */
+.sd-page div:has(> .viz-table) {
+    max-width: 100%;
+    max-height: none !important;
+    overflow-x: auto !important;
+    overflow-y: visible !important;
+    -webkit-overflow-scrolling: touch;
+}
+
+/* the house table as a gridded range (dashboard.sheet.grid_table): every cell ruled,
+   sized to its content, one bold line under the header (table_div styles are inline) */
+.sd-grid div:has(> .viz-table) { margin-bottom: 0 !important; }
+.sd-grid .viz-table {
+    min-width: 0 !important;
+    border-left: 1px solid #D4D4D4;
+}
+.sd-grid .viz-table th,
+.sd-grid .viz-table td {
+    padding: 3px 9px !important;
+    border-right: 1px solid #D4D4D4;
+    border-bottom: 1px solid #D4D4D4;
+    font-size: 12px !important;
+}
+.sd-grid .viz-table th {
+    background: #F2F2F2 !important;
+    border-bottom: 2px solid #333333 !important;
+    text-align: left !important;
+}
+.sd-card .oven-pager { flex-wrap: wrap; }
+
+/* ---- phones ------------------------------------------------------------------- */
+@media (max-width: 700px) {
+    .sd-page { padding: 10px 10px; }
+    .sd-picker { width: 100%; }
+
+    /* the same table, tighter: position to confidence fit the screen, the rest scrolls */
+    .sd-sheet { font-size: 11px; }
+    .sd-row-head > span,
+    .sd-row-legend > span { padding: 3px 5px; }
+    .sd-n { overflow-wrap: anywhere; }
+
+    /* the folder tabs stay side by side */
+    #dashboard-tabs { padding: 8px 10px 0 !important; }
+    #dashboard-tabs .tab { min-width: 0 !important; padding: 8px 9px !important; margin-right: 2px !important; }
+}

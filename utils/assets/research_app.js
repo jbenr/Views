@@ -50,7 +50,8 @@
     const suffix = button.id.slice(buttonPrefix.length);
     const status = document.getElementById(statusPrefix + suffix);
     const charts = document.getElementById(chartPrefix + suffix);
-    const images = charts ? Array.from(charts.querySelectorAll("img")) : [];
+    const images = charts ? Array.from(charts.querySelectorAll("img"))
+      .filter((image) => !charts.closest(".sd-card") || image.getClientRects().length > 0) : [];
     if (!images.length) {
       if (status) status.textContent = "No charts";
       return;
@@ -65,7 +66,8 @@
     if (status) status.textContent = "Copying…";
     try {
       const padding = 20;
-      const columns = 2;
+      // the Oven's grid is two charts to a row; a container can say otherwise
+      const columns = Number(charts.dataset.copyColumns) || 2;
       const cellWidth = Math.max(...images.map((image) => image.naturalWidth));
       const rows = [];
       for (let i = 0; i < images.length; i += columns) {

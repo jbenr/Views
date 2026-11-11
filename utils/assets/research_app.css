@@ -110,8 +110,8 @@ body .dash-dropdown-value-count {
     text-align: center;
 }
 
-/* Dashboard loaders share one deliberate, viewport-relative anchor: directly
-   below the tab strip. The page boot and overview refresh can briefly overlap,
+/* Dashboard loaders share one deliberate, viewport-relative anchor.
+   The page boot and overview refresh can briefly overlap,
    so giving them the same coordinates prevents duplicate marks on the page.
    This is fixed to the viewport, not a scrolling panel. */
 .dashboard-page-loader {
@@ -119,13 +119,20 @@ body .dash-dropdown-value-count {
     min-height: 140px;
 }
 
-.dashboard-page-loader .shimmer-loader,
-.dashboard-overview-loader .shimmer-loader,
 .research-panel-loader .shimmer-loader {
     position: fixed;
     top: 130px;
     left: 50%;
     transform: translateX(-50%);
+}
+
+/* the signal dashboard's sits mid-screen, clear of the header and tabs */
+.dashboard-page-loader .shimmer-loader,
+.dashboard-overview-loader .shimmer-loader {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
 }
 
 .shimmer-loader__mark {
@@ -207,8 +214,10 @@ body .dash-dropdown-value-count {
 ._dash-loading {
     font-size: 0;
     color: transparent;
-    text-align: center;
-    padding-top: 12px;
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
 }
 
 ._dash-loading::after {

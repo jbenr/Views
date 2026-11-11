@@ -1,25 +1,34 @@
-"""Read-only IBKR portfolio tab."""
+"""Read-only IBKR portfolio: the broker's account, positions, orders and fills as plain tables."""
 from decimal import Decimal, InvalidOperation
 
+import pandas as pd
 from dash import Input, Output, dcc, html
 
+from dashboard.sheet import grid_table, heading, kv, kv_range
 from execution.journal import TradeJournal
 from execution.portfolio import fetch_snapshot
 from execution.ibkr import IBKRConfig
 from execution.grouping import group_positions
-from utils.research_app import stat_block
 
 
 ACCOUNT_STATS = [
-    ("InitMarginReq", "Initial margin"),
-    ("MaintMarginReq", "Maintenance margin"),
+    ("NetLiquidation", "net liquidation"),
+    ("InitMarginReq", "initial margin"),
+    ("MaintMarginReq", "maintenance margin"),
 ]
 FORWARD_STATS = [
-    ("FullInitMarginReq", "Full initial margin"),
-    ("FullMaintMarginReq", "Full maintenance margin"),
-    ("LookAheadInitMarginReq", "Look-ahead initial margin"),
-    ("LookAheadMaintMarginReq", "Look-ahead maintenance margin"),
+    ("FullInitMarginReq", "full initial margin"),
+    ("FullMaintMarginReq", "full maintenance margin"),
+    ("LookAheadInitMarginReq", "look-ahead initial margin"),
+    ("LookAheadMaintMarginReq", "look-ahead maintenance margin"),
 ]
+POSITION_COLS = {"symbol": "Symbol", "quantity": "Qty", "avg_cost": "Avg cost", "current_price": "Price",
+                 "unrealized_pnl": "Unrealized P&L", "currency": "Ccy", "activity": "Last trade (UTC)"}
+ORDER_COLS = {"symbol": "Symbol", "action": "Side", "quantity": "Qty", "status": "Status", "filled": "Filled",
+              "remaining": "Remaining", "avg_fill_price": "Avg fill", "strategy": "Signal"}
+FILL_COLS = {"time": "Time", "symbol": "Symbol", "side": "Side", "quantity": "Qty", "price": "Price",
+             "strategy": "Signal"}
+GAIN, LOSS = "#27AE60", "#E74C3C"
 
 
 def _account_value(balances, tag):
@@ -41,106 +50,103 @@ def _account_value(balances, tag):
     return " / ".join(dict.fromkeys(values)) or "—"
 
 
-def _account_summary(balances):
-    def grid(stats):
-        return html.Div([stat_block(label, _account_value(balances, tag)) for tag, label in stats],
-                        style={"display": "flex", "flexWrap": "wrap", "gap": "24px",
-                               "margin": "16px 0"})
-    return html.Div([
-        html.Div([html.Div("Net liquidation"),
-                  html.Div(_account_value(balances, "NetLiquidation"),
-                           style={"fontSize": "28px", "fontWeight": "bold", "fontFamily": "monospace"})],
-                 style={"marginTop": "16px"}),
-        grid(ACCOUNT_STATS),
-        html.Details([html.Summary("Full and look-ahead margin"), grid(FORWARD_STATS),
-                      html.P("Full figures exclude intraday credits; look-ahead figures reflect the next margin change.")]),
-    ])
+def _account_range(balances, stats):
+    return kv_range([kv(label, _account_value(balances, tag)) for tag, label in stats])
 
 
-def _table(rows):
+def _number(value, precision):
+    return f"{value:,.{precision}f}" if value is not None else "—"
+
+
+def _text_left(columns):
+    """Cell style: the named columns read as text (left), the rest as numbers."""
+    def style(column, _value, _row):
+        return {"textAlign": "left"} if column in columns else None
+    return style
+
+
+def _records_table(rows, columns):
+    """Broker rows as a gridded table of the chosen columns; a plain line when there are none."""
     if not rows:
-        return html.P("No records.")
-    cols = list(rows[0])
-    return html.Div(html.Table([
-        html.Thead(html.Tr([html.Th(c.replace('_', ' ')) for c in cols])),
-        html.Tbody([html.Tr([html.Td(str(r.get(c, '')), style={"padding": "6px 12px"})
-                            for c in cols]) for r in rows]),
-    ]), style={"overflowX": "auto"})
+        return html.Div("none", className="sd-note")
+    frame = pd.DataFrame([{c: "" if r.get(c) is None else str(r.get(c)) for c in columns} for r in rows])
+    return grid_table(frame, columns=list(columns), headers=columns,
+                      cell_style=_text_left({"symbol", "action", "status", "strategy", "time", "side"}))
 
 
-def _positions_table(rows):
-    formatted = []
-    for row in rows:
-        def number(key, precision=2):
-            value = row.get(key)
-            return f"{value:,.{precision}f}" if value is not None else "—"
-        pnl = row.get("unrealized_pnl")
-        formatted.append({
-            "symbol": row["symbol"], "quantity": row["quantity"],
-            "avg cost": number("avg_cost", 4), "current price": number("current_price", 4),
-            "unrealized P&L": html.Span(number("unrealized_pnl"), style={
-                "color": "#4caf88" if pnl is not None and pnl > 0 else
-                         "#ef6b73" if pnl is not None and pnl < 0 else "inherit"}),
-            "currency": row.get("currency", ""), "strategy": row.get("strategy", "Unattributed"),
-        })
-    if not formatted:
-        return html.P("No positions.")
-    cols = list(formatted[0])
-    return html.Div(html.Table([
-        html.Thead(html.Tr([html.Th(c) for c in cols])),
-        html.Tbody([html.Tr([html.Td(r[c], style={"padding": "6px 12px"}) for c in cols])
-                    for r in formatted]),
-    ]), style={"overflowX": "auto"})
+def _positions_table(groups):
+    """Every position in one table; the trade-activity group it was inferred into is a column."""
+    rows = []
+    for stamp, positions in groups:
+        for p in positions:
+            rows.append({
+                "symbol": p["symbol"], "quantity": p["quantity"], "avg_cost": _number(p.get("avg_cost"), 4),
+                "current_price": _number(p.get("current_price"), 4),
+                "unrealized_pnl": _number(p.get("unrealized_pnl"), 2), "currency": p.get("currency", ""),
+                "activity": f"{stamp:%Y-%m-%d %H:%M}" if stamp else "—", "_pnl": p.get("unrealized_pnl"),
+            })
+    if not rows:
+        return html.Div("none", className="sd-note")
+
+    def style(column, _value, row):
+        if column in ("symbol", "currency", "activity"):
+            return {"textAlign": "left", **({"fontWeight": "bold"} if column == "symbol" else {})}
+        if column == "unrealized_pnl" and row["_pnl"]:
+            return {"color": GAIN if row["_pnl"] > 0 else LOSS, "fontWeight": "bold"}
+        return None
+
+    return grid_table(pd.DataFrame(rows), columns=list(POSITION_COLS), headers=POSITION_COLS, cell_style=style)
 
 
 def _content():
     journal = TradeJournal()
     snapshot = journal.latest_snapshot()
-    items = []
-    if snapshot:
-        items += [html.P(w, role="status") for w in snapshot.get("warnings", [])]
-        items += [html.H4(f"Account {snapshot['account']}"),
-                  html.P(f"Last successful snapshot: {snapshot['as_of']} · disconnected after refresh"),
-                  html.P("Broker history is limited to what TWS returns. Refresh for current statuses. "
-                         "Average cost and current price use the same price units. P&L is IBKR’s unrealized P&L at refresh.")]
-        items.append(_account_summary(snapshot.get("balances", [])))
-        for key, label in [("positions", "Positions"),
-                           ("orders", "Open orders"), ("completed_orders", "Recent completed orders"),
-                           ("fills", "Recent fills")]:
-            records = snapshot[key]
-            if key in ("orders", "completed_orders", "fills"):
-                refs = {r["order_ref"]: r["signal_id"] for r in journal.records("intent")}
-                records = [dict(r, strategy=refs.get(r.get("order_ref"), "Unattributed")) for r in records]
-            items.append(html.H4(label))
-            if key == "positions":
-                fills = journal.saved_fills(snapshot["account"]) + snapshot.get("fills", [])
-                groups = group_positions(records, fills)
-                if any(stamp is not None for stamp, _ in groups):
-                    items.append(html.P("Grouped by latest reported trade activity within 2 minutes; times shown in UTC. "
-                                        "These are inferred groups, not confirmed opening trades or strategies."))
-                for stamp, positions in groups:
-                    heading = (f"Trade activity · {stamp:%Y-%m-%d %H:%M:%S} UTC"
-                               if stamp else "Trade time unavailable")
-                    items += [html.H5(heading), _positions_table(positions)]
-                if not records:
-                    items.append(html.P("No positions."))
-            else:
-                items.append(_table(records))
-    else:
-        items.append(html.P("No broker snapshot yet. Start TWS / IB Gateway and refresh."))
-    return items
+    if not snapshot:
+        return [html.Div("No broker snapshot yet. Start TWS / IB Gateway and refresh.", className="sd-note")]
+    balances = snapshot.get("balances", [])
+    refs = {r["order_ref"]: r["signal_id"] for r in journal.records("intent")}
+
+    def attributed(records):
+        return [dict(r, strategy=refs.get(r.get("order_ref"), "unattributed")) for r in records]
+
+    fills = journal.saved_fills(snapshot["account"]) + snapshot.get("fills", [])
+    return [
+        *[html.Div(w, role="status", className="sd-note", style={"color": "#D35400"})
+          for w in snapshot.get("warnings", [])],
+        kv_range([kv("account", snapshot["account"]), kv("snapshot", str(snapshot["as_of"])[:19].replace("T", " "),
+                                                         "UTC · disconnected after refresh")]),
+        heading("ACCOUNT"),
+        _account_range(balances, ACCOUNT_STATS),
+        html.Details([html.Summary("FULL AND LOOK-AHEAD MARGIN"),
+                      html.Div([_account_range(balances, FORWARD_STATS),
+                                html.Div("Full figures exclude intraday credits; look-ahead figures reflect the next "
+                                         "margin change.", className="sd-note")], className="sd-fold-body")],
+                     className="sd-fold sd-fold--quiet"),
+        heading("POSITIONS", "P&L is IBKR's unrealized P&L at refresh · average cost and price in the same units"),
+        _positions_table(group_positions(snapshot["positions"], fills)),
+        heading("OPEN ORDERS"),
+        _records_table(attributed(snapshot["orders"]), ORDER_COLS),
+        heading("RECENT COMPLETED ORDERS"),
+        _records_table(attributed(snapshot["completed_orders"]), ORDER_COLS),
+        heading("RECENT FILLS"),
+        _records_table(attributed(snapshot["fills"]), FILL_COLS),
+        html.Div("Last trade is the latest reported activity for the position, grouped within 2 minutes: an inferred "
+                 "group, not a confirmed opening trade or strategy. Broker history is limited to what TWS returns.",
+                 className="sd-note", style={"marginTop": 8}),
+    ]
 
 
 def layout():
     config = IBKRConfig.from_env()
     return html.Div([
-        html.H3("IBKR Portfolio"),
-        html.P("Read-only connection · order submission disabled · refresh on demand"),
-        html.P(f"TWS / Gateway endpoint: {config.host}:{config.port} · client ID {config.client_id}"),
-        html.Button("Refresh IBKR portfolio", id="ibkr-refresh"),
-        html.Div(id="ibkr-message", role="status"),
+        heading("BROKER ACCOUNT (IBKR)", f"read-only · order submission disabled · {config.host}:{config.port} "
+                                         f"client {config.client_id}"),
+        html.Div(className="sd-bar", children=[
+            html.Button("Refresh IBKR", id="ibkr-refresh", className="ref-btn sd-btn"),
+            html.Div(id="ibkr-message", role="status", className="sd-note"),
+        ]),
         dcc.Loading(html.Div(id="ibkr-content", children=_content())),
-    ], style={"padding": "20px"})
+    ])
 
 
 def register_callbacks(app):
