@@ -51,3 +51,6 @@ data/
 
 # backtest metric store (parquet run history)
 store/
+
+# pytest --basetemp scratch dirs
+tmp_*/
