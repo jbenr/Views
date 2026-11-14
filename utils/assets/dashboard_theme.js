@@ -7,6 +7,15 @@
     const app = document.querySelector(".sd-app");
     if (!app) return;
     document.documentElement.dataset.sdTheme = theme;
+    // Supporting mobile browsers use this for the address/tab bar and edge chrome.
+    let browserTheme = document.querySelector('meta[name="theme-color"]');
+    if (!browserTheme) {
+      browserTheme = document.createElement("meta");
+      browserTheme.name = "theme-color";
+      document.head.appendChild(browserTheme);
+    }
+    const browserColor = theme === "dark" ? "#17191d" : "#ffffff";
+    if (browserTheme.content !== browserColor) browserTheme.content = browserColor;
     app.querySelectorAll("img[data-chart-dark]").forEach((image) => {
       const source = theme === "dark" ? image.dataset.chartDark : image.dataset.chartLight;
       if (image.getAttribute("src") !== source) image.setAttribute("src", source);

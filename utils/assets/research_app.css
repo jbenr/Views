@@ -151,7 +151,8 @@ body .dash-dropdown-value-count {
 
 /* the signal dashboard's sits mid-screen, clear of the header and tabs */
 .dashboard-page-loader .shimmer-loader,
-.dashboard-overview-loader .shimmer-loader {
+.dashboard-overview-loader .shimmer-loader,
+.dashboard-portfolio-loader .shimmer-loader {
     position: fixed;
     top: 50%;
     left: 50%;

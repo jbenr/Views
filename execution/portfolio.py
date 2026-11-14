@@ -40,9 +40,7 @@ def position_row(p, marks):
                 strategy="Unattributed")
 
 
-async def _snapshot(config, factory=None):
-    if config.client_id <= 0:
-        raise ValueError("Use a positive, dedicated VIEWS_IB_CLIENT_ID for read-only access.")
+def new_ib(factory=None):
     if factory is None:
         try:
             from ib_async import IB
@@ -51,60 +49,76 @@ async def _snapshot(config, factory=None):
         factory = IB
     ib = factory()
     ib.RaiseRequestErrors = True
+    return ib
+
+
+async def connect(ib, config):
+    """Open a read-only connection and return the one account it serves."""
+    if config.client_id <= 0:
+        raise ValueError("Use a positive, dedicated VIEWS_IB_CLIENT_ID for read-only access.")
     try:
+        await ib.connectAsync(config.host, config.port, clientId=config.client_id,
+                              readonly=True, timeout=10, account=config.account or "",
+                              raiseSyncErrors=True)
+    except ConnectionRefusedError as exc:
+        raise ConnectionError(
+            f"IBKR refused the connection to {config.host}:{config.port}. "
+            "Start TWS or IB Gateway and log in, enable ActiveX and Socket Clients "
+            "under API Settings, and match its Socket Port to VIEWS_IB_PORT. "
+            "Keep Read-Only API enabled. Restart the dashboard after changing "
+            "environment variables."
+        ) from exc
+    accounts = ib.managedAccounts()
+    if config.account and config.account not in accounts:
+        raise ValueError("Configured IBKR account is not available in this session.")
+    if not config.account and len(accounts) != 1:
+        raise ValueError("Set VIEWS_IB_ACCOUNT to select exactly one managed account.")
+    return config.account or accounts[0]
+
+
+async def collect(ib, account):
+    """One account's balances, positions, orders and fills from an open connection."""
+    balances = await ib.accountSummaryAsync()
+    positions = await ib.reqPositionsAsync()
+    # connectAsync already downloads the portfolio for its selected account.
+    # Re-requesting an existing subscription may not send another end marker.
+    if positions and not ib.portfolio(account):
+        await asyncio.wait_for(ib.reqAccountUpdatesAsync(account), 10)
+    orders = await ib.reqAllOpenOrdersAsync()
+    warnings = []
+    async def optional_history(label, request):
         try:
-            await ib.connectAsync(config.host, config.port, clientId=config.client_id,
-                                  readonly=True, timeout=10, account=config.account or "",
-                                  raiseSyncErrors=True)
-        except ConnectionRefusedError as exc:
-            raise ConnectionError(
-                f"IBKR refused the connection to {config.host}:{config.port}. "
-                "Start TWS or IB Gateway and log in, enable ActiveX and Socket Clients "
-                "under API Settings, and match its Socket Port to VIEWS_IB_PORT. "
-                "Keep Read-Only API enabled. Restart the dashboard after changing "
-                "environment variables."
-            ) from exc
-        accounts = ib.managedAccounts()
-        if config.account and config.account not in accounts:
-            raise ValueError("Configured IBKR account is not available in this session.")
-        if not config.account and len(accounts) != 1:
-            raise ValueError("Set VIEWS_IB_ACCOUNT to select exactly one managed account.")
-        account = config.account or accounts[0]
-        balances = await ib.accountSummaryAsync()
-        positions = await ib.reqPositionsAsync()
-        # connectAsync already downloads the portfolio for its selected account.
-        # Re-requesting an existing subscription may not send another end marker.
-        if positions and not ib.portfolio(account):
-            await asyncio.wait_for(ib.reqAccountUpdatesAsync(account), 10)
-        orders = await ib.reqAllOpenOrdersAsync()
-        warnings = []
-        async def optional_history(label, request):
-            try:
-                return await asyncio.wait_for(request, 5)
-            except (TimeoutError, ConnectionError) as exc:
-                warnings.append(f"{label} unavailable ({type(exc).__name__}); refresh to retry.")
-                return []
-        completed = await optional_history("Completed-order history", ib.reqCompletedOrdersAsync(apiOnly=False))
-        fills = await optional_history("Execution history", ib.reqExecutionsAsync())
-        marks = {(p.account, p.contract.conId): p for p in ib.portfolio(account)}
-        def order_row(t):
-            o, s = t.order, t.orderStatus
-            return dict(account=o.account, **contract_row(t.contract), order_id=o.orderId,
-                        client_id=o.clientId, perm_id=o.permId, order_ref=o.orderRef,
-                        action=o.action, quantity=str(o.totalQuantity), status=s.status,
-                        filled=str(s.filled), remaining=str(s.remaining), avg_fill_price=s.avgFillPrice)
-        return dict(as_of=dt.datetime.now(dt.timezone.utc).isoformat(), account=account, warnings=warnings,
-                    balances=[dict(tag=v.tag, value=v.value, currency=v.currency)
-                              for v in balances if v.account == account],
-                    positions=[position_row(p, marks)
-                               for p in positions if p.account == account],
-                    orders=[order_row(t) for t in orders if t.order.account == account],
-                    completed_orders=[order_row(t) for t in completed if t.order.account == account],
-                    fills=[dict(**contract_row(f.contract), exec_id=f.execution.execId,
-                                perm_id=f.execution.permId, order_ref=f.execution.orderRef,
-                                time=str(f.time), side=f.execution.side,
-                                quantity=str(f.execution.shares), price=f.execution.price)
-                           for f in fills if f.execution.acctNumber == account])
+            return await asyncio.wait_for(request, 5)
+        except (TimeoutError, ConnectionError) as exc:
+            warnings.append(f"{label} unavailable ({type(exc).__name__}); refresh to retry.")
+            return []
+    completed = await optional_history("Completed-order history", ib.reqCompletedOrdersAsync(apiOnly=False))
+    fills = await optional_history("Execution history", ib.reqExecutionsAsync())
+    marks = {(p.account, p.contract.conId): p for p in ib.portfolio(account)}
+    def order_row(t):
+        o, s = t.order, t.orderStatus
+        return dict(account=o.account, **contract_row(t.contract), order_id=o.orderId,
+                    client_id=o.clientId, perm_id=o.permId, order_ref=o.orderRef,
+                    action=o.action, quantity=str(o.totalQuantity), status=s.status,
+                    filled=str(s.filled), remaining=str(s.remaining), avg_fill_price=s.avgFillPrice)
+    return dict(as_of=dt.datetime.now(dt.timezone.utc).isoformat(), account=account, warnings=warnings,
+                balances=[dict(tag=v.tag, value=v.value, currency=v.currency)
+                          for v in balances if v.account == account],
+                positions=[position_row(p, marks)
+                           for p in positions if p.account == account],
+                orders=[order_row(t) for t in orders if t.order.account == account],
+                completed_orders=[order_row(t) for t in completed if t.order.account == account],
+                fills=[dict(**contract_row(f.contract), exec_id=f.execution.execId,
+                            perm_id=f.execution.permId, order_ref=f.execution.orderRef,
+                            time=str(f.time), side=f.execution.side,
+                            quantity=str(f.execution.shares), price=f.execution.price)
+                       for f in fills if f.execution.acctNumber == account])
+
+
+async def _snapshot(config, factory=None):
+    ib = new_ib(factory)
+    try:
+        return await collect(ib, await connect(ib, config))
     finally:
         ib.disconnect()
 

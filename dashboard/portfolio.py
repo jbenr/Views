@@ -2,13 +2,17 @@
 from decimal import Decimal, InvalidOperation
 
 import pandas as pd
-from dash import Input, Output, dcc, html
+from dash import Input, Output, State, ctx, dcc, html, no_update
 
 from dashboard.sheet import grid_table, heading, kv, kv_range
 from execution.journal import TradeJournal
 from execution.portfolio import fetch_snapshot
 from execution.ibkr import IBKRConfig
 from execution.grouping import group_positions
+from execution.session import BUSY, Session
+from utils.research_app import shimmer_loader
+
+SESSION = Session()  # the dashboard's one broker connection; it dies with the server process
 
 
 ACCOUNT_STATS = [
@@ -28,7 +32,7 @@ ORDER_COLS = {"symbol": "Symbol", "action": "Side", "quantity": "Qty", "status":
               "remaining": "Remaining", "avg_fill_price": "Avg fill", "strategy": "Signal"}
 FILL_COLS = {"time": "Time", "symbol": "Symbol", "side": "Side", "quantity": "Qty", "price": "Price",
              "strategy": "Signal"}
-GAIN, LOSS = "#27AE60", "#E74C3C"
+GAIN, LOSS, BUSY_COLOUR = "#27AE60", "#E74C3C", "#D35400"
 
 
 def _account_value(balances, tag):
@@ -114,7 +118,7 @@ def _content():
         *[html.Div(w, role="status", className="sd-note", style={"color": "#D35400"})
           for w in snapshot.get("warnings", [])],
         kv_range([kv("account", snapshot["account"]), kv("snapshot", str(snapshot["as_of"])[:19].replace("T", " "),
-                                                         "UTC · disconnected after refresh")]),
+                                                         "UTC")]),
         heading("ACCOUNT"),
         _account_range(balances, ACCOUNT_STATS),
         html.Details([html.Summary("FULL AND LOOK-AHEAD MARGIN"),
@@ -136,27 +140,72 @@ def _content():
     ]
 
 
+def _connection(status):
+    """The connect button's label, the status line beside it, and whether to keep polling."""
+    state, detail = status["state"], status["detail"]
+    if state == "connected":
+        mode = "paper" if status["account"].startswith("D") else "live"
+        text = " · ".join(filter(None, ["connected", status["account"], mode, detail]))
+        return "Disconnect", html.Span(text, style={"color": GAIN}), False
+    if state in BUSY:
+        return "Cancel", html.Span(detail, style={"color": BUSY_COLOUR}), False
+    if state == "failed":
+        return "Connect IBKR", html.Span(f"connection failed · {detail}", style={"color": LOSS}), True
+    return "Connect IBKR", " · ".join(filter(None, ["not connected", detail])), True
+
+
 def layout():
     config = IBKRConfig.from_env()
+    status = SESSION.status()
+    label, text, idle = _connection(status)
     return html.Div([
         heading("BROKER ACCOUNT (IBKR)", f"read-only · order submission disabled · {config.host}:{config.port} "
                                          f"client {config.client_id}"),
         html.Div(className="sd-bar", children=[
+            html.Button(label, id="ibkr-connect", className="ref-btn sd-btn"),
             html.Button("Refresh IBKR", id="ibkr-refresh", className="ref-btn sd-btn"),
+            html.Div(text, id="ibkr-status", role="status", className="sd-note"),
             html.Div(id="ibkr-message", role="status", className="sd-note"),
         ]),
-        dcc.Loading(html.Div(id="ibkr-content", children=_content())),
+        # ticks only while a connection is up or being made; the snapshot stamp it last drew
+        dcc.Interval(id="ibkr-poll", interval=2000, disabled=idle),
+        dcc.Store(id="ibkr-drawn", data=status["snapshot"]),
+        dcc.Loading(
+            html.Div(id="ibkr-content", children=_content()),
+            custom_spinner=shimmer_loader(image="guy.png"),
+            overlay_style={"visibility": "visible"},
+            parent_className="dashboard-portfolio-loader",
+        ),
     ])
 
 
 def register_callbacks(app):
+    @app.callback(Output("ibkr-connect", "children"), Output("ibkr-status", "children"),
+                  Output("ibkr-poll", "disabled"), Output("ibkr-drawn", "data"),
+                  Input("ibkr-connect", "n_clicks"), Input("ibkr-poll", "n_intervals"),
+                  State("ibkr-drawn", "data"), prevent_initial_call=True)
+    def connection(_connect, _tick, drawn):
+        if ctx.triggered_id == "ibkr-connect":
+            if SESSION.state == "connected" or SESSION.state in BUSY:
+                SESSION.disconnect()
+            else:
+                SESSION.connect()
+        status = SESSION.status()
+        # a new snapshot stamp redraws the tables below; the tick alone never does
+        return *_connection(status), status["snapshot"] if status["snapshot"] != drawn else no_update
+
     @app.callback(Output("ibkr-content", "children"), Output("ibkr-message", "children"),
-                  Input("ibkr-refresh", "n_clicks"), prevent_initial_call=True)
-    def update(_refresh):
+                  Input("ibkr-refresh", "n_clicks"), Input("ibkr-drawn", "data"), prevent_initial_call=True)
+    def update(_refresh, _drawn):
+        if ctx.triggered_id != "ibkr-refresh":
+            return _content(), ""
         try:
-            journal = TradeJournal()
-            journal.save_snapshot(fetch_snapshot())
-            message = "Snapshot refreshed. Broker connection closed."
+            if SESSION.state == "connected":
+                SESSION.refresh()
+                message = "Snapshot refreshed."
+            else:
+                TradeJournal().save_snapshot(fetch_snapshot())
+                message = "Snapshot refreshed. Broker connection closed."
             return _content(), message
         except Exception as exc:
             return _content(), f"Refresh/action failed ({type(exc).__name__}): {exc}. Previous snapshot retained."

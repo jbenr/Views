@@ -72,6 +72,23 @@ All three follow `backtest.lab.MetricStore`'s atomic-write pattern
 
 ## Dashboard layout
 
+The **Market** tab's **Pull Bloomberg live** button runs the existing
+`python data_pull.ref --live` workflow: live BDP futures and indices are written
+to the market database, then the Market board cache is refreshed. Bloomberg
+Terminal must be logged in on the dashboard host. The console streams the real
+stdout/stderr (with ANSI escapes removed and connection credentials redacted),
+shows elapsed time and exit status, and prevents another pull in the same
+dashboard process while one is running. Browser reloads reattach to the current
+run. Full sanitized logs are kept under `store/market_pulls/`; the visible console
+keeps the latest 64,000 characters. Keep the dashboard server running until the
+pull finishes. This button does not rerun signal analysis.
+
+The Market board shows the source bar date and the stored Bloomberg snapshot's
+update timestamp in Eastern time. That timestamp is retained with the cached
+prices and does not advance on a DB-only Ref. It is the source ingestion time,
+not an exchange last-trade timestamp. Mixed dates and missing timestamps are
+shown explicitly.
+
 The **Portfolio** tab provides on-demand read-only IBKR account and position snapshots.
 See [connection setup](../execution/README.md).
 Trade submission remains disabled.

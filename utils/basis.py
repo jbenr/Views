@@ -282,15 +282,15 @@ def accrued_interest(coupon: pl.Expr, maturity: pl.Expr, on: pl.Expr) -> pl.Expr
 
 # ── the basis ────────────────────────────────────────────────────────────────
 
-def net_basis(
+def basket_basis(
     roots: list[str] | None = None,
     start: str = "2010-01-01",
     min_days: int = 15,
 ) -> pl.DataFrame:
-    """Daily CTD net basis per contract root.
+    """Every deliverable of the chosen contract, each day, priced against the future.
 
-    One row per (ts, root): the deliverable with the highest implied repo,
-    its net basis in 32nds, and the implied-repo spread to financing in bps.
+    One row per (ts, root, cusip): forward price, invoice, gross and net basis in
+    price points and implied repo. `net_basis` keeps only each day's CTD row.
 
     `min_days` is the roll rule — once the front contract is within this many
     calendar days of its assumed delivery date the deferred contract takes
@@ -341,7 +341,7 @@ def net_basis(
         .filter(pl.col("ts") >= pl.col("issue_date"))
     )
 
-    priced = quotes.with_columns(
+    return quotes.with_columns(
         accrued_interest(pl.col("coupon"), pl.col("maturity"), pl.col("ts")).alias("ai_now"),
         accrued_interest(pl.col("coupon"), pl.col("maturity"), pl.col("delivery")).alias("ai_dlv"),
         coupon_period(pl.col("maturity"), pl.col("ts"))[1].alias("next_coupon"),
@@ -384,6 +384,19 @@ def net_basis(
         ).alias("implied_repo"),
     )
 
+
+def net_basis(
+    roots: list[str] | None = None,
+    start: str = "2010-01-01",
+    min_days: int = 15,
+) -> pl.DataFrame:
+    """Daily CTD net basis per contract root.
+
+    One row per (ts, root): the deliverable with the highest implied repo,
+    its net basis in 32nds, and the implied-repo spread to financing in bps.
+    See `basket_basis` for the roll rule.
+    """
+    priced = basket_basis(roots, start, min_days)
     ctd = (
         priced.drop_nulls(["implied_repo", "net_basis"])
         .sort(["ts", "root", "implied_repo"], descending=[False, False, True])

@@ -47,6 +47,8 @@ from research.term_premium import CURVE as TP_CURVE, FLY as TP_FLY, TP_WINDOWS, 
 from research.inflation_carry import BREAKEVENS, HORIZONS, carry, carry_table, load_inflation
 from research.sofr_ff import AHEADS as SF_AHEADS, LOOKBACKS as SF_LOOKBACKS, study as sofr_ff_study
 from research.cta import TENORS as CTA_TENORS, study as cta_study
+from research.basis_basket import (CURVE_CHOICES as BASIS_CURVES, LOOKBACKS as BASIS_LOOKBACKS,
+                                   ROOTS as BASIS_ROOTS, study as basis_study)
 from research.gamma import CFTC_LOOKBACKS as GAMMA_CFTC_LOOKBACKS, study as gamma_study
 
 from research.panel import (
@@ -1624,6 +1626,8 @@ def tabs() -> html.Div:
                 selected_style=SELECTED_TAB_STYLE, children=fair_value_tab()),
         dcc.Tab(label="Idio", value="idio", style=TAB_STYLE,
                 selected_style=SELECTED_TAB_STYLE, children=idio_tab()),
+        dcc.Tab(label="Basis", value="basis", style=TAB_STYLE,
+                selected_style=SELECTED_TAB_STYLE, children=basis_tab()),
     ])], className="research-bench")
 
 
@@ -2309,6 +2313,119 @@ def gamma_view(result: dict, window: str) -> html.Div:
     return html.Div(parts)
 
 
+BASIS_BOND_HEADERS = {
+    "bond": "Bond", "cusip": "CUSIP", "cf": "CF", "clean": "Price", "yld": "Yield", "gross_32": "Gross (32)",
+    "carry_32": "Carry (32)", "net_32": "Net (32)", "implied_repo": "IRR %", "irr_spread_bp": "IRR − fin (bp)",
+    "dv01_usd": "DV01 $", "dv01_cf_usd": "DV01/CF $", "p_ctd": "P(CTD)",
+}
+BASIS_BOND_FORMATS = {
+    "cf": "{:.4f}", "clean": "{:.3f}", "yld": "{:.3f}", "gross_32": "{:+.2f}", "carry_32": "{:+.2f}",
+    "net_32": "{:+.2f}", "implied_repo": "{:.3f}", "irr_spread_bp": "{:+.0f}", "dv01_usd": "{:,.2f}",
+    "dv01_cf_usd": "{:,.2f}", "p_ctd": "{:.1f}%",
+}
+BASIS_CTD_COLOURS = [ORANGE, C0, C1, C2, "#8E44AD", "#16A085", "#C0392B", "#2C3E50", "#B7950B", "#7F8C8D"]
+
+
+def basis_tab() -> html.Div:
+    controls = html.Div([
+        field("curve the basket sits on", dcc.Dropdown(id="basis-curve", value="auto", clearable=False, options=[
+            {"label": "contract default", "value": "auto"}, *[{"label": k, "value": k} for k in BASIS_CURVES]])),
+        field("vol lookback (days)", dcc.Dropdown(id="basis-lookback", value=252, clearable=False,
+                                                  options=[{"label": f"{k}", "value": k} for k in BASIS_LOOKBACKS])),
+        html.Button("Update", id="basis-run", n_clicks=0, className="ref-btn",
+                    style={**btn_style(primary=True), "width": "100%", "marginTop": 4, "marginBottom": 14}),
+        info("The basket table",
+             "Each deliverable is priced against the future. Gross basis = price − future × CF. Carry = gross − net. "
+             "Net basis is what is left after carry to delivery: the delivery option premium. IRR is the implied "
+             "repo of buying the bond and delivering it; the highest IRR is the CTD.",
+             "DV01 $ is per contract face; DV01/CF is the DV01 the future would carry if that bond were the one "
+             "delivered. Financing is the front SOFR future, delivery the last business day of the month."),
+        info("The CTD matrix",
+             "Each bond's forward yield is shifted by a parallel move plus a curve move, the bond is repriced on "
+             "the delivery date, and the cheapest is the lowest price / CF. A bond's shift is level + curve × "
+             "(its maturity − short tenor) / (long tenor − short tenor): level is the short leg's yield change, "
+             "curve the change in the curve itself.",
+             "Scenarios run to ±2 sd of each over the days left to delivery, from daily changes over the lookback, "
+             "with their correlation. A cell's % is the probability of ending nearest that cell; P(CTD) sums the "
+             "probability of every scenario in which the bond is cheapest. Not modelled: end-of-month and timing "
+             "options, repo specialness, moves that are not level plus this one curve."),
+    ], className="research-controls")
+    return html.Div(style={"padding": "14px 24px"}, children=[
+        dcc.Tabs(id="basis-tabs", value="TY", children=[
+            dcc.Tab(label=root, value=root, style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED)
+            for root in BASIS_ROOTS]),
+        html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)", "gap": 26,
+                        "alignItems": "start", "paddingTop": 14}, children=[
+            controls, dcc.Loading(html.Div(id="basis-out"), type="dot")]),
+        dcc.Store(id="basis-shown"),
+    ])
+
+
+def basis_view(result: dict) -> html.Div:
+    bonds, ctd, moves, matrix = result["bonds"], result["ctd"], result["moves"], result["matrix"]
+    labels = {b["cusip"]: f"{b['coupon']:g} {b['maturity']:%b-%y}" for b in bonds.iter_rows(named=True)}
+    frame = bonds.select(pl.Series("bond", [labels[c] for c in bonds["cusip"]]), "cusip", "cf", "clean", "yld",
+                         "gross_32", "carry_32", "net_32", "implied_repo", "irr_spread_bp", "dv01_usd",
+                         "dv01_cf_usd", (pl.col("p_ctd") * 100).alias("p_ctd")).to_pandas()
+    for column, fmt in BASIS_BOND_FORMATS.items():
+        frame[column] = frame[column].map(fmt.format)
+
+    def bond_style(column, _value, row):
+        base = {"textAlign": "left"} if column in ("bond", "cusip") else {}
+        return {**base, "color": ORANGE, "fontWeight": "bold"} if row["cusip"] == ctd["cusip"] else base or None
+
+    # the matrix: rows are curve moves, columns parallel moves; each distinct CTD gets its own colour
+    cheapest = [[matrix["cusips"][i] for i in row] for row in matrix["ctd"]]
+    seen = list(dict.fromkeys(c for row in cheapest for c in row))
+    colour = {c: BASIS_CTD_COLOURS[i % len(BASIS_CTD_COLOURS)] for i, c in enumerate(seen)}
+    level_cols = [f"{v:+.0f}" for v in matrix["level"]]
+    grid, owner = [], {}
+    for r, curve_move in enumerate(matrix["curve"]):
+        row = {"curve": f"{curve_move:+.0f}"}
+        for c, name in enumerate(level_cols):
+            row[name] = f"{labels[cheapest[r][c]]} · {matrix['mass'][r, c]:.0%}"
+            owner[(row["curve"], name)] = cheapest[r][c]
+        grid.append(row)
+    middle = (grid[len(grid) // 2]["curve"], level_cols[len(level_cols) // 2])  # the no-move scenario
+
+    def matrix_style(column, _value, row):
+        if column == "curve":
+            return {"fontWeight": "bold"}
+        return {"color": colour[owner[(row["curve"], column)]], "textAlign": "center",
+                **({"fontWeight": "bold"} if (row["curve"], column) == middle else {})}
+
+    notes = []
+    if ctd["net_32"] < 0:
+        notes.append(note(f"The CTD's net basis is negative ({ctd['net_32']:+.2f}/32): bond and futures closes are "
+                          "probably not simultaneous, or the financing proxy is below true repo.", "warn"))
+    if len(bonds) < result["basket_size"]:
+        notes.append(note(f"{len(bonds)} of {result['basket_size']} deliverables are priced on {result['asof']}; "
+                          "the rest are left out.", "warn"))
+    return html.Div([
+        _stats_bar(stat_block("contract", result["contract"]), stat_block("as of", str(result["asof"])),
+                   stat_block("future", f"{result['fut_px']:.4f}"),
+                   stat_block("delivery", f"{result['delivery']} · {result['days']}bd"),
+                   stat_block("financing", f"{result['financing']:.3f}%"),
+                   stat_block("CTD", labels[ctd["cusip"]]),
+                   stat_block("CTD net basis", f"{ctd['net_32']:+.2f}/32", alert=ctd["net_32"] < 0),
+                   stat_block("CTD IRR", f"{ctd['implied_repo']:.3f}%"),
+                   stat_block("CTD DV01/CF", f"${ctd['dv01_cf_usd']:,.2f}"),
+                   stat_block("P(CTD)-weighted DV01/CF", f"${result['blend_dv01']:,.2f}")),
+        *notes,
+        table(frame, title="deliverable basket · richest IRR first · gross, carry and net basis in 32nds",
+              columns=list(BASIS_BOND_HEADERS), headers=BASIS_BOND_HEADERS, cell_style=bond_style),
+        html.Div(style={"height": 18}),
+        table(pl.DataFrame(grid).to_pandas(), title=f"cheapest to deliver at delivery · columns: parallel shift in "
+              f"bp · rows: {result['curve']} shift in bp · each cell: CTD · probability",
+              columns=["curve", *level_cols], headers={"curve": f"{result['curve']} / level"},
+              cell_style=matrix_style),
+        note(f"Over {result['days']} business days: level sd {moves['level']:.1f}bp, {result['curve']} sd "
+             f"{moves['curve']:.1f}bp, correlation {moves['corr']:+.2f} ({moves['observations']} daily changes). "
+             f"Scenarios shown at 0, ±0.5, ±1, ±1.5 and ±2 sd; edge cells hold the tails. The future at delivery, "
+             f"averaged over all scenarios with no option value left: {result['expected_future']:.4f}.", "dim"),
+    ])
+
+
 def idio_tab() -> html.Div:
     return remember_controls(html.Div(style={"padding": "14px 24px"}, children=[
         dcc.Tabs(id="idio-tabs", value="sf", children=[
@@ -2899,6 +3016,20 @@ def register_callbacks(app) -> None:
                 return (no_update,) * (1 + len(WINDOW_PRESETS))
             selected = ctx.triggered_id.removeprefix(f"{prefix}-window-")
             return (selected, *[btn_style(primary=(key == selected)) for key in WINDOW_PRESETS])
+
+    @app.callback(Output("basis-out", "children"), Output("basis-shown", "data"),
+                  Input("basis-run", "n_clicks"), Input("bench-tabs", "value"), Input("basis-tabs", "value"),
+                  State("basis-curve", "value"), State("basis-lookback", "value"), State("basis-shown", "data"))
+    def _basis(_clicks, tab, root, curve, lookback, shown):
+        # Runs on Update, when the Basis tab is first opened, and when the contract sub-tab changes.
+        key = f"{root}|{curve}|{lookback}"
+        if tab != "basis" or (ctx.triggered_id != "basis-run" and shown == key):
+            return no_update, no_update
+        try:
+            result = basis_study(root, curve=None if curve in (None, "auto") else curve, lookback=int(lookback or 252))
+            return basis_view(result), key
+        except Exception as exc:
+            return note(f"{root} basket failed: {type(exc).__name__}: {exc}", "bad"), no_update
 
     @app.callback(Output("sf-out", "children"), Output("sf-shown", "data"),
                   Input("sf-run", "n_clicks"), Input("bench-tabs", "value"), Input("idio-tabs", "value"),

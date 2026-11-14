@@ -202,6 +202,31 @@
 .sd-v { grid-column: 2; text-align: right; font-weight: bold; white-space: nowrap; }
 .sd-n { grid-column: 3; color: #777777; }
 
+.sd-bbg-panel { margin: 12px 0 20px; }
+.sd-futures-heading { display: flex; align-items: center; gap: 12px; }
+.sd-futures-heading > .sd-h { flex: 1; }
+.sd-futures-activity {
+    flex: 0 0 11px; width: 11px; height: 11px; margin-right: 4px;
+    border: 2px solid #88888855; border-radius: 50%; box-sizing: border-box;
+}
+.sd-futures-activity--updating {
+    border-top-color: #ffcc33;
+    animation: sd-quote-refresh 0.8s linear infinite;
+}
+@keyframes sd-quote-refresh { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+    .sd-futures-activity--updating { animation: none; border-color: #ffcc33; }
+}
+.sd-bbg-controls { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+.sd-bbg-controls button:disabled { opacity: 0.55; cursor: wait; }
+.sd-bbg-output > summary { cursor: pointer; font-size: 11px; padding: 4px 0; }
+.sd-bbg-console {
+    background: #15181d; color: #dce2eb; border: 1px solid #454951;
+    border-radius: 3px; padding: 10px 12px; margin: 8px 0 0;
+    font: 11px/1.5 Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere;
+    min-height: 80px; max-height: 240px; overflow: auto;
+}
+
 /* ---- Deep Dive card ----------------------------------------------------------- */
 .sd-deep-tabs { display: flex; gap: 4px; margin-top: 12px; border-bottom: 1px solid #D4D4D4; }
 .sd-deep-tab { padding: 6px 12px; background: #F7F7F7; border: 1px solid #D4D4D4; border-bottom: 0; cursor: pointer; font: inherit; }
@@ -212,7 +237,8 @@
 .sd-card[data-deep-tab="details"] .sd-chart-tools { display: none; }
 .sd-deep-details .sd-kv { max-width: 900px; }
 .sd-deep-details .sd-v { white-space: normal; overflow-wrap: anywhere; text-align: left; }
-.sd-deep-details .sd-kv { grid-template-columns: max-content minmax(0, 1fr) minmax(0, max-content); }
+.sd-deep-details .sd-kv { grid-template-columns: max-content minmax(0, 1fr); }
+.sd-deep-details .sd-kv .sd-n { display: none; }
 .sd-card-head {
     display: flex;
     flex-wrap: wrap;

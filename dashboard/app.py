@@ -38,7 +38,10 @@ from dash import ALL, MATCH, Input, Output, Patch, State, ctx, dcc, html
 import utils.helpers
 from dashboard import runner
 from dashboard import markets
+from dashboard import futures
+from dashboard import market_pull
 from dashboard import portfolio
+from dashboard import tickets
 from dashboard.charts import (
     chart_image,
     dual_theme_charts,
@@ -629,7 +632,7 @@ def _headline_cell_style(column: str, value, row: dict) -> dict | None:
 def _market_content() -> list:
     """Yields, curves and flies as one table: last level (yields in %, the rest in bps)
     and the 1d, 1m and YTD moves in bps. Read from the cache a Ref fills."""
-    frame, pulled = markets.cached()
+    frame, _pulled = markets.cached()
     if frame is None or frame.is_empty():
         return [html.Div("Market data not loaded yet: click Ref.", className="sd-note")]
     lines = markets.board(frame)
@@ -639,13 +642,15 @@ def _market_content() -> list:
         rows += [{"group": title if i == 0 else "", "name": r["name"], "last": _fnum(r["last"], last_fmt),
                   **{k: _fnum(r[k], "+.1f") for k in ("d1", "m1", "ytd")}, "pos": _held_text(r["held"])}
                  for i, r in enumerate(lines[key])]
-    stamp = f"bar {markets.asof(frame)} · pulled {_clock(pulled)} · changes in bps"
+    stamp = markets.source_stamp(frame)
     if markets.HELD_IS_EXAMPLE and markets.HELD:
         stamp += " · * example position: no trades are wired to the dashboard yet"
     return [
+        html.Div(stamp, className="sd-note", style={"marginBottom": 8},
+                 title="Bloomberg snapshot ingestion time from the stored source rows, not the dashboard refresh time or exchange last-trade time."),
         _grid_table(pd.DataFrame(rows), columns=[k for k, _ in HEADLINE_COLUMNS], headers=dict(HEADLINE_COLUMNS),
                     cell_style=_headline_cell_style),
-        html.Div(stamp, className="sd-note", style={"marginTop": 6}),
+        html.Div("Changes in bps", className="sd-note", style={"marginTop": 6}),
     ]
 
 
@@ -769,6 +774,11 @@ def _model_positions(rows: list[dict]) -> list:
         html.Div("Exp bp is what the trade expected at its entry; Captured is P&L as a share of it. These are the "
                  "signals' own trades, not the broker's fills.", className="sd-note", style={"marginTop": 6}),
     ]
+
+
+def _portfolio_model(rows: list[dict]) -> list:
+    """The model's side of the Portfolio tab: its positions, then the orders that express them."""
+    return [*_model_positions(rows), *tickets.content(rows, USD_PER_BP, _display_name)]
 
 
 def _trade_page_label(n: int, page: int, size: int = TRADES_PER_PAGE) -> str:
@@ -1501,6 +1511,7 @@ def _btn_style(primary: bool = False) -> dict:
         "background": ORANGE if primary else "#FFFFFF",
         "color": "#FFFFFF" if primary else TEXT,
         "borderRadius": 3,
+        "boxShadow": "inset 0 -2px 0 #ffcc33" if primary else "none",
     }
 
 
@@ -1715,6 +1726,8 @@ def build_app() -> dash.Dash:
                             html.Button("Ref", id="refresh-market", n_clicks=0, className="ref-btn",
                                         style=_btn_style(primary=True)),
                         ]),
+                        market_pull.layout(),
+                        futures.layout(),
                         html.Div(id="market-content", children=_market_content()),
                     ]),
                 ),
@@ -1729,7 +1742,7 @@ def build_app() -> dash.Dash:
                     label="Portfolio", value="portfolio", style=tab_style, selected_style=selected_tab_style,
                     # what the signals hold and how close each is to its exit, then the broker's account
                     children=html.Div(className="sd-page", children=[
-                        html.Div(id="model-positions", children=_model_positions(rows)),
+                        html.Div(id="model-positions", children=_portfolio_model(rows)),
                         portfolio.layout(),
                     ]),
                 ),
@@ -1762,6 +1775,7 @@ def build_app() -> dash.Dash:
             dcc.Loading(
                 html.Div(id="page-body"),
                 custom_spinner=shimmer_loader(image="guy.png"),
+                target_components={"page-body": "children"},
                 overlay_style={"visibility": "visible"},
                 parent_className="dashboard-page-loader",
             ),
@@ -1772,6 +1786,7 @@ def build_app() -> dash.Dash:
                     **{"aria-pressed": "false", "aria-label": "Toggle dark mode"}),
     ])
     portfolio.register_callbacks(app)
+    futures.register_callbacks(app)
 
     app.clientside_callback(
         f"function(_n) {{ return window.innerWidth < {PHONE_MAX_WIDTH} ? 'phone' : 'desktop'; }}",
@@ -1841,7 +1856,7 @@ def build_app() -> dash.Dash:
         except Exception:  # db down: the market keeps its last pull, as the signals do
             pass
         # the Market and Portfolio tabs read the same pull, so one Ref brings all three up to date
-        return _overview_content(rows), _market_content(), _model_positions(rows)
+        return _overview_content(rows), _market_content(), _portfolio_model(rows)
 
     app.callback(
         Output("overview-content", "children"),
@@ -1864,6 +1879,7 @@ def build_app() -> dash.Dash:
         Input("refresh-market", "n_clicks"),
         prevent_initial_call=True,
     )(_refresh_market)
+    market_pull.register_callbacks(app, _market_content)
 
     def _update(_ref, *rest):
         *_window_clicks, _snap, window, snap_range, page, viewport = rest

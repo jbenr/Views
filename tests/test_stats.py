@@ -204,3 +204,39 @@ def test_beta_cv_and_quality_weight():
     w_noisy = quality_weight(r2, beta_cv(noisy, lookback=60)).drop_nulls()
     assert w_stable.mean() > w_noisy.mean()
     assert w_stable.max() <= 1.0
+
+
+def test_bond_price_yield_and_dv01():
+    import datetime as dt
+    from utils import bonds
+    d = dt.date
+    assert bonds.clean_price(4.0, d(2036, 11, 15), d(2026, 11, 15), 4.0) == pytest.approx(100.0)
+    price = float(bonds.clean_price(4.25, d(2034, 11, 15), d(2026, 11, 12), 4.31))
+    assert bonds.yield_to_maturity(4.25, d(2034, 11, 15), d(2026, 11, 12), price) == pytest.approx(4.31)
+    assert bonds.accrued(4.0, d(2036, 11, 15), d(2027, 2, 15)) == pytest.approx(2.0 * 92 / 181)  # act/act
+    assert bonds.dv01(4.0, d(2036, 11, 15), d(2026, 11, 15), 4.0) == pytest.approx(0.0818, abs=2e-4)
+    # an end-of-month maturity pays on month ends, not an invalid 31st
+    assert bonds.coupon_schedule(d(2031, 8, 31), d(2026, 11, 12))[1][0] == d(2027, 2, 28)
+
+
+def test_ctd_switches_to_long_duration_when_yields_rise():
+    import datetime as dt
+    import numpy as np
+    import polars as pl
+    from research import basis_basket as bb
+    from utils.bonds import clean_price
+    delivery = dt.date(2026, 12, 31)
+    rows = []
+    for coupon, maturity in ((6.0, dt.date(2034, 2, 15)), (6.0, dt.date(2036, 11, 15))):
+        # 6% bonds at a 6% yield with factors of about 1: equally cheap, the classic crossover
+        rows.append(dict(cusip=str(maturity), coupon=coupon, maturity=maturity, delivery=delivery,
+                         cf=float(clean_price(coupon, maturity, delivery, 6.0)) / 100, fwd_yld=6.0,
+                         years=(maturity - delivery).days / 365.25))
+    basket = pl.DataFrame(rows)
+    level = np.array([-50.0, 50.0])
+    cheapest = bb.converted_prices(basket, "7s10s", level, np.array([0.0])).argmin(axis=0)[0]
+    assert list(cheapest) == [0, 1]  # yields down: short duration is CTD; yields up: long duration
+    steeper = bb.converted_prices(basket, "7s10s", np.array([0.0]), np.array([20.0])).argmin(axis=0)[0, 0]
+    assert steeper == 1  # a steeper curve cheapens the longer bond
+    weights = bb.scenario_weights(dict(corr=-0.4))
+    assert weights.sum() == pytest.approx(1.0) and weights.shape == (len(bb.FINE), len(bb.FINE))

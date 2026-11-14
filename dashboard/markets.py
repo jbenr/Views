@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import json
 from pathlib import Path
+from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -50,15 +53,58 @@ def pull(today: dt.date | None = None) -> pl.DataFrame:
     wake=False: the overview must not hang on a sleeping database."""
     today = today or dt.date.today()
     long_df = query_db(
-        "SELECT ts, ticker, px_last::float AS px FROM md.index_eod WHERE ticker = ANY(%s) AND ts >= %s ORDER BY ts",
+        "SELECT ts, ticker, px_last::float AS px, updated_at, is_live "
+        "FROM md.index_eod WHERE ticker = ANY(%s) AND ts >= %s ORDER BY ts",
         params=[list(TICKERS.values()), dt.date(today.year - 1, 12, 1)],
         wake=False,
     )
     frame = long_to_wide(long_df, TICKERS, bps_cols=list(YIELDS))  # curve tickers are quoted in bps already
+    # Store provenance with the prices so a later DB/cache refresh cannot make
+    # yesterday's quote appear freshly observed. Ignore rows without a price.
+    long_frame = pl.from_pandas(long_df) if not isinstance(long_df, pl.DataFrame) else long_df
+    latest = (long_frame.filter(pl.col("px").is_not_null() & pl.col("px").cast(pl.Float64).is_finite())
+              .sort("ts").unique("ticker", keep="last"))
+    source = latest.select("ticker", "ts", "updated_at", "is_live").to_dicts()
+    frame = frame.with_columns(pl.lit(json.dumps(source, default=str)).alias("_source_rows"))
     path = _cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    frame.write_parquet(path)
+    temporary = path.with_name(f".{path.stem}.{uuid4().hex}.parquet")
+    try:
+        frame.write_parquet(temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return frame
+
+
+def source_stamp(frame: pl.DataFrame) -> str:
+    """Describe the provider update of the displayed rows, never cache mtime."""
+    if frame.is_empty() or "_source_rows" not in frame.columns:
+        return f"Data as of {asof(frame) or 'unknown'} · source update time unavailable; click Ref to load it"
+    source = json.loads(frame["_source_rows"][0])
+    if not source:
+        return "Data as of unknown · no source prices available"
+    dates = sorted({str(row["ts"])[:10] for row in source})
+    bars = dates[0] if len(dates) == 1 else f"{dates[0]} – {dates[-1]} (mixed dates)"
+    times = []
+    for row in source:
+        try:
+            stamp = dt.datetime.fromisoformat(row["updated_at"])
+            if stamp.tzinfo is not None:
+                times.append(stamp.astimezone(ZoneInfo("America/New_York")))
+        except (TypeError, ValueError):
+            pass
+    # Historical bars have a date, not a precise observation time; live rows
+    # use the time Bloomberg's snapshot was written to the source database.
+    mode = "live snapshot" if all(r["is_live"] for r in source) else "EOD / mixed snapshot"
+    if not times:
+        return f"Data as of {bars} · Bloomberg update time unavailable"
+    start, end = min(times), max(times)
+    fmt = "%b %d, %Y %I:%M:%S %p %Z"
+    updated = start.strftime(fmt) if start == end else f"{start.strftime(fmt)} – {end.strftime(fmt)}"
+    missing = len(source) - len(times)
+    suffix = f" · {missing} source timestamps unavailable" if missing else ""
+    return f"Data as of {bars} · Bloomberg {mode} saved {updated}{suffix}"
 
 
 def cached() -> tuple[pl.DataFrame | None, dt.datetime | None]:

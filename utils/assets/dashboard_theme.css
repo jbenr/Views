@@ -26,6 +26,11 @@
     cursor: pointer;
 }
 html[data-sd-theme="dark"] { color-scheme: dark; background: #17191d; }
+/* Mobile margins and overscroll expose the document canvas outside .sd-app. */
+html[data-sd-theme="dark"] body {
+    background: #17191d !important;
+    color: #dcdfe4;
+}
 html[data-sd-theme="dark"] .sd-app {
     background: #17191d !important;
     color: #dcdfe4 !important;
@@ -89,3 +94,37 @@ html[data-sd-theme="dark"] .sd-app #dashboard-tabs { border-bottom-color: #45495
 html[data-sd-theme="dark"] body .dash-dropdown-option { box-shadow: 0 -1px 0 0 #2c3038 inset; }
 html[data-sd-theme="dark"] body .dash-dropdown-option:hover { background: #303640; }
 html[data-sd-theme="dark"] body .dash-dropdown-option:has(input:checked) { background: #40372a; }
+
+/* Selected tabs keep a clear gold accent above the neutral dark-theme rules. */
+html[data-sd-theme="dark"] .sd-app #dashboard-tabs .tab--selected,
+html[data-sd-theme="dark"] .sd-app .sd-deep-tab[aria-pressed="true"] {
+    color: #ffcc33 !important;
+    background: #373020 !important;
+    border-top-color: #ffcc33 !important;
+    font-weight: 700 !important;
+}
+
+/* Action buttons share the club burgundy in both themes; tabs retain gold selection. */
+.sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)),
+html[data-sd-theme="dark"] .sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)) {
+    background: #773141 !important;
+    color: #ffffff !important;
+    border-color: #773141 !important;
+    border-style: solid;
+    border-width: 1px;
+    border-radius: 3px;
+    padding: 6px 14px;
+    font-size: 12px;
+    cursor: pointer;
+}
+.sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)):hover:not(:disabled),
+html[data-sd-theme="dark"] .sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)):hover:not(:disabled) {
+    background: #8d3c4f !important;
+}
+.sd-app button:not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)):disabled { opacity: 0.55; cursor: default; }
+.sd-app button:not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)):focus-visible { outline: 2px solid #ffcc33; outline-offset: 2px; }
+html[data-sd-theme="dark"] .sd-app .sd-deep-tab[aria-pressed="true"] {
+    background: #773141 !important;
+    color: #ffcc33 !important;
+    border-top-color: #ffcc33 !important;
+}

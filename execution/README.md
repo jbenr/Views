@@ -16,12 +16,45 @@ variables override these values. No credentials are needed in this file.
    `VIEWS_IB_ACCOUNT` if the login has multiple accounts. Paper TWS usually
    uses 7497; paper Gateway usually uses 4002. Check the actual API settings.
 4. Launch `python -m dashboard.app`, open **Portfolio**, and click
-   **Refresh IBKR portfolio**. No network request occurs on page load.
+   **Connect IBKR**. No network request occurs on page load.
 
-The connector uses `ib_async`, opens a read-only connection for each refresh,
-requests balances, positions, all open orders, recent completed orders and
-executions, filters to one account, then disconnects. Refresh has a 45-second
-overall deadline. A failed refresh preserves the previous snapshot with its
+**Connect IBKR** (`execution/session.py`) holds one read-only connection for
+as long as the dashboard process runs. If nothing is listening on the API port
+and the host is local, it starts the newest IB Gateway under `C:\Jts\ibgateway`
+and waits up to five minutes for you to log in there (password and 2FA are
+typed into Gateway, never into the dashboard), then connects and takes a
+snapshot. The button becomes **Cancel** while waiting and **Disconnect** once
+connected; Gateway itself is left running. A dropped connection (Gateway's
+daily restart) shows as not connected and is one click to restore. A dashboard
+restart or `--reload` drops the connection too.
+
+**Automatic login.** With [IBC](https://github.com/IbcAlpha/IBC) unpacked at
+`C:\IBC` and `IbLoginId` / `IbPassword` filled in at
+`%USERPROFILE%\Documents\IBC\config.ini` (outside the repo, plaintext), Connect
+starts Gateway through IBC, which fills in the login form; you only approve the
+2FA prompt on your phone. A missed prompt is re-sent. The dashboard never reads
+the password. IBC logs to `C:\IBC\Logs`. With `IbLoginId` blank, Connect falls
+back to opening Gateway for a manual login.
+
+**Gateway needs a desktop.** Its login window only opens in a Windows session a
+user is logged on to. A dashboard started over SSH (the tmux session) runs in
+session 0, which has none, so Connect starts Gateway through the scheduled task
+`IB Gateway` instead, which runs `C:\IBC\launch_gateway.cmd` (written by Connect,
+no credentials) on the logged-on desktop. Someone must be logged on to Windows
+on that machine; a disconnected Remote Desktop session counts, a signed-out one
+does not. Create the task once, in PowerShell:
+
+```powershell
+Register-ScheduledTask -TaskName 'IB Gateway' `
+  -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c C:\IBC\launch_gateway.cmd') `
+  -Principal (New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive) `
+  -Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero))
+```
+
+The connector uses `ib_async`. **Refresh IBKR** reuses the open connection, or
+without one opens a read-only connection just for that refresh. It requests
+balances, positions, all open orders, recent completed orders and executions,
+filtered to one account. Refresh has a 45-second overall deadline. A failed refresh preserves the previous snapshot with its
 original timestamp. This is a snapshot viewer, not a streaming order monitor.
 TWS order/execution history is limited; this is not a full historical broker
 reconciliation or strategy PnL service. Account summaries retain currencies;
