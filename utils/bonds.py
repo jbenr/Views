@@ -7,6 +7,7 @@ and coupons are in percent.
     clean_price(4.25, date(2034, 11, 15), date(2026, 11, 12), 4.31)
     yield_to_maturity(4.25, date(2034, 11, 15), date(2026, 11, 12), 99.59)
     dv01(4.25, date(2034, 11, 15), date(2026, 11, 12), 4.31)   # price points per bp
+    bond_label(4.5, date(2036, 11, 15))                        # '4.5 11/15/36'
 """
 
 from __future__ import annotations
@@ -15,6 +16,11 @@ import calendar
 import datetime as dt
 
 import numpy as np
+
+
+def bond_label(coupon: float, maturity: dt.date) -> str:
+    """The street name of a Treasury, coupon then maturity: '4 11/15/36', '4.5 2/15/36'."""
+    return f"{coupon:g} {maturity.month}/{maturity.day}/{maturity:%y}"
 
 
 def _months_back(date: dt.date, months: int) -> dt.date:

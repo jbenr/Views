@@ -36,6 +36,13 @@ easier to read but divides by days-to-delivery and so amplifies a fixed price
 error as delivery approaches — median |spread| runs 88bp inside 30 days
 against 23bp beyond 105. Treat it as a diagnostic, not a signal.
 
+Strike times. Futures prices are the 3pm New York settlement; md.ust_eod bond
+closes are 5pm. Mixing them puts the 3pm-to-5pm market move into the basis,
+which for TY is 3.7/32 of daily noise against 0.5/32 on synchronous closes.
+Everything here therefore defaults to the 3pm bond closes in md.ust_eod_3pm
+(data_pull/pull_dlv_3pm.py, every deliverable from 2008-07-15); pass
+cash_close="5pm" for the md.ust_eod closes, which go back further.
+
 Two approximations, both deliberate and both material enough to state:
 
   * There is no repo rate in the database. Financing is proxied by the front
@@ -71,6 +78,10 @@ MONTH_CODES = {
 # transposed; the issue-date filter catches most of those and this catches
 # the rest.
 PRICE_BOUNDS = (20.0, 200.0)
+
+# Bond closes by strike time. Futures settle at 3pm New York; see the module
+# docstring for why the choice matters.
+CASH_TABLES = {"5pm": "md.ust_eod", "3pm": "md.ust_eod_3pm"}
 
 
 # ── loaders ──────────────────────────────────────────────────────────────────
@@ -139,12 +150,16 @@ def load_bond_terms(cusips: list[str]) -> pl.DataFrame:
     )
 
 
-def load_deliverable_prices(cusips: list[str], start: str) -> pl.DataFrame:
-    """Clean prices for deliverable CUSIPs: ts, cusip, clean."""
+def load_deliverable_prices(cusips: list[str], start: str, cash_close: str = "3pm") -> pl.DataFrame:
+    """Clean prices for deliverable CUSIPs: ts, cusip, clean.
+
+    `cash_close` picks the bond close: "3pm" is md.ust_eod_3pm, struck with
+    the futures settlement and stored from 2008-07-15; "5pm" is md.ust_eod.
+    """
     raw = query_db(
-        """
+        f"""
         SELECT ts, left(cusip, 8) AS cusip, px_last::float AS clean
-        FROM md.ust_eod
+        FROM {CASH_TABLES[cash_close]}
         WHERE left(cusip, 8) = ANY(%s) AND ts >= %s
           AND px_last BETWEEN %s AND %s
         ORDER BY ts
@@ -286,11 +301,16 @@ def basket_basis(
     roots: list[str] | None = None,
     start: str = "2010-01-01",
     min_days: int = 15,
+    cash_close: str = "3pm",
 ) -> pl.DataFrame:
     """Every deliverable of the chosen contract, each day, priced against the future.
 
     One row per (ts, root, cusip): forward price, invoice, gross and net basis in
     price points and implied repo. `net_basis` keeps only each day's CTD row.
+
+    Bond closes default to 3pm so they are struck with the futures settlement;
+    days with no 3pm close (early market closes, anything before 2008-07-15)
+    drop out.
 
     `min_days` is the roll rule — once the front contract is within this many
     calendar days of its assumed delivery date the deferred contract takes
@@ -305,7 +325,7 @@ def basket_basis(
     )
     cusips = baskets["cusip"].unique().to_list()
     terms = load_bond_terms(cusips)
-    prices = load_deliverable_prices(cusips, start)
+    prices = load_deliverable_prices(cusips, start, cash_close)
     financing = load_financing(start)
 
     observed_last = {
@@ -389,14 +409,17 @@ def net_basis(
     roots: list[str] | None = None,
     start: str = "2010-01-01",
     min_days: int = 15,
+    cash_close: str = "3pm",
 ) -> pl.DataFrame:
     """Daily CTD net basis per contract root.
 
     One row per (ts, root): the deliverable with the highest implied repo,
     its net basis in 32nds, and the implied-repo spread to financing in bps.
     See `basket_basis` for the roll rule.
+
+    Bond closes default to 3pm, as in `basket_basis`.
     """
-    priced = basket_basis(roots, start, min_days)
+    priced = basket_basis(roots, start, min_days, cash_close)
     ctd = (
         priced.drop_nulls(["implied_repo", "net_basis"])
         .sort(["ts", "root", "implied_repo"], descending=[False, False, True])
@@ -577,3 +600,131 @@ def futures_roll_panel(roll: pl.DataFrame) -> pl.DataFrame:
     for part in frames[1:]:
         panel = panel.join(part, on="ts", how="full", coalesce=True)
     return panel.sort("ts")
+
+
+# -- deliverable grades, conversion factors and bonds not yet issued ----------
+
+# CME deliverable grades in months. `lo`/`hi` bound the remaining maturity
+# counted from the first day of the delivery month (TU's upper bound counts
+# from the last day), `original` caps the term at issue, and `monthly` says
+# the conversion factor rounds maturity down to the month, not the quarter.
+DELIVERY_GRADES = {
+    "TU": dict(lo=21, hi=24, original=63, monthly=True),
+    "FV": dict(lo=50, hi=63, original=63, monthly=True),
+    "TY": dict(lo=78, hi=120, original=120, monthly=False),
+    "UXY": dict(lo=113, hi=120, original=120, monthly=False),
+    "US": dict(lo=180, hi=300, original=10_000, monthly=False),
+    "WN": dict(lo=300, hi=10_000, original=10_000, monthly=False),
+}
+# TY baskets stop at 8 years remaining from this contract month on (the
+# stored baskets run to 10 years before it).
+TY_SHORT_FROM = dt.date(2023, 9, 1)
+TY_SHORT_HI = 96
+
+
+def _add_months(date: dt.date, months: int) -> dt.date:
+    """`date` moved by `months`; a month-end stays a month-end."""
+    total = date.year * 12 + date.month - 1 + months
+    year, month = total // 12, total % 12 + 1
+    month_len = ((dt.date(year, month, 28) + dt.timedelta(days=4)).replace(day=1) - dt.timedelta(days=1)).day
+    is_month_end = (date + dt.timedelta(days=1)).month != date.month
+    return dt.date(year, month, month_len if is_month_end else min(date.day, month_len))
+
+
+def _whole_months(start: dt.date, end: dt.date) -> int:
+    return (end.year - start.year) * 12 + end.month - start.month - (1 if end.day < start.day else 0)
+
+
+def conversion_factor(root: str, coupon: float, maturity: dt.date, contract_month: dt.date) -> float:
+    """CME conversion factor: the bond's price per 1 face at a 6% yield on the
+    first day of the delivery month, maturity rounded down to the quarter
+    (month for TU and FV). Reproduces every stored factor to the 4th decimal."""
+    years, months = divmod(_whole_months(contract_month, maturity), 12)
+    monthly = DELIVERY_GRADES[root]["monthly"]
+    if not monthly:
+        months -= months % 3
+    c = coupon / 100.0
+    v = months if months < 7 else (months - 6 if monthly else 3)
+    a = 1.03 ** (-v / 6.0)
+    b = c / 2.0 * (6 - v) / 6.0
+    par = 1.03 ** -(2 * years if months < 7 else 2 * years + 1)
+    return round(a * (c / 2.0 + par + c / 0.06 * (1.0 - par)) - b, 4)
+
+
+def is_deliverable(root: str, maturity: dt.date, original_months: int, contract_month: dt.date) -> bool:
+    """Whether a bond's maturity and original term put it in the contract's basket."""
+    grade = DELIVERY_GRADES[root]
+    hi = TY_SHORT_HI if root == "TY" and contract_month >= TY_SHORT_FROM else grade["hi"]
+    if maturity < _add_months(contract_month, grade["lo"]) or original_months > grade["original"]:
+        return False
+    if root == "TU":
+        return maturity <= _add_months(_add_months(contract_month, 1) - dt.timedelta(days=1), hi)
+    if root == "US":
+        return maturity < _add_months(contract_month, hi)
+    return maturity <= _add_months(contract_month, hi)
+
+
+def load_new_issues() -> pl.DataFrame:
+    """Every first issue of a nominal coupon Treasury, reopenings left out:
+    cusip (8-char), term (months), issue_date, maturity, coupon (null until auctioned)."""
+    raw = query_db(
+        """
+        SELECT left(cusip, 8) AS cusip, min(issue_date)::date AS issue_date,
+               max(maturity_date)::date AS maturity, max(int_rate)::float AS coupon
+        FROM sec.auctioned_securities
+        WHERE security_type IN ('Note', 'Bond') AND inflation_index_security = 'No'
+          AND floating_rate = 'No'
+        GROUP BY 1
+        """
+    )
+    issues = pl.from_pandas(raw).with_columns(
+        pl.col("issue_date").cast(pl.Date), pl.col("maturity").cast(pl.Date)
+    )
+    # 2-, 3-, 5-, 7-, 10-, 20- and 30-year lines; the day of month differs
+    # between issue and maturity on some, so round to the year
+    return issues.with_columns(
+        (((pl.col("maturity") - pl.col("issue_date")).dt.total_days() / 365.25).round() * 12)
+        .cast(pl.Int32).alias("term")
+    ).sort("issue_date")
+
+
+def upcoming_deliverables(
+    root: str,
+    contract_month: dt.date,
+    last_delivery: dt.date,
+    asof: dt.date,
+    issues: pl.DataFrame,
+) -> list[dict]:
+    """Bonds deliverable into the contract that were not issued by `asof`.
+
+    Two kinds, both from `issues` (load_new_issues): bonds already announced
+    with an issue date after `asof`, and bonds not announced yet, placed by
+    stepping each line's last two issues forward at their own spacing
+    (monthly for 2s, 3s, 5s and 7s, quarterly for 10s, 20s and 30s). A bond
+    counts if it is issued before the contract's last delivery day.
+
+    Each is dict(cusip, term, issue_date, maturity, coupon); cusip and coupon
+    are None where Treasury has not set them yet.
+    """
+    out = []
+    for (term,), line in issues.group_by("term", maintain_order=True):
+        if line.height < 2:
+            continue
+        for row in line.filter(pl.col("issue_date") > asof).iter_rows(named=True):
+            out.append(row)
+        last, prior = line.row(-1, named=True), line.row(-2, named=True)
+        step = ((last["maturity"].year - prior["maturity"].year) * 12
+                + last["maturity"].month - prior["maturity"].month)
+        if step not in (1, 3):
+            continue
+        for k in range(1, 12):
+            issue = _add_months(last["issue_date"], k * step)
+            if issue >= last_delivery:
+                break
+            out.append(dict(cusip=None, term=term, issue_date=issue,
+                            maturity=_add_months(last["maturity"], k * step), coupon=None))
+    return sorted(
+        (b for b in out if asof < b["issue_date"] < last_delivery
+         and is_deliverable(root, b["maturity"], b["term"], contract_month)),
+        key=lambda b: b["maturity"],
+    )

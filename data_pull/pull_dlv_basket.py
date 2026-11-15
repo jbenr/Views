@@ -39,13 +39,17 @@ def ensure_dlv_basket_column(conn):
 
 
 def get_contracts(conn, only_missing: bool = True):
-    """Get contracts to update."""
+    """Get contracts to update.
+
+    A basket grows until delivery ends, because Bloomberg adds each newly
+    auctioned bond, so "missing" includes every contract still open.
+    """
     with conn.cursor() as cur:
         if only_missing:
             cur.execute("""
                 SELECT contract
                 FROM sec.fut_contracts
-                WHERE dlv_basket IS NULL
+                WHERE (dlv_basket IS NULL OR last_delivery_date >= CURRENT_DATE)
                   AND generic_ticker = ANY(%s)
                 ORDER BY contract_month DESC
             """, (DELIVERABLE_ROOTS,))

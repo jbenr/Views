@@ -89,6 +89,7 @@ STEPS = [
     ("fut",       "pull_fut_eod.py",             "md.fut_eod",                True),
     ("options",   "pull_options.py",             "md.opt_eod",                True),
     ("dlv",       "pull_dlv_basket.py",          "deliverable baskets",       True),
+    ("dlv_3pm",   "pull_dlv_3pm.py",             "md.ust_eod_3pm",            True),
     ("strips",    "pull_strips.py",              "md.strips_eod",             True),
     ("index",     "pull_index_eod.py",           "md.index_eod",              True),
     ("cftc",      "pull_cftc.py",                "md.cftc + md.cftc_combined", False),

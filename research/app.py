@@ -48,7 +48,7 @@ from research.inflation_carry import BREAKEVENS, HORIZONS, carry, carry_table, l
 from research.sofr_ff import AHEADS as SF_AHEADS, LOOKBACKS as SF_LOOKBACKS, study as sofr_ff_study
 from research.cta import TENORS as CTA_TENORS, study as cta_study
 from research.basis_basket import (CURVE_CHOICES as BASIS_CURVES, LOOKBACKS as BASIS_LOOKBACKS,
-                                   ROOTS as BASIS_ROOTS, study as basis_study)
+                                   ROOTS as BASIS_ROOTS, new_issue_history, study as basis_study)
 from research.gamma import CFTC_LOOKBACKS as GAMMA_CFTC_LOOKBACKS, study as gamma_study
 
 from research.panel import (
@@ -85,6 +85,7 @@ from utils.research_app import (
     shimmer_loader, stat_block,
 )
 from utils.viz import table_div
+from utils.bonds import bond_label
 
 DEFAULT_TARGET = "10s20s30s"
 DEFAULT_FEATURES: list[str] = []
@@ -2314,16 +2315,31 @@ def gamma_view(result: dict, window: str) -> html.Div:
 
 
 BASIS_BOND_HEADERS = {
-    "bond": "Bond", "cusip": "CUSIP", "cf": "CF", "clean": "Price", "yld": "Yield", "gross_32": "Gross (32)",
-    "carry_32": "Carry (32)", "net_32": "Net (32)", "implied_repo": "IRR %", "irr_spread_bp": "IRR − fin (bp)",
+    "bond": "Bond", "cusip": "CUSIP", "wi": "Status", "cf": "CF", "clean": "Price", "yld": "Yield", "gross_32": "Gross (32)",
+    "carry_32": "Carry (32)", "net_32": "Net (32)", "model_32": "Model (32)", "rich_32": "Net − model (32)",
+    "implied_repo": "IRR %", "irr_spread_bp": "IRR − fin (bp)",
     "dv01_usd": "DV01 $", "dv01_cf_usd": "DV01/CF $", "p_ctd": "P(CTD)",
 }
 BASIS_BOND_FORMATS = {
     "cf": "{:.4f}", "clean": "{:.3f}", "yld": "{:.3f}", "gross_32": "{:+.2f}", "carry_32": "{:+.2f}",
-    "net_32": "{:+.2f}", "implied_repo": "{:.3f}", "irr_spread_bp": "{:+.0f}", "dv01_usd": "{:,.2f}",
+    "net_32": "{:+.2f}", "model_32": "{:.2f}", "rich_32": "{:+.2f}", "implied_repo": "{:.3f}", "irr_spread_bp": "{:+.0f}", "dv01_usd": "{:,.2f}",
     "dv01_cf_usd": "{:,.2f}", "p_ctd": "{:.1f}%",
 }
-BASIS_CTD_COLOURS = [ORANGE, C0, C1, C2, "#8E44AD", "#16A085", "#C0392B", "#2C3E50", "#B7950B", "#7F8C8D"]
+# one pastel per bond, shared by its basket row and its cells in the CTD matrix
+BASIS_PASTELS = ["#FAD7A0", "#AED6F1", "#A9DFBF", "#F5B7B1", "#D7BDE2", "#F9E79F", "#A3E4D7", "#F5CBA7",
+                 "#C5CAE9", "#DCEDC8", "#F8BBD0", "#B2EBF2"]
+
+
+BASIS_AXIS = "2px solid #222"     # the unmoved row and column of the CTD matrix
+BASIS_TODAY = "3px solid #D0021B"  # the unmoved cell: today's CTD
+BASIS_TIGHT = {"minWidth": 0}      # columns as wide as their contents, not stretched across the page
+
+
+def basis_pastel(i: int) -> str:
+    """The i-th bond colour: the hand-picked pastels, then evenly spread hues for long baskets."""
+    if i < len(BASIS_PASTELS):
+        return BASIS_PASTELS[i]
+    return f"hsl({(i * 137.5) % 360:.0f}, 55%, {82 + 6 * (i % 2)}%)"
 
 
 def basis_tab() -> html.Div:
@@ -2337,17 +2353,32 @@ def basis_tab() -> html.Div:
         info("The basket table",
              "Each deliverable is priced against the future. Gross basis = price − future × CF. Carry = gross − net. "
              "Net basis is what is left after carry to delivery: the delivery option premium. IRR is the implied "
-             "repo of buying the bond and delivering it; the highest IRR is the CTD.",
+             "repo of buying the bond and delivering it; the highest IRR is the CTD. Each bond has its own "
+             "colour, used again in the matrix. Bond prices are 3pm New York closes, struck with the futures "
+             "settlement.",
+             "Model is what the bond's basis is worth at delivery in the matrix's scenarios: CF × (its converted "
+             "price − the cheapest converted price), probability-weighted. It is the delivery option's value in "
+             "this model, in the same 32nds as Net. Net − model above zero means the market charges more for the "
+             "option than the scenarios say it is worth (basis rich: a sale); below zero, less (cheap: a buy).",
              "DV01 $ is per contract face; DV01/CF is the DV01 the future would carry if that bond were the one "
              "delivered. Financing is the front SOFR future, delivery the last business day of the month."),
+        info("Bonds not issued yet",
+             "A basket grows until delivery: every new issue auctioned before the last delivery day joins it. "
+             "Those are listed as WI and compete in the matrix. A WI has no price, so its yield is read off the "
+             "basket (nearest bond plus the basket's yield slope), its net basis is its forward price at that "
+             "yield less future x CF, and gross, carry and IRR are blank.",
+             "WI est. means Treasury has not set the coupon: it is the modelled yield rounded down to an eighth, "
+             "with the CME conversion factor at that coupon, held fixed across the scenarios. est. is a bond "
+             "already issued that the auction table does not have yet."),
         info("The CTD matrix",
              "Each bond's forward yield is shifted by a parallel move plus a curve move, the bond is repriced on "
              "the delivery date, and the cheapest is the lowest price / CF. A bond's shift is level + curve × "
              "(its maturity − short tenor) / (long tenor − short tenor): level is the short leg's yield change, "
              "curve the change in the curve itself.",
              "Scenarios run to ±2 sd of each over the days left to delivery, from daily changes over the lookback, "
-             "with their correlation. A cell's % is the probability of ending nearest that cell; P(CTD) sums the "
-             "probability of every scenario in which the bond is cheapest. Not modelled: end-of-month and timing "
+             "with their correlation. A cell takes the colour of the bond that is cheapest there; the red box is "
+             "the unmoved scenario, its row a pure parallel shift and its column a pure curve move. P(CTD) in the "
+             "basket table sums the probability of every scenario in which the bond is cheapest. Not modelled: end-of-month and timing "
              "options, repo specialness, moves that are not level plus this one curve."),
     ], className="research-controls")
     return html.Div(style={"padding": "14px 24px"}, children=[
@@ -2363,27 +2394,27 @@ def basis_tab() -> html.Div:
 
 def basis_view(result: dict) -> html.Div:
     bonds, ctd, moves, matrix = result["bonds"], result["ctd"], result["moves"], result["matrix"]
-    labels = {b["cusip"]: f"{b['coupon']:g} {b['maturity']:%b-%y}" for b in bonds.iter_rows(named=True)}
-    frame = bonds.select(pl.Series("bond", [labels[c] for c in bonds["cusip"]]), "cusip", "cf", "clean", "yld",
-                         "gross_32", "carry_32", "net_32", "implied_repo", "irr_spread_bp", "dv01_usd",
-                         "dv01_cf_usd", (pl.col("p_ctd") * 100).alias("p_ctd")).to_pandas()
-    for column, fmt in BASIS_BOND_FORMATS.items():
-        frame[column] = frame[column].map(fmt.format)
+    labels = {b["cusip"]: bond_label(b["coupon"], b["maturity"]) for b in bonds.iter_rows(named=True)}
+    colour = {c: basis_pastel(i) for i, c in enumerate(bonds["cusip"])}
+    frame = bonds.select(pl.Series("bond", [labels[c] for c in bonds["cusip"]]), "cusip", "wi", "cf", "clean", "yld",
+                         "gross_32", "carry_32", "net_32", "model_32", "rich_32", "implied_repo", "irr_spread_bp",
+                         "dv01_usd", "dv01_cf_usd", (pl.col("p_ctd") * 100).alias("p_ctd")).to_pandas()
+    for column, fmt in BASIS_BOND_FORMATS.items():  # a WI has no price, so no gross, carry or IRR
+        frame[column] = frame[column].map(lambda v, fmt=fmt: "" if v is None or v != v else fmt.format(v))
 
     def bond_style(column, _value, row):
-        base = {"textAlign": "left"} if column in ("bond", "cusip") else {}
-        return {**base, "color": ORANGE, "fontWeight": "bold"} if row["cusip"] == ctd["cusip"] else base or None
+        return {"backgroundColor": colour[row["cusip"]], "color": "#222",
+                **({"textAlign": "left"} if column in ("bond", "cusip", "wi") else {}),
+                **({"fontWeight": "bold"} if row["cusip"] == ctd["cusip"] else {})}
 
-    # the matrix: rows are curve moves, columns parallel moves; each distinct CTD gets its own colour
+    # the matrix: rows are curve moves, columns parallel moves; a cell is the colour of its CTD
     cheapest = [[matrix["cusips"][i] for i in row] for row in matrix["ctd"]]
-    seen = list(dict.fromkeys(c for row in cheapest for c in row))
-    colour = {c: BASIS_CTD_COLOURS[i % len(BASIS_CTD_COLOURS)] for i, c in enumerate(seen)}
     level_cols = [f"{v:+.0f}" for v in matrix["level"]]
     grid, owner = [], {}
     for r, curve_move in enumerate(matrix["curve"]):
         row = {"curve": f"{curve_move:+.0f}"}
         for c, name in enumerate(level_cols):
-            row[name] = f"{labels[cheapest[r][c]]} · {matrix['mass'][r, c]:.0%}"
+            row[name] = labels[cheapest[r][c]]
             owner[(row["curve"], name)] = cheapest[r][c]
         grid.append(row)
     middle = (grid[len(grid) // 2]["curve"], level_cols[len(level_cols) // 2])  # the no-move scenario
@@ -2391,16 +2422,27 @@ def basis_view(result: dict) -> html.Div:
     def matrix_style(column, _value, row):
         if column == "curve":
             return {"fontWeight": "bold"}
-        return {"color": colour[owner[(row["curve"], column)]], "textAlign": "center",
-                **({"fontWeight": "bold"} if (row["curve"], column) == middle else {})}
+        style = {"backgroundColor": colour[owner[(row["curve"], column)]], "color": "#222", "textAlign": "center"}
+        # a crosshair through today: along its row the curve is unmoved (a pure parallel shift),
+        # down its column the level is unmoved (a pure curve move)
+        if row["curve"] == middle[0]:
+            style.update(borderTop=BASIS_AXIS, borderBottom=BASIS_AXIS)
+        if column == middle[1]:
+            style.update(borderLeft=BASIS_AXIS, borderRight=BASIS_AXIS)
+        if (row["curve"], column) == middle:
+            style.update(border=BASIS_TODAY, fontWeight="bold")
+        return style
 
     notes = []
     if ctd["net_32"] < 0:
-        notes.append(note(f"The CTD's net basis is negative ({ctd['net_32']:+.2f}/32): bond and futures closes are "
-                          "probably not simultaneous, or the financing proxy is below true repo.", "warn"))
-    if len(bonds) < result["basket_size"]:
-        notes.append(note(f"{len(bonds)} of {result['basket_size']} deliverables are priced on {result['asof']}; "
-                          "the rest are left out.", "warn"))
+        notes.append(note(f"The CTD's net basis is negative ({ctd['net_32']:+.2f}/32). Bond and futures closes are "
+                          "both 3pm, so either the future is rich to cash or the financing proxy is above true "
+                          "repo.", "warn"))
+    priced = bonds.filter(pl.col("wi") == "").height
+    history = new_issue_history(result["root"], asof=result["asof"])
+    if priced < result["basket_size"]:
+        notes.append(note(f"{priced} of {result['basket_size']} deliverables are priced on {result['asof']}; "
+                          "the rest are left out or modelled as est.", "warn"))
     return html.Div([
         _stats_bar(stat_block("contract", result["contract"]), stat_block("as of", str(result["asof"])),
                    stat_block("future", f"{result['fut_px']:.4f}"),
@@ -2408,20 +2450,29 @@ def basis_view(result: dict) -> html.Div:
                    stat_block("financing", f"{result['financing']:.3f}%"),
                    stat_block("CTD", labels[ctd["cusip"]]),
                    stat_block("CTD net basis", f"{ctd['net_32']:+.2f}/32", alert=ctd["net_32"] < 0),
+                   stat_block("model option value", f"{ctd['model_32']:.2f}/32"),
+                   stat_block("net − model", f"{ctd['rich_32']:+.2f}/32"),
                    stat_block("CTD IRR", f"{ctd['implied_repo']:.3f}%"),
                    stat_block("CTD DV01/CF", f"${ctd['dv01_cf_usd']:,.2f}"),
                    stat_block("P(CTD)-weighted DV01/CF", f"${result['blend_dv01']:,.2f}")),
         *notes,
-        table(frame, title="deliverable basket · richest IRR first · gross, carry and net basis in 32nds",
-              columns=list(BASIS_BOND_HEADERS), headers=BASIS_BOND_HEADERS, cell_style=bond_style),
+        table(frame, title="deliverable basket · richest IRR first, bonds not issued yet last · gross, carry "
+              "and net basis in 32nds", columns=list(BASIS_BOND_HEADERS), headers=BASIS_BOND_HEADERS,
+              cell_style=bond_style, table_style=BASIS_TIGHT),
+        note(f"New issues as CTD, {result['root']} since {history['start'][:4]}: a bond issued after "
+             f"its contract went front was the CTD at some point in {history['ever']} of {history['contracts']} "
+             f"contracts, for five or more days in {history['week']}, and on the last day measured in "
+             f"{history['at_end']} ({history['days_new']:,} of {history['days']:,} days).", "dim"),
         html.Div(style={"height": 18}),
         table(pl.DataFrame(grid).to_pandas(), title=f"cheapest to deliver at delivery · columns: parallel shift in "
-              f"bp · rows: {result['curve']} shift in bp · each cell: CTD · probability",
+              f"bp · rows: {result['curve']} shift in bp · each cell: the CTD, in its colour from the table above · "
+              "red box: today",
               columns=["curve", *level_cols], headers={"curve": f"{result['curve']} / level"},
-              cell_style=matrix_style),
+              cell_style=matrix_style, table_style=BASIS_TIGHT),
         note(f"Over {result['days']} business days: level sd {moves['level']:.1f}bp, {result['curve']} sd "
              f"{moves['curve']:.1f}bp, correlation {moves['corr']:+.2f} ({moves['observations']} daily changes). "
-             f"Scenarios shown at 0, ±0.5, ±1, ±1.5 and ±2 sd; edge cells hold the tails. The future at delivery, "
+             f"Scenarios shown at 0, ±0.5, ±1, ±1.5 and ±2 sd. The red box is today's CTD; along its row only the level "
+             f"moves (a parallel shift), down its column only the {result['curve']} curve moves. The future at delivery, "
              f"averaged over all scenarios with no option value left: {result['expected_future']:.4f}.", "dim"),
     ])
 
