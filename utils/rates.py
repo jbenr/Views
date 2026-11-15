@@ -41,6 +41,33 @@ def linear_forward(r1, t1, r2, t2):
 
 
 
+def annual_yield(semi):
+    """A semiannually compounded yield in percent as an annually compounded one, so a
+    Treasury, gilt or Canada yield can sit against an annual-pay swap rate."""
+    return ((1.0 + semi / 200.0) ** 2 - 1.0) * 100.0
+
+
+def swap_annuity(rate, years):
+    """What 1 a year for `years` years is worth, discounted flat at the annual par
+    rate `rate` (percent): the swap's basis point value up to scale."""
+    r = rate / 100.0
+    return (1.0 - (1.0 + r) ** -years) / r
+
+
+def usd_asset_swap_spread(local_asw, ccbs, bpv_ratio=1.0):
+    """A foreign bond's spread over USD SOFR once asset swapped and basis swapped:
+
+        (local_asw - ccbs) * bpv_ratio
+
+    local_asw is its spread over its own currency's swap rate, ccbs the cross-currency
+    basis swap against SOFR quoted on the foreign leg, bpv_ratio the foreign swap
+    annuity over the dollar one (the inverse of the book's conversion factor). Huggins
+    & Schaller ch. 16: a JGB at +11bp to yen swaps with the basis at -64.5bp and a
+    conversion factor of 0.95 is (11 + 64.5) / 0.95 = 79bp over dollars.
+    """
+    return (local_asw - ccbs) * bpv_ratio
+
+
 def synthetic_5y5y_real(sofr_5y, sofr_10y, zcis_5y, zcis_10y):
     """Approximate synthetic 5y5y real rate from SOFR and ZCIS rates."""
     real_5y = synthetic_real_rate(sofr_5y, zcis_5y)

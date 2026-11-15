@@ -27,6 +27,15 @@ ag = [f"{a}{' ' if len(a) == 1 else ''}{b} Comdty" for a in ["C","W","S","KC","S
 ind_met = [f"{a}{b} Comdty" for a in ["HG","LA","LX","LN","TIO"] for b in [1,2]]
 
 # mortgage
+# overnight rates that finance the bonds behind non-US futures: EUR (EONIA to 2021, then ESTR), GBP, CAD, JPY
+on_rates = ["ESTRON Index", "EONIA Index", "SONIO/N Index", "CAONREPO Index", "MUTKCALM Index"]
+# benchmark government yields outside the US: Germany, France, Italy, UK, Japan, Canada
+g7_yields = ([f"{p}{n} Index" for p in ["GDBR", "GFRN", "GBTPGR", "GUKG", "GJGB"] for n in [2, 3, 5, 7, 10, 20, 30]]
+             + [f"GCAN{n}YR Index" for n in [2, 3, 5, 7, 10, 20, 30]])
+# cross-market RV: OIS swap rates outside the US, and cross-currency basis swaps against SOFR
+# (the spread on the foreign leg). The yen basis swap ticker is still to be found.
+xmkt_ois = [f"{p}{n} Curncy" for p in ["CDSO", "EESWE", "BPSWS", "JYSO"] for n in [2, 5, 10, 30]]
+xmkt_ccbs = [f"{p}{n} Curncy" for p in ["CDXOQQ", "EUXOQQ", "BPXOQQ"] for n in [2, 5, 10, 30]]
 mtg = ["MTGEFNCL Index"]  # Fannie 30yr current coupon yield — use for MBS basis vs 10yr
 
 # swaption vol surface — normal vol (bps/yr), expiry × tenor × strike

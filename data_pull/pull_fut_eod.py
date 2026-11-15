@@ -65,6 +65,19 @@ GENERIC_RANKS = {
     "UXY": range(1, 3),
     "US": range(1, 3),
     "WN": range(1, 3),
+    # government bond futures outside the US: Eurex, ICE, Montreal, Osaka
+    "DU": range(1, 3),
+    "OE": range(1, 3),
+    "RX": range(1, 3),
+    "UB": range(1, 3),
+    "OAT": range(1, 3),
+    "IK": range(1, 3),
+    "BTS": range(1, 3),
+    "G ": range(1, 3),
+    "CV": range(1, 3),
+    "XQ": range(1, 3),
+    "CN": range(1, 3),
+    "JB": range(1, 3),
     "FF": range(1, 9),
     "SER": range(1, 9),
     "SFR": range(1, 9),
@@ -197,7 +210,8 @@ def parse_contract_ticker(ticker: str) -> tuple[str, str]:
         'WN1 Comdty' -> ('WN', 'WN1')
     """
     # Known rates futures roots
-    KNOWN_ROOTS = ["SFR", "SER", "UXY", "WN", "TU", "FV", "TY", "US", "UB", "Z3N", "FF"]
+    KNOWN_ROOTS = ["SFR", "SER", "UXY", "WN", "TU", "FV", "TY", "US", "UB", "Z3N", "FF",
+                   "DU", "OE", "RX", "OAT", "IK", "BTS", "G ", "CV", "XQ", "CN", "JB"]
     
     clean = ticker.replace(" Comdty", "").strip()
     

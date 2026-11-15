@@ -47,6 +47,8 @@ from research.term_premium import CURVE as TP_CURVE, FLY as TP_FLY, TP_WINDOWS, 
 from research.inflation_carry import BREAKEVENS, HORIZONS, carry, carry_table, load_inflation
 from research.sofr_ff import AHEADS as SF_AHEADS, LOOKBACKS as SF_LOOKBACKS, study as sofr_ff_study
 from research.cta import TENORS as CTA_TENORS, study as cta_study
+from research.cross_market import (LOOKBACKS as XM_LOOKBACKS, MARKETS as XM_MARKETS, TENORS as XM_TENORS,
+                                   study as cross_market_study)
 from research.basis_basket import (CURVE_CHOICES as BASIS_CURVES, LOOKBACKS as BASIS_LOOKBACKS,
                                    ROOTS as BASIS_ROOTS, new_issue_history, study as basis_study)
 from research.gamma import CFTC_LOOKBACKS as GAMMA_CFTC_LOOKBACKS, study as gamma_study
@@ -81,7 +83,7 @@ from research import artifacts, jobs, progress as work
 from research.preferences import load_controls, load_preferences, save_controls, save_preferences
 from backtest.legacy import TradeDef
 from utils.research_app import (
-    BORDER, C0, C1, C2, DIM, ORANGE, PANEL, TEXT, make_app, run,
+    BORDER, C0, C1, C2, DIM, FOLDER_TAB, FOLDER_TAB_SELECTED, FOLDER_TABS, ORANGE, PANEL, TEXT, make_app, run,
     shimmer_loader, stat_block,
 )
 from utils.viz import table_div
@@ -195,14 +197,7 @@ TARGET_OPTIONS = [
                                             [int(x) for x in re.findall(r"\d+", n)]))
 ]
 
-TAB_STYLE = {
-    "padding": "10px 18px", "fontSize": 12, "fontWeight": "bold",
-    "background": PANEL, "border": f"1px solid {BORDER}", "color": DIM,
-}
-SELECTED_TAB_STYLE = {
-    **TAB_STYLE, "background": "#FFFFFF", "color": ORANGE,
-    "borderTop": f"3px solid {ORANGE}",
-}
+TAB_STYLE, SELECTED_TAB_STYLE = FOLDER_TAB, FOLDER_TAB_SELECTED  # the signal dashboard's folder tabs
 LABEL = {
     "color": DIM, "fontSize": 10, "fontWeight": "bold",
     "letterSpacing": "0.05em", "textTransform": "uppercase",
@@ -266,6 +261,7 @@ def section(title: str, children: list, open: bool = True) -> html.Details:
 
 def table(df, title=None, **kwargs) -> html.Div:
     """House table that shows about 20 rows and scrolls for the rest."""
+    kwargs["table_style"] = {"minWidth": 0, **(kwargs.get("table_style") or {})}  # as wide as its contents
     return table_div(df, title=title, max_rows=kwargs.pop("max_rows", 2000), max_height=TABLE_HEIGHT, **kwargs)
 
 
@@ -275,6 +271,13 @@ def heading(text: str, right=None) -> html.Div:
         kids.append(html.Div(right, style={"marginLeft": "auto"}))
     return html.Div(kids, style={"display": "flex", "alignItems": "center",
                                  "gap": 12, "marginBottom": 12})
+
+
+def loader(child) -> dcc.Loading:
+    """The logo loader, the previous content dimmed underneath."""
+    return dcc.Loading(child, custom_spinner=shimmer_loader(image="guy.png"),
+                       overlay_style={"visibility": "visible", "opacity": 0.35},
+                       parent_className="dashboard-overview-loader")
 
 
 def loading_panel(output_id: str, task: str, caption: str) -> html.Div:
@@ -1603,7 +1606,7 @@ def backtest_grid_view(grid: pl.DataFrame, selected: dict, sort_by: str | None =
 def tabs() -> html.Div:
     return html.Div([dcc.Store(id="research-session", data=uuid4().hex),
         dcc.Interval(id="research-progress-poll", interval=750),
-        dcc.Tabs(id="bench-tabs", value="setup", children=[
+        dcc.Tabs(id="bench-tabs", value="setup", style=FOLDER_TABS, mobile_breakpoint=0, children=[
         dcc.Tab(label="Setup", value="setup", style=TAB_STYLE,
                 selected_style=SELECTED_TAB_STYLE, children=setup_tab()),
         dcc.Tab(label="Dislocation", value="dis", style=TAB_STYLE,
@@ -1629,11 +1632,14 @@ def tabs() -> html.Div:
                 selected_style=SELECTED_TAB_STYLE, children=idio_tab()),
         dcc.Tab(label="Basis", value="basis", style=TAB_STYLE,
                 selected_style=SELECTED_TAB_STYLE, children=basis_tab()),
+        dcc.Tab(label="Cross-Market", value="xm", style=TAB_STYLE,
+                selected_style=SELECTED_TAB_STYLE, children=cross_market_tab()),
     ])], className="research-bench")
 
 
-SUB_TAB_STYLE = {**TAB_STYLE, "padding": "7px 14px", "fontSize": 11}
-SUB_TAB_SELECTED = {**SUB_TAB_STYLE, "background": "#FFFFFF", "color": TEXT, "borderTop": f"2px solid {ORANGE}"}
+SUB_FOLDER_TABS = {**FOLDER_TABS, "padding": "0"}
+SUB_TAB_STYLE = {**FOLDER_TAB, "padding": "6px 14px", "fontSize": 11, "minWidth": 0}
+SUB_TAB_SELECTED = {**FOLDER_TAB_SELECTED, "padding": "6px 14px", "fontSize": 11, "minWidth": 0, "color": TEXT}
 
 
 def fv_placeholder(title: str, what: str, plan: list[str], data: list[str]) -> html.Div:
@@ -1688,7 +1694,7 @@ def pca_tab() -> html.Div:
         html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)", "gap": 26,
                         "alignItems": "start"}, children=[
             pca_controls(),
-            dcc.Loading(html.Div(id="fv-pca-out"), type="dot"),
+            loader(html.Div(id="fv-pca-out")),
         ]),
         dcc.Store(id="fv-pca-settings"),
     ])
@@ -1757,7 +1763,7 @@ def regimes_tab() -> html.Div:
                         "alignItems": "start"}, children=[
             regimes_controls(),
             html.Div([level_window_nav(REGIME_WINDOW, prefix="reg-window"),
-                      dcc.Loading(html.Div(id="reg-out"), type="dot")]),
+                      loader(html.Div(id="reg-out"))]),
         ]),
         dcc.Store(id="reg-shown"),
         dcc.Store(id="reg-window", data=REGIME_WINDOW),
@@ -1858,7 +1864,7 @@ def term_premium_tab() -> html.Div:
                         "alignItems": "start"}, children=[
             controls,
             html.Div([level_window_nav(TP_WINDOW, prefix="tp-window"),
-                      dcc.Loading(html.Div(id="tp-out"), type="dot")]),
+                      loader(html.Div(id="tp-out"))]),
         ]),
         dcc.Store(id="tp-shown"),
         dcc.Store(id="tp-window", data=TP_WINDOW),
@@ -1968,7 +1974,7 @@ def inflation_tab() -> html.Div:
                         "alignItems": "start"}, children=[
             controls,
             html.Div([level_window_nav(INFL_WINDOW, prefix="infl-window"),
-                      dcc.Loading(html.Div(id="infl-out"), type="dot")]),
+                      loader(html.Div(id="infl-out"))]),
         ]),
         dcc.Store(id="infl-shown"),
         dcc.Store(id="infl-window", data=INFL_WINDOW),
@@ -2031,7 +2037,7 @@ def _idio_layout(title: str, what: str, controls: html.Div, prefix: str) -> html
                         "alignItems": "start"}, children=[
             controls,
             html.Div([level_window_nav(IDIO_WINDOW, prefix=f"{prefix}-window"),
-                      dcc.Loading(html.Div(id=f"{prefix}-out"), type="dot")]),
+                      loader(html.Div(id=f"{prefix}-out"))]),
         ]),
         dcc.Store(id=f"{prefix}-shown"),
         dcc.Store(id=f"{prefix}-window", data=IDIO_WINDOW),
@@ -2316,13 +2322,14 @@ def gamma_view(result: dict, window: str) -> html.Div:
 
 BASIS_BOND_HEADERS = {
     "bond": "Bond", "cusip": "CUSIP", "wi": "Status", "cf": "CF", "clean": "Price", "yld": "Yield", "gross_32": "Gross (32)",
-    "carry_32": "Carry (32)", "net_32": "Net (32)", "model_32": "Model (32)", "rich_32": "Net − model (32)",
+    "carry_32": "Carry (32)", "net_32": "Net (32)", "switch_32": "Switch (32)", "timing_32": "Early dlv (32)",
+    "wild_32": "Wild card (32)", "model_32": "Model (32)", "rich_32": "Net − model (32)",
     "implied_repo": "IRR %", "irr_spread_bp": "IRR − fin (bp)",
     "dv01_usd": "DV01 $", "dv01_cf_usd": "DV01/CF $", "p_ctd": "P(CTD)",
 }
 BASIS_BOND_FORMATS = {
     "cf": "{:.4f}", "clean": "{:.3f}", "yld": "{:.3f}", "gross_32": "{:+.2f}", "carry_32": "{:+.2f}",
-    "net_32": "{:+.2f}", "model_32": "{:.2f}", "rich_32": "{:+.2f}", "implied_repo": "{:.3f}", "irr_spread_bp": "{:+.0f}", "dv01_usd": "{:,.2f}",
+    "net_32": "{:+.2f}", "switch_32": "{:.2f}", "timing_32": "{:.2f}", "wild_32": "{:.2f}", "model_32": "{:.2f}", "rich_32": "{:+.2f}", "implied_repo": "{:.3f}", "irr_spread_bp": "{:+.0f}", "dv01_usd": "{:,.2f}",
     "dv01_cf_usd": "{:,.2f}", "p_ctd": "{:.1f}%",
 }
 # one pastel per bond, shared by its basket row and its cells in the CTD matrix
@@ -2356,12 +2363,40 @@ def basis_tab() -> html.Div:
              "repo of buying the bond and delivering it; the highest IRR is the CTD. Each bond has its own "
              "colour, used again in the matrix. Bond prices are 3pm New York closes, struck with the futures "
              "settlement.",
-             "Model is what the bond's basis is worth at delivery in the matrix's scenarios: CF × (its converted "
-             "price − the cheapest converted price), probability-weighted. It is the delivery option's value in "
-             "this model, in the same 32nds as Net. Net − model above zero means the market charges more for the "
-             "option than the scenarios say it is worth (basis rich: a sale); below zero, less (cheap: a buy).",
+             "Switch is what the bond's basis is worth at delivery in the matrix's scenarios: CF × (its converted "
+             "price − the cheapest converted price), probability-weighted. Early dlv and Wild card are the timing "
+             "options. Model is the three added up, in the same 32nds as Net. Net − model above zero means the "
+             "market charges more for the options than the model says they are worth (basis rich: a sale); below "
+             "zero, less (cheap: a buy).",
              "DV01 $ is per contract face; DV01/CF is the DV01 the future would carry if that bond were the one "
              "delivered. Financing is the front SOFR future, delivery the last business day of the month."),
+        info("The delivery options",
+             "Named as in the Red Book (Burghardt, ch. 3). Switch and quality are two names for one option: the "
+             "short delivers whichever bond is cheapest, so any change of CTD while the future still trades is "
+             "worth something. Three things drive it: yield levels (duration decides which bond is cheap), yield "
+             "spreads between the deliverables, and new issues joining the basket.",
+             "The end-of-month option is the same switch after the last trading day, when the futures price is "
+             "fixed and DV01, not duration, decides. It is not valued on its own here: the switch scenarios run "
+             "to the last delivery day as if the future traded until then.",
+             "The timing options are about when to deliver. Carry: with negative carry the short delivers on "
+             "the first day, giving up the switch value the month still holds. Wild card: futures settle at 2pm "
+             "Chicago and delivery notices close in the evening; a basis position holds 1 bond per CF futures, "
+             "so delivering leaves a tail of (1 − CF) bonds to trade at the evening's price against a fixed "
+             "invoice. It pays (1 − CF) × the price move, less the basis given up on the CF futures. Limit "
+             "moves, the third timing option, are not valued.",
+             "Both timing options are worked out for the CTD on today's forwards and reach every bond through "
+             "the futures price, so a bond's share is its CF × the CTD's value / the CTD's CF."),
+        info("Contracts outside the US",
+             "DU, OE, RX and UB are the German Schatz, Bobl, Bund and Buxl; OAT is France; IK and BTS the long and "
+             "short BTP; G the long gilt; CV, XQ and CN the Canadian 2-, 5- and 10-year; JB the 10-year JGB. Each "
+             "is priced on its own bonds, coupon frequency, settlement lag and overnight rate, and its scenarios "
+             "use that country's benchmark yields. Basis columns are in 100ths of a price point, DV01 in the "
+             "contract's currency.",
+             "Eurex and Osaka deliver on a single day, so those contracts have no timing options. The gilt and "
+             "the Canadian contracts deliver on any day of the month; here they are priced to the last day and "
+             "their timing options are not valued, which understates them when carry is negative. Bonds not "
+             "issued yet are not added to these baskets, and bond closes are not struck at the exchange's "
+             "settlement time."),
         info("Bonds not issued yet",
              "A basket grows until delivery: every new issue auctioned before the last delivery day joins it. "
              "Those are listed as WI and compete in the matrix. A WI has no price, so its yield is read off the "
@@ -2378,16 +2413,16 @@ def basis_tab() -> html.Div:
              "Scenarios run to ±2 sd of each over the days left to delivery, from daily changes over the lookback, "
              "with their correlation. A cell takes the colour of the bond that is cheapest there; the red box is "
              "the unmoved scenario, its row a pure parallel shift and its column a pure curve move. P(CTD) in the "
-             "basket table sums the probability of every scenario in which the bond is cheapest. Not modelled: end-of-month and timing "
-             "options, repo specialness, moves that are not level plus this one curve."),
+             "basket table sums the probability of every scenario in which the bond is cheapest. Not modelled: "
+             "the end-of-month option on its own, repo specialness, moves that are not level plus this one curve."),
     ], className="research-controls")
     return html.Div(style={"padding": "14px 24px"}, children=[
-        dcc.Tabs(id="basis-tabs", value="TY", children=[
-            dcc.Tab(label=root, value=root, style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED)
+        dcc.Tabs(id="basis-tabs", value="TY", style=SUB_FOLDER_TABS, mobile_breakpoint=0, children=[
+            dcc.Tab(label=root.strip(), value=root, style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED)
             for root in BASIS_ROOTS]),
         html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)", "gap": 26,
                         "alignItems": "start", "paddingTop": 14}, children=[
-            controls, dcc.Loading(html.Div(id="basis-out"), type="dot")]),
+            controls, loader(html.Div(id="basis-out"))]),
         dcc.Store(id="basis-shown"),
     ])
 
@@ -2396,8 +2431,14 @@ def basis_view(result: dict) -> html.Div:
     bonds, ctd, moves, matrix = result["bonds"], result["ctd"], result["moves"], result["matrix"]
     labels = {b["cusip"]: bond_label(b["coupon"], b["maturity"]) for b in bonds.iter_rows(named=True)}
     colour = {c: basis_pastel(i) for i, c in enumerate(bonds["cusip"])}
+    # Treasuries quote the basis in 32nds and DV01 in dollars; other contracts in 100ths and their own currency
+    unit, treasury = result["unit"], result["crncy"] == "USD"
+    money = "$" if treasury else f"{result['crncy']} "
+    headers = {k: v.replace("(32)", f"({unit})").replace("$", money.strip()).replace("CUSIP", "CUSIP" if treasury else "ISIN")
+               for k, v in BASIS_BOND_HEADERS.items()}
     frame = bonds.select(pl.Series("bond", [labels[c] for c in bonds["cusip"]]), "cusip", "wi", "cf", "clean", "yld",
-                         "gross_32", "carry_32", "net_32", "model_32", "rich_32", "implied_repo", "irr_spread_bp",
+                         "gross_32", "carry_32", "net_32", "switch_32", "timing_32", "wild_32", "model_32", "rich_32",
+                         "implied_repo", "irr_spread_bp",
                          "dv01_usd", "dv01_cf_usd", (pl.col("p_ctd") * 100).alias("p_ctd")).to_pandas()
     for column, fmt in BASIS_BOND_FORMATS.items():  # a WI has no price, so no gross, carry or IRR
         frame[column] = frame[column].map(lambda v, fmt=fmt: "" if v is None or v != v else fmt.format(v))
@@ -2435,11 +2476,13 @@ def basis_view(result: dict) -> html.Div:
 
     notes = []
     if ctd["net_32"] < 0:
-        notes.append(note(f"The CTD's net basis is negative ({ctd['net_32']:+.2f}/32). Bond and futures closes are "
-                          "both 3pm, so either the future is rich to cash or the financing proxy is above true "
-                          "repo.", "warn"))
+        notes.append(note(f"The CTD's net basis is negative ({ctd['net_32']:+.2f}/{unit}). " + (
+            "Bond and futures closes are both 3pm, so either the future is rich to cash or the financing proxy "
+            "is above true repo." if treasury else
+            "Bond closes are not struck at the futures settlement here and financing is the overnight rate, so "
+            "a small negative is within the noise."), "warn"))
     priced = bonds.filter(pl.col("wi") == "").height
-    history = new_issue_history(result["root"], asof=result["asof"])
+    history = new_issue_history(result["root"], asof=result["asof"]) if treasury else None
     if priced < result["basket_size"]:
         notes.append(note(f"{priced} of {result['basket_size']} deliverables are priced on {result['asof']}; "
                           "the rest are left out or modelled as est.", "warn"))
@@ -2449,20 +2492,21 @@ def basis_view(result: dict) -> html.Div:
                    stat_block("delivery", f"{result['delivery']} · {result['days']}bd"),
                    stat_block("financing", f"{result['financing']:.3f}%"),
                    stat_block("CTD", labels[ctd["cusip"]]),
-                   stat_block("CTD net basis", f"{ctd['net_32']:+.2f}/32", alert=ctd["net_32"] < 0),
-                   stat_block("model option value", f"{ctd['model_32']:.2f}/32"),
-                   stat_block("net − model", f"{ctd['rich_32']:+.2f}/32"),
+                   stat_block("CTD net basis", f"{ctd['net_32']:+.2f}/{unit}", alert=ctd["net_32"] < 0),
+                   stat_block("model option value", f"{ctd['model_32']:.2f}/{unit}"),
+                   stat_block("net − model", f"{ctd['rich_32']:+.2f}/{unit}"),
                    stat_block("CTD IRR", f"{ctd['implied_repo']:.3f}%"),
-                   stat_block("CTD DV01/CF", f"${ctd['dv01_cf_usd']:,.2f}"),
-                   stat_block("P(CTD)-weighted DV01/CF", f"${result['blend_dv01']:,.2f}")),
+                   stat_block("CTD DV01/CF", f"{money}{ctd['dv01_cf_usd']:,.2f}"),
+                   stat_block("P(CTD)-weighted DV01/CF", f"{money}{result['blend_dv01']:,.2f}")),
         *notes,
         table(frame, title="deliverable basket · richest IRR first, bonds not issued yet last · gross, carry "
-              "and net basis in 32nds", columns=list(BASIS_BOND_HEADERS), headers=BASIS_BOND_HEADERS,
-              cell_style=bond_style, table_style=BASIS_TIGHT),
-        note(f"New issues as CTD, {result['root']} since {history['start'][:4]}: a bond issued after "
-             f"its contract went front was the CTD at some point in {history['ever']} of {history['contracts']} "
-             f"contracts, for five or more days in {history['week']}, and on the last day measured in "
-             f"{history['at_end']} ({history['days_new']:,} of {history['days']:,} days).", "dim"),
+              f"and net basis in {unit}{'nds' if unit == 32 else 'ths'}", columns=list(BASIS_BOND_HEADERS),
+              headers=headers, cell_style=bond_style, table_style=BASIS_TIGHT),
+        *([note(f"New issues as CTD, {result['root']} since {history['start'][:4]}: a bond issued after "
+                f"its contract went front was the CTD at some point in {history['ever']} of {history['contracts']} "
+                f"contracts, for five or more days in {history['week']}, and on the last day measured in "
+                f"{history['at_end']} ({history['days_new']:,} of {history['days']:,} days).", "dim")]
+          if history else []),
         html.Div(style={"height": 18}),
         table(pl.DataFrame(grid).to_pandas(), title=f"cheapest to deliver at delivery · columns: parallel shift in "
               f"bp · rows: {result['curve']} shift in bp · each cell: the CTD, in its colour from the table above · "
@@ -2477,9 +2521,105 @@ def basis_view(result: dict) -> html.Div:
     ])
 
 
+XM_HEADERS = {
+    "bond": "Bond", "future": "Future", "asof": "As of", "yld": "Yield", "ois": "OIS", "local_asw": "Local ASW",
+    "ccbs": "CCBS", "bpv_ratio": "BPV ratio", "usd_asw": "USD ASW", "pickup": "vs UST", "change_20d": "20d chg",
+    "z": "z", "half_life": "Half-life (d)", "days": "Days",
+}
+XM_FORMATS = {"yld": "{:.1f}", "ois": "{:.1f}", "local_asw": "{:+.1f}", "ccbs": "{:+.1f}", "bpv_ratio": "{:.3f}",
+              "usd_asw": "{:+.1f}", "pickup": "{:+.1f}", "change_20d": "{:+.1f}", "z": "{:+.2f}", "half_life": "{:.0f}"}
+
+
+def cross_market_tab() -> html.Div:
+    controls = html.Div([
+        field("tenor (years)", dcc.Dropdown(id="xm-tenor", value=10, clearable=False,
+                                            options=[{"label": f"{k}", "value": k} for k in XM_TENORS])),
+        field("market against the Treasury", dcc.Dropdown(id="xm-market", value="CA", clearable=False, options=[
+            {"label": f"{name} ({crncy})", "value": k} for k, (name, crncy, *_) in XM_MARKETS.items() if k != "US"])),
+        field("range lookback (days)", dcc.Dropdown(id="xm-lookback", value=252, clearable=False,
+                                                    options=[{"label": f"{k}", "value": k} for k in XM_LOOKBACKS])),
+        html.Button("Update", id="xm-run", n_clicks=0, className="ref-btn",
+                    style={**btn_style(primary=True), "width": "100%", "marginTop": 4, "marginBottom": 14}),
+        info("The yardstick",
+             "Huggins & Schaller ch. 15-17. Any government bond can be asset swapped into its own overnight rate "
+             "plus a spread, and that floating leg basis swapped into SOFR. What is left is one number, the "
+             "bond's spread over USD SOFR, comparable across every market.",
+             "USD ASW = (Local ASW − CCBS) × BPV ratio. Local ASW is the benchmark yield less the OIS swap rate "
+             "of the same tenor in its own currency. CCBS is the cross-currency basis swap against SOFR, the "
+             "spread on the foreign leg. The BPV ratio turns a basis point a year in the foreign currency into "
+             "one in dollars. A Treasury's USD ASW is just its yield less SOFR swaps.",
+             "vs UST is a market's USD ASW less the Treasury's: what a dollar investor picks up owning that "
+             "bond swapped into dollars in place of the Treasury. Positive is cheap to the Treasury. z is that "
+             "pick-up against its own mean and sd over the lookback."),
+        info("What it leaves out",
+             "Benchmark yields less the swap rate, not a par asset swap on each bond. No credit adjustment: the "
+             "book subtracts an adjusted CDS, so here Italy's and France's credit sits in their spread and a "
+             "level comparison with Bunds is not a richness comparison. No repo specialness or haircut terms.",
+             "Closes are local to each market, so one day's change mixes time zones; levels and z-scores are "
+             "not affected much. SOFR-based basis swaps start in 2021 (Canada mid-2022), which caps the "
+             "history. Japan is missing until its basis swap is stored. Futures are named only as the way a "
+             "view would be traded; nothing here is a futures price."),
+    ], className="research-controls")
+    return html.Div(style={"padding": "14px 24px"}, children=[
+        html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)", "gap": 26,
+                        "alignItems": "start"}, children=[controls, loader(html.Div(id="xm-out"))]),
+        dcc.Store(id="xm-shown"),
+    ])
+
+
+def cross_market_view(result: dict, market: str) -> html.Div:
+    today, signal, tenor = result["today"], result["signal"], result["tenor"]
+    name = XM_MARKETS[market][0]
+    one = signal.filter(pl.col("market") == market)
+    now = one.row(-1, named=True)
+    frame = today.to_pandas()
+    for column, fmt in XM_FORMATS.items():  # the Treasury has no pick-up over itself
+        frame[column] = frame[column].map(lambda v, fmt=fmt: "" if v is None or v != v else fmt.format(v))
+    frame.loc[frame["market"] == "US", ["pickup", "change_20d", "z"]] = ""
+
+    def row_style(column, _value, row):
+        return {**({"textAlign": "left"} if column in ("bond", "future", "asof") else {}),
+                **({"fontWeight": "bold"} if row["market"] in (market, "US") else {})}
+
+    wide = signal.pivot(index="ts", on="market", values="usd_asw").sort("ts").rename(
+        {k: v[0] for k, v in XM_MARKETS.items()})
+    names = [v[0] for k, v in XM_MARKETS.items() if v[0] in wide.columns]
+    zero = [{"value": 0.0, "style": "solid", "color": DIM}]
+    label = f"{name} over Treasury"
+    return html.Div([
+        _stats_bar(stat_block("as of", str(now["ts"])), stat_block("tenor", f"{tenor}y"),
+                   stat_block(f"{name} USD ASW", f"{now['usd_asw']:+.1f} bp"),
+                   stat_block("Treasury USD ASW", f"{now['ust_asw']:+.1f} bp"),
+                   stat_block(label, f"{now['pickup']:+.1f} bp"),
+                   stat_block("range mean", f"{now['mean']:+.1f} bp" if now["mean"] is not None else "—"),
+                   stat_block("z", f"{now['z']:+.2f}" if now["z"] is not None else "—",
+                              alert=now["z"] is not None and abs(now["z"]) > 2)),
+        table(frame, title=f"{tenor}y benchmarks as a spread over USD SOFR · bp · richest first · USD ASW = "
+              "(Local ASW − CCBS) × BPV ratio · vs UST = USD ASW less the Treasury's",
+              columns=list(XM_HEADERS), headers=XM_HEADERS, cell_style=row_style, table_style=BASIS_TIGHT),
+        _png_img(series_chart(one.select("ts", pl.col("pickup").alias(label), pl.col("mean").alias("range mean"),
+                                         (pl.col("mean") + 2 * pl.col("sd")).alias("+2 sd"),
+                                         (pl.col("mean") - 2 * pl.col("sd")).alias("-2 sd")),
+                              [label, "range mean", "+2 sd", "-2 sd"],
+                              f"{tenor}y {name} swapped into dollars, pick-up over the Treasury (bp) and its "
+                              f"{result['lookback']}d range", hlines=zero,
+                              line_colors={label: ORANGE, "range mean": "#333", "+2 sd": DIM, "-2 sd": DIM})),
+        _png_img(series_chart(one.select("ts", pl.col("local_asw").alias("local ASW"),
+                                         (-pl.col("ccbs")).alias("basis swap (−CCBS)"),
+                                         (-pl.col("ust_asw")).alias("Treasury (−USD ASW)")),
+                              ["local ASW", "basis swap (−CCBS)", "Treasury (−USD ASW)"],
+                              f"what the pick-up is made of (bp, before the BPV ratio): {name} against its own "
+                              "swaps, the basis swap, and the Treasury against SOFR", hlines=zero, fig_height=3.4)),
+        _png_img(series_chart(wide.select("ts", *names), names,
+                              f"{tenor}y USD ASW by market (bp): higher is cheaper against SOFR", hlines=zero)),
+        note("Italy and France carry credit the book would strip out with an adjusted CDS; read their level "
+             "against Bunds as credit plus richness, and their z-score as the move in both.", "dim"),
+    ])
+
+
 def idio_tab() -> html.Div:
     return remember_controls(html.Div(style={"padding": "14px 24px"}, children=[
-        dcc.Tabs(id="idio-tabs", value="sf", children=[
+        dcc.Tabs(id="idio-tabs", value="sf", style=SUB_FOLDER_TABS, mobile_breakpoint=0, children=[
             dcc.Tab(label="SOFR / FF basis", value="sf", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
                     children=html.Div(sofr_ff_tab(), style={"paddingTop": 14})),
             dcc.Tab(label="CTA trend", value="cta", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
@@ -2493,7 +2633,7 @@ def idio_tab() -> html.Div:
 def fair_value_tab() -> html.Div:
     return remember_controls(html.Div(style={"padding": "14px 24px"}, children=[
         html.Div(id="fair-value-context", style={"display": "none"}),  # Setup's Fill tabs still writes here
-        dcc.Tabs(id="fv-tabs", value="pca", children=[
+        dcc.Tabs(id="fv-tabs", value="pca", style=SUB_FOLDER_TABS, mobile_breakpoint=0, children=[
             dcc.Tab(label="PCA", value="pca", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
                     children=html.Div(pca_tab(), style={"paddingTop": 14})),
             dcc.Tab(label="Term Premium", value="tp", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
@@ -3081,6 +3221,20 @@ def register_callbacks(app) -> None:
             return basis_view(result), key
         except Exception as exc:
             return note(f"{root} basket failed: {type(exc).__name__}: {exc}", "bad"), no_update
+
+    @app.callback(Output("xm-out", "children"), Output("xm-shown", "data"),
+                  Input("xm-run", "n_clicks"), Input("bench-tabs", "value"),
+                  State("xm-tenor", "value"), State("xm-market", "value"), State("xm-lookback", "value"),
+                  State("xm-shown", "data"))
+    def _cross_market(_clicks, tab, tenor, market, lookback, shown):
+        # Runs on Update and when the Cross-Market tab is first opened.
+        key = f"{tenor}|{market}|{lookback}"
+        if tab != "xm" or (ctx.triggered_id != "xm-run" and shown == key):
+            return no_update, no_update
+        try:
+            return cross_market_view(cross_market_study(int(tenor), int(lookback)), market), key
+        except Exception as exc:
+            return note(f"Cross-market study failed: {type(exc).__name__}: {exc}", "bad"), no_update
 
     @app.callback(Output("sf-out", "children"), Output("sf-shown", "data"),
                   Input("sf-run", "n_clicks"), Input("bench-tabs", "value"), Input("idio-tabs", "value"),
@@ -3929,10 +4083,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="research bench")
     parser.add_argument("--port", type=int, default=8052)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--reload", action="store_true",
+                        help="restart on saved source changes and refresh the browser (kills running jobs)")
     args = parser.parse_args()
     crash_log = record_native_crashes()  # noqa: F841 - faulthandler writes to it until exit
     print(f"  Native crashes are recorded in {CRASH_LOG}")
-    run(build_app(), port=args.port, host=args.host)
+    run(build_app(), port=args.port, host=args.host, reload=args.reload)
 
 
 if __name__ == "__main__":

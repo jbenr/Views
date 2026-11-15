@@ -11,7 +11,7 @@ import polars as pl
 
 from backtest import SignalPipeline, SignalConfig, TradeDef
 
-STRATEGY_FAMILY = "cross_market_rv"
+STRATEGY_FAMILY = "cross_market"
 SIGNAL_NAME = "hedged_gilt_vs_ust"
 
 TICKERS = {

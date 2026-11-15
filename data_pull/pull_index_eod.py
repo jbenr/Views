@@ -46,7 +46,7 @@ ALL_TICKERS = [
         tkr.tips + tkr.be + tkr.zc +
         tkr.stonk + tkr.sector +
         tkr.prec_met + tkr.enrgy + tkr.ag + tkr.ind_met +
-        tkr.mtg
+        tkr.mtg + tkr.on_rates + tkr.g7_yields + tkr.xmkt_ois + tkr.xmkt_ccbs
     )
     if t not in INDEX_TICKERS
 ]

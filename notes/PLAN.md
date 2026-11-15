@@ -535,7 +535,7 @@ Example signal:
 
 ```json
 {
-  "strategy_family": "cross_market_rv",
+  "strategy_family": "cross_market",
   "signal_name": "gbp_gilt_usd_hedged_vs_ust",
   "instrument": "10Y gilt hedged to USD versus 10Y UST",
   "direction": "long_hedged_gilt_short_ust",
@@ -1014,7 +1014,7 @@ macro-signal-ledger/
       curve.py
       rates_vol.py
       inflation.py
-      cross_market_rv.py
+      cross_market.py
       event_driven_macro.py
     portfolio/
       construct_positions.py

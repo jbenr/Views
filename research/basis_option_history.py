@@ -63,7 +63,8 @@ def daily_values(root: str, start: str = START, lookback: int = LOOKBACK) -> pl.
         rows.append(dict(
             ts=ts, root=root, contract=first["contract"], ctd=basket["cusip"][ctd], n_days=first["n_days"],
             bonds=int((~upcoming).sum()), net_32=basket["net_basis"][ctd] * 32, model_32=float(odds["option"][ctd]) * 32,
-            p_ctd=float(odds["p_ctd"][ctd]), p_wi=float(odds["p_ctd"][upcoming].sum())))
+            p_ctd=float(odds["p_ctd"][ctd]), p_wi=float(odds["p_ctd"][upcoming].sum()),
+            model_ctd=basket["cusip"][int(odds["p_ctd"].argmax())], p_top=float(odds["p_ctd"].max())))
     return pl.DataFrame(rows).with_columns((pl.col("net_32") - pl.col("model_32")).alias("rich_32"))
 
 

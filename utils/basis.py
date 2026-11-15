@@ -267,32 +267,33 @@ def _shift_back_months(date: pl.Expr, months: pl.Expr) -> pl.Expr:
     return pl.date(year, month, pl.min_horizontal(date.dt.day(), month_len))
 
 
-def coupon_period(maturity: pl.Expr, on: pl.Expr) -> tuple[pl.Expr, pl.Expr]:
-    """The semiannual coupon dates bracketing `on`, as (previous, next).
+def coupon_period(maturity: pl.Expr, on: pl.Expr, months: int = 6) -> tuple[pl.Expr, pl.Expr]:
+    """The coupon dates bracketing `on`, as (previous, next).
 
-    Coupon dates are stepped back from maturity in six-month hops.
+    Coupon dates are stepped back from maturity in hops of `months`: six for
+    semiannual coupons, twelve for annual.
     """
     gap_months = (
         maturity.dt.year() * 12 + maturity.dt.month()
         - on.dt.year() * 12 - on.dt.month()
     )
-    hops = gap_months // 6
+    hops = gap_months // months
     # A first guess of `hops` can land after `on` when the day of month falls
     # later than `on`'s; one more hop back always brackets it.
-    guess = _shift_back_months(maturity, hops * 6)
+    guess = _shift_back_months(maturity, hops * months)
     hops = hops + (guess > on).cast(pl.Int32)
     return (
-        _shift_back_months(maturity, hops * 6),
-        _shift_back_months(maturity, (hops - 1) * 6),
+        _shift_back_months(maturity, hops * months),
+        _shift_back_months(maturity, (hops - 1) * months),
     )
 
 
-def accrued_interest(coupon: pl.Expr, maturity: pl.Expr, on: pl.Expr) -> pl.Expr:
-    """Act/act accrued interest per 100 face on semiannual Treasury coupons."""
-    last, nxt = coupon_period(maturity, on)
+def accrued_interest(coupon: pl.Expr, maturity: pl.Expr, on: pl.Expr, months: int = 6) -> pl.Expr:
+    """Act/act accrued interest per 100 face, coupons every `months` months."""
+    last, nxt = coupon_period(maturity, on, months)
     elapsed = (on - last).dt.total_days()
     period = (nxt - last).dt.total_days()
-    return coupon / 2.0 * elapsed / period
+    return coupon * months / 12.0 * elapsed / period
 
 
 # ── the basis ────────────────────────────────────────────────────────────────
@@ -488,6 +489,129 @@ def basis_panel(nb: pl.DataFrame) -> pl.DataFrame:
     for part in frames[1:]:
         panel = panel.join(part, on="ts", how="full", coalesce=True)
     return panel.sort("ts")
+
+
+# -- the basis outside the US --------------------------------------------------
+
+# Contract roots outside the US, with the currency whose overnight rate finances
+# their bonds. OVERNIGHT gives that rate's md.index_eod tickers (the first one
+# stored on a day wins) and its money-market year.
+GLOBAL_ROOTS = {
+    "DU": "EUR", "OE": "EUR", "RX": "EUR", "UB": "EUR", "OAT": "EUR", "IK": "EUR", "BTS": "EUR",
+    "G ": "GBP", "CV": "CAD", "XQ": "CAD", "CN": "CAD", "JB": "JPY",
+}
+OVERNIGHT = {
+    "EUR": (["ESTRON Index", "EONIA Index"], 360.0),
+    "GBP": (["SONIO/N Index"], 365.0),
+    "CAD": (["CAONREPO Index"], 365.0),
+    "JPY": (["MUTKCALM Index"], 365.0),
+}
+
+
+def load_overnight(crncy: str, start: str) -> pl.DataFrame:
+    """The currency's overnight rate in percent: ts, financing."""
+    tickers, _ = OVERNIGHT[crncy]
+    raw = query_db(
+        "SELECT ts, ticker, px_last::float AS rate FROM md.index_eod WHERE ticker = ANY(%s) AND ts >= %s",
+        params=[tickers, start],
+    )
+    wide = pl.from_pandas(raw).with_columns(pl.col("ts").cast(pl.Date)).pivot(index="ts", on="ticker", values="rate")
+    return wide.select("ts", pl.coalesce([t for t in tickers if t in wide.columns]).alias("financing")).sort("ts")
+
+
+def global_basket_basis(roots: list[str] | None = None, start: str = "2015-01-01", min_days: int = 15) -> pl.DataFrame:
+    """`basket_basis` for the contracts in GLOBAL_ROOTS: every deliverable, each day.
+
+    Same columns, with the bond's ISIN in `cusip`, plus `settle`, `crncy`, `freq`
+    and `first_delivery`. What differs from the Treasury version:
+
+      * bonds settle `lag` business days after the close, and accrued interest and
+        carry run from that day, not from the close;
+      * coupons are annual in Germany and France, semiannual elsewhere;
+      * `delivery` is the contract's last delivery day as stored. Eurex and Osaka
+        deliver on one day; the gilt and the Canadian contracts on any day of the
+        month, which matters when carry is negative (`first_delivery` is kept);
+      * financing is the currency's overnight rate, carried forward over days it is
+        not published, on a 360-day year for EUR and 365 elsewhere.
+
+    Accrued interest is act/act within the coupon period everywhere, a hair off the
+    /365 conventions of Japan and Canada; the gilt ex-dividend period is ignored.
+    Bond closes are Bloomberg's, not struck at each exchange's settlement time.
+    """
+    roots = list(roots or GLOBAL_ROOTS)
+    futures = load_futures(roots, start)
+    contracts = pl.from_pandas(query_db(
+        """
+        SELECT contract, first_delivery_date::date AS first_delivery, last_delivery_date::date AS delivery,
+               d->>'isin' AS cusip, (d->>'conversion_factor')::float AS cf
+        FROM sec.fut_contracts, jsonb_array_elements(dlv_basket->'deliverables') d
+        WHERE generic_ticker = ANY(%s) AND d ? 'isin'
+        """,
+        params=[roots],
+    )).with_columns(pl.col("first_delivery").cast(pl.Date), pl.col("delivery").cast(pl.Date))
+    cusips = contracts["cusip"].unique().to_list()
+    terms = pl.from_pandas(query_db(
+        "SELECT isin AS cusip, coupon, maturity, issue_date, crncy, cpn_freq AS freq, days_to_settle AS lag "
+        "FROM sec.govt_bonds WHERE isin = ANY(%s) AND coupon IS NOT NULL", params=[cusips],
+    )).with_columns(pl.col("maturity").cast(pl.Date), pl.col("issue_date").cast(pl.Date))
+    prices = pl.from_pandas(query_db(
+        "SELECT ts, isin AS cusip, px_last::float AS clean FROM md.govt_eod "
+        "WHERE isin = ANY(%s) AND ts >= %s AND px_last BETWEEN %s AND %s",
+        params=[cusips, start, *PRICE_BOUNDS],
+    )).with_columns(pl.col("ts").cast(pl.Date))
+
+    # the front contract until it is inside min_days of delivery, then the deferred one
+    dated = futures.join(contracts.select("contract", "first_delivery", "delivery").unique(), on="contract")
+    chosen = (
+        dated.with_columns((pl.col("delivery") - pl.col("ts")).dt.total_days().alias("days_left"))
+        .filter(pl.col("days_left") >= min_days)
+        .sort(["ts", "root", "rank"]).group_by(["ts", "root"], maintain_order=True).first()
+    )
+    quotes = (
+        chosen.join(contracts.select("contract", "cusip", "cf"), on="contract")
+        .join(prices, on=["ts", "cusip"]).join(terms, on="cusip")
+        .filter(pl.col("ts") >= pl.col("issue_date"))
+    )
+
+    frames = []
+    for (crncy, freq, lag), part in quotes.group_by(["crncy", "freq", "lag"]):
+        months, year = 12 // freq, OVERNIGHT[crncy][1]
+        frames.append(
+            part.sort("ts").join_asof(load_overnight(crncy, start), on="ts")
+            .with_columns(pl.col("ts").dt.add_business_days(lag).alias("settle"))
+            .with_columns(
+                accrued_interest(pl.col("coupon"), pl.col("maturity"), pl.col("settle"), months).alias("ai_now"),
+                accrued_interest(pl.col("coupon"), pl.col("maturity"), pl.col("delivery"), months).alias("ai_dlv"),
+                coupon_period(pl.col("maturity"), pl.col("settle"), months)[1].alias("next_coupon"),
+                (pl.col("delivery") - pl.col("settle")).dt.total_days().alias("n_days"),
+                (pl.col("financing") / 100.0 / year).alias("daily"),
+            ).with_columns(
+                (pl.col("clean") + pl.col("ai_now")).alias("dirty"),
+                (pl.col("fut_px") * pl.col("cf")).alias("principal_invoice"),
+                # a coupon paid between settlement and delivery, reinvested to delivery; a
+                # contract cycle is shorter than any coupon period, so there is at most one
+                pl.when(pl.col("next_coupon") <= pl.col("delivery"))
+                .then(pl.col("coupon") / freq).otherwise(0.0).alias("coupon_cash"),
+                pl.when(pl.col("next_coupon") <= pl.col("delivery"))
+                .then((pl.col("delivery") - pl.col("next_coupon")).dt.total_days()).otherwise(0).alias("coupon_days"),
+            )
+        )
+    return pl.concat(frames).with_columns(
+        (pl.col("principal_invoice") + pl.col("ai_dlv")).alias("invoice"),
+        (
+            pl.col("dirty") * (1.0 + pl.col("daily") * pl.col("n_days"))
+            - pl.col("coupon_cash") * (1.0 + pl.col("daily") * pl.col("coupon_days"))
+            - pl.col("ai_dlv")
+        ).alias("forward_clean"),
+    ).with_columns(
+        (pl.col("clean") - pl.col("principal_invoice")).alias("gross_basis"),
+        (pl.col("forward_clean") - pl.col("principal_invoice")).alias("net_basis"),
+        (
+            (pl.col("invoice") + pl.col("coupon_cash") - pl.col("dirty"))
+            / (pl.col("dirty") * pl.col("n_days") - pl.col("coupon_cash") * pl.col("coupon_days"))
+            / pl.col("daily") * pl.col("financing")
+        ).alias("implied_repo"),
+    ).drop("daily", "days_left").sort("ts", "root", "maturity")
 
 
 # -- futures calendar roll ---------------------------------------------------

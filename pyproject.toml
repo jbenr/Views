@@ -30,7 +30,7 @@ packages = [
     "book",
     "book.basis",
     "book.curve",
-    "book.cross_market_rv",
+    "book.cross_market",
     "book.duration",
     "book.event_driven",
     "book.inflation",

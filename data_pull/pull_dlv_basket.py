@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Populate deliverable basket data for Treasury futures contracts.
+Populate deliverable basket data for government bond futures contracts.
 Fetches FUT_DLVRBLE_BNDS_CUSIPS from Bloomberg and stores in sec.fut_contracts.
+Contracts outside the US are fetched by ISIN (FUT_DLVRBLE_BNDS_ISINS) and their
+basket entries carry "isin" where a Treasury entry carries "cusip".
 """
 
 import os
@@ -16,7 +18,8 @@ from data_pull.berg import Bbg
 
 DB_DSN = os.getenv("DB_DSN", "postgresql://benjils:snickers@raptor:5432/markets")
 BATCH_SIZE = 50
-DELIVERABLE_ROOTS = ["TU", "FV", "TY", "UXY", "US", "WN", "UB", "Z3N"]
+ISIN_ROOTS = ["DU", "OE", "RX", "UB", "OAT", "IK", "BTS", "G ", "CV", "XQ", "CN", "JB"]
+DELIVERABLE_ROOTS = ["TU", "FV", "TY", "UXY", "US", "WN", "Z3N", *ISIN_ROOTS]
 
 
 def ensure_dlv_basket_column(conn):
@@ -69,9 +72,14 @@ def fetch_deliverable_baskets(bbg: Bbg, contracts: list[str]) -> dict[str, list[
     Returns dict: contract -> list of {cusip, conversion_factor}
     """
     tickers = [f"{c} Comdty" for c in contracts]
-    
+    by_isin = {c: any(c.startswith(root) for root in ISIN_ROOTS) for c in contracts}
+
     # bds returns dict: ticker -> DataFrame
-    result = bbg.bds(tickers, "FUT_DLVRBLE_BNDS_CUSIPS")
+    result = {}
+    for isin, field in ((False, "FUT_DLVRBLE_BNDS_CUSIPS"), (True, "FUT_DLVRBLE_BNDS_ISINS")):
+        wanted = [t for c, t in zip(contracts, tickers) if by_isin[c] == isin]
+        if wanted:
+            result.update(bbg.bds(wanted, field))
     
     out = {}
     for contract, ticker in zip(contracts, tickers):
@@ -91,11 +99,11 @@ def fetch_deliverable_baskets(bbg: Bbg, contracts: list[str]) -> dict[str, list[
             cusip_raw = row.iloc[0] if len(row) > 0 else ''
             cf = row.iloc[1] if len(row) > 1 else 0
             
-            # Extract just the CUSIP (remove " Govt" suffix)
-            cusip = str(cusip_raw).replace(' Govt', '').strip()
+            # Extract just the identifier (remove the " Govt" / " Corp" yellow key)
+            cusip = str(cusip_raw).replace(' Govt', '').replace(' Corp', '').strip()
             
             basket.append({
-                'cusip': cusip,
+                'isin' if by_isin[contract] else 'cusip': cusip,
                 'conversion_factor': float(cf)
             })
         
