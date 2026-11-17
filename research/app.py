@@ -2562,13 +2562,18 @@ def cross_market_tab() -> html.Div:
     ], className="research-controls")
     return html.Div(style={"padding": "14px 24px"}, children=[
         html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)", "gap": 26,
-                        "alignItems": "start"}, children=[controls, loader(html.Div(id="xm-out"))]),
+                        "alignItems": "start"}, children=[
+            controls,
+            html.Div([level_window_nav(IDIO_WINDOW, prefix="xm-window"), loader(html.Div(id="xm-out"))]),
+        ]),
         dcc.Store(id="xm-shown"),
+        dcc.Store(id="xm-window", data=IDIO_WINDOW),
     ])
 
 
-def cross_market_view(result: dict, market: str) -> html.Div:
+def cross_market_view(result: dict, market: str, window: str) -> html.Div:
     today, signal, tenor = result["today"], result["signal"], result["tenor"]
+    bars = WINDOW_PRESETS.get(window)
     name = XM_MARKETS[market][0]
     one = signal.filter(pl.col("market") == market)
     now = one.row(-1, named=True)
@@ -2602,16 +2607,18 @@ def cross_market_view(result: dict, market: str) -> html.Div:
                                          (pl.col("mean") - 2 * pl.col("sd")).alias("-2 sd")),
                               [label, "range mean", "+2 sd", "-2 sd"],
                               f"{tenor}y {name} swapped into dollars, pick-up over the Treasury (bp) and its "
-                              f"{result['lookback']}d range", hlines=zero,
+                              f"{result['lookback']}d range", hlines=zero, window_bars=bars,
                               line_colors={label: ORANGE, "range mean": "#333", "+2 sd": DIM, "-2 sd": DIM})),
         _png_img(series_chart(one.select("ts", pl.col("local_asw").alias("local ASW"),
                                          (-pl.col("ccbs")).alias("basis swap (−CCBS)"),
                                          (-pl.col("ust_asw")).alias("Treasury (−USD ASW)")),
                               ["local ASW", "basis swap (−CCBS)", "Treasury (−USD ASW)"],
                               f"what the pick-up is made of (bp, before the BPV ratio): {name} against its own "
-                              "swaps, the basis swap, and the Treasury against SOFR", hlines=zero, fig_height=3.4)),
+                              "swaps, the basis swap, and the Treasury against SOFR", hlines=zero, window_bars=bars,
+                              fig_height=3.4)),
         _png_img(series_chart(wide.select("ts", *names), names,
-                              f"{tenor}y USD ASW by market (bp): higher is cheaper against SOFR", hlines=zero)),
+                              f"{tenor}y USD ASW by market (bp): higher is cheaper against SOFR", hlines=zero,
+                              window_bars=bars)),
         note("Italy and France carry credit the book would strip out with an adjusted CDS; read their level "
              "against Bunds as credit plus richness, and their z-score as the move in both.", "dim"),
     ])
@@ -3197,7 +3204,7 @@ def register_callbacks(app) -> None:
         except Exception as exc:
             return note(f"Inflation carry failed: {type(exc).__name__}: {exc}", "bad"), no_update
 
-    for prefix in ("sf", "cta", "gm"):
+    for prefix in ("sf", "cta", "gm", "xm"):
         @app.callback(Output(f"{prefix}-window", "data"),
                       *[Output(f"{prefix}-window-{key}", "style") for key in WINDOW_PRESETS],
                       *[Input(f"{prefix}-window-{key}", "n_clicks") for key in WINDOW_PRESETS],
@@ -3223,16 +3230,17 @@ def register_callbacks(app) -> None:
             return note(f"{root} basket failed: {type(exc).__name__}: {exc}", "bad"), no_update
 
     @app.callback(Output("xm-out", "children"), Output("xm-shown", "data"),
-                  Input("xm-run", "n_clicks"), Input("bench-tabs", "value"),
+                  Input("xm-run", "n_clicks"), Input("bench-tabs", "value"), Input("xm-window", "data"),
                   State("xm-tenor", "value"), State("xm-market", "value"), State("xm-lookback", "value"),
                   State("xm-shown", "data"))
-    def _cross_market(_clicks, tab, tenor, market, lookback, shown):
-        # Runs on Update and when the Cross-Market tab is first opened.
-        key = f"{tenor}|{market}|{lookback}"
+    def _cross_market(_clicks, tab, window, tenor, market, lookback, shown):
+        # Runs on Update, when the Cross-Market tab is first opened, and when the chart window changes.
+        window = window if window in WINDOW_PRESETS else IDIO_WINDOW
+        key = f"{tenor}|{market}|{lookback}|{window}"
         if tab != "xm" or (ctx.triggered_id != "xm-run" and shown == key):
             return no_update, no_update
         try:
-            return cross_market_view(cross_market_study(int(tenor), int(lookback)), market), key
+            return cross_market_view(cross_market_study(int(tenor), int(lookback)), market, window), key
         except Exception as exc:
             return note(f"Cross-market study failed: {type(exc).__name__}: {exc}", "bad"), no_update
 
