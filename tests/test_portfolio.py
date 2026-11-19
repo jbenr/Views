@@ -158,10 +158,23 @@ class _Handlers(list):
 
 
 class SessionIB(FakeIB):
+    readonly = False  # the default port is a paper one, where the session may trade
+
     def __init__(self):
         super().__init__()
         self.disconnectedEvent = _Handlers()
         self.errorEvent = _Handlers()
+        self.placed = []
+
+    async def connectAsync(self, *args, **kwargs):
+        assert kwargs["readonly"] is self.readonly
+        if self.fail:
+            raise ConnectionError("offline")
+
+    def placeOrder(self, contract, order):
+        self.placed.append((contract.localSymbol, order.action, order.totalQuantity, order.lmtPrice, order.orderRef))
+        return NS(contract=contract, order=NS(orderId=len(self.placed)), log=[],
+                  orderStatus=NS(status="Submitted", filled=0))
 
 
 def _wait(session, state, seconds=5):
@@ -247,6 +260,43 @@ def test_session_reports_failure_and_can_retry(gateway):
     session.disconnect()
     assert session.state == "disconnected"
 
+
+
+def test_session_sends_orders_only_to_a_paper_account(gateway, monkeypatch):
+    from execution.session import Session
+    gateway.up = True
+    ib = SessionIB()
+    session = Session(lambda: ib)
+    session.connect()
+    _wait(session, "connected")
+    session._tickers = {"ZN": NS(contract=NS(localSymbol="ZNZ6", conId=1), bid=110.5, ask=110.515625,
+                                 bidSize=40, askSize=float("nan"), last=-1)}
+    leg = dict(root="TY", action="BUY", quantity=2, limit=110.515625)
+    with pytest.raises(ValueError, match="price tick"):
+        session.submit([dict(leg, limit=110.51)], "views:x")
+    with pytest.raises(ValueError, match="No streamed contract"):
+        session.submit([dict(leg, root="WN")], "views:x")
+    assert not ib.placed  # nothing goes out when any leg is bad
+    [sent] = session.submit([leg], "views:x")
+    assert ib.placed == [("ZNZ6", "BUY", 2, 110.515625, "views:x")] and sent["status"] == "Submitted"
+    # the book it was sent into is kept with it, and fits the journal (no NaN)
+    assert (sent["bid"], sent["ask"], sent["bid_size"], sent["ask_size"], sent["last"]) == (
+        110.5, 110.515625, 40, None, None) and sent["sent"].endswith("+00:00")
+    from dashboard.trades import _sent_table
+    cells = str(_sent_table([sent], signal=False).to_plotly_json())
+    assert "110-16" in cells and "Bid at send" in cells and "Signal" not in cells
+    session.disconnect()
+
+    monkeypatch.setenv("VIEWS_IB_PORT", "4001")  # a live port: read-only, and submit refuses
+    live = SessionIB()
+    live.readonly = True
+    session = Session(lambda: live)
+    session.connect()
+    _wait(session, "connected")
+    assert not session.can_trade()
+    with pytest.raises(PermissionError):
+        session.submit([leg], "views:x")
+    assert not live.placed
 
 
 def test_quote_rows_and_futures_table_render():

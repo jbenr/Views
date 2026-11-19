@@ -41,7 +41,7 @@ from dashboard import markets
 from dashboard import futures
 from dashboard import market_pull
 from dashboard import portfolio
-from dashboard import tickets
+from dashboard import trades
 from dashboard.charts import (
     chart_image,
     dual_theme_charts,
@@ -709,76 +709,9 @@ def _overview_content(rows: list[dict]) -> list:
                            className="sd-note", style={"marginTop": 8})]
 
 
-EXIT_HEADERS = {"target": "Target", "signal": "Signal", "rule": "Exit rule", "now": "Now", "exits_at": "Exits at",
-                "progress": "Of the way"}
-POSITION_HEADERS = {"target": "Target", "signal": "Signal", "dir": "Dir", "since": "Since", "held": "Days",
-                    "pnl_bps": "P&L bp", "pnl_usd": "P&L $", "exp_bps": "Exp bp", "exp_usd": "Exp $",
-                    "captured": "Captured", "nearest": "Nearest exit"}
-NEAR_EXIT = 0.75  # an exit rule this far along is flagged
-
-
-def _model_positions(rows: list[dict]) -> list:
-    """The trades the signals are in, and how close each is to getting out.
-
-    Two tables. Positions: one row per signal in a trade -- P&L in bps and in dollars at
-    USD_PER_BP, what the trade expected at entry, the share of that captured, and its
-    nearest exit. Exits: one row per exit rule of each -- where it stands, where it
-    fires, and how far along it is (runner.exit_status)."""
-    positions, exits = [], []
-    for row in rows:
-        try:
-            read = runner.analysis(_row_id(row))
-        except RuntimeError:
-            continue
-        held = read["open_entry"]
-        if held is None:
-            continue
-        name = {"target": _trade_target(row, read["state"]), "signal": _display_name(row)}
-        pnl, expected = float(held["pnl_bps"]), held.get("expected_return_bps")
-        rules = read.get("exits") or []
-        nearest = max(rules, key=lambda r: r["progress"], default=None)
-        positions.append({
-            **name, "dir": held["direction"], "since": str(held["entry_date"]), "held": str(held["bars_held"]),
-            "pnl_bps": f"{pnl:+.1f}", "pnl_usd": _usd(pnl * USD_PER_BP),
-            "exp_bps": _fnum(expected, "+.1f"), "exp_usd": _usd(None if expected is None else expected * USD_PER_BP),
-            "captured": f"{pnl / expected:.0%}" if expected else "—",
-            "nearest": f"{nearest['rule']} · {max(nearest['progress'], 0.0):.0%}" if nearest else "—",
-            "_near": bool(nearest and nearest["progress"] >= NEAR_EXIT), "_pnl": pnl,
-        })
-        exits += [{**name, "rule": r["rule"], "now": r["now"], "exits_at": r["exits_at"],
-                   "progress": f"{max(r['progress'], 0.0):.0%}", "_near": r["progress"] >= NEAR_EXIT} for r in rules]
-    if not positions:
-        return [_heading("MODEL POSITIONS"), html.Div("No signal is in a trade.", className="sd-note")]
-
-    def style(column, value, record):
-        if column in ("target", "signal", "rule", "now", "nearest", "since"):
-            flag = {"color": ORANGE, "fontWeight": "bold"} if column in ("nearest", "rule") and record["_near"] else {}
-            return {"textAlign": "left", **({"fontWeight": "bold"} if column == "target" else {}), **flag}
-        if column == "dir":
-            return {"textAlign": "left", "color": C1 if value == "long" else C0, "fontWeight": "bold"}
-        if column in ("pnl_bps", "pnl_usd"):
-            return {"color": C1 if record["_pnl"] >= 0 else C0, "fontWeight": "bold"}
-        if column == "progress" and record["_near"]:
-            return {"color": ORANGE, "fontWeight": "bold"}
-        return None
-
-    total = sum(p["_pnl"] for p in positions)
-    return [
-        _heading("MODEL POSITIONS", f"{len(positions)} signals in a trade · P&L {total:+.1f}bp · "
-                                    f"{_usd(total * USD_PER_BP)} at ${USD_PER_BP:,.0f} per bp (assumed size)"),
-        _grid_table(pd.DataFrame(positions), columns=list(POSITION_HEADERS), headers=POSITION_HEADERS,
-                    cell_style=style),
-        _heading("HOW CLOSE TO EXIT", f"each rule of each open trade · 0% at entry, 100% when it fires · "
-                                      f"orange from {NEAR_EXIT:.0%}"),
-        _grid_table(pd.DataFrame(exits), columns=list(EXIT_HEADERS), headers=EXIT_HEADERS, cell_style=style),
-        html.Div("Exp bp is what the trade expected at its entry; Captured is P&L as a share of it. These are the "
-                 "signals' own trades, not the broker's fills.", className="sd-note", style={"marginTop": 6}),
-    ]
-
-
 def _portfolio_model(rows: list[dict]) -> list:
-    """The model's side of the Portfolio tab: its positions, then the orders that express them."""
-    return [*_model_positions(rows), *tickets.content(rows, USD_PER_BP, _display_name)]
+    """The signals' side of the Portfolio tab: a summary, then a section per signal."""
+    return trades.content(rows, USD_PER_BP, _display_name)
 
 
 def _trade_page_label(n: int, page: int, size: int = TRADES_PER_PAGE) -> str:
@@ -1740,10 +1673,12 @@ def build_app() -> dash.Dash:
                 ),
                 dcc.Tab(
                     label="Portfolio", value="portfolio", style=tab_style, selected_style=selected_tab_style,
-                    # what the signals hold and how close each is to its exit, then the broker's account
+                    # the account, then each signal's trade, then the broker's own positions and orders
                     children=html.Div(className="sd-page", children=[
-                        html.Div(id="model-positions", children=_portfolio_model(rows)),
                         portfolio.layout(),
+                        html.Div(id="model-positions", children=_portfolio_model(rows)),
+                        trades.order_layout(),
+                        portfolio.broker_layout(),
                     ]),
                 ),
             ],
@@ -1786,6 +1721,7 @@ def build_app() -> dash.Dash:
                     **{"aria-pressed": "false", "aria-label": "Toggle dark mode"}),
     ])
     portfolio.register_callbacks(app)
+    trades.register_callbacks(app, _registry_rows, USD_PER_BP, _display_name)
     futures.register_callbacks(app)
 
     app.clientside_callback(
@@ -1865,6 +1801,12 @@ def build_app() -> dash.Dash:
         Input("refresh-overview", "n_clicks"),
         prevent_initial_call=True,
     )(_refresh_overview)
+
+    @app.callback(Output("model-positions", "children", allow_duplicate=True),
+                  Input("ibkr-refresh", "n_clicks"), prevent_initial_call=True)
+    def _remark_portfolio(_clicks):
+        """Refresh IBKR re-marks the signals' futures at the stream's prices."""
+        return _portfolio_model(_registry_rows())
 
     def _refresh_market(_clicks):
         """The Market tab's own Ref: just the yields and curves, which is quick."""

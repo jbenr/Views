@@ -9,6 +9,15 @@ FUTURES = {
     "TN": ("UXY", 0.5), "ZB": ("US", 1), "UB": ("WN", 1),
 }
 
+# CME inter-commodity spreads IBKR lists on those futures: name -> its two roots, front leg first.
+# Each trades as one instrument at the exchange's own leg ratio, which IBKR's contract name carries.
+SPREADS = {
+    "TUF": ("TU", "FV"), "TUT": ("TU", "TY"), "TUX": ("TU", "UXY"), "TUB": ("TU", "US"), "TUL": ("TU", "WN"),
+    "FYT": ("FV", "TY"), "FOB": ("FV", "US"), "FOL": ("FV", "WN"), "NOB": ("TY", "US"), "NOL": ("TY", "WN"),
+    "NUB": ("UXY", "WN"), "BOB": ("US", "WN"),
+}
+MONTH_CODES = "FGHJKMNQUVXZ"
+
 
 async def subscribe(ib):
     """Tickers that keep updating, for IBKR's lead contract of each future, keyed by symbol."""
@@ -20,6 +29,29 @@ async def subscribe(ib):
         [contract] = await ib.qualifyContractsAsync(Future(conId=lead.conId, exchange="CBOT"))
         tickers[symbol] = ib.reqMktData(contract)
     return tickers
+
+
+async def spread_contract(ib, name):
+    """The nearest listed contract of a spread. Its localSymbol reads 'TUX 05-02 Z6':
+    name, leg ratio, month."""
+    from ib_async import Contract
+    listed = await ib.reqContractDetailsAsync(Contract(secType="ICS", symbol=name, exchange="CBOT", currency="USD"))
+
+    def month(details):
+        code = details.contract.localSymbol.split()[-1]
+        return int(code[1:]), MONTH_CODES.index(code[0])
+
+    return min(listed, key=month).contract
+
+
+def spread_row(name, ticker):
+    """Prices are decimal points of the spread, as the exchange quotes it."""
+    _, ratio, month = ticker.contract.localSymbol.split()
+    front, back = (int(part) for part in ratio.split("-"))
+    return dict(name=name, legs=f"{front} {SPREADS[name][0]} : {back} {SPREADS[name][1]}", month=month,
+                bid=_number(ticker.bid), ask=_number(ticker.ask), last=_number(ticker.last),
+                bid_size=_number(ticker.bidSize), ask_size=_number(ticker.askSize),
+                volume=_number(ticker.volume), time=ticker.time.isoformat() if ticker.time else None)
 
 
 def quote_row(symbol, ticker):

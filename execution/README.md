@@ -36,6 +36,18 @@ starts Gateway through IBC, which fills in the login form; you only approve the
 the password. IBC logs to `C:\IBC\Logs`. With `IbLoginId` blank, Connect falls
 back to opening Gateway for a manual login.
 
+**Orders.** On a paper port (4002 Gateway, 7497 TWS) Connect opens a trading
+session; on any other port it stays read-only. A signal calling for a trade has
+an **enter** button in the Portfolio tab's signal table. It opens an order
+ticket: one day limit order per futures leg, each starting at the far touch (the
+ask to buy, the bid to sell), with quantity and limit editable. **Submit to
+IBKR** sends the legs together through `Session.submit`, which refuses anything
+but a paper account (IBKR numbers them `D...`) on a paper port and checks every
+leg before sending any. The orders carry the signal's `order_ref`, so they and
+their fills show under that signal in the broker tables, and each submission is
+kept in the journal. Gateway's own "Read-Only API" setting must be off (IBC:
+`ReadOnlyApi=no`, or untick it under Configure > Settings > API > Settings).
+
 **Gateway needs a desktop.** Its login window only opens in a Windows session a
 user is logged on to. A dashboard started over SSH (the tmux session) runs in
 session 0, which has none, so Connect starts Gateway through the scheduled task

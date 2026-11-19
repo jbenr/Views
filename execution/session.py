@@ -1,11 +1,13 @@
-"""One long-lived, read-only IBKR connection, starting IB Gateway when it is not up.
+"""One long-lived IBKR connection, starting IB Gateway when it is not up.
 
 Dashboard requests come and go on short-lived threads, so the connection lives on its
-own event-loop thread and callers hand it work. No order mutation methods are exposed.
+own event-loop thread and callers hand it work. It is read-only except on a paper
+port, where submit() can send limit orders to a paper account and nothing else.
 """
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import os
 import re
 import subprocess
@@ -15,13 +17,14 @@ from pathlib import Path
 from execution.ibkr import IBKRConfig
 from execution.journal import TradeJournal
 from execution.portfolio import collect, connect, new_ib
-from execution.quotes import quote_row, subscribe
+from execution.quotes import FUTURES, SPREADS, quote_row, spread_contract, spread_row, subscribe
 
 GATEWAY_ROOT = Path("C:/Jts/ibgateway")
 IBC_ROOT = Path("C:/IBC")  # https://github.com/IbcAlpha/IBC, optional: automates the login form
 IBC_CONFIG = Path.home() / "Documents" / "IBC" / "config.ini"  # holds IbLoginId / IbPassword
 GATEWAY_TASK = "IB Gateway"  # scheduled task that runs GATEWAY_LAUNCHER on the logged-on desktop
 GATEWAY_LAUNCHER = IBC_ROOT / "launch_gateway.cmd"
+PAPER_PORTS = (4002, 7497)  # IB Gateway and TWS paper trading: the only ports orders are sent on
 LOGIN_WAIT = 300 # seconds allowed for typing the password and approving 2FA
 POLL = 2
 BUSY = ("waiting", "connecting")
@@ -70,7 +73,7 @@ def launch_gateway(port):
     settings = dict(APP="GATEWAY", INLINE="0", TWS_MAJOR_VRSN=exe.parent.name,
                     TWS_PATH=str(GATEWAY_ROOT.parent), TWS_SETTINGS_PATH=str(exe.parent),
                     IBC_PATH=str(IBC_ROOT), CONFIG=str(IBC_CONFIG), LOG_PATH=str(IBC_ROOT / "Logs"),
-                    TRADING_MODE="paper" if port in (4002, 7497) else "live", TWOFA_TIMEOUT_ACTION="exit")
+                    TRADING_MODE="paper" if port in PAPER_PORTS else "live", TWOFA_TIMEOUT_ACTION="exit")
     banner = str(IBC_ROOT / "scripts" / "DisplayBannerAndLaunch.bat")
     if on_desktop():
         subprocess.Popen(["cmd", "/c", "start", "", "/min", banner], env=dict(os.environ, **settings))
@@ -104,8 +107,8 @@ class Session:
     def __init__(self, factory=None):
         self.state, self.detail, self.account, self.snapshot_as_of = "disconnected", "", None, None
         self._factory = factory
-        self._ib = self._loop = self._task = None
-        self._tickers, self.quote_note = {}, ""
+        self._ib = self._loop = self._task = self._port = None
+        self._tickers, self._spreads, self.quote_note = {}, {}, ""
         self._lock = threading.Lock()
 
     def status(self):
@@ -146,8 +149,75 @@ class Session:
         return dict(rows=[quote_row(symbol, ticker) for symbol, ticker in self._tickers.items()],
                     note=self.quote_note)
 
+    def can_trade(self):
+        """Orders go only to a paper account (IBKR numbers them D...) on a paper port."""
+        return (self.state == "connected" and self._port in PAPER_PORTS
+                and bool(self.account) and self.account.startswith("D"))
+
+    def submit(self, legs, order_ref):
+        """Send each leg -- dict(root, action, quantity, limit) -- as a day limit order on that
+        root's streamed contract, tagged order_ref. All legs are checked before any is sent.
+        Returns a row per leg with IBKR's order id and first status."""
+        if not self.can_trade():
+            raise PermissionError("Orders are only sent to a connected paper account.")
+        return self._run(self._submit(legs, order_ref)).result(30)
+
+    async def _submit(self, legs, order_ref):
+        from ib_async import LimitOrder
+        contracts = {FUTURES[symbol][0]: (ticker.contract, FUTURES[symbol][1] / 32.0)
+                     for symbol, ticker in self._tickers.items()}
+        for leg in legs:
+            if leg["root"] not in contracts:
+                raise ValueError(f"No streamed contract for {leg['root']}.")
+            ticks = float(leg["limit"]) / contracts[leg["root"]][1]
+            if leg["action"] not in ("BUY", "SELL") or int(leg["quantity"]) != leg["quantity"] or leg["quantity"] <= 0:
+                raise ValueError(f"{leg['root']}: side must be BUY or SELL and quantity a whole number above zero.")
+            if leg["limit"] <= 0 or abs(ticks - round(ticks)) > 1e-6:
+                raise ValueError(f"{leg['root']}: limit {leg['limit']} is not on the contract's price tick.")
+        tickers = {FUTURES[symbol][0]: ticker for symbol, ticker in self._tickers.items()}
+
+        def seen(value):  # IBKR's "no quote" is NaN or -1; the journal wants None
+            return float(value) if value is not None and value == value and value > 0 else None
+
+        placed, books = [], []
+        for leg in legs:
+            ticker = tickers[leg["root"]]
+            # the book each leg was sent into, read the instant before it went
+            books.append(dict(sent=dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds"),
+                              bid=seen(ticker.bid), ask=seen(ticker.ask), bid_size=seen(ticker.bidSize),
+                              ask_size=seen(ticker.askSize), last=seen(ticker.last), account=self.account))
+            placed.append(self._ib.placeOrder(contracts[leg["root"]][0], LimitOrder(
+                leg["action"], int(leg["quantity"]), float(leg["limit"]), orderRef=order_ref, account=self.account,
+                tif="DAY")))
+        await asyncio.sleep(2)  # the first status of each
+        rows = [dict(leg, **book, contract=trade.contract.localSymbol, order_id=trade.order.orderId,
+                     status=trade.orderStatus.status, filled=float(trade.orderStatus.filled),
+                     message=trade.log[-1].message if trade.log else "")
+                for leg, book, trade in zip(legs, books, placed)]
+        try:
+            await self._refresh()
+        except Exception:
+            pass  # the orders are in; the snapshot catches up on the next refresh
+        return rows
+
+    def set_spreads(self, names):
+        """Stream exactly these exchange-listed spreads: subscribe to the new, drop the rest."""
+        if self.state == "connected" and set(names) != set(self._spreads):
+            self._run(self._set_spreads([name for name in names if name in SPREADS])).result(30)
+
+    def spread_quotes(self):
+        return [spread_row(name, ticker) for name, ticker in self._spreads.items()]
+
+    async def _set_spreads(self, names):
+        for name in set(self._spreads) - set(names):
+            self._ib.cancelMktData(self._spreads.pop(name).contract)
+        for name in names:
+            if name not in self._spreads:
+                self._spreads[name] = self._ib.reqMktData(await spread_contract(self._ib, name))
+
     def _quote_error(self, _id, code, message, contract):
-        if contract is not None and any(t.contract.conId == contract.conId for t in self._tickers.values()):
+        streams = [*self._tickers.values(), *self._spreads.values()]
+        if contract is not None and any(t.contract.conId == contract.conId for t in streams):
             self.quote_note = f"IBKR {code}: {message.split(', contract:')[0]}"
 
     async def _connect(self, config):
@@ -162,7 +232,8 @@ class Session:
                     said = []  # Gateway's own words say more than the timeout they end in
                     ib.errorEvent += lambda _id, code, message, _contract: said.append(f"{code} {message}")
                     try:
-                        account = await connect(ib, config)
+                        # a trading session on a paper port, read-only everywhere else
+                        account = await connect(ib, config, readonly=config.port not in PAPER_PORTS)
                         break
                     except (ConnectionError, TimeoutError, OSError) as exc:
                         # the port can open moments before Gateway accepts API clients
@@ -184,7 +255,7 @@ class Session:
                                        f"{retry}")
                 await asyncio.sleep(POLL)
             ib.disconnectedEvent += self._dropped
-            self._ib, self.account = ib, account
+            self._ib, self.account, self._port = ib, account, config.port
             self._set("connected")
         except asyncio.CancelledError:
             if ib:
@@ -212,7 +283,7 @@ class Session:
         self.snapshot_as_of = snapshot["as_of"]
 
     async def _close(self):
-        ib, self._ib, self._tickers = self._ib, None, {}
+        ib, self._ib, self._tickers, self._spreads = self._ib, None, {}, {}
         self._set("disconnected")
         if ib:
             ib.disconnect()
@@ -220,5 +291,5 @@ class Session:
     def _dropped(self):
         # Gateway restarts daily and logs out weekly; reconnecting is a click, not automatic.
         if self.state == "connected":
-            self._ib, self._tickers = None, {}
+            self._ib, self._tickers, self._spreads = None, {}, {}
             self._set("disconnected", "IBKR closed the connection.")

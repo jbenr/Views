@@ -63,6 +63,8 @@ html[data-sd-theme="dark"] .sd-app :is(.sd-kv, .sd-row-body, .sd-theme-toggle, b
 html[data-sd-theme="dark"] .sd-app :is(.sd-sheet, .sd-row, .sd-row-body, .sd-row-legend, .sd-kv, .sd-kv span, .sd-detail-cell, .sd-row-head > span, .sd-row-head::before, .sd-row-legend > span, .sd-h, .sd-fold, .sd-deep-tabs, .sd-deep-tab, button, .tab, .viz-table, .viz-table th, .viz-table td) {
     border-color: #454951 !important;
 }
+html[data-sd-theme="dark"] .sd-app .sd-modal-box { background: #202329; border-color: #8a909a; }
+html[data-sd-theme="dark"] .sd-app .sd-modal-box input { background: #2a2e36; color: #dcdfe4; border-color: #454951; }
 html[data-sd-theme="dark"] .sd-app :is(.sd-note, .sd-h-note, .sd-detail-label, .sd-n, .sd-pos--quiet, .sd-stamp span span) { color: #a4abb5; }
 html[data-sd-theme="dark"] .sd-app .sd-row-head:hover { background: #292e37; }
 html[data-sd-theme="dark"] .sd-app .sd-reading--active { background: #304657; color: #c4dff1; }

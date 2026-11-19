@@ -1,4 +1,4 @@
-"""Read-only IBKR portfolio: the broker's account, positions, orders and fills as plain tables."""
+"""The IBKR account on the Portfolio tab: the broker's balances, positions, orders and fills as plain tables."""
 from decimal import Decimal, InvalidOperation
 
 import pandas as pd
@@ -16,7 +16,7 @@ SESSION = Session()  # the dashboard's one broker connection; it dies with the s
 
 
 ACCOUNT_STATS = [
-    ("NetLiquidation", "net liquidation"),
+    ("NetLiquidation", "AUM (net liquidation)"),
     ("InitMarginReq", "initial margin"),
     ("MaintMarginReq", "maintenance margin"),
 ]
@@ -102,11 +102,27 @@ def _positions_table(groups):
     return grid_table(pd.DataFrame(rows), columns=list(POSITION_COLS), headers=POSITION_COLS, cell_style=style)
 
 
+def _summary():
+    """The account at the top of the page: who, as of when, what it is worth, what it has posted."""
+    snapshot = TradeJournal().latest_snapshot()
+    if not snapshot:
+        return [html.Div("No broker snapshot yet. Connect IBKR for the account's value.", className="sd-note")]
+    balances = snapshot.get("balances", [])
+    return [
+        *[html.Div(w, role="status", className="sd-note", style={"color": "#D35400"})
+          for w in snapshot.get("warnings", [])],
+        kv_range([kv("account", snapshot["account"]),
+                  kv("snapshot", str(snapshot["as_of"])[:19].replace("T", " "), "UTC"),
+                  *[kv(label, _account_value(balances, tag)) for tag, label in ACCOUNT_STATS]]),
+    ]
+
+
 def _content():
+    """What the broker holds and has done, below the signals' sections."""
     journal = TradeJournal()
     snapshot = journal.latest_snapshot()
     if not snapshot:
-        return [html.Div("No broker snapshot yet. Start TWS / IB Gateway and refresh.", className="sd-note")]
+        return []
     balances = snapshot.get("balances", [])
     refs = {r["order_ref"]: r["signal_id"] for r in journal.records("intent")}
 
@@ -115,19 +131,14 @@ def _content():
 
     fills = journal.saved_fills(snapshot["account"]) + snapshot.get("fills", [])
     return [
-        *[html.Div(w, role="status", className="sd-note", style={"color": "#D35400"})
-          for w in snapshot.get("warnings", [])],
-        kv_range([kv("account", snapshot["account"]), kv("snapshot", str(snapshot["as_of"])[:19].replace("T", " "),
-                                                         "UTC")]),
-        heading("ACCOUNT"),
-        _account_range(balances, ACCOUNT_STATS),
+        heading("BROKER POSITIONS", "what IBKR holds, not yet tied to a signal · P&L is IBKR's unrealized P&L at "
+                                    "refresh · average cost and price in the same units"),
+        _positions_table(group_positions(snapshot["positions"], fills)),
         html.Details([html.Summary("FULL AND LOOK-AHEAD MARGIN"),
                       html.Div([_account_range(balances, FORWARD_STATS),
                                 html.Div("Full figures exclude intraday credits; look-ahead figures reflect the next "
                                          "margin change.", className="sd-note")], className="sd-fold-body")],
                      className="sd-fold sd-fold--quiet"),
-        heading("POSITIONS", "P&L is IBKR's unrealized P&L at refresh · average cost and price in the same units"),
-        _positions_table(group_positions(snapshot["positions"], fills)),
         heading("OPEN ORDERS"),
         _records_table(attributed(snapshot["orders"]), ORDER_COLS),
         heading("RECENT COMPLETED ORDERS"),
@@ -159,8 +170,8 @@ def layout():
     status = SESSION.status()
     label, text, idle = _connection(status)
     return html.Div([
-        heading("BROKER ACCOUNT (IBKR)", f"read-only · order submission disabled · {config.host}:{config.port} "
-                                         f"client {config.client_id}"),
+        heading("ACCOUNT (IBKR)", f"orders go to a paper account only · {config.host}:{config.port} "
+                                  f"client {config.client_id}"),
         html.Div(className="sd-bar", children=[
             html.Button(label, id="ibkr-connect", className="ref-btn sd-btn"),
             html.Button("Refresh IBKR", id="ibkr-refresh", className="ref-btn sd-btn"),
@@ -170,13 +181,18 @@ def layout():
         # ticks only while a connection is up or being made; the snapshot stamp it last drew
         dcc.Interval(id="ibkr-poll", interval=2000, disabled=idle),
         dcc.Store(id="ibkr-drawn", data=status["snapshot"]),
-        dcc.Loading(
-            html.Div(id="ibkr-content", children=_content()),
-            custom_spinner=shimmer_loader(image="guy.png"),
-            overlay_style={"visibility": "visible"},
-            parent_className="dashboard-portfolio-loader",
-        ),
+        html.Div(id="ibkr-summary", children=_summary()),
     ])
+
+
+def broker_layout():
+    """The broker's own positions, orders and fills: the foot of the page."""
+    return dcc.Loading(
+        html.Div(id="ibkr-content", children=_content()),
+        custom_spinner=shimmer_loader(image="guy.png"),
+        overlay_style={"visibility": "visible"},
+        parent_className="dashboard-portfolio-loader",
+    )
 
 
 def register_callbacks(app):
@@ -194,11 +210,12 @@ def register_callbacks(app):
         # a new snapshot stamp redraws the tables below; the tick alone never does
         return *_connection(status), status["snapshot"] if status["snapshot"] != drawn else no_update
 
-    @app.callback(Output("ibkr-content", "children"), Output("ibkr-message", "children"),
+    @app.callback(Output("ibkr-summary", "children"), Output("ibkr-content", "children"),
+                  Output("ibkr-message", "children"),
                   Input("ibkr-refresh", "n_clicks"), Input("ibkr-drawn", "data"), prevent_initial_call=True)
     def update(_refresh, _drawn):
         if ctx.triggered_id != "ibkr-refresh":
-            return _content(), ""
+            return _summary(), _content(), ""
         try:
             if SESSION.state == "connected":
                 SESSION.refresh()
@@ -206,6 +223,6 @@ def register_callbacks(app):
             else:
                 TradeJournal().save_snapshot(fetch_snapshot())
                 message = "Snapshot refreshed. Broker connection closed."
-            return _content(), message
         except Exception as exc:
-            return _content(), f"Refresh/action failed ({type(exc).__name__}): {exc}. Previous snapshot retained."
+            message = f"Refresh/action failed ({type(exc).__name__}): {exc}. Previous snapshot retained."
+        return _summary(), _content(), message

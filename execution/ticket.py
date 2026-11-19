@@ -41,19 +41,28 @@ def futures_dv01() -> dict[str, dict]:
 
 def contract_legs(legs: dict[str, float], usd_per_bp: float, dv01: dict[str, dict]) -> list[dict]:
     """Each yield leg as a futures order: buy contracts to be short the yield, sell to be
-    long it. residual is the dollars per bp of that leg left over by whole contracts."""
+    long it. risk is the dollars per bp the model wants on that leg, held what the whole
+    contracts carry, residual the difference; signed is contracts, positive long."""
     rows = []
     for tenor, weight in legs.items():
         root = ROOTS.get(tenor)
         risk = weight * usd_per_bp  # dollars gained per bp rise in this yield
-        row = dict(tenor=tenor, root=root, risk=risk, contract=None, dv01=None, exact=None, quantity=None,
-                   action=None, residual=None)
+        row = dict(tenor=tenor, weight=weight, root=root, risk=risk, contract=None, dv01=None, exact=None,
+                   quantity=None, signed=None, action=None, held=None, residual=None)
         if root in dv01:
             each = dv01[root]["dv01"]
             exact = -risk / each
             quantity = round(exact)
             row.update(contract=dv01[root]["contract"], dv01=each, exact=exact, quantity=abs(quantity),
-                       action="BUY" if quantity > 0 else "SELL" if quantity < 0 else None,
-                       residual=risk + quantity * each)
+                       signed=quantity, action="BUY" if quantity > 0 else "SELL" if quantity < 0 else None,
+                       held=-quantity * each, residual=risk + quantity * each)
         rows.append(row)
     return rows
+
+
+def package_dv01(rows: list[dict]) -> float | None:
+    """Dollars per bp of the package the whole contracts carry: the held leg risks projected
+    onto the package's leg weights (least squares). None when a leg has no DV01."""
+    if any(row["held"] is None for row in rows):
+        return None
+    return sum(row["held"] * row["weight"] for row in rows) / sum(row["weight"] ** 2 for row in rows)

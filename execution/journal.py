@@ -44,6 +44,10 @@ class TradeJournal:
         return self._save("intent", dict(signal_id=signal_id, module=module,
                           signal_run=signal_run, status="pending_review", order_ref=f"views:{key}"), key)
 
+    def save_orders(self, intent_id, signal_id, orders):
+        """What was sent to the broker for a flagged signal: one record per submission."""
+        return self._save("orders", dict(intent_id=intent_id, signal_id=signal_id, orders=orders))
+
     def save_snapshot(self, snapshot):
         # Retain executions when they disappear from TWS's recent-history window.
         for fill in snapshot.get("fills", []):

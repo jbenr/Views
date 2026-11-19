@@ -52,13 +52,13 @@ def new_ib(factory=None):
     return ib
 
 
-async def connect(ib, config):
-    """Open a read-only connection and return the one account it serves."""
+async def connect(ib, config, readonly=True):
+    """Open a connection, read-only unless told otherwise, and return the one account it serves."""
     if config.client_id <= 0:
         raise ValueError("Use a positive, dedicated VIEWS_IB_CLIENT_ID for read-only access.")
     try:
         await ib.connectAsync(config.host, config.port, clientId=config.client_id,
-                              readonly=True, timeout=10, account=config.account or "",
+                              readonly=readonly, timeout=10, account=config.account or "",
                               raiseSyncErrors=True)
     except ConnectionRefusedError as exc:
         raise ConnectionError(

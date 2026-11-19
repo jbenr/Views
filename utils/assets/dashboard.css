@@ -205,6 +205,9 @@
 .sd-bbg-panel { margin: 12px 0 20px; }
 .sd-futures-heading { display: flex; align-items: center; gap: 12px; }
 .sd-futures-heading > .sd-h { flex: 1; }
+/* its table sits one wrapper down: the rule moves onto the table, as under any other heading */
+.sd-futures-heading:has(+ div .sd-grid) > .sd-h { margin-bottom: 0; border-bottom: none; }
+.sd-futures-heading + div .sd-grid .viz-table { border-top: 2px solid #333333; }
 .sd-futures-activity {
     flex: 0 0 11px; width: 11px; height: 11px; margin-right: 4px;
     border: 2px solid #88888855; border-radius: 50%; box-sizing: border-box;
@@ -254,6 +257,19 @@
     font-size: 11px;
 }
 .sd-stamp span span { color: #888888; }
+
+/* the order ticket: one plain box over a dimmed page */
+.sd-modal {
+    position: fixed; inset: 0; z-index: 50; display: flex; align-items: flex-start; justify-content: center;
+    padding-top: 10vh; background: rgba(0, 0, 0, 0.35);
+}
+.sd-modal-box {
+    max-width: 94vw; max-height: 80vh; overflow: auto; padding: 4px 18px 14px;
+    border: 2px solid #333333; background: #FFFFFF;
+}
+.sd-modal-box div:has(> .viz-table) { max-width: 100%; overflow-x: auto; }
+.sd-modal-box input { width: 92px; padding: 1px 4px; border: 1px solid #BBBBBB; font: inherit; text-align: right; }
+.sd-status-btn { margin-top: 0; font-weight: bold; }
 
 /* folded detail: one line until opened */
 .sd-fold { border-bottom: 1px solid #E0E0E0; }
@@ -348,4 +364,19 @@
     /* the folder tabs stay side by side */
     #dashboard-tabs { padding: 8px 10px 0 !important; }
     #dashboard-tabs .tab { min-width: 0 !important; padding: 8px 9px !important; margin-right: 2px !important; }
+
+    /* the order ticket takes the whole screen; 16px inputs stop iOS zooming on focus,
+       and Submit / Close stay pinned at the bottom while the table scrolls sideways */
+    .sd-modal { padding-top: 0; align-items: stretch; }
+    .sd-modal-box {
+        max-width: none; width: 100%; max-height: none; height: 100%; box-sizing: border-box;
+        padding: 4px 8px 0; border: none; display: flex; flex-direction: column;
+    }
+    .sd-modal-box input { width: 72px; font-size: 16px; padding: 4px; }
+    .sd-modal-box .sd-bar {
+        position: sticky; bottom: 0; order: 2; margin-top: auto; padding: 8px 0;
+        background: inherit; border-top: 1px solid #D4D4D4;
+    }
+    .sd-modal-box .sd-bar .sd-btn { flex: 1; padding: 10px 0; font-size: 14px; }
+    #order-result { order: 1; }
 }
