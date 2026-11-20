@@ -258,6 +258,38 @@
 }
 .sd-stamp span span { color: #888888; }
 
+.sd-loading-box { padding: 14px 18px; }
+/* the order ticket's lead-leg picker: one line of plain radio buttons */
+.sd-lead { display: flex; align-items: center; gap: 12px; margin: 4px 0 6px; flex-wrap: wrap; }
+.sd-lead-pick label { margin-right: 14px; font-size: 12px; }
+.sd-lead-pick input { margin-right: 4px; }
+.sd-loading-box .sd-note { font-size: 13px; }
+
+/* the paper/live switch: top right of the Portfolio tab, above the account */
+.sd-mode-bar { display: flex; flex-direction: column; align-items: flex-end; margin-bottom: 4px; }
+.sd-mode { display: flex; align-items: center; gap: 8px; }
+.sd-mode .sd-btn { margin-top: 0; }
+.sd-mode-label { font-weight: 300; font-size: 20px; letter-spacing: 1px; }
+.sd-mode-bar > .sd-note { max-width: 360px; text-align: right; }
+/* the passcode keypad: a phone's 1-9 in three rows, then C 0 ⌫ */
+.sd-keypad-display {
+    height: 36px; margin: 10px 0; border: 1px solid #BBBBBB; text-align: center;
+    font-size: 24px; letter-spacing: 6px; line-height: 36px;
+}
+.sd-keypad { display: flex; flex-direction: column; align-items: center; gap: 12px; margin-bottom: 12px; }
+.sd-keypad-row { display: flex; gap: 18px; }
+.sd-app .sd-keypad .sd-keypad-row button.sd-key {
+    width: 64px; height: 64px; border-radius: 50%; padding: 0; margin: 0;
+    font-size: 22px; line-height: 64px; text-align: center;
+}
+/* the passcode box sits in the middle of the screen, as the loading mark does */
+.sd-modal.sd-modal--center { align-items: center; padding-top: 0; }
+.sd-modal--center .sd-modal-box { text-align: center; }
+@media (max-width: 700px) {
+    .sd-modal.sd-modal--center { align-items: center; }
+    .sd-modal--center .sd-modal-box { width: auto; height: auto; padding: 8px 16px 14px; border: 2px solid #333333; }
+}
+
 /* the order ticket: one plain box over a dimmed page */
 .sd-modal {
     position: fixed; inset: 0; z-index: 50; display: flex; align-items: flex-start; justify-content: center;
@@ -268,7 +300,23 @@
     border: 2px solid #333333; background: #FFFFFF;
 }
 .sd-modal-box div:has(> .viz-table) { max-width: 100%; overflow-x: auto; }
-.sd-modal-box input { width: 92px; padding: 1px 4px; border: 1px solid #BBBBBB; font: inherit; text-align: right; }
+/* dcc.Input is a wrapper div (which gets the className, at width 100% of a cell that
+   shrinks to its content) around the real input, plus its own -/+ buttons for numbers:
+   size the wrapper, fill it with the input, and drop those buttons */
+.sd-modal-box .dash-input-container {
+    width: auto; height: 26px; border: 1px solid #BBBBBB; border-radius: 2px; background: #FFFFFF;
+}
+.sd-modal-box .dash-input-container.sd-qty { width: 5em; min-width: 5em; }
+.sd-modal-box .dash-input-container.sd-limit { width: 7.5em; min-width: 7.5em; }
+.sd-modal-box .dash-input-stepper { display: none !important; }
+.sd-modal-box .dash-input-element {
+    width: 100%; min-width: 0; height: 100%; box-sizing: border-box; padding: 0 6px; border: none;
+    background: transparent; color: inherit; font: inherit; text-align: right;
+}
+.sd-modal-box .sd-limit .dash-input-element { text-align: center; }
+/* a limit between its one-tick arrows */
+.sd-stepper { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
+.sd-app .sd-stepper button { padding: 0 8px !important; margin: 0; line-height: 20px; font-size: 14px !important; }
 .sd-status-btn { margin-top: 0; font-weight: bold; }
 
 /* folded detail: one line until opened */
@@ -370,9 +418,14 @@
     .sd-modal { padding-top: 0; align-items: stretch; }
     .sd-modal-box {
         max-width: none; width: 100%; max-height: none; height: 100%; box-sizing: border-box;
-        padding: 4px 8px 0; border: none; display: flex; flex-direction: column;
+        padding: 4px 8px 0; border: none; display: flex; flex-direction: column; min-width: 0;
     }
-    .sd-modal-box input { width: 72px; font-size: 16px; padding: 4px; }
+    /* a flex item is otherwise as wide as its widest table: keep it to the screen and let
+       the table scroll sideways inside */
+    .sd-modal-box > * { min-width: 0; max-width: 100%; }
+    .sd-modal-box .dash-input-container { height: 34px; }
+    .sd-modal-box .dash-input-element { font-size: 16px; }
+    .sd-app .sd-stepper button { padding: 4px 12px !important; font-size: 16px !important; }
     .sd-modal-box .sd-bar {
         position: sticky; bottom: 0; order: 2; margin-top: auto; padding: 8px 0;
         background: inherit; border-top: 1px solid #D4D4D4;

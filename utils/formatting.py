@@ -1,3 +1,5 @@
+import re
+
 from tabulate import tabulate
 
 try:
@@ -64,3 +66,30 @@ def format_tsy_price(decimal_price, is_ticks=True, tick_32nds=0.125):
         suffix = f"{int(remainder * 8)}"
 
     return f"{handles:03d}-{whole_32nds:02d}{suffix}"
+
+
+def parse_tsy_price(text):
+    """
+    Treasury futures notation back to a decimal price; the inverse of format_tsy_price.
+
+    The digit after the 32nds is eighths of a 32nd ("+" is a half). A plain decimal
+    passes through. None when the text is neither.
+
+    Examples:
+        "110-16+" -> 110.515625
+        "104-032" -> 104.0703125 (3 and 2/8 32nds)
+        "110.5"   -> 110.5
+    """
+    text = str(text or "").strip()
+    match = re.fullmatch(r"(\d+)-(\d{2})([+0-7]?)", text)
+    if match:
+        handles, thirty_seconds, eighth = match.groups()
+        eighths = 4 if eighth == "+" else int(eighth or 0)
+        if int(thirty_seconds) > 31:
+            return None
+        return int(handles) + (int(thirty_seconds) + eighths / 8) / 32
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value if value == value else None

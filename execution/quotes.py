@@ -31,11 +31,23 @@ async def subscribe(ib):
     return tickers
 
 
+async def listed_spreads(ib, name):
+    """Every listed month of a spread, as IBKR's contract details."""
+    from ib_async import Contract
+    return await ib.reqContractDetailsAsync(Contract(secType="ICS", symbol=name, exchange="CBOT", currency="USD"))
+
+
+def spread_ratio(local_symbol):
+    """'TUX 05-02 Z6' -> (5, 2, 'Z6'): front and back contracts per spread, and its month."""
+    _, ratio, month = local_symbol.split()
+    front, back = (int(part) for part in ratio.split("-"))
+    return front, back, month
+
+
 async def spread_contract(ib, name):
     """The nearest listed contract of a spread. Its localSymbol reads 'TUX 05-02 Z6':
     name, leg ratio, month."""
-    from ib_async import Contract
-    listed = await ib.reqContractDetailsAsync(Contract(secType="ICS", symbol=name, exchange="CBOT", currency="USD"))
+    listed = await listed_spreads(ib, name)
 
     def month(details):
         code = details.contract.localSymbol.split()[-1]
@@ -46,8 +58,7 @@ async def spread_contract(ib, name):
 
 def spread_row(name, ticker):
     """Prices are decimal points of the spread, as the exchange quotes it."""
-    _, ratio, month = ticker.contract.localSymbol.split()
-    front, back = (int(part) for part in ratio.split("-"))
+    front, back, month = spread_ratio(ticker.contract.localSymbol)
     return dict(name=name, legs=f"{front} {SPREADS[name][0]} : {back} {SPREADS[name][1]}", month=month,
                 bid=_number(ticker.bid), ask=_number(ticker.ask), last=_number(ticker.last),
                 bid_size=_number(ticker.bidSize), ask_size=_number(ticker.askSize),

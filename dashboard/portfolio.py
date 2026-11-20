@@ -7,7 +7,6 @@ from dash import Input, Output, State, ctx, dcc, html, no_update
 from dashboard.sheet import grid_table, heading, kv, kv_range
 from execution.journal import TradeJournal
 from execution.portfolio import fetch_snapshot
-from execution.ibkr import IBKRConfig
 from execution.grouping import group_positions
 from execution.session import BUSY, Session
 from utils.research_app import shimmer_loader
@@ -166,7 +165,7 @@ def _connection(status):
 
 
 def layout():
-    config = IBKRConfig.from_env()
+    config = SESSION.config()
     status = SESSION.status()
     label, text, idle = _connection(status)
     return html.Div([

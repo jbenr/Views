@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 import polars as pl
 import pandas as pd
 import psycopg
@@ -195,6 +196,23 @@ def _connect(dsn: str | None = None, wake: bool = True) -> psycopg.Connection:
     except Exception:
         stop2.set()
         raise
+
+
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"  # git-ignored
+
+
+def env_value(name: str, path: Path = ENV_FILE) -> str | None:
+    """A setting from the process environment, else from the repo's .env file (KEY=value
+    lines, # comments, optional quotes). Read on every call, so editing .env needs no restart."""
+    if os.getenv(name):
+        return os.getenv(name)
+    if not path.exists():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep and key.strip().removeprefix("export ").strip() == name:
+            return value.strip().strip("'\"") or None
+    return None
 
 
 @contextlib.contextmanager

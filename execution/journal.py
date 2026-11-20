@@ -31,6 +31,14 @@ class TradeJournal:
                        (key, kind, dt.datetime.now(dt.timezone.utc).isoformat(), json.dumps(payload, allow_nan=False)))
         return key
 
+    def save_plan(self, key, plan):
+        """A contingent-legging plan (execution.legging), rewritten in place as its hedges go.
+        A plan read back by records() carries the row's own id and created: they are not saved twice."""
+        payload = {k: v for k, v in plan.items() if k not in ("id", "created")}
+        with self._connect() as db:
+            db.execute("INSERT OR REPLACE INTO records VALUES (?, 'legging', ?, ?)",
+                       (key, dt.datetime.now(dt.timezone.utc).isoformat(), json.dumps(payload, allow_nan=False)))
+
     def records(self, kind):
         with self._connect() as db:
             return [dict(id=r[0], created=r[1], **json.loads(r[2])) for r in db.execute(

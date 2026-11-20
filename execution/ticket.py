@@ -7,6 +7,8 @@ Preview only: nothing here talks to the broker.
 """
 from __future__ import annotations
 
+import itertools
+
 from research import basis_basket
 from research.panel import CATALOG
 
@@ -58,6 +60,43 @@ def contract_legs(legs: dict[str, float], usd_per_bp: float, dv01: dict[str, dic
                        held=-quantity * each, residual=risk + quantity * each)
         rows.append(row)
     return rows
+
+
+def spread_orders(signed: dict[str, int], dv01: dict[str, float],
+                  listed: dict[str, tuple[str, str, int, int]]) -> tuple[list[dict], dict[str, int]]:
+    """Cover the legs' contracts with whole exchange-listed spreads, leaving the least DV01
+    to trade outright (the legging risk), then the fewest outright contracts, then the
+    fewest spread orders. signed is contracts per root, positive long; listed is name ->
+    (front root, back root, front ratio, back ratio), and buying one spread buys the front
+    ratio and sells the back. A spread is used only where the package trades its two legs
+    opposite ways and never for more than a leg holds, so the package stays exactly as
+    sized. Returns the spread orders -- name, action, quantity and parts, each part a root
+    and its signed contracts per spread -- and the contracts left to trade outright."""
+    candidates = []
+    for name, (front, back, front_ratio, back_ratio) in listed.items():
+        if signed.get(front, 0) * signed.get(back, 0) < 0:
+            side = 1 if signed[front] > 0 else -1
+            most = min(abs(signed[front]) // front_ratio, abs(signed[back]) // back_ratio)
+            if most:
+                candidates.append((name, side, [(front, side * front_ratio), (back, -side * back_ratio)], most))
+    best = None
+    for units in itertools.product(*[range(most + 1) for *_, most in candidates]):
+        left = dict(signed)
+        for count, (_, _, parts, _) in zip(units, candidates):
+            for root, per in parts:
+                left[root] -= count * per
+        if any(left[root] * signed[root] < 0 for root in left):
+            continue  # a shared leg overdrawn by two spreads
+        key = (sum(abs(n) * dv01[root] for root, n in left.items()), sum(abs(n) for n in left.values()),
+               sum(1 for count in units if count))
+        if best is None or key < best[0]:
+            best = key, units, left
+    if best is None:
+        return [], dict(signed)
+    _, units, left = best
+    orders = [dict(name=name, action="BUY" if side > 0 else "SELL", quantity=count, parts=parts)
+              for count, (name, side, parts, _) in zip(units, candidates) if count]
+    return orders, left
 
 
 def package_dv01(rows: list[dict]) -> float | None:

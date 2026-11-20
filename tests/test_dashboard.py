@@ -72,7 +72,16 @@ def test_overview_details_tabularize_return_and_holding_period(monkeypatch, tmp_
     detail = app._overview_details({"target": "10s30s"}, state, live,
                                   dict(bars_held=3, entry_date="2026-11-06", pnl_bps=0.7))
     assert dict(detail["position"])["held"] == "3 bars"
-    assert dict(detail["expected"]) == {"net": "+1.25bp", "recovery": "25% of 5.38bp", "horizon": "11 bars", "cost": "0.1bp"}
+    usd = 1.25 * app.USD_PER_BP
+    assert dict(detail["expected"]) == {"net": "+1.25bp", "recovery": "25% of 5.38bp", "days": "11",
+                                        "$/day": app._usd(usd / 11), "cost": "0.1bp", "sharpe": "—"}
+    # with a backtest behind it, its Sharpe from the first entry on, as the Deep Dive scores it
+    days = pd.date_range("2026-01-01", periods=4).date.tolist()
+    state["equity_curve"] = pl.DataFrame({"ts": days, "pnl_bps": [0.0, 1.0, -0.5, 2.0]})
+    trades = pl.DataFrame({"entry_date": [days[1]], "pnl_bps": [2.5]})
+    detail = app._overview_details({"target": "10s30s"}, state, live, None, trades)
+    daily = np.array([1.0, -0.5, 2.0])
+    assert dict(detail["expected"])["sharpe"] == f"{daily.mean() / daily.std() * np.sqrt(252):.2f}"
     assert dict(detail["target"])["hedge"] == "β×10y"
     assert dict(detail["reading"])["loss stop"] == "5bp"
     assert dict(detail["confidence"])["trades"] == "42"
@@ -268,7 +277,7 @@ def test_overview_snapshot_uses_exact_open_position(monkeypatch, tmp_path):
         }
     )
 
-    assert snapshot["position"] == "LONG OPEN"
+    assert snapshot["position"] == "LONG"
     # the live value and the threshold it is judged against share one cell
     assert snapshot["reading"] == "-1.20z / ±0.9z"
     assert snapshot["gate_rule"] == "none"
@@ -343,24 +352,21 @@ def _state(signal, threshold=1.7, fired="flat", gate=None, gate_window=None):
     }
 
 
-def test_position_column_folds_in_what_the_signal_is_saying(monkeypatch, tmp_path):
-    """One column has to carry both what is held and what today calls for --
-    a fired-but-gated signal used to render as a bare FLAT."""
+def test_signal_column_reads_long_flat_or_short(monkeypatch, tmp_path):
+    """The Signal column is only ever LONG, FLAT or SHORT: an open trade's side, else
+    the side today fires; gated or warming up is FLAT (the Gate column says why)."""
     app = _load_app_module(monkeypatch, tmp_path)
 
     held = {"direction": "long", "pnl_bps": 2.5}
-    assert app._position_label(_state(-2.0, fired="long"), held) == "LONG OPEN"
+    assert app._position_label(_state(-2.0, fired="long"), held) == "LONG"
     # an open trade wins even when today's reading has gone quiet
-    assert app._position_label(_state(0.1), held) == "LONG OPEN"
+    assert app._position_label(_state(0.1), held) == "LONG"
 
     assert app._position_label(_state(0.1), None) == "FLAT"
-    assert app._position_label(_state(-2.0, fired="long"), None) == "LONG SIGNAL"
-    assert app._position_label(_state(2.0, fired="short"), None) == "SHORT SIGNAL"
-    assert (
-        app._position_label(_state(-2.0, fired="flat (gated)"), None)
-        == "LONG GATED"
-    )
-    assert app._position_label(_state(float("nan")), None) == "WARMING UP"
+    assert app._position_label(_state(-2.0, fired="long"), None) == "LONG"
+    assert app._position_label(_state(2.0, fired="short"), None) == "SHORT"
+    assert app._position_label(_state(-2.0, fired="flat (gated)"), None) == "FLAT"
+    assert app._position_label(_state(float("nan")), None) == "FLAT"
 
 
 def test_gate_column_states_the_rule_and_its_percentile_basis(

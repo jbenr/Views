@@ -39,6 +39,7 @@ import utils.helpers
 from dashboard import runner
 from dashboard import markets
 from dashboard import futures
+from dashboard import live_switch
 from dashboard import market_pull
 from dashboard import portfolio
 from dashboard import trades
@@ -201,25 +202,12 @@ def _visible_trade_range(trades, open_entry: dict | None, page: int, data_asof, 
 
 
 def _position_label(state: dict, open_entry: dict | None) -> str:
-    """One column for what the book holds and what today says.
-
-    An open trade wins; otherwise report whether the signal is calling for one
-    and, if it is, why nothing happened -- a fired-but-gated signal is the case
-    a desk most needs to see, and it read as a bare "FLAT" before.
-    """
+    """The Signal column: LONG, SHORT or FLAT -- the side of an open trade, else the side
+    today fires. A reading held back by its gate, or still warming up, is FLAT; the Gate
+    column says why."""
     if open_entry is not None:
-        return f"{open_entry['direction'].upper()} OPEN"
-    signal = state["last"].get("signal")
-    threshold = float(state["params"]["entry_threshold"])
-    if signal is None or signal != signal:
-        return "WARMING UP"
-    if signal <= -threshold:
-        side = "LONG"
-    elif signal >= threshold:
-        side = "SHORT"
-    else:
-        return "FLAT"
-    return f"{side} GATED" if state["fired"] == "flat (gated)" else f"{side} SIGNAL"
+        return open_entry["direction"].upper()
+    return state["fired"].upper() if state.get("fired") in ("long", "short") else "FLAT"
 
 
 def _gate_status(state: dict) -> str:
@@ -335,7 +323,7 @@ def _overview_snapshot(row: dict) -> dict:
         "module": row["module"],
         "target": row["target"],
         "name": _display_name(row),
-        "position": "UNAVAILABLE",
+        "position": "—",
         "model": "—",
         "input_now": "—",
         "fair": "—",
@@ -374,7 +362,7 @@ def _overview_snapshot(row: dict) -> dict:
         **base,
         **_signal_facts(row, state, read["live"]),
         "target": _trade_target(row, state),
-        "details": _overview_details(row, state, read["live"], open_entry),
+        "details": _overview_details(row, state, read["live"], open_entry, trades),
         "reading_active": bool(signal_value is not None and abs(float(signal_value)) >= threshold),
         "reading_value": float(signal_value) if signal_value is not None and np.isfinite(signal_value) else None,
         "position": _position_label(state, open_entry),
@@ -415,8 +403,10 @@ def _trade_target(row: dict, state: dict) -> str:
     return target
 
 
-def _overview_details(row: dict, state: dict, live: dict | None, held: dict | None) -> dict:
-    """Short label/value pairs grouped under the overview's seven columns."""
+def _overview_details(row: dict, state: dict, live: dict | None, held: dict | None, trades=None) -> dict:
+    """Short label/value pairs grouped under the overview's seven columns. Under Exp $:
+    the expected bp, days in the trade and dollars a day, and the backtest's Sharpe
+    (``trades``, the signal's closed trades, scope it as the Deep Dive does)."""
     from research.panel import CATALOG
 
     params, strategy = state["params"], state.get("strategy")
@@ -454,13 +444,18 @@ def _overview_details(row: dict, state: dict, live: dict | None, held: dict | No
     if params.get("stop_loss_bps"):
         exits.append(("loss stop", f"{params['stop_loss_bps']:g}bp"))
     expected = _expected(state, live) if live else None
+    days = float(live["exp_bars"]) if expected and setup and live.get("exp_bars") else None  # daily bars
     estimate = [("net", _fnum(expected["bps"], "+.2f", "bp")),
-                ("horizon", _fnum(live.get("exp_bars"), ".0f", " bars") if setup else "OU mean"),
+                ("days", f"{days:.0f}" if days else "OU mean"),
+                ("$/day", _usd(expected["usd"] / days) if days else "—"),
                 ("cost", f"{getattr(strategy, 'transaction_cost_bps', 0):g}bp")] if expected else [("net", "—")]
     if expected and setup:
         resid = abs(float(live["resid"]))
         gross = expected["bps"] + float(getattr(strategy, "transaction_cost_bps", 0))
         estimate.insert(1, ("recovery", f"{gross / resid:.0%} of {resid:.2f}bp" if resid else "—"))
+    equity = state.get("equity_curve")
+    stats = _backtest_stats(equity, trades) if equity is not None else None
+    estimate.append(("sharpe", _fnum(stats["sharpe"], ".2f") if stats else "—"))
     conf = (live or {}).get("confidence", {})
     return dict(position=position, target=construction, reading=exits or [("exit", "—")],
                 expected=estimate, confidence=[("trades", str(conf.get("n_past", "—")))])
@@ -584,13 +579,38 @@ def _signal_row(snap: dict) -> html.Details:
 
 def _row_legend(key: str) -> html.Div:
     """The header row over a section's signals; its first cell sits over the rows' +/- marker."""
-    labels = ["Position", "Target", "Reading / entry", "Exp $", "Conf", "Gate now", "Signal"]
+    labels = ["Signal", "Target", "Reading / entry", "Exp $", "Conf", "Gate now", "Name"]
     return html.Div([html.Span(), *[
         html.Span(html.Button([label, html.Span(className="viz-sort-arrow", **{"aria-hidden": "true"})],
                              className="sd-sort", **{"data-sort-column": str(i)}),
                   role="columnheader", **{"aria-sort": "none"})
         for i, label in enumerate(labels)
     ]], className="sd-row-legend")
+
+
+def _loaded_at(rows: list[dict]) -> dict:
+    """How current the signals' data is, for the stamp beside Ref, each the stalest signal's
+    (ISO UTC, None when unknown): loaded is when the dashboard last pulled it from the
+    database; live is when the database last got new market data for it (the Bloomberg
+    write, updated_at) and bar the newest day it has; behind is whether the database has
+    data newer than what was loaded, which a Ref would pick up."""
+    ids = [_row_id(row) for row in rows]
+    runner.prime_freshness(ids)  # every signal's db stamp in one query
+    loaded, live, bars, behind = [], [], [], False
+    for signal_id in ids:
+        try:
+            pulled, fresh = runner.cache_written_at(signal_id), runner.db_freshness(signal_id)
+        except Exception:  # a module that no longer resolves has no data to date
+            continue
+        loaded.append(pulled)
+        if fresh is not None:
+            written = _local(fresh["last_written"]).tz_convert("UTC")
+            live.append(written)
+            bars.append(pd.Timestamp(fresh["last_ts"]).date())
+            behind |= pulled is not None and written > pd.Timestamp(pulled)
+    return dict(loaded=None if not loaded or None in loaded else min(loaded).isoformat(),
+                live=min(live).isoformat() if live else None,
+                bar=str(min(bars)) if bars else None, behind=behind)
 
 
 def _refresh_all_data(rows: list[dict]) -> None:
@@ -1583,10 +1603,18 @@ def build_app() -> dash.Dash:
                             className="ref-btn",
                             style=_btn_style(primary=True),
                         ),
+                        html.Span(id="overview-loaded-text", className="sd-note", role="status",
+                                  title="loaded: when this page last pulled the signals' data from the database. "
+                                        "market data: when the database last got new Bloomberg data for them "
+                                        "(bar: the newest day it has); Ref cannot make it newer than that. Each is "
+                                        "the stalest signal's: green under 4 hours, orange under 24, red after."),
                         html.Button("Close all", type="button", className="sd-btn sd-close-all",
                                     title="Collapse all strategy details"),
                     ],
                 ),
+                dcc.Store(id="overview-loaded", data=_loaded_at(rows)),
+                # only re-ages the stamp in the browser; nothing is fetched
+                dcc.Interval(id="overview-loaded-tick", interval=60_000),
                 dcc.Loading(
                     html.Div(id="overview-content", children=_overview_content(rows)),
                     custom_spinner=shimmer_loader(image="guy.png"),
@@ -1656,8 +1684,6 @@ def build_app() -> dash.Dash:
                     children=html.Div(className="sd-page", children=[
                         html.Div(className="sd-bar", children=[
                             html.Div("TREASURY MARKET", className="sd-bar-title"),
-                            html.Button("Ref", id="refresh-market", n_clicks=0, className="ref-btn",
-                                        style=_btn_style(primary=True)),
                         ]),
                         market_pull.layout(),
                         futures.layout(),
@@ -1675,6 +1701,7 @@ def build_app() -> dash.Dash:
                     label="Portfolio", value="portfolio", style=tab_style, selected_style=selected_tab_style,
                     # the account, then each signal's trade, then the broker's own positions and orders
                     children=html.Div(className="sd-page", children=[
+                        live_switch.layout(),  # paper / live, above the account
                         portfolio.layout(),
                         html.Div(id="model-positions", children=_portfolio_model(rows)),
                         trades.order_layout(),
@@ -1723,6 +1750,7 @@ def build_app() -> dash.Dash:
     portfolio.register_callbacks(app)
     trades.register_callbacks(app, _registry_rows, USD_PER_BP, _display_name)
     futures.register_callbacks(app)
+    live_switch.register_callbacks(app)
 
     app.clientside_callback(
         f"function(_n) {{ return window.innerWidth < {PHONE_MAX_WIDTH} ? 'phone' : 'desktop'; }}",
@@ -1792,15 +1820,53 @@ def build_app() -> dash.Dash:
         except Exception:  # db down: the market keeps its last pull, as the signals do
             pass
         # the Market and Portfolio tabs read the same pull, so one Ref brings all three up to date
-        return _overview_content(rows), _market_content(), _portfolio_model(rows)
+        return _overview_content(rows), _market_content(), _portfolio_model(rows), _loaded_at(rows)
 
     app.callback(
         Output("overview-content", "children"),
         Output("market-content", "children"),
         Output("model-positions", "children"),
+        Output("overview-loaded", "data"),
         Input("refresh-overview", "n_clicks"),
         prevent_initial_call=True,
     )(_refresh_overview)
+
+    app.clientside_callback(
+        """function(fresh, _tick) {
+            const pad = n => String(n).padStart(2, '0');
+            // one stamp: green under 4h old, orange under 24h, red after (or never)
+            function stamp(label, iso, tail) {
+                if (!iso) {
+                    return {props: {children: `${label} unknown`, style: {color: '#E74C3C'}},
+                            type: 'Span', namespace: 'dash_html_components'};
+                }
+                const when = new Date(iso), hours = (Date.now() - when) / 3600000;
+                const clock = `${pad(when.getMonth() + 1)}-${pad(when.getDate())} ${pad(when.getHours())}:${pad(when.getMinutes())}`;
+                const age = hours < 1 ? `${Math.max(0, Math.floor(hours * 60))}m ago`
+                          : hours < 48 ? `${Math.floor(hours)}h ago` : `${Math.floor(hours / 24)}d ago`;
+                const color = hours >= 24 ? '#E74C3C' : hours >= 4 ? '#D35400' : '#27AE60';
+                return {props: {children: `${label} ${clock} · ${age}${tail || ''}`, style: {color: color}},
+                        type: 'Span', namespace: 'dash_html_components'};
+            }
+            fresh = fresh || {};
+            const parts = [
+                fresh.loaded ? stamp('loaded', fresh.loaded)
+                             : {props: {children: 'never loaded · click Ref', style: {color: '#E74C3C'}},
+                                type: 'Span', namespace: 'dash_html_components'},
+                ' | ',
+                stamp('market data', fresh.live, fresh.bar ? ` (bar ${fresh.bar.slice(5)})` : ''),
+            ];
+            if (fresh.behind) {
+                parts.push(' | ', {props: {children: 'newer data in db · click Ref', style: {color: '#D35400'}},
+                                   type: 'Span', namespace: 'dash_html_components'});
+            }
+            return [parts, {fontWeight: 'bold'}];
+        }""",
+        Output("overview-loaded-text", "children"),
+        Output("overview-loaded-text", "style"),
+        Input("overview-loaded", "data"),
+        Input("overview-loaded-tick", "n_intervals"),
+    )
 
     @app.callback(Output("model-positions", "children", allow_duplicate=True),
                   Input("ibkr-refresh", "n_clicks"), prevent_initial_call=True)
@@ -1808,19 +1874,6 @@ def build_app() -> dash.Dash:
         """Refresh IBKR re-marks the signals' futures at the stream's prices."""
         return _portfolio_model(_registry_rows())
 
-    def _refresh_market(_clicks):
-        """The Market tab's own Ref: just the yields and curves, which is quick."""
-        try:
-            markets.pull()
-        except Exception:
-            pass
-        return _market_content()
-
-    app.callback(
-        Output("market-content", "children", allow_duplicate=True),
-        Input("refresh-market", "n_clicks"),
-        prevent_initial_call=True,
-    )(_refresh_market)
     market_pull.register_callbacks(app, _market_content)
 
     def _update(_ref, *rest):

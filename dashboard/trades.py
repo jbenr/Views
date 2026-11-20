@@ -8,19 +8,20 @@ from __future__ import annotations
 import datetime as dt
 
 import pandas as pd
-from dash import ALL, Input, Output, State, ctx, dcc, html, no_update
+from dash import ALL, MATCH, Input, Output, State, ctx, dcc, html, no_update
 
 from dashboard import runner
 from dashboard.portfolio import SESSION
-from dashboard.sheet import grid_table, heading, usd
+from dashboard.sheet import grid_table, heading, kv, kv_range, usd
 from execution.journal import TradeJournal
-from execution.quotes import FUTURES
-from execution.ticket import ROOTS, contract_legs, futures_dv01, package_dv01, yield_legs
+from execution.legging import SLIP_TICKS, pick_lead, thin_hedges
+from execution.quotes import FUTURES, SPREADS
+from execution.ticket import ROOTS, contract_legs, futures_dv01, package_dv01, spread_orders, yield_legs
 from oven.engine import hedgeable
 from research.basis_basket import FACE
 from research.panel import CATALOG
 from utils.basis import load_futures
-from utils.formatting import format_tsy_price
+from utils.formatting import format_tsy_price, parse_tsy_price
 
 SUMMARY_HEADERS = {"signal": "Signal", "package": "Package", "status": "Status", "entry": "Entry",
                    "pnl_bps": "P&L bp", "fut_usd": "P&L $", "dv01_held": "DV01 $/bp", "exp_bps": "Exp bp",
@@ -31,6 +32,10 @@ LEG_HEADERS = {"action": "Side", "quantity": "Qty", "contract": "Contract", "exa
 EXIT_HEADERS = {"rule": "Exit rule", "now": "Now", "exits_at": "Exits at", "progress": "Progress"}
 NEAR_EXIT = 0.75  # an exit rule this far along is flagged
 TICKS = {root: tick for root, tick in FUTURES.values()}  # each contract's price tick in 32nds
+# IBKR quotes and trades no CBOT inter-commodity spreads (no data, 10092 on depth, orders refused on paper):
+# packages are legged, lead first (execution.legging). Flip this on if IBKR ever supports them.
+USE_SPREADS = False
+CAP_TICKS = 4  # a hedge's default cap: this many ticks through the far touch
 GAIN, LOSS, WARN = "#27AE60", "#E74C3C", "#D35400"
 TOTAL_RULE = {"borderTop": "2px solid #333333", "fontWeight": "bold"}
 _dv01_cache: dict[dt.date, dict] = {}
@@ -332,9 +337,10 @@ def content(rows: list[dict], usd_per_bp: float, label) -> list:
 
 # ── the order ticket ─────────────────────────────────────────────────────────
 
-TICKET_HEADERS = {"action": "Side", "quantity": "Qty", "contract": "Contract", "bid": "Bid", "ask": "Ask",
-                  "limit": "Limit (decimal)", "dv01": "DV01 actual"}
-SENT_HEADERS = {"sent": "Sent (UTC)", "signal": "Signal", "action": "Side", "quantity": "Qty", "contract": "Contract",
+TICKET_HEADERS = {"action": "Side", "contract": "Contract", "quantity": "Qty", "limit": "Limit (lead) · cap (hedge)",
+                  "bid": "Bid", "ask": "Ask", "dv01": "DV01 $/bp"}
+SENT_HEADERS = {"sent": "Sent (UTC)", "signal": "Signal", "role": "Role", "action": "Side", "quantity": "Qty",
+                "contract": "Contract",
                 "bid": "Bid at send", "ask": "Ask at send", "limit": "Limit", "order_id": "Order id",
                 "status": "Status at send", "message": "IBKR"}
 HIDDEN, SHOWN = {"display": "none"}, {"display": "flex"}
@@ -342,20 +348,24 @@ HIDDEN, SHOWN = {"display": "none"}, {"display": "flex"}
 
 def _sent_table(records: list[dict], signal: bool) -> html.Div:
     """Orders as sent: each leg's limit beside the bid and ask it was sent into, in 32nds."""
-    def price(value, root):
-        return "—" if not value else format_tsy_price(value, is_ticks=False, tick_32nds=TICKS.get(root, 1))
+    def price(value, record):
+        if record.get("kind") == "spread":
+            return _spread_price(value)
+        return "—" if not value else format_tsy_price(value, is_ticks=False, tick_32nds=TICKS.get(record["root"], 1))
 
     columns = [c for c in SENT_HEADERS if signal or c != "signal"]
     frame = pd.DataFrame([{
-        "sent": (r.get("sent") or "")[:23].replace("T", " "), "signal": r.get("signal", ""), "action": r["action"],
-        "quantity": str(int(r["quantity"])), "contract": r["contract"], "bid": price(r.get("bid"), r["root"]),
-        "ask": price(r.get("ask"), r["root"]), "limit": price(r["limit"], r["root"]),
-        "order_id": str(r["order_id"]), "status": r["status"], "message": r.get("message") or ""} for r in records])
+        "sent": (r.get("sent") or "")[:23].replace("T", " "), "signal": r.get("signal", ""),
+        "role": r.get("role", ""), "action": r["action"],
+        "quantity": str(int(r["quantity"])), "contract": r["contract"], "bid": price(r.get("bid"), r),
+        "ask": price(r.get("ask"), r), "limit": price(r["limit"], r),
+        "order_id": "—" if r["order_id"] is None else str(r["order_id"]), "status": r["status"],
+        "message": r.get("message") or ""} for r in records])
 
     def style(column, _value, row):
         if column == "action":
             return {"textAlign": "left", "color": GAIN if row["action"] == "BUY" else LOSS, "fontWeight": "bold"}
-        return {"textAlign": "left"} if column in ("sent", "signal", "contract", "status", "message") else None
+        return {"textAlign": "left"} if column in ("sent", "signal", "role", "contract", "status", "message") else None
 
     return grid_table(frame, columns=columns, headers=SENT_HEADERS, cell_style=style)
 
@@ -375,6 +385,10 @@ def order_layout() -> html.Div:
     """The order ticket: hidden until a signal's enter button fills and shows it."""
     return html.Div([
         dcc.Store(id="order-ticket"),
+        # shown while the ticket is being built (the enter callback's `running`)
+        html.Div(id="order-loading", className="sd-modal", style=HIDDEN, children=html.Div([
+            html.Div("Building the order ticket…", className="sd-note", role="status"),
+        ], className="sd-modal-box sd-loading-box")),
         html.Div(id="order-modal", className="sd-modal", style=HIDDEN, children=html.Div([
             html.Div(id="order-body"),
             html.Div(className="sd-bar", children=[
@@ -386,29 +400,155 @@ def order_layout() -> html.Div:
     ])
 
 
-def _ticket(trade: dict) -> tuple[list, list[dict]]:
-    """The ticket's body for one trade, and the legs it would send. Each leg's limit starts
-    at the far touch -- the ask to buy, the bid to sell -- where the stream is quoting."""
+def _price(value, root) -> str:
+    """A futures price in 32nds on the contract's tick; '—' when there is none."""
+    return "—" if not value or value <= 0 else format_tsy_price(value, is_ticks=False, tick_32nds=TICKS[root])
+
+
+def _spread_price(value) -> str:
+    """A spread price in signed 32nds (the spreads table's units); '—' when there is none."""
+    return "—" if value is None else f"{value * 32:+.3f}"
+
+
+def _parse(leg: dict, text):
+    """A typed limit as a decimal price: 32nds like 110-16+ (or decimal) for a future,
+    signed 32nds for a spread."""
+    if leg.get("kind") != "spread":
+        return parse_tsy_price(text)
+    try:
+        value = float(str(text or "").strip())
+    except ValueError:
+        return None
+    return value / 32 if value == value else None
+
+
+def _format(leg: dict, value) -> str:
+    return _spread_price(value) if leg.get("kind") == "spread" else _price(value, leg["root"])
+
+
+def _parts(leg: dict) -> list:
+    """Each root this order trades and its signed contracts per unit of the order."""
+    return leg["parts"] if leg.get("kind") == "spread" else [(leg["root"], 1 if leg["action"] == "BUY" else -1)]
+
+
+def _ticket_stats(ticket: dict, quantities: list, limits: list) -> tuple[list[str], html.Div]:
+    """What the ticket as typed would put on: each order's DV01, and for the package its
+    DV01 against the target, contracts, what the limits pay over mid, and the signal's
+    expected return at this size. Unreadable quantities or limits count as missing. A
+    spread's cost vs mid is unknown until its price convention is confirmed by a fill."""
+    roots = ticket["roots"]
+    net, shown, cost = {root: 0 for root in roots}, [], 0.0
+    for leg, quantity, text in zip(ticket["legs"], quantities, limits):
+        quantity = int(quantity) if quantity and quantity > 0 else 0
+        held = 0.0
+        for root, per in _parts(leg):
+            net[root] += per * quantity
+            held -= per * quantity * roots[root]["dv01"]
+        shown.append(usd(held))
+        limit, side = _parse(leg, text), 1 if leg["action"] == "BUY" else -1
+        if cost is not None and leg.get("kind") != "spread" and leg["bid"] and leg["ask"] and limit:
+            cost += side * (limit - (leg["bid"] + leg["ask"]) / 2) * quantity * FACE.get(leg["root"], 100_000) / 100
+        else:
+            cost = None  # one leg without a market or a limit leaves the total unknown
+    rows = [dict(weight=info["weight"], held=-net[root] * info["dv01"]) for root, info in roots.items()]
+    contracts = sum(abs(n) for n in net.values())
+    dv01 = package_dv01(rows)
+    size = abs(dv01) if dv01 else None
+    expected = ticket.get("exp_bps")
+    stats = kv_range([
+        kv("package DV01", usd(dv01), f"$/bp · target ${ticket['target']:,.0f}"),
+        kv("contracts", str(contracts)),
+        kv("cost vs mid", usd(cost) if cost is not None else "—",
+           f"{cost / size:+.2f} bp" if cost is not None and size else ""),
+        kv("expected return", _num(expected, "+.1f", " bp"),
+           usd(expected * size) if expected is not None and size else ""),
+    ])
+    return shown, stats
+
+
+def _orders(sized: list[dict]) -> tuple[list[dict], str]:
+    """The ticket's orders for the sized legs: whole exchange-listed spreads where they
+    fit (spread_orders picks them to leave the least DV01 legged), the rest as outright
+    futures. Each order carries its bid and ask; also a note when spreads were not tried."""
+    signed = {leg["root"]: leg["signed"] for leg in sized}
+    months = {leg["contract"][-2:] for leg in sized}
+    listing, note = {}, ""
+    if USE_SPREADS and SESSION.state == "connected" and len(months) == 1 and len(sized) > 1:
+        try:
+            listing = SESSION.spread_listing(months.pop())
+        except Exception as exc:
+            note = f"Spreads not tried ({type(exc).__name__}: {exc}): every leg goes outright."
+    spreads, left = spread_orders(signed, {leg["root"]: leg["dv01"] for leg in sized},
+                                  {name: (*SPREADS[name], info["front_ratio"], info["back_ratio"])
+                                   for name, info in listing.items()})
+    book = SESSION.spread_book([listing[s["name"]]["contract"] for s in spreads]) if spreads else {}
+    orders = [dict(s, kind="spread", contract=listing[s["name"]]["contract"], tick=listing[s["name"]]["tick"],
+                   **{k: (book.get(listing[s["name"]]["contract"]) or {}).get(k) for k in ("bid", "ask")})
+              for s in spreads]
     quotes = {q["root"]: q for q in SESSION.quotes()["rows"]} if SESSION.state == "connected" else {}
-    legs, records = [], []
-    for leg in [leg for leg in trade["legs"] or [] if leg["signed"]]:
+    for leg in sized:
+        if not left[leg["root"]]:
+            continue
         quote = quotes.get(leg["root"]) or {}
         if quote and quote["contract"][-2:] != leg["contract"][-2:]:
             quote = {}  # the stream is on another month than the one the legs are sized on
-        bid, ask = quote.get("bid"), quote.get("ask")
-        touch = ask if leg["action"] == "BUY" else bid
-        tick = TICKS[leg["root"]]
+        bid, ask, bid_size, ask_size = [value if value and value > 0 else None for value in (
+            quote.get("bid"), quote.get("ask"), quote.get("bid_size"), quote.get("ask_size"))]
+        orders.append(dict(root=leg["root"], contract=leg["contract"], action="BUY" if left[leg["root"]] > 0 else "SELL",
+                           quantity=abs(left[leg["root"]]), bid=bid, ask=ask, bid_size=bid_size, ask_size=ask_size))
+    return orders, note
 
-        def price(value):
-            return "—" if not value or value <= 0 else format_tsy_price(value, is_ticks=False, tick_32nds=tick)
 
+def _start(order: dict, lead: bool):
+    """Where a row's price starts: the lead rests at the near touch (the bid to buy); a
+    hedge's cap sits CAP_TICKS through the far touch, the worst it may pay once the lead fills."""
+    if lead:
+        return order["bid"] if order["action"] == "BUY" else order["ask"]
+    touch = order["ask"] if order["action"] == "BUY" else order["bid"]
+    if touch is None:
+        return None
+    tick = TICKS[order["root"]] / 32.0
+    return touch + CAP_TICKS * tick if order["action"] == "BUY" else touch - CAP_TICKS * tick
+
+
+def _legging_notes(legs: list[dict], quantities: list, lead: int) -> list:
+    """Which leg leads, and each hedge too big for the size showing at its touch."""
+    sized = [dict(leg, quantity=int(q or 0)) for leg, q in zip(legs, quantities)]
+    notes = [html.Div(f"Lead: {legs[lead]['contract']} rests at its limit. "
+                      + ("The others go out only as it fills, in proportion, as marketable limits "
+                         f"{SLIP_TICKS} ticks through the far touch and never past their cap."
+                         if len(legs) > 1 else ""), className="sd-note")]
+    notes += [html.Div(f"Thin: {warning}.", className="sd-note", style={"color": WARN})
+              for warning in thin_hedges(sized, lead)]
+    return notes
+
+
+def _ticket(trade: dict, usd_per_bp: float) -> tuple[list, dict]:
+    """The ticket's body for one trade, and what the callbacks need of it (its orders,
+    roots, lead, target and expected return). The lead -- the leg hardest to fill, or the
+    one picked -- starts at its near touch; each hedge's cap a few ticks through its far
+    touch. ‹ › step a tick at a time."""
+    sized = [leg for leg in trade["legs"] or [] if leg["signed"]]
+    orders, note = _orders(sized)
+    spreads = any(order.get("kind") == "spread" for order in orders)
+    lead = None if spreads or not orders else pick_lead(orders)
+    legs, records = [], []
+    for i, order in enumerate(orders):
+        spread = order.get("kind") == "spread"
+        start = (order["ask"] if order["action"] == "BUY" else order["bid"]) if spread else _start(order, i == lead)
         records.append(dict(
-            action=leg["action"], contract=leg["contract"], bid=price(bid), ask=price(ask), dv01=usd(leg["held"]),
-            quantity=dcc.Input(id={"type": "order-qty", "leg": len(legs)}, type="number", min=1, step=1,
-                               value=leg["quantity"]),
-            limit=dcc.Input(id={"type": "order-limit", "leg": len(legs)}, type="number", step=tick / 32.0,
-                            value=touch if touch and touch > 0 else None)))
-        legs.append(dict(root=leg["root"], action=leg["action"]))
+            action=order["action"], contract=order["contract"], bid=_format(order, order["bid"]),
+            ask=_format(order, order["ask"]), dv01=html.Span("", id={"type": "order-dv01", "leg": i}),
+            quantity=dcc.Input(id={"type": "order-qty", "leg": i}, type="number", min=1, step=1, debounce=True,
+                               value=order["quantity"], className="sd-qty"),
+            limit=html.Div([
+                html.Button("‹", id={"type": "order-down", "leg": i}, n_clicks=0, title="down one tick"),
+                dcc.Input(id={"type": "order-limit", "leg": i}, type="text", debounce=True, className="sd-limit",
+                          value=_format(order, start) if start is not None else "",
+                          placeholder="+12.500" if spread else "110-16+"),
+                html.Button("›", id={"type": "order-up", "leg": i}, n_clicks=0, title="up one tick"),
+            ], className="sd-stepper")))
+        legs.append({k: v for k, v in order.items() if k != "quantity"})
 
     def style(column, _value, record):
         if column == "action":
@@ -416,20 +556,55 @@ def _ticket(trade: dict) -> tuple[list, list[dict]]:
         return {"textAlign": "left"} if column == "contract" else None
 
     pack = trade["pack"]
+    ticket = dict(signal_id=trade["id"], module=trade["module"], asof=str(trade["state"]["data"]["ts"][-1]),
+                  legs=legs, roots={leg["root"]: dict(weight=leg["weight"], dv01=leg["dv01"]) for leg in sized},
+                  lead=lead, target=usd_per_bp, exp_bps=trade["live"].get("exp_return"))
     if not legs:
         return [heading(trade["name"].upper(), pack["name"]),
-                html.Div(trade["why"] or "No legs to send.", className="sd-note")], []
+                html.Div(trade["why"] or "No legs to send.", className="sd-note")], ticket
     if SESSION.can_trade():
-        where = html.Div(f"Submit sends {len(legs)} separate day limit orders to paper account {SESSION.account}, "
-                         "one per row, back to back: not a spread order, so one leg can fill without the others. "
-                         "Each limit starts at the far touch and can be changed · limits in decimal points.",
+        where = html.Div(f"Submit works the package on paper account {SESSION.account} as one lead and its hedges: "
+                         "the lead goes now as a day limit; each hedge only as the lead fills, its share of each fill, "
+                         "so a lead that never fills leaves nothing on. Keep the dashboard connected while the lead "
+                         "works; if it restarts, it sends any hedges owed when it reconnects. Type a price in 32nds "
+                         "(110-16+) or decimal; ‹ › move one tick. Cost vs mid is at the lead's limit and the hedges' "
+                         "caps, the worst case; expected return is the signal's for a new entry, at this DV01.",
                          className="sd-note", style={"marginTop": 6})
     else:
         where = html.Div("Orders are only sent to a connected paper account: connect IBKR on a paper port first.",
                          className="sd-note", style={"marginTop": 6, "color": WARN})
-    return [heading(trade["name"].upper(), f"{pack['name']} · order ticket"),
+    if note:
+        where = html.Div([html.Div(note, className="sd-note", style={"color": WARN}), where])
+    dv01s, stats = _ticket_stats(ticket, [order["quantity"] for order in orders],
+                                 [record["limit"].children[1].value for record in records])
+    for record, dv01 in zip(records, dv01s):
+        record["dv01"].children = dv01
+    picker = [] if lead is None else [html.Div([
+        html.Span("Lead leg", className="sd-detail-label"),
+        dcc.RadioItems(id="order-lead", value=lead, inline=True, className="sd-lead-pick",
+                       options=[{"label": order["contract"], "value": i} for i, order in enumerate(orders)]),
+    ], className="sd-lead")]
+    notes = [] if lead is None else _legging_notes(legs, [order["quantity"] for order in orders], lead)
+    return [heading(trade["name"].upper(), f"{pack['name']} · order ticket"), *picker,
             grid_table(pd.DataFrame(records), columns=list(TICKET_HEADERS), headers=TICKET_HEADERS, cell_style=style),
-            where], legs
+            html.Div(notes, id="order-legging", style={"marginTop": 6}),
+            html.Div(stats, id="order-stats", style={"marginTop": 8}), where], ticket
+
+
+def _contingent_result(sent: list[dict]) -> list:
+    """What a contingent submission did: the lead working (or refused), the hedges waiting on it."""
+    lead, hedges = sent[0], sent[1:]
+    if lead["status"] not in ("PreSubmitted", "Submitted", "Filled"):
+        text = (f"IBKR did not accept the lead {lead['contract']}"
+                f"{': ' + lead['message'] if lead['message'] else ''}. No hedge was sent, so nothing is on. ")
+        colour = LOSS
+    else:
+        text = (f"Lead {lead['action']} {int(lead['quantity'])} {lead['contract']} is {lead['status'].lower()}. "
+                + (f"{', '.join(h['contract'] for h in hedges)} go out as it fills, in proportion. " if hedges else ""))
+        colour = GAIN
+    return [html.Div(text + "Each order is in the order log as it goes; working orders are under Open orders on the "
+                     "Portfolio tab.", className="sd-note", style={"color": colour, "margin": "8px 0 4px"}),
+            _sent_table(sent, signal=False)]
 
 
 def register_callbacks(app, rows, usd_per_bp: float, label) -> None:
@@ -438,7 +613,7 @@ def register_callbacks(app, rows, usd_per_bp: float, label) -> None:
     @app.callback(Output("order-modal", "style"), Output("order-body", "children"), Output("order-ticket", "data"),
                   Output("order-result", "children"), Output("order-submit", "disabled"),
                   Input({"type": "trade-enter", "signal": ALL}, "n_clicks"), Input("order-close", "n_clicks"),
-                  prevent_initial_call=True)
+                  running=[(Output("order-loading", "style"), SHOWN, HIDDEN)], prevent_initial_call=True)
     def show(_enters, _close):
         trigger = ctx.triggered_id
         if trigger == "order-close":
@@ -449,10 +624,54 @@ def register_callbacks(app, rows, usd_per_bp: float, label) -> None:
         trade = next((t for t in sized(rows(), usd_per_bp, label)[0] if t["id"] == trigger["signal"]), None)
         if trade is None:
             return (no_update,) * 5
-        body, legs = _ticket(trade)
-        ticket = dict(signal_id=trade["id"], module=trade["module"], asof=str(trade["state"]["data"]["ts"][-1]),
-                      legs=legs)
-        return SHOWN, body, ticket, "", not (legs and SESSION.can_trade())
+        body, ticket = _ticket(trade, usd_per_bp)
+        return SHOWN, body, ticket, "", not (ticket["legs"] and SESSION.can_trade())
+
+    @app.callback(Output({"type": "order-limit", "leg": MATCH}, "value"),
+                  Input({"type": "order-down", "leg": MATCH}, "n_clicks"),
+                  Input({"type": "order-up", "leg": MATCH}, "n_clicks"),
+                  State({"type": "order-limit", "leg": MATCH}, "value"), State("order-ticket", "data"),
+                  prevent_initial_call=True)
+    def step(_down, _up, text, ticket):
+        """‹ and › move a leg's limit one of its contract's ticks; an unreadable limit
+        starts again from the far touch."""
+        trigger = ctx.triggered_id
+        if not ticket or not ctx.triggered[0]["value"]:
+            return no_update
+        leg = ticket["legs"][trigger["leg"]]
+        start = _parse(leg, text)
+        if start is None:
+            start = leg["ask"] if leg["action"] == "BUY" else leg["bid"]
+        if start is None:
+            return no_update
+        tick = leg["tick"] if leg.get("kind") == "spread" else TICKS[leg["root"]] / 32.0
+        moved = round(start / tick) * tick + (tick if trigger["type"] == "order-up" else -tick)
+        return _format(leg, moved)
+
+    @app.callback(Output({"type": "order-dv01", "leg": ALL}, "children"), Output("order-stats", "children"),
+                  Output("order-legging", "children"),
+                  Input({"type": "order-qty", "leg": ALL}, "value"),
+                  Input({"type": "order-limit", "leg": ALL}, "value"), State("order-ticket", "data"),
+                  prevent_initial_call=True)
+    def restat(quantities, limits, ticket):
+        """The legs' and package's numbers, and the thin-book warnings, follow the
+        quantities and limits as typed."""
+        if not ticket or len(quantities) != len(ticket["legs"]):
+            return no_update, no_update, no_update
+        lead = ticket.get("lead")
+        notes = [] if lead is None else _legging_notes(ticket["legs"], quantities, lead)
+        return *_ticket_stats(ticket, quantities, limits), notes
+
+    @app.callback(Output({"type": "order-limit", "leg": ALL}, "value", allow_duplicate=True),
+                  Output("order-ticket", "data", allow_duplicate=True),
+                  Input("order-lead", "value"), State("order-ticket", "data"), prevent_initial_call=True)
+    def relead(lead, ticket):
+        """A new lead: it starts at its near touch, every other leg's cap through its far touch."""
+        if not ticket or lead is None or lead == ticket.get("lead"):
+            return no_update, no_update
+        starts = [_start(leg, i == lead) for i, leg in enumerate(ticket["legs"])]
+        return ([_format(leg, s) if s is not None else "" for leg, s in zip(ticket["legs"], starts)],
+                dict(ticket, lead=lead))
 
     @app.callback(Output("order-result", "children", allow_duplicate=True),
                   Output("order-submit", "disabled", allow_duplicate=True),
@@ -463,18 +682,40 @@ def register_callbacks(app, rows, usd_per_bp: float, label) -> None:
         if not clicks or not ticket:
             return no_update, no_update
         try:
-            if None in quantities or None in limits or len(quantities) != len(ticket["legs"]):
-                raise ValueError("every leg needs a quantity and a limit price")
-            legs = [dict(leg, quantity=quantity, limit=limit)
-                    for leg, quantity, limit in zip(ticket["legs"], quantities, limits)]
+            prices = [_parse(leg, text) for leg, text in zip(ticket["legs"], limits)]
+            if None in quantities or None in prices or len(quantities) != len(ticket["legs"]):
+                raise ValueError("every row needs a quantity and a limit price (32nds like 110-16+ for a future, "
+                                 "signed 32nds like +12.500 for a spread)")
+            legs = [dict(kind="spread", contract=leg["contract"], name=leg["name"], action=leg["action"],
+                         quantity=quantity, limit=price) if leg.get("kind") == "spread" else
+                    dict(root=leg["root"], action=leg["action"], quantity=quantity, limit=price)
+                    for leg, quantity, price in zip(ticket["legs"], quantities, prices)]
             journal = TradeJournal()
             intent = journal.flag(ticket["signal_id"], ticket["module"], ticket["asof"])
-            sent = SESSION.submit(legs, f"views:{intent}")  # the tag ties orders and fills back to the signal
+            lead = ticket.get("lead")
+            if lead is not None:
+                # the tag ties orders and fills back to the signal; hedges are journaled as they go
+                sent = SESSION.submit_contingent(
+                    legs[lead], [dict(leg, cap=leg.pop("limit")) for i, leg in enumerate(legs) if i != lead],
+                    f"views:{intent}", intent, ticket["signal_id"])
+                journal.save_orders(intent, ticket["signal_id"], [r for r in sent if r["status"] != "Waiting for lead"])
+                return _contingent_result(sent), True
+            sent = SESSION.submit(legs, f"views:{intent}")
             journal.save_orders(intent, ticket["signal_id"], sent)
         except Exception as exc:
             return html.Div(f"Not sent ({type(exc).__name__}): {exc}", className="sd-note",
                             style={"color": LOSS, "marginTop": 8}), False
-        return [html.Div(f"Sent {len(sent)} limit orders to {SESSION.account}, one per leg. They are in the order "
-                         "log and under Open orders on the Portfolio tab.", className="sd-note",
-                         style={"color": GAIN, "margin": "8px 0 4px"}),
+        went = [r for r in sent if r["order_id"] is not None]
+        refused = [r for r in went if r["status"] not in ("PreSubmitted", "Submitted", "Filled")]
+        if refused or len(went) < len(sent):
+            text = (f"IBKR did not accept {', '.join(r['contract'] for r in refused) or 'every order'}"
+                    f"{': ' + refused[0]['message'] if refused and refused[0]['message'] else ''}. "
+                    f"{len(sent) - len(went)} outright orders were held back, so nothing is half on. "
+                    if len(went) < len(sent) else
+                    f"IBKR did not accept {', '.join(r['contract'] for r in refused)}: see the table. ")
+            colour = LOSS
+        else:
+            text, colour = f"Sent {len(went)} limit orders to {SESSION.account}, one per row. ", GAIN
+        return [html.Div(text + "Every row is in the order log; working orders are under Open orders on the "
+                         "Portfolio tab.", className="sd-note", style={"color": colour, "margin": "8px 0 4px"}),
                 _sent_table(sent, signal=False)], True

@@ -64,7 +64,7 @@ html[data-sd-theme="dark"] .sd-app :is(.sd-sheet, .sd-row, .sd-row-body, .sd-row
     border-color: #454951 !important;
 }
 html[data-sd-theme="dark"] .sd-app .sd-modal-box { background: #202329; border-color: #8a909a; }
-html[data-sd-theme="dark"] .sd-app .sd-modal-box input { background: #2a2e36; color: #dcdfe4; border-color: #454951; }
+html[data-sd-theme="dark"] .sd-app .sd-modal-box .dash-input-container { background: #2a2e36; color: #dcdfe4; border-color: #454951; }
 html[data-sd-theme="dark"] .sd-app :is(.sd-note, .sd-h-note, .sd-detail-label, .sd-n, .sd-pos--quiet, .sd-stamp span span) { color: #a4abb5; }
 html[data-sd-theme="dark"] .sd-app .sd-row-head:hover { background: #292e37; }
 html[data-sd-theme="dark"] .sd-app .sd-reading--active { background: #304657; color: #c4dff1; }
@@ -123,10 +123,41 @@ html[data-sd-theme="dark"] .sd-app button:not(.sd-sort):not(:where(.dash-dropdow
 html[data-sd-theme="dark"] .sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)):hover:not(:disabled) {
     background: #8d3c4f !important;
 }
+/* Light theme: action buttons take the light theme's orange accent (the selected tabs'),
+   burgundy stays dark mode's. */
+html:not([data-sd-theme="dark"]) .sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)) {
+    background: #D35400 !important;
+    border-color: #D35400 !important;
+}
+html:not([data-sd-theme="dark"]) .sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)):hover:not(:disabled) {
+    background: #B84A00 !important;
+    border-color: #B84A00 !important;
+}
 .sd-app button:not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)):disabled { opacity: 0.55; cursor: default; }
 .sd-app button:not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)):focus-visible { outline: 2px solid #ffcc33; outline-offset: 2px; }
 html[data-sd-theme="dark"] .sd-app .sd-deep-tab[aria-pressed="true"] {
     background: #773141 !important;
     color: #ffcc33 !important;
     border-top-color: #ffcc33 !important;
+}
+/* Light theme: the Deep Dive view tabs look like the folder tabs above them (grey,
+   and white with an orange top rule when selected), not like burgundy action buttons. */
+html:not([data-sd-theme="dark"]) .sd-app button.sd-deep-tab:not(.sd-sort) {
+    background: #F5F5F5 !important;
+    color: #888888 !important;
+    border: 1px solid #DCDCDC !important;
+    border-bottom: 0 !important;
+    border-radius: 6px 6px 0 0;
+    font-weight: bold;
+}
+html:not([data-sd-theme="dark"]) .sd-app button.sd-deep-tab:not(.sd-sort):hover:not([aria-pressed="true"]) {
+    background: #EBEBEB !important;
+    color: #333333 !important;
+}
+html:not([data-sd-theme="dark"]) .sd-app button.sd-deep-tab:not(.sd-sort)[aria-pressed="true"] {
+    background: #FFFFFF !important;
+    color: #D35400 !important;
+    border-top: 3px solid #D35400 !important;
+    margin-bottom: -1px;
+    padding-bottom: 7px;
 }
