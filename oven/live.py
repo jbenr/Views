@@ -49,7 +49,8 @@ def registry_entry(run_path: str | Path, name: str, sid: str, rationale: str | N
         "signal_id": sig,
         "module": sig,  # the dashboard keys data refreshes by module; each oven signal pulls its own
         "kind": "oven",
-        "name": re.sub(r"\W+", "_", f"oven_{name}_{target}_lb{setup['lookback']}_h{setup['hedge_lb']}"),
+        "name": re.sub(r"\W+", "_", f"oven_{name}_{target}_lb{setup['lookback']}_h{setup['hedge_lb']}"
+                                    + ("" if setup.get("hedge_fit", "ols") == "ols" else f"_{setup['hedge_fit']}")),
         "family": "curve",
         "target": target,
         "feature": name,
@@ -105,7 +106,8 @@ class OvenStrategy:
         """The setup's model on the pulled data: what the cache holds and every card reads."""
         if "beta_changes" in data.columns:  # already a model frame (the cached pull)
             return data
-        return engine.model_frame(data, self.target, self.feature, self.setup["lookback"], self.setup["hedge_lb"])
+        return engine.model_frame(data, self.target, self.feature, self.setup["lookback"], self.setup["hedge_lb"],
+                                  self.setup.get("hedge_fit", "ols"))
 
     def compute(self, data: pl.DataFrame, params: dict | None = None) -> pl.DataFrame:
         """Per bar: the setup's own entry signal (its residual in bps, or its z) and the

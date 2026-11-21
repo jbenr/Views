@@ -5,6 +5,7 @@ import numpy as np
 import polars as pl
 import pandas as pd
 from typing import Union
+from numba import njit, prange
 from utils.helpers import to_pl_df, to_pl_series
 
 
@@ -339,3 +340,78 @@ def fit_lr(x, y) -> dict:
     total = np.sum((y - y.mean()) ** 2)
     return {"alpha": float(alpha), "beta": float(beta), "r2": float(1 - np.sum(resid ** 2) / total) if total > 0 else np.nan,
             "n": int(len(x)), "resid_std": float(resid.std())}
+
+
+# Kalman beta search grid. SNR is the state-noise variance relative to a one-day
+# OLS beta's variance (r / mean dx^2): ~1e-6 remembers ~1000 days, ~1e-1 a few.
+KALMAN_SNR = np.geomspace(1e-6, 1e-1, 11)
+KALMAN_PHI = np.array([1.0, 0.999, 0.995, 0.99, 0.98, 0.95, 0.9, 0.8, 0.6])
+
+
+@njit(cache=True)
+def _kf_pass(dx, dy, start, end, mu, phi, q, p0):
+    """Scalar Kalman filter of dy = b dx + e over rows [start, end), with
+    b_t = mu + phi (b_{t-1} - mu) + eta. Variances are in units of the
+    observation variance, which is concentrated out of the likelihood.
+    Returns (final filtered beta, concentrated log-likelihood)."""
+    b, p, sv, slf = mu, p0, 0.0, 0.0
+    for i in range(start, end):
+        b = mu + phi * (b - mu)
+        p = phi * phi * p + q
+        f = dx[i] * dx[i] * p + 1.0
+        v = dy[i] - b * dx[i]
+        sv += v * v / f
+        slf += np.log(f)
+        k = p * dx[i] / f
+        b += k * v
+        p -= k * dx[i] * p
+    n = end - start
+    return b, -0.5 * (slf + n * np.log(sv / n))
+
+
+@njit(parallel=True, cache=True)
+def _kalman_beta_roll(dx, dy, lookback, snr_grid, phi_grid):
+    n = len(dx)
+    beta, snr, phi = np.full(n, np.nan), np.full(n, np.nan), np.full(n, np.nan)
+    for t in prange(lookback - 1, n):
+        start, end = t - lookback + 1, t + 1
+        sxx, sxy = 0.0, 0.0
+        for i in range(start, end):
+            sxx += dx[i] * dx[i]
+            sxy += dx[i] * dy[i]
+        if not (sxx > 0 and np.isfinite(sxy)):
+            continue
+        mu, m2 = sxy / sxx, sxx / lookback
+        best = -np.inf
+        for s in snr_grid:
+            for ph in phi_grid:
+                b, ll = _kf_pass(dx, dy, start, end, mu, ph, s / m2, 1.0 / m2)
+                if ll > best:
+                    best, beta[t], snr[t], phi[t] = ll, b, s, ph
+    return beta, snr, phi
+
+
+def kalman_beta(
+    x: Union[pl.Series, pd.Series],
+    y: Union[pl.Series, pd.Series],
+    lookback: int = 252,
+    phi: float = None,
+) -> pl.DataFrame:
+    """Changes hedge ratio dy = beta dx from a Kalman filter, refit every day.
+
+    Each day the filter's parameters are fit by maximum likelihood on the
+    trailing `lookback` changes only, the filter is run over that window, and
+    the day's beta is its last filtered value -- no lookahead. Beta follows an
+    AR(1) toward the window's OLS beta (through the origin): `phi=None` fits
+    phi from KALMAN_PHI, `phi=1.0` is a random-walk beta (pure recency
+    weighting, decay fitted). The decay (SNR) is always fitted from KALMAN_SNR.
+
+    Same length and alignment as `roll_lr_diff`. Returns polars DataFrame with
+    columns: x, y, dx, dy, beta, snr, phi.
+    """
+    levels = pl.DataFrame({"x": to_pl_series(x), "y": to_pl_series(y)}).drop_nulls()
+    levels = levels.with_columns(pl.col("x").diff().alias("dx"), pl.col("y").diff().alias("dy")).slice(1)
+    phi_grid = KALMAN_PHI if phi is None else np.array([float(phi)])
+    beta, snr, phi_fit = _kalman_beta_roll(levels["dx"].to_numpy().astype(float), levels["dy"].to_numpy().astype(float),
+                                           lookback, KALMAN_SNR, phi_grid)
+    return levels.with_columns(pl.Series("beta", beta), pl.Series("snr", snr), pl.Series("phi", phi_fit))

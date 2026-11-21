@@ -337,3 +337,14 @@ body .dash-dropdown-value-count {
 .dashboard-tight .oven-tight .viz-table td {
     padding: 2px 7px !important;
 }
+
+/* ---- phones, every app ----------------------------------------------------------
+   folder_tabs() keeps the tabs side by side; here they shrink to fit, and the
+   header and page gutters come in from the desktop 24px. */
+@media (max-width: 700px) {
+    .research-app-header { padding: 8px 10px !important; gap: 10px !important; flex-wrap: wrap; }
+    .folder-tabs { padding-left: 8px !important; padding-right: 8px !important; }
+    .folder-tabs .tab { min-width: 0 !important; padding: 8px 10px !important; margin-right: 2px !important; }
+    /* 16px stops iOS zooming the page in when a field takes focus */
+    .dash-input-element { font-size: 16px !important; }
+}

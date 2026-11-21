@@ -67,12 +67,12 @@
       return;
     }
     if (!sections.length) return;
-    sections.forEach((s) => s.style.setProperty("--sd-columns", `${MARKER} repeat(7, max-content)`));
-    const widest = new Array(7).fill(0);
+    sections.forEach((s) => s.style.setProperty("--sd-columns", `${MARKER} repeat(6, max-content)`));
+    const widest = new Array(6).fill(0);
     document.querySelectorAll(".sd-signal-section :is(.sd-row-head, .sd-row-legend)").forEach((row) => {
       const cells = Array.from(row.children);
       const offset = row.matches(".sd-row-legend") ? 1 : 0;  // the legend has a real marker cell
-      cells.slice(offset, offset + 7).forEach((cell, i) => {
+      cells.slice(offset, offset + 6).forEach((cell, i) => {
         widest[i] = Math.max(widest[i], Math.ceil(cell.getBoundingClientRect().width));
       });
     });

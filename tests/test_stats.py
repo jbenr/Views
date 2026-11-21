@@ -240,3 +240,27 @@ def test_ctd_switches_to_long_duration_when_yields_rise():
     assert steeper == 1  # a steeper curve cheapens the longer bond
     weights = bb.scenario_weights(dict(corr=-0.4))
     assert weights.sum() == pytest.approx(1.0) and weights.shape == (len(bb.FINE), len(bb.FINE))
+
+
+def test_kalman_beta_tracks_a_beta_jump_without_lookahead():
+    from stats import kalman_beta
+    rng = np.random.default_rng(3)
+    n, lb = 1500, 252
+    true_b = np.where(np.arange(n) < 750, 0.3, 0.9)
+    dx = rng.normal(0, 5, n)
+    dy = true_b * dx + rng.normal(0, 3, n)
+    x, y = np.cumsum(dx), np.cumsum(dy)
+
+    kf = kalman_beta(x, y, lookback=lb)
+    ols = roll_lr_diff(pl.Series(x), pl.Series(y), lookback=lb)
+    assert len(kf) == len(ols)
+    assert kf["beta"][: lb - 1].is_nan().all() and kf["beta"].slice(lb).is_finite().all()
+
+    # 60 bars after the jump the refit Kalman beta is closer to the new beta than rolling OLS
+    assert abs(kf["beta"][750 + 60] - 0.9) < abs(ols["beta"][750 + 60] - 0.9)
+
+    # changing the future leaves every earlier beta untouched
+    y2 = y.copy()
+    y2[1000:] += rng.normal(0, 50, n - 1000)
+    kf2 = kalman_beta(x, y2, lookback=lb)
+    np.testing.assert_array_equal(kf["beta"].to_numpy()[:998], kf2["beta"].to_numpy()[:998])

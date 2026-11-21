@@ -1,0 +1,32 @@
+# Dark mode, defined once for every app built with make_app(theme=True).
+#
+# [dark] becomes CSS variables (--theme-page, --theme-border, ...) that
+# utils/assets/theme.css and each app's own stylesheet read; [dark.chart] is the
+# matplotlib restyle dashboard.charts applies to the dark copy of each chart.
+# Change a colour here and every themed app and chart follows.
+
+[dark]
+page = "#17191d"          # the canvas behind everything
+surface = "#202329"       # cells, inputs, buttons, modals
+raised = "#292d34"        # header rows, labels, unselected tabs
+hover = "#303640"         # row and option hover
+border = "#454951"        # every rule and cell edge
+border_strong = "#8a909a" # edges that must stand out (modals)
+input = "#2a2e36"         # text inputs
+text = "#dcdfe4"
+dim = "#a4abb5"           # notes, labels, secondary text
+accent = "#ffcc33"        # selected tab
+accent_bg = "#373020"     # selected tab / chosen option fill
+highlight = "#c4dff1"     # an active reading's ink
+highlight_bg = "#304657"  # an active reading's fill
+loader = "#62666e"        # the loading shimmer's resting colour
+
+[dark.chart]
+canvas = "#17191d"
+axes = "#202329"
+tick = "#b5bdc8"
+spine = "#68717f"
+grid = "#3d444f"
+line = "#a4abb5"          # neutral (grey) series
+text = "#dcdfe4"
+box = "#303640"           # neutral label boxes

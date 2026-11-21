@@ -81,8 +81,9 @@
       canvas.height = rowHeights.reduce((total, height) => total + height, 0)
         + (rows.length + 1) * padding;
       const context = canvas.getContext("2d");
-      context.fillStyle = charts.closest(".sd-app") && document.documentElement.dataset.sdTheme === "dark"
-        ? "#17191d" : "#ffffff";
+      const page = getComputedStyle(document.documentElement).getPropertyValue("--theme-page").trim();
+      context.fillStyle = charts.closest(".themed") && document.documentElement.dataset.theme === "dark" && page
+        ? page : "#ffffff";
       context.fillRect(0, 0, canvas.width, canvas.height);
 
       let y = padding;

@@ -62,9 +62,9 @@
 .sd-pos--gated { color: #D35400; }
 .sd-pos--quiet { color: #888888; font-weight: normal; }
 
-/* Keep section rules aligned with the eight signal columns and their left border. */
+/* Keep section rules aligned with the seven signal columns and their left border. */
 .sd-signal-section {
-    --sd-columns: 18px 112px 180px 146px 100px 64px 104px 250px;
+    --sd-columns: 18px 112px 180px 146px 100px 64px 354px;
     width: var(--sd-signal-width);
     max-width: 100%;
 }
@@ -393,7 +393,7 @@
     /* the same table, tighter. dashboard.js fits each column to its widest cell;
        these widths only hold until it runs */
     .sd-signal-section {
-        --sd-columns: 14px 91px 100px 101px 48px 35px 84px 188px;
+        --sd-columns: 14px 91px 100px 101px 48px 35px 188px;
         width: max-content;
     }
     .sd-sheet { font-size: 11px; }
@@ -408,10 +408,6 @@
     .sd-grid .viz-table th,
     .sd-grid .viz-table td { padding: 2px 4px !important; font-size: 11px !important; }
     .sd-kv > div > span { padding: 2px 4px; }
-
-    /* the folder tabs stay side by side */
-    #dashboard-tabs { padding: 8px 10px 0 !important; }
-    #dashboard-tabs .tab { min-width: 0 !important; padding: 8px 9px !important; margin-right: 2px !important; }
 
     /* the order ticket takes the whole screen; 16px inputs stop iOS zooming on focus,
        and Submit / Close stay pinned at the bottom while the table scrolls sideways */

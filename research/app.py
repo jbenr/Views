@@ -83,7 +83,7 @@ from research import artifacts, jobs, progress as work
 from research.preferences import load_controls, load_preferences, save_controls, save_preferences
 from backtest.legacy import TradeDef
 from utils.research_app import (
-    BORDER, C0, C1, C2, DIM, FOLDER_TAB, FOLDER_TAB_SELECTED, FOLDER_TABS, ORANGE, PANEL, TEXT, make_app, run,
+    BORDER, C0, C1, C2, DIM, FOLDER_TAB, FOLDER_TAB_SELECTED, FOLDER_TABS, ORANGE, PANEL, TEXT, folder_tabs, make_app, run,
     shimmer_loader, stat_block,
 )
 from utils.viz import table_div
@@ -1606,7 +1606,7 @@ def backtest_grid_view(grid: pl.DataFrame, selected: dict, sort_by: str | None =
 def tabs() -> html.Div:
     return html.Div([dcc.Store(id="research-session", data=uuid4().hex),
         dcc.Interval(id="research-progress-poll", interval=750),
-        dcc.Tabs(id="bench-tabs", value="setup", style=FOLDER_TABS, mobile_breakpoint=0, children=[
+        folder_tabs("bench-tabs", "setup", children=[
         dcc.Tab(label="Setup", value="setup", style=TAB_STYLE,
                 selected_style=SELECTED_TAB_STYLE, children=setup_tab()),
         dcc.Tab(label="Dislocation", value="dis", style=TAB_STYLE,
@@ -2417,7 +2417,7 @@ def basis_tab() -> html.Div:
              "the end-of-month option on its own, repo specialness, moves that are not level plus this one curve."),
     ], className="research-controls")
     return html.Div(style={"padding": "14px 24px"}, children=[
-        dcc.Tabs(id="basis-tabs", value="TY", style=SUB_FOLDER_TABS, mobile_breakpoint=0, children=[
+        folder_tabs("basis-tabs", "TY", style=SUB_FOLDER_TABS, children=[
             dcc.Tab(label=root.strip(), value=root, style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED)
             for root in BASIS_ROOTS]),
         html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)", "gap": 26,
@@ -2626,7 +2626,7 @@ def cross_market_view(result: dict, market: str, window: str) -> html.Div:
 
 def idio_tab() -> html.Div:
     return remember_controls(html.Div(style={"padding": "14px 24px"}, children=[
-        dcc.Tabs(id="idio-tabs", value="sf", style=SUB_FOLDER_TABS, mobile_breakpoint=0, children=[
+        folder_tabs("idio-tabs", "sf", style=SUB_FOLDER_TABS, children=[
             dcc.Tab(label="SOFR / FF basis", value="sf", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
                     children=html.Div(sofr_ff_tab(), style={"paddingTop": 14})),
             dcc.Tab(label="CTA trend", value="cta", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
@@ -2640,7 +2640,7 @@ def idio_tab() -> html.Div:
 def fair_value_tab() -> html.Div:
     return remember_controls(html.Div(style={"padding": "14px 24px"}, children=[
         html.Div(id="fair-value-context", style={"display": "none"}),  # Setup's Fill tabs still writes here
-        dcc.Tabs(id="fv-tabs", value="pca", style=SUB_FOLDER_TABS, mobile_breakpoint=0, children=[
+        folder_tabs("fv-tabs", "pca", style=SUB_FOLDER_TABS, children=[
             dcc.Tab(label="PCA", value="pca", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,
                     children=html.Div(pca_tab(), style={"paddingTop": 14})),
             dcc.Tab(label="Term Premium", value="tp", style=SUB_TAB_STYLE, selected_style=SUB_TAB_SELECTED,

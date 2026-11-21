@@ -44,12 +44,12 @@
     left: 50%;
     transform: translateX(-50%);
     z-index: 1201;
-    width: min(460px, calc(100vw - 40px));
+    width: min(360px, calc(100vw - 40px));
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 9px;
-    padding: 0 14px 14px;
+    gap: 6px;
+    padding: 6px 12px 10px;
     pointer-events: none;
     text-align: center;
     color: #858087;
@@ -62,8 +62,9 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    margin-bottom: 4px;
+    margin-bottom: 2px;
 }
+.research-work-status .shimmer-loader__mark--logo { width: 44px; height: 44px; }
 .research-work-count,
 .research-work-log {
     font-family: Consolas, "SFMono-Regular", monospace;
@@ -90,7 +91,7 @@
     display: flex;
     flex-direction: column;
     overflow-anchor: none; /* Explicit message anchoring in research_log.js. */
-    max-height: 108.9px; /* Six lines at 11px * 1.65 line-height. */
+    max-height: 54.45px; /* Three lines at 11px * 1.65 line-height. */
     overflow-y: auto;
     overflow-x: hidden;
     overscroll-behavior: contain;
@@ -114,4 +115,10 @@
 .research-work-finished .research-work-bar { display: none; }
 @media (prefers-reduced-motion: reduce) {
     .research-work-bar-fill { transition: none; }
+}
+/* phones: the same centred stack, smaller -- logo, then count, bar and log */
+@media (max-width: 700px) {
+    .research-work-status { width: calc(100vw - 40px); gap: 4px; padding: 4px 10px 8px; }
+    .research-work-status .shimmer-loader__mark--logo { width: 34px; height: 34px; }
+    .research-work-status .shimmer-loader__caption { display: none; }
 }

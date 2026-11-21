@@ -293,3 +293,39 @@ def test_setup_ids_from_older_bakes_keep_their_rules():
     assert {k: old[k] for k in LEGACY_RULES} == LEGACY_RULES
     new = app.setup_from_id("10y", "126|504|portfolio|raw|2.5|0.75|40|0.0|2.0|0.0|flat|same|by_exit|r2:high_75|full|True")
     assert (new["fill"], new["rearm"], new["gate"], new["need_half_life"]) == ("same", "by_exit", "r2:high_75", True)
+    assert old["hedge_fit"] == new["hedge_fit"] == "ols"  # before the hedge fit was a knob
+    assert app.setup_id({**new, "hedge_fit": "ols"}) == "126|504|portfolio|raw|2.5|0.75|40|0.0|2.0|0.0|flat|same|by_exit|r2:high_75|full|True"
+
+
+def test_hedge_fits_are_swept_and_their_setups_rewalk_to_the_board(tmp_path, monkeypatch):
+    """Each hedge fit is its own setup on the board, with its own hedge ratios, and a
+    Kalman-hedged setup re-walks to exactly what the board scored."""
+    from oven import app
+    from oven.engine import save
+
+    rng = np.random.default_rng(11)
+    n = 1500
+    x = np.cumsum(rng.normal(0, 5, n))
+    ou = np.zeros(n)
+    for i in range(1, n):
+        ou[i] = 0.9 * ou[i - 1] + rng.normal(0, 2)
+    panel = _panel(0.5 * x + ou, x)
+    configs = config_grid(z_entries=[2.0], raw_entries=[], reverts=[1.0], max_holds=[20], stops=[0.0], hl_mults=[0.0])
+    run = bake(panel, ["10y"], lookbacks=[126], hedge_lookbacks=[126], configs=configs, cost=0.5,
+               hedge_fits=["ols", "kalman", "kalman_rw"], keep_trades=True)
+    assert set(run["board"]["hedge_fit"]) == {"ols", "kalman", "kalman_rw"}
+    ratios = {f: run["trades"].filter((pl.col("hedge_fit") == f) & (pl.col("basis") == "portfolio"))["hedge_ratio"]
+              for f in ("ols", "kalman")}
+    assert not np.allclose(ratios["ols"].head(5).to_numpy(), ratios["kalman"].head(5).to_numpy())
+
+    run["trades"] = pl.DataFrame()  # re-walk from the board, as a normal bake does
+    run_dir = save(run, "10s30s", ["10y"], {"cost": 0.5, "lookbacks": [126]}, root=tmp_path)
+    monkeypatch.setattr(app, "build_panel", lambda *_a, **_k: panel)
+    for row in run["board"].filter(pl.col("hedge_fit") != "ols").iter_rows(named=True):
+        sid = app.setup_id(row)
+        assert sid.endswith(row["hedge_fit"])
+        trades = app.bake_trades(str(run_dir), app.setup_from_id("10y", sid))
+        assert len(trades) == row["n_trades"]
+        assert np.isclose(trades["pnl"].sum(), row["total_pnl"], rtol=1e-4)
+    with np.testing.assert_raises(ValueError):
+        bake(panel, ["10y"], lookbacks=[126], hedge_lookbacks=[126], configs=configs, hedge_fits=["huber"])

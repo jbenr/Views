@@ -17,6 +17,8 @@ from pathlib import Path
 import plotly.graph_objects as go
 from dash import Dash, dcc, html
 
+from utils.theme import css_variables
+
 # ── palette ───────────────────────────────────────────────────────────────────
 BG     = "#FFFFFF"
 PANEL  = "#F5F5F5"
@@ -43,6 +45,15 @@ FOLDER_TAB_SELECTED = {
     **FOLDER_TAB, "background": "#FFFFFF", "color": ORANGE, "borderTop": f"3px solid {ORANGE}",
     "borderBottom": "1px solid #FFFFFF",
 }
+
+
+def folder_tabs(id_: str, value: str, children: list, style: dict = FOLDER_TABS, className: str = "",
+                **kwargs) -> dcc.Tabs:
+    """dcc.Tabs for every app here: always side by side, a phone included. dcc.Tabs
+    stacks them under 800px by default (mobile_breakpoint); research_app.css's
+    .folder-tabs tightens them on a narrow screen instead."""
+    return dcc.Tabs(id=id_, value=value, children=children, style=style, mobile_breakpoint=0,
+                    className=f"folder-tabs {className}".strip(), **kwargs)
 
 
 # ── Plotly figure factory ─────────────────────────────────────────────────────
@@ -198,6 +209,7 @@ def make_app(
     debug: bool = True,
     class_name: str = "",
     header_controls: list | None = None,
+    theme: bool = False,
 ) -> Dash:
     """
     Build a Dash app with a standard header + slider row(s) + body area.
@@ -216,6 +228,9 @@ def make_app(
                 freezes at whatever it read when the app was constructed and
                 every later browser refresh re-serves that same snapshot.
     debug     : True shows callback errors in browser (recommended during dev)
+    theme     : True adds the light/dark toggle (utils/theme.toml palette,
+                assets/theme.css + theme.js). Charts follow only if rendered
+                under dashboard.charts.dual_theme_charts and shown with chart_image.
     """
     _assets = Path(__file__).parent / "assets"
     _assets.mkdir(exist_ok=True)
@@ -231,6 +246,18 @@ def make_app(
         meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
     )
     app.title = title
+    if theme:
+        app.index_string = app.index_string.replace(
+            "{%css%}", "{%css%}\n        <style>" + css_variables() + "</style>"
+        )
+        class_name = f"{class_name} themed".strip()
+        header_controls = [
+            *(header_controls or []),
+            # right-aligned inline, so the header lays out even before theme.css loads
+            html.Button("Dark mode", id="theme-toggle", type="button", className="theme-toggle",
+                        style={"marginLeft": "auto"},
+                        **{"aria-pressed": "false", "aria-label": "Toggle dark mode"}),
+        ]
 
     slider_rows = sliders if sliders and isinstance(sliders[0], list) else [sliders]
     slider_row_divs = [

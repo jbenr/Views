@@ -34,6 +34,7 @@ from matplotlib.ticker import MaxNLocator, StrMethodFormatter
 
 from backtest.lab import parse_gate
 from utils.research_app import C0, C1, C2, DIM, ORANGE
+from utils.theme import DARK_CHART
 from utils.viz import Viz
 
 # pyplot keeps one process-wide figure registry and is not thread-safe: two
@@ -81,27 +82,28 @@ def _dark_figure(fig):
         except (ValueError, TypeError):
             return False
 
-    fig.set_facecolor("#17191d")
+    c = DARK_CHART
+    fig.set_facecolor(c["canvas"])
     for ax in fig.axes:
-        ax.set_facecolor("#202329")
-        ax.tick_params(colors="#b5bdc8")
+        ax.set_facecolor(c["axes"])
+        ax.tick_params(colors=c["tick"])
         for spine in ax.spines.values():
-            spine.set_color("#68717f")
+            spine.set_color(c["spine"])
         for line in ax.lines:
             if neutral(line.get_color()):
-                line.set_color("#a4abb5")
+                line.set_color(c["line"])
         for line in [*ax.get_xgridlines(), *ax.get_ygridlines()]:
-            line.set_color("#3d444f")
+            line.set_color(c["grid"])
         legend = ax.get_legend()
         if legend:
-            legend.get_frame().set_facecolor("#202329")
-            legend.get_frame().set_edgecolor("#68717f")
+            legend.get_frame().set_facecolor(c["axes"])
+            legend.get_frame().set_edgecolor(c["spine"])
     for text in fig.findobj(match=Text):
         if neutral(text.get_color()):
-            text.set_color("#dcdfe4")
+            text.set_color(c["text"])
         box = text.get_bbox_patch()
         if box is not None and neutral(box.get_facecolor()):
-            box.set_facecolor("#303640")
+            box.set_facecolor(c["box"])
 
 
 def _one_at_a_time(render):
@@ -697,7 +699,7 @@ def _png(fig) -> str:
         if not _DUAL_THEME.get():
             return light
         _dark_figure(fig)
-        return _ThemedPng(light, encode("#17191d"))
+        return _ThemedPng(light, encode(DARK_CHART["canvas"]))
     finally:
         plt.close(fig)
 

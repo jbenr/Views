@@ -7,6 +7,9 @@ regressions of the target y on the input x, each with its own job:
   signal  levels OLS     y = a + bL * x      "is y rich/cheap vs where x says it should be?"
   hedge   changes OLS   dy = c + bC * dx     "what ratio of x neutralises y's daily moves?"
 
+The hedge's bC is fit over the hedge lookback by rolling OLS or by a Kalman filter
+refit every day on that window (HEDGE_FITS), swept like the lookback.
+
 The trade is the PORTFOLIO y hedged by x: hold y and -bC x, with bC frozen at
 entry. An input that isn't itself tradable (vol, macro) can't be held as a
 hedge, so its trade is y alone.
@@ -65,13 +68,20 @@ from backtest import engine as core
 from backtest.engine import EXIT_REASONS, FILLS, REARMS, SCALES, SIZINGS, STATS, TRADE_COLS, expect, horizon
 from backtest.lab import CONDITION_NAMES, REGIME_GATE_BUCKETS
 from research.panel import CATALOG, TRADEABLE_LEGS, build_panel
-from stats import roll_half_life, roll_lr, roll_lr_diff
+from stats import kalman_beta, roll_half_life, roll_lr, roll_lr_diff
 
 OVEN_RUNS = Path(__file__).parent / "data"
 
 LOOKBACKS = [63, 126, 252, 504]
 HEDGE_LOOKBACK = 126  # the hedge lookback older bakes used, before it was swept
 HEDGE_LOOKBACKS = [63, 126, 252]  # changes-OLS lookbacks for the hedge ratio, swept like the signal's
+# How the changes hedge ratio is fit over its hedge lookback, swept like it:
+#   ols        rolling OLS on daily changes
+#   kalman     Kalman filter refit every day on the window, beta pulled back (AR(1)) to the window's OLS beta
+#   kalman_rw  the same with a random-walk beta: recency-weighted, its decay fitted every day
+# A setup from before this was a knob is ols.
+HEDGE_FITS = ("ols", "kalman", "kalman_rw")
+HEDGE_FIT_DEFAULT = ["ols"]
 Z_ENTRIES = [1.5, 2.0, 2.5]
 RAW_ENTRIES = [5.0, 10.0, 15.0, 20.0]
 REVERTS = [0.0, 0.5, 1.0]  # share of the entry residual recovered; 1.0 = back to fair; 0 = no reversion exit
@@ -94,7 +104,7 @@ PERIODS = 252
 
 FEATURES = ("entry_z", "r2", "beta_levels", "beta_changes", "hedge_gap", "beta_drift20",
             "half_life", "resid_sigma", "input_vol60", "target_vol60")
-SETUP = ["input", "lookback", "hedge_lb", "basis", "scale", "entry", "revert", "max_hold", "stop", "hl_mult",
+SETUP = ["input", "lookback", "hedge_lb", "hedge_fit", "basis", "scale", "entry", "revert", "max_hold", "stop", "hl_mult",
          "pnl_stop", "sizing", "fill", "rearm", "gate", "gate_mode", "need_half_life"]
 # fills, re-arms and gates (backtest.engine): a gate is "<condition>:<bucket>" or none
 FILLS_DEFAULT = ["same"]
@@ -132,16 +142,28 @@ def _front_pad(values: np.ndarray, n: int) -> np.ndarray:
     return np.r_[np.full(n - len(values), np.nan), values]
 
 
-def model_arrays(y: np.ndarray, x: np.ndarray, lookback: int, hedge_lookback: int) -> dict[str, np.ndarray]:
+def hedge_beta(y: np.ndarray, x: np.ndarray, hedge_lookback: int, hedge_fit: str = "ols") -> np.ndarray:
+    """The changes hedge ratio through each bar, fit over ``hedge_lookback`` bars the
+    ``hedge_fit`` way (HEDGE_FITS). y and x are aligned with no gaps."""
+    if hedge_fit == "ols":
+        beta = roll_lr_diff(pl.Series(x), pl.Series(y), lookback=hedge_lookback)["beta"]
+    elif hedge_fit in ("kalman", "kalman_rw"):
+        beta = kalman_beta(x, y, lookback=hedge_lookback, phi=1.0 if hedge_fit == "kalman_rw" else None)["beta"]
+    else:
+        raise ValueError(f"unknown hedge fit {hedge_fit!r}; expected one of {HEDGE_FITS}")
+    return _front_pad(beta.to_numpy().astype(float), len(y))
+
+
+def model_arrays(y: np.ndarray, x: np.ndarray, lookback: int, hedge_lookback: int, hedge_fit: str = "ols",
+                 beta_c: np.ndarray | None = None) -> dict[str, np.ndarray]:
     """Rolling levels fit (signal), rolling changes beta (hedge) and the entry-state
-    features, all fitted through each bar. y and x are aligned with no gaps."""
-    n = len(y)
+    features, all fitted through each bar. y and x are aligned with no gaps. ``beta_c``
+    is the hedge ratio already fit (hedge_beta), shared across signal lookbacks."""
     lv = roll_lr(pl.Series(x), pl.Series(y), lookback=lookback)
     resid = lv["resid"].to_numpy().astype(float)
     sigma = pl.Series(resid).rolling_std(lookback, min_samples=lookback).to_numpy().astype(float)
     beta_l = lv["beta"].to_numpy().astype(float)
-    beta_c = _front_pad(roll_lr_diff(pl.Series(x), pl.Series(y), lookback=hedge_lookback)["beta"]
-                        .to_numpy().astype(float), n)
+    beta_c = hedge_beta(y, x, hedge_lookback, hedge_fit) if beta_c is None else beta_c
     with np.errstate(invalid="ignore", divide="ignore"):
         z = resid / sigma
     dx, dy = np.diff(x, prepend=np.nan), np.diff(y, prepend=np.nan)
@@ -182,14 +204,15 @@ def model_arrays(y: np.ndarray, x: np.ndarray, lookback: int, hedge_lookback: in
     }
 
 
-def model_frame(data: pl.DataFrame, target: str, name: str, lookback: int, hedge_lookback: int) -> pl.DataFrame:
+def model_frame(data: pl.DataFrame, target: str, name: str, lookback: int, hedge_lookback: int,
+                hedge_fit: str = "ols") -> pl.DataFrame:
     """One model on a panel's data: ts, the target and the input under their own names
     (aligned, no gaps), every model array, the hedged portfolio's level and the 126d
     correlation of daily moves. What the Oven app and a live oven signal draw from."""
     aligned = data.select("ts", target, name).drop_nulls()
     y = aligned[target].to_numpy().astype(float)
     x = aligned[name].to_numpy().astype(float)
-    arrays = model_arrays(y, x, lookback, hedge_lookback)
+    arrays = model_arrays(y, x, lookback, hedge_lookback, hedge_fit)
     package = held_package(y, x, arrays["beta_changes"], 1.0 if hedgeable(name) else 0.0)
     corr = (pl.DataFrame({"dy": np.diff(y, prepend=np.nan), "dx": np.diff(x, prepend=np.nan)})
             .select(pl.rolling_corr("dy", "dx", window_size=126)).to_series())
@@ -389,8 +412,8 @@ def setup_trades(frame: pl.DataFrame, target: str, setup: dict, cost: float = CO
         return pl.DataFrame()
     lb = setup["lookback"]
     fits = {**(horizons or {}), lb: arrays}
-    return trade_frame(raw, setup["input"], lb, setup["hedge_lb"], setup["basis"], frame["ts"], arrays, fits,
-                       sorted(fits), configs, hedge)
+    return trade_frame(raw, setup["input"], lb, setup["hedge_lb"], setup.get("hedge_fit", "ols"), setup["basis"],
+                       frame["ts"], arrays, fits, sorted(fits), configs, hedge)
 
 
 # ---- bake: the whole search -------------------------------------------------
@@ -398,9 +421,9 @@ def setup_trades(frame: pl.DataFrame, target: str, setup: dict, cost: float = CO
 
 def bake(panel, inputs: list[str], lookbacks=LOOKBACKS, hedge_lookbacks=HEDGE_LOOKBACKS,
          configs: pl.DataFrame | None = None, cost: float = COST, progress=None, bases=BASES,
-         keep_trades: bool = False) -> dict:
-    """Walk every (input, signal lookback, hedge lookback, signal basis, config) for the
-    panel's target.
+         keep_trades: bool = False, hedge_fits=HEDGE_FIT_DEFAULT) -> dict:
+    """Walk every (input, signal lookback, hedge lookback, hedge fit, signal basis, config)
+    for the panel's target.
 
     Returns ``board`` (one row per setup that traded, with its strategy stats),
     ``skipped`` (inputs without enough overlap, with the reason), ``data_end`` (the
@@ -415,8 +438,11 @@ def bake(panel, inputs: list[str], lookbacks=LOOKBACKS, hedge_lookbacks=HEDGE_LO
     data = panel.data
     trade_frames, board_frames, skipped = [], [], []
     names = [i for i in dict.fromkeys(inputs) if i != target]
-    total, k = len(names) * len(lookbacks) * len(hedge_lookbacks), 0
-    for name, hedge_lookback in product(names, hedge_lookbacks):
+    unknown = [f for f in hedge_fits if f not in HEDGE_FITS]
+    if unknown:
+        raise ValueError(f"unknown hedge fit {unknown}; expected some of {HEDGE_FITS}")
+    total, k = len(names) * len(lookbacks) * len(hedge_lookbacks) * len(hedge_fits), 0
+    for name, hedge_lookback, hedge_fit in product(names, hedge_lookbacks, hedge_fits):
         if name not in data.columns:
             skipped += [dict(input=name, lookback=lb, reason="not in panel") for lb in lookbacks]
             k += len(lookbacks)
@@ -428,27 +454,30 @@ def bake(panel, inputs: list[str], lookbacks=LOOKBACKS, hedge_lookbacks=HEDGE_LO
         hedge = 1.0 if hedgeable(name) else 0.0
         # every horizon's fit for this input first, so each trade can record what the other
         # horizons said at its entry (z_lb<L>): the multi-resolution view
-        fits = {lb: model_arrays(y, x, lb, hedge_lookback) for lb in lookbacks if len(aligned) >= lb + MIN_BARS}
+        beta_c = hedge_beta(y, x, hedge_lookback, hedge_fit) if len(aligned) >= min(lookbacks) + MIN_BARS else None
+        fits = {lb: model_arrays(y, x, lb, hedge_lookback, hedge_fit, beta_c) for lb in lookbacks
+                if len(aligned) >= lb + MIN_BARS}
         skipped += [dict(input=name, lookback=lb, reason=f"only {len(aligned)} shared bars")
                     for lb in lookbacks if lb not in fits]
         k += len(lookbacks) - len(fits)
         for lookback, arrays in fits.items():
             if progress:
-                progress(k, total, f"Baking {target} vs {name} · lookback {lookback} · hedge {hedge_lookback}")
+                progress(k, total, f"Baking {target} vs {name} · lookback {lookback} · hedge {hedge_lookback}"
+                                   f" {hedge_fit}")
             k += 1
             usable = np.flatnonzero(np.isfinite(arrays["entry_z"]))
             split = int(usable[0] + (len(y) - usable[0]) // 2) if len(usable) else len(y)
             # with no hedge the "portfolio" is the target alone, the same for every input: skip it
             for basis in [b for b in bases if hedge or b == "levels"]:
-                _walk_basis(name, lookback, hedge_lookback, basis, y, x, ts, arrays, fits, lookbacks, configs, hedge,
-                            cost, split, board_frames, trade_frames if keep_trades else None)
+                _walk_basis(name, lookback, hedge_lookback, hedge_fit, basis, y, x, ts, arrays, fits, lookbacks,
+                            configs, hedge, cost, split, board_frames, trade_frames if keep_trades else None)
     return {"board": pl.concat(board_frames) if board_frames else pl.DataFrame(),
             "trades": pl.concat(trade_frames) if trade_frames else pl.DataFrame(),
             "skipped": pl.DataFrame(skipped), "data_end": data["ts"].max()}
 
 
-def _walk_basis(name, lookback, hedge_lookback, basis, y, x, ts, arrays, fits, lookbacks, configs, hedge, cost, split,
-                board_frames, trade_frames=None) -> None:
+def _walk_basis(name, lookback, hedge_lookback, hedge_fit, basis, y, x, ts, arrays, fits, lookbacks, configs, hedge,
+                cost, split, board_frames, trade_frames=None) -> None:
     """One model on one signal basis: its setups' board rows, appended -- and, when
     ``trade_frames`` is given, its trades.
 
@@ -459,16 +488,17 @@ def _walk_basis(name, lookback, hedge_lookback, basis, y, x, ts, arrays, fits, l
     scored = core.score(stats)
     board_frames.append(pl.concat([
         pl.DataFrame({"input": [name] * len(configs), "lookback": [lookback] * len(configs),
-                      "hedge_lb": [hedge_lookback] * len(configs), "basis": [basis] * len(configs),
+                      "hedge_lb": [hedge_lookback] * len(configs), "hedge_fit": [hedge_fit] * len(configs),
+                      "basis": [basis] * len(configs),
                       "split_date": [ts[min(split, len(ts) - 1)]] * len(configs)}), configs,
         scored.with_columns(pl.selectors.float().cast(pl.Float32)),
         pl.DataFrame({"hedged": [bool(hedge)] * len(configs)})], how="horizontal").filter(pl.col("n_trades") > 0))
     if trade_frames is not None and len(raw):
-        trade_frames.append(trade_frame(raw, name, lookback, hedge_lookback, basis, ts, arrays, fits, lookbacks,
-                                        configs, hedge))
+        trade_frames.append(trade_frame(raw, name, lookback, hedge_lookback, hedge_fit, basis, ts, arrays, fits,
+                                        lookbacks, configs, hedge))
 
 
-def trade_frame(raw, name, lookback, hedge_lookback, basis, ts, arrays, fits, lookbacks, configs,
+def trade_frame(raw, name, lookback, hedge_lookback, hedge_fit, basis, ts, arrays, fits, lookbacks, configs,
                 hedge) -> pl.DataFrame:
     """The engine's raw trade rows as a frame, with each trade's entry state and what
     the other horizons said at entry."""
@@ -481,7 +511,7 @@ def trade_frame(raw, name, lookback, hedge_lookback, basis, ts, arrays, fits, lo
     horizons = {f"z_lb{lb}": (basis_arrays(fits[lb], basis)["z"][decided].astype(np.float32) if lb in fits
                               else np.full(len(decided), np.nan, dtype=np.float32)) for lb in lookbacks}
     return pl.DataFrame({
-        "input": name, "lookback": lookback, "hedge_lb": hedge_lookback, "basis": basis,
+        "input": name, "lookback": lookback, "hedge_lb": hedge_lookback, "hedge_fit": hedge_fit, "basis": basis,
         **{c: cfg[c] for c in configs.columns},
         "entry_ts": ts.gather(entered), "exit_ts": ts.gather(filled),
         "bars": filled - entered, "side": col["side"],
@@ -595,7 +625,8 @@ def oven_job(target: str, inputs: list[str], settings: dict) -> dict:
                hedge_lookbacks=[int(h) for h in settings.get("hedge_lookbacks", HEDGE_LOOKBACKS)],
                configs=configs,
                cost=float(settings.get("cost", COST)), progress=progress,
-               bases=tuple(settings.get("bases", BASES)))
+               bases=tuple(settings.get("bases", BASES)),
+               hedge_fits=list(settings.get("hedge_fits", HEDGE_FIT_DEFAULT)))
     path = save(run, target, inputs, settings, Path(settings.get("runs_dir", OVEN_RUNS)))
     n_trades = int(run["board"]["n_trades"].sum()) if not run["board"].is_empty() else 0
     progress(1, 1, f"Completed · {len(run['board']):,} setups, {n_trades:,} trades")

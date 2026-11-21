@@ -1,0 +1,119 @@
+/* Dark mode for every app built with make_app(theme=True): its root carries .themed
+   and theme.js sets html[data-theme]. Colours are the --theme-* variables generated
+   from utils/theme.toml -- change them there, not here. App-specific dark rules live
+   in the app's own stylesheet (dashboard_theme.css) and read the same variables. */
+.theme-toggle {
+    margin-left: auto;
+    border: 1px solid #bbb;
+    border-radius: 3px;
+    padding: 4px 9px;
+    background: #fff;
+    color: #444;
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+html[data-theme="dark"] { color-scheme: dark; background: var(--theme-page); }
+/* Mobile margins and overscroll expose the document canvas outside the app root. */
+html[data-theme="dark"] body {
+    background: var(--theme-page) !important;
+    color: var(--theme-text);
+}
+html[data-theme="dark"] .themed {
+    background: var(--theme-page) !important;
+    color: var(--theme-text) !important;
+}
+html[data-theme="dark"] .themed .research-app-header {
+    background: var(--theme-surface) !important;
+    border-color: var(--theme-border) !important;
+}
+html[data-theme="dark"] .themed .shimmer-loader__mark {
+    background-image: linear-gradient(100deg,
+        var(--theme-loader) 0%, var(--theme-loader) 40%, #ffcc33 47%, #9b2948 53%,
+        var(--theme-loader) 60%, var(--theme-loader) 100%);
+}
+@media (prefers-reduced-motion: reduce) {
+    html[data-theme="dark"] .themed .shimmer-loader__mark {
+        background-image: linear-gradient(var(--theme-loader), var(--theme-loader));
+    }
+}
+html[data-theme="dark"] .themed img[data-chart-dark] { border-color: var(--theme-border) !important; }
+
+/* tabs, table headers, buttons and their edges */
+html[data-theme="dark"] .themed :is(.tab, .viz-table th) {
+    background: var(--theme-raised) !important;
+    color: var(--theme-text) !important;
+}
+html[data-theme="dark"] .themed :is(.theme-toggle, .ref-btn) {
+    background: var(--theme-surface) !important;
+    color: var(--theme-text) !important;
+}
+html[data-theme="dark"] .themed :is(button, .tab, .viz-table, .viz-table th, .viz-table td) {
+    border-color: var(--theme-border) !important;
+}
+html[data-theme="dark"] .themed .tab.tab--selected {
+    color: var(--theme-accent) !important;
+    background: var(--theme-accent-bg) !important;
+    border-top-color: var(--theme-accent) !important;
+    font-weight: 700 !important;
+}
+html[data-theme="dark"] .themed .viz-table tbody tr:hover > td { background: var(--theme-hover) !important; }
+html[data-theme="dark"] .themed .viz-th-sortable:hover { background: var(--theme-hover) !important; }
+
+/* Neutral inline colours the Python layouts write (TEXT, PANEL, BORDER, white);
+   signal colours are left as they are. */
+html[data-theme="dark"] .themed [style*="color: rgb(51, 51, 51)"],
+html[data-theme="dark"] .themed [style*="color: rgb(68, 68, 68)"] { color: var(--theme-text) !important; }
+html[data-theme="dark"] .themed [style*="background: rgb(255, 255, 255)"],
+html[data-theme="dark"] .themed [style*="background-color: rgb(255, 255, 255)"],
+html[data-theme="dark"] .themed [style*="background: rgb(245, 245, 245)"],
+html[data-theme="dark"] .themed [style*="background-color: rgb(245, 245, 245)"] { background: var(--theme-surface) !important; }
+html[data-theme="dark"] .themed [style*="rgb(220, 220, 220)"] { border-color: var(--theme-border) !important; }
+/* Heatmap cells keep their existing fill/ink pairing, including pale P&L fills. */
+html[data-theme="dark"] .themed .viz-table td[style*="background: rgb("][style*="color: rgb(51, 51, 51)"]:not([style*="background: rgb(255, 255, 255)"]) { color: #333333 !important; }
+html[data-theme="dark"] .themed .viz-table tbody tr:hover > td[style*="background: rgb("][style*="color: rgb(51, 51, 51)"] { color: var(--theme-text) !important; }
+
+/* research-bench pieces (research_app.css) */
+html[data-theme="dark"] .themed .research-section { border-top-color: var(--theme-border); }
+html[data-theme="dark"] .themed :is(.research-section > summary, .research-info > summary:hover) { color: var(--theme-text); }
+html[data-theme="dark"] .themed .research-banner { background: var(--theme-surface); border-color: var(--theme-border); }
+/* the progress box (logo, count, bar, rolling log) over a running job */
+html[data-theme="dark"] .themed .research-work-status {
+    background: color-mix(in srgb, var(--theme-page) 92%, transparent);
+    color: var(--theme-dim);
+}
+html[data-theme="dark"] .themed .research-work-finished { color: var(--theme-dim); }
+html[data-theme="dark"] .themed .research-work-line:last-child { color: var(--theme-text); }
+html[data-theme="dark"] .themed .research-work-bar { background: var(--theme-raised); }
+html[data-theme="dark"] .themed .research-work-bar-fill { background: var(--theme-dim); }
+html[data-theme="dark"] .themed .research-work-log { scrollbar-color: var(--theme-border) transparent; }
+html[data-theme="dark"] .themed .shimmer-loader__caption { color: var(--theme-dim); }
+
+/* Dash dropdown menus can be portalled outside the app root, so these key off html alone. */
+/* Dash 4 components (dropdowns, inputs, steppers) all paint from these variables;
+   research_app.css re-sets some on dropdowns, so those are named here too. */
+html[data-theme="dark"],
+html[data-theme="dark"] body :is(.dash-dropdown, .dash-dropdown-content) {
+    --Dash-Fill-Inverse-Strong: var(--theme-surface);
+    --Dash-Fill-Interactive-Weak: var(--theme-accent-bg);
+    --Dash-Fill-Primary-Hover: var(--theme-hover);
+    --Dash-Fill-Primary-Active: var(--theme-raised);
+    --Dash-Text-Primary: var(--theme-text);
+    --Dash-Text-Strong: var(--theme-text);
+    --Dash-Text-Weak: var(--theme-dim);
+    --Dash-Stroke-Strong: var(--theme-border);
+}
+/* the field inside a dcc.Input box paints itself white with dark ink otherwise */
+html[data-theme="dark"] .themed .dash-input-element {
+    background: transparent !important;
+    color: var(--theme-text) !important;
+}
+html[data-theme="dark"] body :is(.dash-dropdown, .dash-dropdown-content) {
+    background: var(--theme-surface);
+    color: var(--theme-text);
+    border-color: var(--theme-border);
+}
+html[data-theme="dark"] body .dash-dropdown-value-count { background: var(--theme-accent-bg); color: var(--theme-text); }
+html[data-theme="dark"] body .dash-dropdown-option { box-shadow: 0 -1px 0 0 var(--theme-raised) inset; }
+html[data-theme="dark"] body .dash-dropdown-option:hover { background: var(--theme-hover); }
+html[data-theme="dark"] body .dash-dropdown-option:has(input:checked) { background: var(--theme-accent-bg); }

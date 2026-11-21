@@ -2,10 +2,10 @@
 
 The Live Overview tab groups trusted signals by traded target and answers the
 desk questions first: is a position open, what does the latest reading say,
-is its gate open, and how has the frozen backtest behaved?
+and how has the frozen backtest behaved?
 
 The Signal Deep Dive tab selects one promoted signal at a time and exposes the
-full chart, gate, PnL, and trade-history card. One button drives its data:
+full chart, PnL, and trade-history card. One button drives its data:
 
     Ref     fresh Strategy.load_data() cached to disk, then Strategy.compute()
             on it, logged as one timestamped row in the signal ledger.
@@ -48,7 +48,6 @@ from dashboard.charts import (
     dual_theme_charts,
     DEFAULT_WINDOW,
     WINDOW_PRESETS,
-    gate_chart,
     input_chart,
     level_chart,
     pnl_chart,
@@ -57,7 +56,7 @@ from dashboard.charts import (
 )
 from dashboard.ledger import SignalLedger
 from dashboard.params import (
-    exit_short, gate_short as _gate_rule, input_label, setting_rows, short_label,
+    exit_short, input_label, setting_rows, short_label,
     signal_label as _display_name,
 )
 from dashboard.registry import LiveRegistry
@@ -66,7 +65,7 @@ from stats import CONF_SHRINK
 from research.app import _diverging, note, pnl_heatmap, regression_scatter, table
 from utils.viz import table_div
 from utils.research_app import (
-    BORDER, C0, C1, DIM, FOLDER_TAB, FOLDER_TAB_SELECTED, FOLDER_TABS, ORANGE, TEXT, make_app, run,
+    BORDER, C0, C1, DIM, FOLDER_TAB, FOLDER_TAB_SELECTED, ORANGE, TEXT, folder_tabs, make_app, run,
     shimmer_loader,
 )
 
@@ -203,27 +202,10 @@ def _visible_trade_range(trades, open_entry: dict | None, page: int, data_asof, 
 
 def _position_label(state: dict, open_entry: dict | None) -> str:
     """The Signal column: LONG, SHORT or FLAT -- the side of an open trade, else the side
-    today fires. A reading held back by its gate, or still warming up, is FLAT; the Gate
-    column says why."""
+    today fires. A reading held back by its gate, or still warming up, is FLAT."""
     if open_entry is not None:
         return open_entry["direction"].upper()
     return state["fired"].upper() if state.get("fired") in ("long", "short") else "FLAT"
-
-
-def _gate_status(state: dict) -> str:
-    params = state["params"]
-    if params.get("gate") is None:
-        return "—"
-    last = state["last"]
-    percentile = last.get("gate_percentile")
-    if percentile is None or percentile != percentile:
-        return "warming up"
-    status = "open" if bool(last.get("gate_allow")) else "closed"
-    pct = round(float(percentile) * 100)
-    suffix = "th" if 10 <= pct % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(
-        pct % 10, "th"
-    )
-    return f"{status} {pct}{suffix}"
 
 
 LOCAL_TZ = dt.datetime.now().astimezone().tzinfo
@@ -331,8 +313,6 @@ def _overview_snapshot(row: dict) -> dict:
         "exp_usd": "—",
         "exp_work": "",
         "reading": "—",
-        "gate_rule": "—",
-        "gate_status": "—",
         "live_pnl_bps": None,
         "data_asof": "—",
         "data_stale": 0,
@@ -367,8 +347,6 @@ def _overview_snapshot(row: dict) -> dict:
         "reading_value": float(signal_value) if signal_value is not None and np.isfinite(signal_value) else None,
         "position": _position_label(state, open_entry),
         "reading": reading_str,
-        "gate_rule": _gate_rule(params),
-        "gate_status": _gate_status(state).upper(),
         "live_pnl_bps": round(_live_pnl_bps(trades, open_entry), 1),
         # compact for the table: the target header above it carries the full stamp
         "data_asof": _short_asof(asof_bar, asof_written),
@@ -421,7 +399,8 @@ def _overview_details(row: dict, state: dict, live: dict | None, held: dict | No
         from oven.engine import hedgeable
         hedged = hedgeable(strategy.feature)
         construction += [("hedge", f"β×{strategy.feature}" if hedged else "none"),
-                         ("β fit", f"Δ · {setup['hedge_lb']} bars") if hedged else ("input", strategy.feature),
+                         ("β fit", f"Δ {setup.get('hedge_fit', 'ols')} · {setup['hedge_lb']} bars") if hedged
+                         else ("input", strategy.feature),
                          ("signal", f"{setup['basis']} · {setup['lookback']} bars")]
         data = state.get("data")
         if hedged and data is not None and "beta_changes" in data.columns:
@@ -507,11 +486,6 @@ def _tone(position: str) -> str:
     return "quiet"
 
 
-def _gate_colour(status: str) -> str:
-    status = status.upper()
-    return C0 if "CLOSED" in status else C1 if "OPEN" in status else DIM
-
-
 def _expected(state: dict, live: dict | None) -> dict | None:
     """What an entry at today's reading is expected to make: {bps, usd, work}, or None
     when the model has no expectation yet. ``bps`` is runner.live_read's, net of cost;
@@ -549,7 +523,6 @@ def _signal_row(snap: dict) -> html.Details:
         ], className="sd-reading"),
         html.Span(snap["exp_usd"], className="sd-reading"),
         html.Span(snap["conf"], className="sd-conf", style={"color": CONF_COLOURS.get(snap["conf"], TEXT)}),
-        html.Span(snap["gate_status"], className="sd-gate", style={"color": _gate_colour(snap["gate_status"])}),
         html.Span([snap["name"], *([html.Span("STALE", className="sd-stale")] if stale else [])],
                   className="sd-name"),
     ])
@@ -566,20 +539,19 @@ def _signal_row(snap: dict) -> html.Details:
         cell(detail.get("reading", [])),
         cell(detail.get("expected", [])),
         cell(detail.get("confidence", [])),
-        cell([("rule", snap["gate_rule"])]),
         html.Div([
             cell([("as of", snap["data_asof"]), *([("data", "stale · click Ref")] if stale else [])]),
             html.Button("Deep Dive →", id=_pid("open-deep", snap["signal_id"]), className="ref-btn sd-btn"),
         ], className="sd-detail-cell"),
     ])
     sort_values = [snap["position"], snap["target"], snap.get("reading_value"), snap.get("exp_value"),
-                   {"LOW": 0, "MED": 1, "HIGH": 2}.get(snap["conf"]), snap["gate_status"], snap["name"]]
+                   {"LOW": 0, "MED": 1, "HIGH": 2}.get(snap["conf"]), snap["name"]]
     return html.Details([head, body], className="sd-row", **{"data-sort-values": json.dumps(sort_values)})
 
 
 def _row_legend(key: str) -> html.Div:
     """The header row over a section's signals; its first cell sits over the rows' +/- marker."""
-    labels = ["Signal", "Target", "Reading / entry", "Exp $", "Conf", "Gate now", "Name"]
+    labels = ["Signal", "Target", "Reading / entry", "Exp $", "Conf", "Name"]
     return html.Div([html.Span(), *[
         html.Span(html.Button([label, html.Span(className="viz-sort-arrow", **{"aria-hidden": "true"})],
                              className="sd-sort", **{"data-sort-column": str(i)}),
@@ -895,19 +867,15 @@ def _card_sections(
         marks, held_mark = _on_series(trades, open_entry, state["data"], traded) if traded != target             else (trades, open_entry)
         level_png = level_chart(data, traded, trades=marks, open_entry=held_mark, overlays=["fair"], **span)
         second = input_chart(state["data"], state["strategy"].feature, **span)
-        gate_png = gate_chart(
-            state["data"], state["signal_frame"], state["params"].get("gate"),
-            gate_window=state["params"].get("gate_window"), **span,
-        )
         pnl_png = pnl_chart(state["equity_curve"], **span)
         # one to a row, in the order the trade is read: the signal, what it trades against
-        # fair value, its input, its gate, then what it has made
+        # fair value, its input, then what it has made
         chart_body = html.Div(
             className="sd-charts",
             children=[html.Div([
                 chart_image(png) for png in pngs if png is not None
             ], className=f"sd-charts sd-deep-view sd-deep-{view}") for view, pngs in (
-                ("signal", [signal_png, level_png, second, gate_png]),
+                ("signal", [signal_png, level_png, second]),
                 ("performance", [pnl_png, return_distribution_chart(trades, size=span["size"])]))],
         )
 
@@ -1127,7 +1095,7 @@ def _now_panel(state: dict, live: dict, open_entry: dict | None, live_pnl: float
     """Today, as one label | value | note range, in the order it is read: what the book
     holds or the signal calls for, the reading against its entry threshold, the open
     position, what an entry now is expected to make, level against fair value,
-    half-life, walk-forward confidence and what drives it, and the gate."""
+    half-life, and walk-forward confidence and what drives it."""
     params = state["params"]
     units = "bps" if params["entry_signal"] == "residual" else "z"
     reading = live["resid"] if units == "bps" else live["z"]
@@ -1153,7 +1121,6 @@ def _now_panel(state: dict, live: dict, open_entry: dict | None, live_pnl: float
                         f"{over}{risk} · at ${USD_PER_BP:,.0f} per bp")
     else:
         entry_row = _kv("if entered now", "—", "no half-life yet")
-    gate = _gate_status(state)
     drivers = conf["drivers"] or ("needs more closed trades" if conf["label"] == "—" else "")
     expected = _expected(state, live)
     return html.Div([_range([
@@ -1170,7 +1137,6 @@ def _now_panel(state: dict, live: dict, open_entry: dict | None, live_pnl: float
         _kv("confidence", conf["label"],
             f"from {conf['n_past']} closed trades",
             CONF_COLOURS.get(conf["label"])),
-        *([_kv("gate", gate, _gate_rule(params), _gate_colour(gate))] if params.get("gate") is not None else []),
     ]),
         _section("ENTRY ESTIMATE", [_range([
             entry_row,
@@ -1665,11 +1631,9 @@ def build_app() -> dash.Dash:
         built in a callback rather than in the layout -- see _body. ``phone``
         draws the Deep Dive's charts for a narrow screen."""
         rows = _registry_rows()
-        return dcc.Tabs(
-            id="dashboard-tabs",
+        return folder_tabs(
+            "dashboard-tabs",
             className="dashboard-tight",
-            style=FOLDER_TABS,  # the line the folder tabs sit on
-            mobile_breakpoint=0,  # side by side on a phone too, never stacked
             value="live-overview",
             children=[
                 dcc.Tab(
@@ -1743,10 +1707,7 @@ def build_app() -> dash.Dash:
             ),
         ])
 
-    app = make_app(title="Model", sliders=[], body=_body, class_name="sd-app", header_controls=[
-        html.Button("Dark mode", id="sd-theme-toggle", type="button", className="sd-theme-toggle",
-                    **{"aria-pressed": "false", "aria-label": "Toggle dark mode"}),
-    ])
+    app = make_app(title="Model", sliders=[], body=_body, class_name="sd-app", theme=True)
     portfolio.register_callbacks(app)
     trades.register_callbacks(app, _registry_rows, USD_PER_BP, _display_name)
     futures.register_callbacks(app)

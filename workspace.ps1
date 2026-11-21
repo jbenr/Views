@@ -1,7 +1,8 @@
 # Opens and arranges the 3-monitor workspace.
 #   Left monitor:  htop (left half) | claude --resume (right half)
-#   Main monitor:  Zed (left two-thirds) | two terminals stacked (right third), bottom one attached to tmux "views"
-#   Right monitor: terminal (top half) / Spotify (bottom half), Chrome on top of Spotify
+#   Main monitor:  Zed (left two-thirds) | tmux "views" (top right) / tmux "jd5tothesupie" (bottom right)
+#   Right monitor: tmux "dat" (top half) / Spotify (bottom half), Chrome on top of Spotify
+# Each tmux session is created (2s10s activated) if missing, otherwise just attached.
 
 $ErrorActionPreference = 'Stop'
 $Dir = $PSScriptRoot
@@ -94,23 +95,29 @@ function Stop-Port([int]$port) {
     }
 }
 
-# tmux session "views": create it if missing (signal / oven / plain window).
-# Commands are passed as separate words: psmux's new-window silently drops a single quoted command string.
-tmux has-session -t views 2>$null
-if ($LASTEXITCODE -ne 0) {
-    Stop-Port 8052
-    Stop-Port 8053
-    tmux new-session -d -s views -n signal -c $Dir pwsh -NoLogo -NoExit -Command "python -m dashboard.app --host raptor --reload"
-    tmux new-window -t views: -n oven -c $Dir pwsh -NoLogo -NoExit -Command "python -m oven --host raptor --port 8053"
-    tmux new-window -t views: -c $Dir
+# Create a detached tmux session (if missing) whose shell activates 2s10s, then runs $command.
+# psmux can't give several terminals independent views of one session, so each terminal gets its own session.
+# The startup command is base64-encoded because psmux splits a command on ';' and drops quoted strings.
+function Ensure-Session([string]$name, [string]$window, [string]$command = '') {
+    tmux has-session -t $name 2>$null
+    if ($LASTEXITCODE -eq 0) { return }
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("mamba activate 2s10s; $command"))
+    tmux new-session -d -s $name -n $window -c $Dir pwsh -NoLogo -NoExit -EncodedCommand $b64
 }
+
+# tmux sessions: "views" runs the dashboard (clear its port first), the other two are plain 2s10s shells
+tmux has-session -t views 2>$null
+if ($LASTEXITCODE -ne 0) { Stop-Port 8052 }
+Ensure-Session views signal 'python -m dashboard.app --host raptor --reload'
+Ensure-Session jd5tothesupie jd5tothesupie
+Ensure-Session dat dat
 
 # Launch everything
 $htop    = Start-Term 'htop'
 $claude  = Start-Term 'claude --resume'
-$mainTop = Start-Term
-$mainBot = Start-Term 'tmux attach -t views'
-$rightTop = Start-Term
+$mainTop = Start-Term 'tmux attach -t views'
+$mainBot = Start-Term 'tmux attach -t jd5tothesupie'
+$rightTop = Start-Term 'tmux attach -t dat'
 
 if (-not (Get-Process Zed -ErrorAction SilentlyContinue | Where-Object MainWindowHandle -ne 0)) {
     Start-Process $Zed -ArgumentList $Dir -WindowStyle Hidden

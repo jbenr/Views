@@ -154,6 +154,7 @@ def setting_rows(row: dict) -> list[tuple[str, str]]:
         return [
             ("signal lookback", f"{s['lookback']}d"),
             ("hedge lookback", f"{s['hedge_lb']}d"),
+            ("hedge fit", s.get("hedge_fit", "ols")),
             ("basis", s["basis"]),
             ("entry", f"{s['scale']} > {float(s['entry']):g}{units}"),
             ("revert", f"{float(s['revert']):g}" if s["revert"] else "off"),

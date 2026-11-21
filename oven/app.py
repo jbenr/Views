@@ -14,8 +14,8 @@ reads the same. Two tabs:
   Results  three paged boards, each opened by an Inspect click on the one
            above: the inputs (each input's best setup), that input's setups,
            and one setup laid out as the dashboard's Dig card -- stats, chart
-           window + Copy, the chart grid, the paged trade table with Snap chart
-           to view beside the monthly P&L heatmap, the regression scatters --
+           window + Copy, the charts, the paged trade table with Snap chart
+           to view above the monthly P&L heatmap, the regression scatters --
            followed by trade mechanics (exit reasons), multi-resolution and the
            Oven's own diagnostics (lookback x entry, years, entry state, P&L
            correlation with other inputs' best setups).
@@ -44,7 +44,7 @@ import pandas as pd
 import polars as pl
 from dash import ALL, Input, Output, State, ctx, dcc, html, no_update
 
-from dashboard.charts import (WINDOW_PRESETS, input_chart, level_chart, pnl_chart,
+from dashboard.charts import (WINDOW_PRESETS, chart_image, dual_theme_charts, input_chart, level_chart, pnl_chart,
                               return_distribution_chart, series_chart, signal_chart)
 from oven import engine
 from research import jobs
@@ -52,8 +52,8 @@ from research.app import (FEATURE_GROUPS, FEATURE_LABELS, INPUT, TARGET_OPTIONS,
                           _diverging, btn_style, field, heading, info, loading_panel, note, pnl_heatmap,
                           progress_view, regression_scatter, section, table)
 from research.panel import CATALOG, build_panel
-from utils.research_app import (BORDER, C0, C1, DIM, FOLDER_TAB, FOLDER_TAB_SELECTED, FOLDER_TABS, ORANGE, PANEL,
-                                make_app, run, shimmer_loader, stat_block)
+from utils.research_app import (BORDER, C0, C1, DIM, FOLDER_TAB, FOLDER_TAB_SELECTED, ORANGE, PANEL,
+                                folder_tabs, make_app, run, shimmer_loader, stat_block)
 
 ALL_INPUTS = list(dict.fromkeys(name for names in FEATURE_GROUPS.values() for name in names))
 GRID_CONTROLS = {
@@ -68,11 +68,16 @@ GRID_CONTROLS = {
     "stops": ("exit · stop, entry sigmas wider (0 = none)", [0.0, 0.5, 1.0, 2.0], engine.STOPS),
     "pnl_stops": ("exit · stop loss, bps lost on the close (0 = none)", [0.0, 2.5, 5.0, 7.5, 10.0, 15.0, 20.0],
                   engine.PNL_STOPS),
-    "hedge_lookbacks": ("hedge lookback · changes OLS (d)", [21, 42, 63, 126, 189, 252, 378, 504],
+    "hedge_lookbacks": ("hedge lookback · changes fit window (d)", [21, 42, 63, 126, 189, 252, 378, 504],
                         engine.HEDGE_LOOKBACKS),
 }
 SETUP_COLS = ["lookback", "hedge_lb", "basis", "scale", "entry", "revert", "max_hold", "stop", "hl_mult", "pnl_stop",
-              "sizing", "fill", "rearm", "gate", "gate_mode", "need_half_life"]
+              "sizing", "fill", "rearm", "gate", "gate_mode", "need_half_life", "hedge_fit"]
+HEDGE_FIT_TEXT = {
+    "ols": "rolling OLS on daily changes",
+    "kalman": "Kalman, refit daily, pulled back to the window's β",
+    "kalman_rw": "Kalman, refit daily, random-walk β (recency-weighted)",
+}
 SIZING_TEXT = {
     "flat": "every trade the same size",
     "exp_return": "∝ expected return",
@@ -100,11 +105,7 @@ DEFAULT_WINDOW = "All"
 SNAP_LEFT_BUFFER_BDAYS = 5  # as the dashboard's Snap chart to view
 ET = ZoneInfo("America/New_York")
 STATS_ROW = {"display": "flex", "gap": 28, "flexWrap": "wrap", "padding": "8px 2px 8px"}
-# every chart cell the same shape: the PNGs come out at slightly different aspect
-# ratios (each chart type has its own figure size, then tight cropping), so each is
-# fitted inside an identical frame rather than setting its own row height
-IMG = {"width": "100%", "aspectRatio": "1.75", "objectFit": "contain", "background": "#FFFFFF", "display": "block",
-       "border": f"1px solid {BORDER}"}
+IMG = {"width": "100%", "background": "#FFFFFF", "display": "block", "border": f"1px solid {BORDER}"}
 
 
 # ---- data --------------------------------------------------------------------
@@ -140,6 +141,8 @@ def _with_basis(frame: pl.DataFrame, hedge_lb: int) -> pl.DataFrame:
         frame = frame.with_columns(pl.lit(0.0).alias("pnl_stop"))
     if "sizing" not in frame.columns:
         frame = frame.with_columns(pl.lit("flat").alias("sizing"))
+    if "hedge_fit" not in frame.columns:  # before the hedge fit was a knob, every hedge was rolling OLS
+        frame = frame.with_columns(pl.lit("ols").alias("hedge_fit"))
     # before fills, re-arms and gates were knobs: the rules those bakes ran on
     frame = frame.with_columns(*[pl.lit(v).alias(k) for k, v in engine.LEGACY_RULES.items() if k not in frame.columns])
     if "sharpe" in frame.columns and "n_episodes" not in frame.columns:
@@ -147,7 +150,7 @@ def _with_basis(frame: pl.DataFrame, hedge_lb: int) -> pl.DataFrame:
     return frame
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=1)  # a big bake's board runs to 10+ GB: hold only the one being read
 def load_run(path: str) -> dict:
     """A run's meta and board: all the boards need. Trades load only when a setup is opened."""
     p = Path(path)
@@ -176,10 +179,10 @@ def run_panel(path: str) -> pl.DataFrame:
 
 
 @lru_cache(maxsize=32)
-def bake_frame(path: str, name: str, lookback: int, hedge_lookback: int) -> pl.DataFrame:
+def bake_frame(path: str, name: str, lookback: int, hedge_lookback: int, hedge_fit: str = "ols") -> pl.DataFrame:
     """One model on the bake's panel, up to the last bar it baked: what its board was scored on."""
     meta = load_run(path)["meta"]
-    frame = engine.model_frame(run_panel(path), meta["target"], name, lookback, hedge_lookback)
+    frame = engine.model_frame(run_panel(path), meta["target"], name, lookback, hedge_lookback, hedge_fit)
     end = meta.get("data_end")
     return frame.filter(pl.col("ts").cast(pl.Date) <= date.fromisoformat(end[:10])) if end else frame
 
@@ -190,14 +193,14 @@ def bake_trades(path: str, setup: dict) -> pl.DataFrame:
     if saved_trades(path):
         return matches(load_trades(path), setup).sort("entry_ts")
     meta = load_run(path)["meta"]
-    name, lb, hlb = setup["input"], setup["lookback"], setup["hedge_lb"]
+    name, lb, hlb, hfit = setup["input"], setup["lookback"], setup["hedge_lb"], setup.get("hedge_fit", "ols")
     horizons = {}
     for other in meta["settings"].get("lookbacks", [lb]):
         if other != lb:
-            fit = bake_frame(path, name, int(other), hlb)
+            fit = bake_frame(path, name, int(other), hlb, hfit)
             horizons[int(other)] = {c: fit[c].to_numpy().astype(float) for c in fit.columns
                                     if c not in ("ts", meta["target"], name, "portfolio", "corr126")}
-    trades = engine.setup_trades(bake_frame(path, name, lb, hlb), meta["target"], setup,
+    trades = engine.setup_trades(bake_frame(path, name, lb, hlb, hfit), meta["target"], setup,
                                  float(meta["settings"].get("cost", engine.COST)), horizons)
     return trades.filter(pl.col("reason") != "open").sort("entry_ts") if not trades.is_empty() else trades
 
@@ -207,7 +210,8 @@ def setup_gate(path: str, setup: dict) -> dict | None:
     today's data and live; None without a full-sample gate."""
     if setup.get("gate", engine.NO_GATE) == engine.NO_GATE:
         return None
-    return engine.freeze_gate(bake_frame(path, setup["input"], setup["lookback"], setup["hedge_lb"]),
+    return engine.freeze_gate(bake_frame(path, setup["input"], setup["lookback"], setup["hedge_lb"],
+                                         setup.get("hedge_fit", "ols")),
                               load_run(path)["meta"]["target"], setup)
 
 
@@ -232,22 +236,30 @@ def describe(setup: dict) -> str:
     rules = {k: setup.get(k, v) for k, v in engine.LEGACY_RULES.items()}
     gate = (f" · gate {rules['gate']}" + (" (point in time)" if rules["gate_mode"] == "causal" else "")
             if rules["gate"] != engine.NO_GATE else "")
-    return (f"lb {setup['lookback']} · hedge {setup['hedge_lb']} · {setup['basis']} · {setup['scale']} > {setup['entry']:g} · {revert}"
+    hedge_fit = "" if setup.get("hedge_fit", "ols") == "ols" else f" {setup['hedge_fit']}"
+    return (f"lb {setup['lookback']} · hedge {setup['hedge_lb']}{hedge_fit} · {setup['basis']} · {setup['scale']} > {setup['entry']:g} · {revert}"
             f"{half_life} · hold {setup['max_hold']} · stop {setup['stop']:g}{stop_loss}{sizing} · {rules['fill']} fill"
             f" · re-arm {rules['rearm']}{gate}" + ("" if rules["need_half_life"] else " · no half-life needed"))
 
 
 @lru_cache(maxsize=32)
-def model_frame(target: str, name: str, lookback: int, hedge_lookback: int) -> pl.DataFrame:
+def model_frame(target: str, name: str, lookback: int, hedge_lookback: int, hedge_fit: str = "ols") -> pl.DataFrame:
     """ts, the target and the input under their own names, every model array, the
     hedged portfolio's level and the 126d correlation of daily moves."""
     return engine.model_frame(build_panel(CATALOG[target], features=[name]).data, target, name, lookback,
-                              hedge_lookback)
+                              hedge_lookback, hedge_fit)
 
 
-def input_board(board: pl.DataFrame, by: str, min_trades: int) -> pl.DataFrame:
-    """One row per input: its best setup by ``by`` and how many of its setups pay."""
-    b = engine.rank(board, by, min_trades, top=None)
+@lru_cache(maxsize=1)
+def ranked(path: str, by: str, min_trades: int) -> pl.DataFrame:
+    """The bake's setups with ``min_trades``+ trades, best ``by`` first. Sorting a board of
+    tens of millions takes seconds to minutes, so it is done once and every board, page
+    and peer list reads this."""
+    return engine.rank(load_run(path)["board"], by, min_trades, top=None)
+
+
+def input_board(b: pl.DataFrame) -> pl.DataFrame:
+    """One row per input: its best setup in ``b`` (ranked) and how many of its setups pay."""
     if b.is_empty():
         return b
     best = b.unique("input", keep="first", maintain_order=True)
@@ -264,20 +276,24 @@ def input_board(board: pl.DataFrame, by: str, min_trades: int) -> pl.DataFrame:
 
 
 def setup_id(row: dict) -> str:
-    return "|".join(str(row[c]) for c in SETUP_COLS)
+    """The setup's SETUP_COLS joined by '|'; an ols hedge fit is left off, so ids from
+    before it was a knob still name the same setup."""
+    cols = SETUP_COLS if row.get("hedge_fit", "ols") != "ols" else SETUP_COLS[:-1]
+    return "|".join(str(row[c]) for c in cols)
 
 
 def setup_from_id(name: str, sid: str) -> dict:
     """A setup from its id; an id from before fills, re-arms and gates (11 parts) is a
-    setup on the rules it was baked under (engine.LEGACY_RULES)."""
+    setup on the rules it was baked under (engine.LEGACY_RULES), and one without a hedge
+    fit (16 parts or fewer) hedged by rolling OLS."""
     parts = sid.split("|")
     lb, hedge_lb, basis, scale, entry, revert, hold, stop, hl_mult, pnl_stop, sizing = parts[:11]
     setup = dict(input=name, lookback=int(lb), hedge_lb=int(hedge_lb), basis=basis, scale=scale, entry=float(entry),
                  revert=float(revert), max_hold=int(hold), stop=float(stop), hl_mult=float(hl_mult),
-                 pnl_stop=float(pnl_stop), sizing=sizing)
+                 pnl_stop=float(pnl_stop), sizing=sizing, hedge_fit=parts[16] if len(parts) > 16 else "ols")
     if len(parts) == 11:
         return {**setup, **engine.LEGACY_RULES}
-    fill, rearm, gate, gate_mode, need_half_life = parts[11:]
+    fill, rearm, gate, gate_mode, need_half_life = parts[11:16]
     return {**setup, "fill": fill, "rearm": rearm, "gate": gate, "gate_mode": gate_mode,
             "need_half_life": need_half_life == "True"}
 
@@ -339,7 +355,7 @@ def bundle(path: str, name: str, sid: str) -> dict:
     target = meta["target"]
     trades = bake_trades(path, setup)
     row = matches(run["board"], setup).to_dicts()
-    frame = model_frame(target, name, setup["lookback"], setup["hedge_lb"])
+    frame = model_frame(target, name, setup["lookback"], setup["hedge_lb"], setup["hedge_fit"])
     cost = float(meta["settings"].get("cost", engine.COST))
     gate_edges = setup_gate(path, setup)
     if saved_trades(path):
@@ -395,8 +411,7 @@ def monthly_pnl(trades: pl.DataFrame) -> pl.DataFrame:
 def peer_correlations(path: str, setup: dict, by: str, min_trades: int, peers: int = 12) -> pl.DataFrame:
     """Monthly P&L correlation of this setup with the best setup of each other top input:
     does it add something to a book of signals, or is it the same bet?"""
-    ranked = engine.rank(load_run(path)["board"], by, min_trades, top=None)
-    best = (ranked.filter(pl.col("input") != setup["input"])
+    best = (ranked(path, by, min_trades).filter(pl.col("input") != setup["input"])
             .unique("input", keep="first", maintain_order=True).head(peers))
     mine = monthly_pnl(bake_trades(path, setup))
     rows = []
@@ -555,13 +570,13 @@ def multi_resolution(trades: pl.DataFrame, setup: dict, sharpe=None) -> pl.DataF
 
 def lookback_grid(board: pl.DataFrame, setup: dict, by: str) -> pl.DataFrame:
     """``by`` over lookback x entry for this input, holding the setup's scale, exit and stop."""
-    fixed = {k: setup[k] for k in ("input", "hedge_lb", "basis", "scale", "revert", "max_hold", "stop", "hl_mult",
+    fixed = {k: setup[k] for k in ("input", "hedge_lb", "hedge_fit", "basis", "scale", "revert", "max_hold", "stop", "hl_mult",
                                    "pnl_stop", "sizing", "fill", "rearm", "gate", "gate_mode", "need_half_life")}
     return (matches(board, fixed).select("lookback", pl.format("entry {}", pl.col("entry")).alias("entry"), by)
             .pivot(on="entry", index="lookback", values=by).sort("lookback"))
 
 
-KNOBS = {"hedge_lb": "hedge lookback", "basis": "basis", "revert": "revert", "max_hold": "max hold",
+KNOBS = {"hedge_lb": "hedge lookback", "hedge_fit": "hedge fit", "basis": "basis", "revert": "revert", "max_hold": "max hold",
          "stop": "stop", "hl_mult": "half-life ×", "sizing": "sizing", "fill": "fill", "rearm": "re-arm",
          "gate": "gate"}
 
@@ -788,8 +803,9 @@ def default_view(name: str) -> dict:
     return {"page": 0, "sort": DEFAULT_SORT[name], "desc": True}
 
 
+@lru_cache(maxsize=4)
 def inputs_rows(path: str, by: str, min_trades: int) -> pl.DataFrame:
-    rows = input_board(load_run(path)["board"], by, min_trades)
+    rows = input_board(ranked(path, by, min_trades))
     if rows.is_empty():
         return rows
     return rows.with_row_index("#", offset=1).select(
@@ -797,13 +813,14 @@ def inputs_rows(path: str, by: str, min_trades: int) -> pl.DataFrame:
         "best_setup", "setups", "median_sharpe", "sharpe_above_0.5", "both_halves_above_0.5", "hedged")
 
 
+@lru_cache(maxsize=1)  # every page and sort click of the setups board reads this
 def setups_rows(path: str, name: str, by: str, min_trades: int) -> pl.DataFrame:
     """One input's setups, best first. Their ids (sid, for Inspect) are built only for the
     page on screen, in paged_table: one per setup takes minutes on a bake of millions."""
-    ranked = engine.rank(load_run(path)["board"].filter(pl.col("input") == name), by, min_trades, top=None)
-    if ranked.is_empty():
-        return ranked
-    return ranked.with_row_index("#", offset=1).select("#", "score", *SETUP_COLS, *STRATEGY_COLS)
+    rows = ranked(path, by, min_trades).filter(pl.col("input") == name)
+    if rows.is_empty():
+        return rows
+    return rows.with_row_index("#", offset=1).select("#", "score", *SETUP_COLS, *STRATEGY_COLS)
 
 
 def trades_rows(path: str, picked: dict) -> pl.DataFrame:
@@ -824,8 +841,13 @@ def _sorted_page(rows: pl.DataFrame, name: str, view: dict) -> tuple[pl.DataFram
     view = {**view, "page": min(max(int(view.get("page", 0)), 0), pages - 1)}
     if view["sort"] not in rows.columns:
         view = {**view, "sort": DEFAULT_SORT[name] if DEFAULT_SORT[name] in rows.columns else rows.columns[0]}
-    ordered = rows.sort(view["sort"], descending=view["desc"], nulls_last=True)
-    return ordered.slice(view["page"] * size, size), view
+    # the boards arrive ranked: on their default sort, don't re-sort millions of rows per click;
+    # otherwise order just the one column and fetch only this page's rows, not a sorted copy
+    key = rows[view["sort"]]
+    if key.is_sorted(descending=view["desc"], nulls_last=True):
+        return rows.slice(view["page"] * size, size), view
+    order = key.arg_sort(descending=view["desc"], nulls_last=True).slice(view["page"] * size, size)
+    return rows[order], view
 
 
 def inspect_button(kind: str, key: str) -> html.Button:
@@ -937,7 +959,8 @@ def render_page(name: str, view: dict, path: str, by: str, min_trades, picked_in
 def run_view(path: str, by: str, min_trades: int) -> tuple[html.Div, dict]:
     run = load_run(path)
     meta, board = run["meta"], run["board"]
-    eligible = board.filter(pl.col("n_trades") >= min_trades)
+    # just the columns the stats read: filtering all 41 copies a big board
+    eligible = board.select("n_trades", "basis", "sharpe", "worst_half_sharpe").filter(pl.col("n_trades") >= min_trades)
     sharpe = eligible["sharpe"].drop_nulls()
     if not len(sharpe):
         return note(f"No setup has {min_trades}+ trades. Lower the minimum trades.", "warn"), default_view("inputs")
@@ -1000,10 +1023,11 @@ def signal_now(b: dict) -> float:
     return float(finite[-1]) if len(finite) else float("nan")
 
 
+@dual_theme_charts
 def charts_view(b: dict, window: str | None, date_range=None) -> list:
-    """The Dig card's chart grid, two to a row: the traded portfolio | the target (both
-    with trades), the entry signal | the input, cumulative P&L | the return
-    distribution, betas | fit quality."""
+    """The Dig card's charts, one to a row: the traded portfolio, the target (both
+    with trades), the entry signal, the input, cumulative P&L, the return
+    distribution, betas, fit quality."""
     setup, target, name, frame, daily = b["setup"], b["target"], b["setup"]["input"], b["frame"], b["daily"]
     bars = None if date_range is not None else WINDOW_PRESETS[window or DEFAULT_WINDOW]
     raw = setup["scale"] == "raw"
@@ -1037,7 +1061,7 @@ def charts_view(b: dict, window: str | None, date_range=None) -> list:
                      ["r2", "signal_half_life"], f"levels fit R² · {setup['basis']} residual half-life (≤ 5× lookback)",
                      "half-life (bars)", left=["r2"], yaxis_right_title="R²", window_bars=bars),
     ]
-    return [html.Img(src=f"data:image/png;base64,{png}", style=IMG) for png in pngs]
+    return [chart_image(png, style=IMG) for png in pngs]
 
 
 def window_row(window: str | None) -> list:
@@ -1057,6 +1081,7 @@ def window_row(window: str | None) -> list:
 SCATTER_WINDOWS = ["lookback", *WINDOW_PRESETS]
 
 
+@dual_theme_charts
 def scatter_pair(b: dict, window: str) -> list:
     """The levels and changes scatters, fitted over ``window`` (a SCATTER_WINDOWS key)
     with the stretch of the same length before it in grey; All fits every day, with no grey."""
@@ -1151,8 +1176,9 @@ def detail_view(path: str, picked: dict, by: str, min_trades: int, window: str) 
             stat_block("best trade share", _fmt(row["best_trade_share"], ".0%"))]),
         html.Div(window_row(window), style={"display": "flex", "gap": 8, "marginBottom": 8, "alignItems": "center",
                                             "flexWrap": "wrap"}),
-        html.Div(charts_view(b, window), id="card-charts-oven", className="two-up"),
-        # the trades beside the monthly P&L (see oven.css)
+        html.Div(charts_view(b, window), id="card-charts-oven", className="oven-stack",
+                 **{"data-copy-columns": "1"}),
+        # the trades above the monthly P&L (see oven.css)
         html.Div(className="oven-trades-months", children=[
             html.Div(style={"minWidth": 0}, children=[
                 html.Div(page, id="oven-trades-page"),
@@ -1166,7 +1192,7 @@ def detail_view(path: str, picked: dict, by: str, min_trades: int, window: str) 
         html.Div(scatter_window_row(setup["lookback"], "lookback"),
                  style={"display": "flex", "gap": 8, "margin": "6px 0 8px", "alignItems": "center",
                         "flexWrap": "wrap"}),
-        html.Div(scatter_pair(b, "lookback"), id="oven-scatters", className="two-up", style={"gap": 12}),
+        html.Div(scatter_pair(b, "lookback"), id="oven-scatters", className="oven-stack"),
     ])
     mechanics = html.Div([
         heading("trade mechanics"),
@@ -1247,7 +1273,7 @@ SMALL_BTN = {**btn_style(), "padding": "1px 8px", "fontSize": 10}
 
 def loader(child) -> dcc.Loading:
     """The dashboard's logo loader, the previous content dimmed underneath."""
-    return dcc.Loading(child, custom_spinner=shimmer_loader(image="guy.png", caption="loading"),
+    return dcc.Loading(child, custom_spinner=shimmer_loader(image="guy.png"),
                        overlay_style={"visibility": "visible", "opacity": 0.35},
                        parent_className="dashboard-overview-loader")
 
@@ -1260,18 +1286,36 @@ def _all_none(prefix: str) -> html.Div:
     ])
 
 
-def _multi(key: str) -> html.Div:
+def last_bake() -> dict:
+    """The newest saved bake's target, inputs and settings: the Bake form opens with
+    them, so it keeps what was baked last. {} before the first bake."""
+    runs = engine.list_runs()
+    if not runs:
+        return {}
+    meta = json.loads((runs[0] / "meta.json").read_text(encoding="utf-8"))
+    return {"target": meta["target"], "inputs": meta["inputs"], **meta["settings"]}
+
+
+def _kept(saved: dict, key: str, options, default) -> list:
+    """The last bake's choices for one multi-select, minus any it no longer offers;
+    the default for a knob that bake didn't have."""
+    return [v for v in saved[key] if v in options] if key in saved else list(default)
+
+
+def _multi(key: str, saved: dict) -> html.Div:
     label, options, default = GRID_CONTROLS[key]
-    return html.Div([field(label, dcc.Dropdown(id=f"oven-{key}", value=default, multi=True,
+    return html.Div([field(label, dcc.Dropdown(id=f"oven-{key}", value=_kept(saved, key, options, default), multi=True,
                                                options=[{"label": f"{v:g}", "value": v} for v in options])),
                      _all_none(f"oven-{key}")])
 
 
 def bake_controls() -> html.Div:
+    saved = last_bake()
     return html.Div([
-        field("target", dcc.Dropdown(id="oven-target", value="10s30s", clearable=False, options=TARGET_OPTIONS)),
-        field("inputs · default: everything in the panel", dcc.Dropdown(
-            id="oven-inputs", value=ALL_INPUTS, multi=True,
+        field("target", dcc.Dropdown(id="oven-target", clearable=False, options=TARGET_OPTIONS,
+                                     value=next((o["value"] for o in TARGET_OPTIONS if o["value"] == saved.get("target")), "10s30s"))),
+        field("inputs", dcc.Dropdown(
+            id="oven-inputs", value=_kept(saved, "inputs", ALL_INPUTS, ALL_INPUTS), multi=True,
             options=[{"label": f"{FEATURE_LABELS.get(n, n)} · {n}", "value": n} for n in ALL_INPUTS],
             style={"maxHeight": 200, "overflowY": "auto"})),
         _all_none("oven-inputs"),
@@ -1283,44 +1327,51 @@ def bake_controls() -> html.Div:
         ]),
         section("Signal & entries", [
             html.Div([field("signal basis · what the entry signal measures", dcc.Dropdown(
-                id="oven-bases", value=list(engine.BASES), multi=True,
+                id="oven-bases", value=_kept(saved, "bases", engine.BASES, engine.BASES), multi=True,
                 options=[{"label": f"{b} · {BASIS_TEXT[b]}", "value": b} for b in engine.BASES])),
                 _all_none("oven-bases")]),
-            *[_multi(k) for k in ("lookbacks", "z_entries", "raw_entries")]]),
+            *[_multi(k, saved) for k in ("lookbacks", "z_entries", "raw_entries")]]),
         section("Exits", [
-            *[_multi(k) for k in ("reverts", "hl_mults", "max_holds", "stops", "pnl_stops")]]),
+            *[_multi(k, saved) for k in ("reverts", "hl_mults", "max_holds", "stops", "pnl_stops")]]),
         section("Sizing", [
             html.Div([field("sizing", dcc.Dropdown(
-                id="oven-sizings", value=list(engine.SIZING_DEFAULT), multi=True,
+                id="oven-sizings", value=_kept(saved, "sizings", engine.SIZINGS, engine.SIZING_DEFAULT), multi=True,
                 options=[{"label": f"{s} · {SIZING_TEXT[s]}", "value": s} for s in engine.SIZINGS])),
                 _all_none("oven-sizings")]),
         ]),
         section("Fills & re-entry", [
             html.Div([field("fill", dcc.Dropdown(
-                id="oven-fills", value=list(engine.FILLS_DEFAULT), multi=True,
+                id="oven-fills", value=_kept(saved, "fills", engine.FILLS, engine.FILLS_DEFAULT), multi=True,
                 options=[{"label": f"{f} · {FILL_TEXT[f]}", "value": f} for f in engine.FILLS])),
                 _all_none("oven-fills")]),
             html.Div([field("re-arm · before the next entry, the signal is", dcc.Dropdown(
-                id="oven-rearms", value=list(engine.REARMS_DEFAULT), multi=True,
+                id="oven-rearms", value=_kept(saved, "rearms", engine.REARMS, engine.REARMS_DEFAULT), multi=True,
                 options=[{"label": f"{r} · {REARM_TEXT[r]}", "value": r} for r in engine.REARMS])),
                 _all_none("oven-rearms")]),
         ]),
         section("Gates", [
             html.Div([field("conditions · none = no gate", dcc.Dropdown(
-                id="oven-gate-conditions", value=[], multi=True,
+                id="oven-gate-conditions", value=_kept(saved, "gate_conditions", engine.GATE_CONDITIONS, []),
+                multi=True,
                 options=[{"label": c, "value": c} for c in engine.GATE_CONDITIONS])),
                 _all_none("oven-gate-conditions")]),
             html.Div([field("buckets", dcc.Dropdown(
-                id="oven-gate-buckets", value=list(engine.GATE_BUCKETS_DEFAULT), multi=True,
+                id="oven-gate-buckets", value=_kept(saved, "gate_buckets", engine.GATE_BUCKETS, engine.GATE_BUCKETS_DEFAULT),
+                multi=True,
                 options=[{"label": b, "value": b} for b in engine.GATE_BUCKETS])),
                 _all_none("oven-gate-buckets")]),
-            field("bucket edges", dcc.Dropdown(id="oven-gate-mode", value="full", clearable=False, options=[
+            field("bucket edges", dcc.Dropdown(id="oven-gate-mode", value=saved.get("gate_mode", "full"), clearable=False, options=[
                 {"label": "full sample · fixed raw cut", "value": "full"},
                 {"label": "point in time · no look-ahead", "value": "causal"}])),
         ], open=False),
         section("Hedge & costs", [
-            _multi("hedge_lookbacks"),
-            field("cost · bps per round trip", dcc.Input(id="oven-cost", type="number", value=engine.COST, min=0,
+            _multi("hedge_lookbacks", saved),
+            html.Div([field("hedge fit · how the changes β is fit over the hedge lookback", dcc.Dropdown(
+                id="oven-hedge-fits", value=_kept(saved, "hedge_fits", engine.HEDGE_FITS, engine.HEDGE_FIT_DEFAULT),
+                multi=True,
+                options=[{"label": f"{h} · {HEDGE_FIT_TEXT[h]}", "value": h} for h in engine.HEDGE_FITS])),
+                _all_none("oven-hedge-fits")]),
+            field("cost · bps per round trip", dcc.Input(id="oven-cost", type="number", value=saved.get("cost", engine.COST), min=0,
                                                          step=0.1, style=INPUT)),
         ], open=False),
         html.Div(id="oven-grid-size"),
@@ -1331,9 +1382,9 @@ def bake_controls() -> html.Div:
 
 
 def bake_tab() -> html.Div:
-    return html.Div(style={"padding": "18px 24px"}, children=[
-        html.Div(style={"display": "grid", "gridTemplateColumns": "300px minmax(0, 1fr)", "gap": 26,
-                        "alignItems": "start"}, children=[
+    # oven.css lays these out, so a phone can stack them
+    return html.Div(className="oven-tab-body", children=[
+        html.Div(className="oven-bake-grid", children=[
             bake_controls(),
             loading_panel("oven-bake-out", "oven", "baking"),
         ]),
@@ -1342,9 +1393,8 @@ def bake_tab() -> html.Div:
 
 def results_tab() -> html.Div:
     runs = run_options()
-    return html.Div(style={"padding": "14px 24px"}, children=[
-        html.Div(style={"display": "grid", "gridTemplateColumns": "minmax(0, 520px) 220px 120px", "gap": 14},
-                 children=[
+    return html.Div(className="oven-tab-body", children=[
+        html.Div(className="oven-results-pickers", children=[
             field("saved bake", dcc.Dropdown(id="oven-run-pick", options=runs, clearable=False,
                                               value=runs[0]["value"] if runs else None)),
             field("rank by", dcc.Dropdown(id="oven-rank", value="sharpe", clearable=False,
@@ -1369,7 +1419,7 @@ def tabs() -> html.Div:
         dcc.Store(id="oven-seen-job"),
         dcc.Interval(id="oven-poll", interval=750),
         # the signal dashboard's folder tabs
-        dcc.Tabs(id="oven-tabs", value="bake", style=FOLDER_TABS, children=[
+        folder_tabs("oven-tabs", "bake", children=[
             dcc.Tab(label="Bake", value="bake", style=FOLDER_TAB, selected_style=FOLDER_TAB_SELECTED,
                     children=bake_tab()),
             dcc.Tab(label="Results", value="results", style=FOLDER_TAB, selected_style=FOLDER_TAB_SELECTED,
@@ -1393,6 +1443,7 @@ def register(app) -> None:
                "gate-conditions": (list(engine.GATE_CONDITIONS), []),
                "gate-buckets": (list(engine.GATE_BUCKETS), list(engine.GATE_BUCKETS_DEFAULT)),
                "sizings": (list(engine.SIZINGS), list(engine.SIZING_DEFAULT)),
+               "hedge-fits": (list(engine.HEDGE_FITS), list(engine.HEDGE_FIT_DEFAULT)),
                **{k: (opts, default) for k, (_label, opts, default) in GRID_CONTROLS.items()}}
     for key, (options, default) in choices.items():
         # one callback per control: its own all / none, and -- for the params, not the inputs --
@@ -1411,9 +1462,10 @@ def register(app) -> None:
     @app.callback(Output("oven-grid-size", "children"), Input("oven-target", "value"), Input("oven-inputs", "value"),
                   *[Input(f"oven-{k}", "value") for k in GRID_CONTROLS], Input("oven-bases", "value"),
                   Input("oven-sizings", "value"), Input("oven-fills", "value"), Input("oven-rearms", "value"),
-                  Input("oven-gate-conditions", "value"), Input("oven-gate-buckets", "value"))
+                  Input("oven-gate-conditions", "value"), Input("oven-gate-buckets", "value"),
+                  Input("oven-hedge-fits", "value"))
     def _grid_size(target, inputs, lookbacks, z, raw, reverts, hl_mults, holds, stops, pnl_stops, hedge_lbs, bases,
-                   sizings, fills, rearms, gate_conditions, gate_buckets):
+                   sizings, fills, rearms, gate_conditions, gate_buckets, hedge_fits):
         bases = bases or []
         # the portfolio basis only runs for inputs that can be held as a hedge
         models = sum(("levels" in bases) + ("portfolio" in bases and engine.hedgeable(i))
@@ -1422,7 +1474,7 @@ def register(app) -> None:
                      * max(len(stops or []), 1) * max(len(hl_mults or []), 1) * max(len(pnl_stops or []), 1)
                      * max(len(sizings or []), 1) * max(len(fills or []), 1) * max(len(rearms or []), 1)
                      * len(engine.gate_grid(gate_conditions or [], gate_buckets or [])))
-        setups = models * len(lookbacks or []) * len(hedge_lbs or []) * per_model
+        setups = models * len(lookbacks or []) * len(hedge_lbs or []) * max(len(hedge_fits or []), 1) * per_model
         # a bake keeps one board row per setup (about 400 bytes in memory), not its trades
         ram_gb = setups * 400 / 1e9
         tone = "bad" if ram_gb > 40 else "warn" if ram_gb > 10 else "dim"
@@ -1439,9 +1491,10 @@ def register(app) -> None:
                   State("oven-cost", "value"), State("oven-bases", "value"), State("oven-sizings", "value"),
                   State("oven-fills", "value"), State("oven-rearms", "value"), State("oven-gate-conditions", "value"),
                   State("oven-gate-buckets", "value"), State("oven-gate-mode", "value"),
+                  State("oven-hedge-fits", "value"),
                   prevent_initial_call=True)
     def _bake(_clicks, target, inputs, *grid):
-        *lists, cost, bases, sizings, fills, rearms, gate_conditions, gate_buckets, gate_mode = grid
+        *lists, cost, bases, sizings, fills, rearms, gate_conditions, gate_buckets, gate_mode, hedge_fits = grid
         settings = dict(zip(GRID_CONTROLS, [sorted(v or []) for v in lists]), cost=float(cost or 0),
                         bases=[b for b in engine.BASES if b in (bases or [])],
                         sizings=[s for s in engine.SIZINGS if s in (sizings or [])] or ["flat"],
@@ -1449,7 +1502,9 @@ def register(app) -> None:
                         rearms=[r for r in engine.REARMS if r in (rearms or [])] or list(engine.REARMS_DEFAULT),
                         gate_conditions=[c for c in engine.GATE_CONDITIONS if c in (gate_conditions or [])],
                         gate_buckets=[g for g in engine.GATE_BUCKETS if g in (gate_buckets or [])],
-                        gate_mode=gate_mode or "full")
+                        gate_mode=gate_mode or "full",
+                        hedge_fits=[h for h in engine.HEDGE_FITS if h in (hedge_fits or [])]
+                        or list(engine.HEDGE_FIT_DEFAULT))
         settings["stops"] = settings["stops"] or [0.0]
         settings["hl_mults"] = settings["hl_mults"] or [0.0]
         settings["pnl_stops"] = settings["pnl_stops"] or [0.0]
@@ -1627,7 +1682,7 @@ def register(app) -> None:
 
 
 def build_app():
-    app = make_app(title="Oven", sliders=[], body=tabs)
+    app = make_app(title="Oven", sliders=[], body=tabs, theme=True)
     register(app)
     return app
 
@@ -1636,8 +1691,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Oven: bake signals and dig through them")
     parser.add_argument("--port", type=int, default=8054)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--reload", action="store_true",
+                        help="restart on saved source changes and refresh the browser (kills running bakes)")
     args = parser.parse_args()
-    run(build_app(), port=args.port, host=args.host)
+    run(build_app(), port=args.port, host=args.host, reload=args.reload)
 
 
 if __name__ == "__main__":

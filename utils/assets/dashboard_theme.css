@@ -1,4 +1,6 @@
-/* Only the signal dashboard opts into this theme. Light styles remain intact. */
+/* The signal dashboard's own look: its title, burgundy/orange buttons, and the dark
+   rules for its .sd-* classes. Dark mode shared with other apps lives in theme.css;
+   colours come from the --theme-* variables utils/theme.toml defines. */
 @font-face {
     font-family: "Model Script";
     src: url("fonts/Lobster-Regular.ttf") format("truetype");
@@ -14,101 +16,31 @@
     font-size: 30px !important;
     letter-spacing: 0 !important;
 }
-.sd-theme-toggle {
-    margin-left: auto;
-    border: 1px solid #bbb;
-    border-radius: 3px;
-    padding: 4px 9px;
-    background: #fff;
-    color: #444;
-    font: inherit;
-    font-size: 11px;
-    cursor: pointer;
-}
-html[data-sd-theme="dark"] { color-scheme: dark; background: #17191d; }
-/* Mobile margins and overscroll expose the document canvas outside .sd-app. */
-html[data-sd-theme="dark"] body {
-    background: #17191d !important;
-    color: #dcdfe4;
-}
-html[data-sd-theme="dark"] .sd-app {
-    background: #17191d !important;
-    color: #dcdfe4 !important;
-}
-html[data-sd-theme="dark"] .sd-app .research-app-header {
-    background: #22252b !important;
-    border-color: #454951 !important;
-}
-html[data-sd-theme="dark"] .sd-app .research-app-title {
+html[data-theme="dark"] .sd-app .research-app-title {
     /* A fine gold edge keeps the burgundy lettering clear without a badge. */
     -webkit-text-stroke: 0.4px #edc773;
     paint-order: stroke fill;
 }
-html[data-sd-theme="dark"] .sd-app .shimmer-loader__mark {
-    background-image: linear-gradient(100deg,
-        #62666e 0%, #62666e 40%, #ffcc33 47%, #9b2948 53%, #62666e 60%, #62666e 100%);
+html[data-theme="dark"] .sd-app :is(.sd-row-legend, .sd-k, .sd-deep-tab) {
+    background: var(--theme-raised) !important;
+    color: var(--theme-text) !important;
 }
-html[data-sd-theme="dark"] .sd-app .sd-charts img { border-color: #454951; }
-@media (prefers-reduced-motion: reduce) {
-    html[data-sd-theme="dark"] .sd-app .shimmer-loader__mark { background-image: linear-gradient(#62666e, #62666e); }
+html[data-theme="dark"] .sd-app :is(.sd-kv, .sd-row-body) {
+    background: var(--theme-surface) !important;
+    color: var(--theme-text) !important;
 }
-html[data-sd-theme="dark"] .sd-app :is(.sd-row-legend, .sd-k, .sd-deep-tab, .tab, .viz-table th) {
-    background: #292d34 !important;
-    color: #dcdfe4 !important;
+html[data-theme="dark"] .sd-app :is(.sd-sheet, .sd-row, .sd-row-body, .sd-row-legend, .sd-kv, .sd-kv span, .sd-detail-cell, .sd-row-head > span, .sd-row-head::before, .sd-row-legend > span, .sd-h, .sd-fold, .sd-deep-tabs, .sd-deep-tab) {
+    border-color: var(--theme-border) !important;
 }
-html[data-sd-theme="dark"] .sd-app :is(.sd-kv, .sd-row-body, .sd-theme-toggle, button:not(.sd-sort), .tab--selected) {
-    background: #202329 !important;
-    color: #dcdfe4 !important;
-}
-html[data-sd-theme="dark"] .sd-app :is(.sd-sheet, .sd-row, .sd-row-body, .sd-row-legend, .sd-kv, .sd-kv span, .sd-detail-cell, .sd-row-head > span, .sd-row-head::before, .sd-row-legend > span, .sd-h, .sd-fold, .sd-deep-tabs, .sd-deep-tab, button, .tab, .viz-table, .viz-table th, .viz-table td) {
-    border-color: #454951 !important;
-}
-html[data-sd-theme="dark"] .sd-app .sd-modal-box { background: #202329; border-color: #8a909a; }
-html[data-sd-theme="dark"] .sd-app .sd-modal-box .dash-input-container { background: #2a2e36; color: #dcdfe4; border-color: #454951; }
-html[data-sd-theme="dark"] .sd-app :is(.sd-note, .sd-h-note, .sd-detail-label, .sd-n, .sd-pos--quiet, .sd-stamp span span) { color: #a4abb5; }
-html[data-sd-theme="dark"] .sd-app .sd-row-head:hover { background: #292e37; }
-html[data-sd-theme="dark"] .sd-app .sd-reading--active { background: #304657; color: #c4dff1; }
-html[data-sd-theme="dark"] .sd-app .sd-deep-tab[aria-pressed="true"] { color: #f0b83c !important; }
-/* Neutral inline colours from the shared table renderer; signal colours are retained. */
-html[data-sd-theme="dark"] .sd-app [style*="color: rgb(51, 51, 51)"],
-html[data-sd-theme="dark"] .sd-app [style*="color: rgb(68, 68, 68)"] { color: #dcdfe4 !important; }
-html[data-sd-theme="dark"] .sd-app [style*="background: rgb(255, 255, 255)"],
-html[data-sd-theme="dark"] .sd-app [style*="background-color: rgb(255, 255, 255)"],
-html[data-sd-theme="dark"] .sd-app [style*="background: rgb(245, 245, 245)"],
-html[data-sd-theme="dark"] .sd-app [style*="background-color: rgb(245, 245, 245)"] { background: #202329 !important; }
-html[data-sd-theme="dark"] .sd-app .viz-table tbody tr:hover > td { background: #303640 !important; }
-/* Heatmap cells keep their existing fill/ink pairing, including pale P&L fills. */
-html[data-sd-theme="dark"] .sd-app .viz-table td[style*="background: rgb("][style*="color: rgb(51, 51, 51)"]:not([style*="background: rgb(255, 255, 255)"]) { color: #333333 !important; }
-html[data-sd-theme="dark"] .sd-app .viz-table tbody tr:hover > td[style*="background: rgb("][style*="color: rgb(51, 51, 51)"] { color: #dcdfe4 !important; }
-/* Dash dropdown menus can be portalled outside the app wrapper. */
-html[data-sd-theme="dark"] body :is(.dash-dropdown, .dash-dropdown-content) {
-    --Dash-Fill-Inverse-Strong: #202329;
-    --Dash-Fill-Interactive-Weak: #40372a;
-    --Dash-Text-Strong: #dcdfe4;
-    --Dash-Text-Weak: #a4abb5;
-    --Dash-Stroke-Strong: #454951;
-    background: #202329;
-    color: #dcdfe4;
-    border-color: #454951;
-}
-/* The line the folder tabs sit on is an inline light border. */
-html[data-sd-theme="dark"] .sd-app #dashboard-tabs { border-bottom-color: #454951 !important; }
-html[data-sd-theme="dark"] body .dash-dropdown-option { box-shadow: 0 -1px 0 0 #2c3038 inset; }
-html[data-sd-theme="dark"] body .dash-dropdown-option:hover { background: #303640; }
-html[data-sd-theme="dark"] body .dash-dropdown-option:has(input:checked) { background: #40372a; }
-
-/* Selected tabs keep a clear gold accent above the neutral dark-theme rules. */
-html[data-sd-theme="dark"] .sd-app #dashboard-tabs .tab--selected,
-html[data-sd-theme="dark"] .sd-app .sd-deep-tab[aria-pressed="true"] {
-    color: #ffcc33 !important;
-    background: #373020 !important;
-    border-top-color: #ffcc33 !important;
-    font-weight: 700 !important;
-}
+html[data-theme="dark"] .sd-app .sd-modal-box { background: var(--theme-surface); border-color: var(--theme-border-strong); }
+html[data-theme="dark"] .sd-app .sd-modal-box .dash-input-container { background: var(--theme-input); color: var(--theme-text); border-color: var(--theme-border); }
+html[data-theme="dark"] .sd-app :is(.sd-note, .sd-h-note, .sd-detail-label, .sd-n, .sd-pos--quiet, .sd-stamp span span) { color: var(--theme-dim); }
+html[data-theme="dark"] .sd-app .sd-row-head:hover { background: var(--theme-hover); }
+html[data-theme="dark"] .sd-app .sd-reading--active { background: var(--theme-highlight-bg); color: var(--theme-highlight); }
 
 /* Action buttons share the club burgundy in both themes; tabs retain gold selection. */
 .sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)),
-html[data-sd-theme="dark"] .sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)) {
+html[data-theme="dark"] .sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)) {
     background: #773141 !important;
     color: #ffffff !important;
     border-color: #773141 !important;
@@ -120,29 +52,30 @@ html[data-sd-theme="dark"] .sd-app button:not(.sd-sort):not(:where(.dash-dropdow
     cursor: pointer;
 }
 .sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)):hover:not(:disabled),
-html[data-sd-theme="dark"] .sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)):hover:not(:disabled) {
+html[data-theme="dark"] .sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)):hover:not(:disabled) {
     background: #8d3c4f !important;
 }
 /* Light theme: action buttons take the light theme's orange accent (the selected tabs'),
    burgundy stays dark mode's. */
-html:not([data-sd-theme="dark"]) .sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)) {
+html:not([data-theme="dark"]) .sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)) {
     background: #D35400 !important;
     border-color: #D35400 !important;
 }
-html:not([data-sd-theme="dark"]) .sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)):hover:not(:disabled) {
+html:not([data-theme="dark"]) .sd-app button:not(.sd-sort):not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)):hover:not(:disabled) {
     background: #B84A00 !important;
     border-color: #B84A00 !important;
 }
 .sd-app button:not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)):disabled { opacity: 0.55; cursor: default; }
 .sd-app button:not(:where(.dash-dropdown, .dash-dropdown *, .dash-dropdown-content, .dash-dropdown-content *)):focus-visible { outline: 2px solid #ffcc33; outline-offset: 2px; }
-html[data-sd-theme="dark"] .sd-app .sd-deep-tab[aria-pressed="true"] {
+html[data-theme="dark"] .sd-app .sd-deep-tab[aria-pressed="true"] {
     background: #773141 !important;
-    color: #ffcc33 !important;
-    border-top-color: #ffcc33 !important;
+    color: var(--theme-accent) !important;
+    border-top-color: var(--theme-accent) !important;
+    font-weight: 700 !important;
 }
 /* Light theme: the Deep Dive view tabs look like the folder tabs above them (grey,
    and white with an orange top rule when selected), not like burgundy action buttons. */
-html:not([data-sd-theme="dark"]) .sd-app button.sd-deep-tab:not(.sd-sort) {
+html:not([data-theme="dark"]) .sd-app button.sd-deep-tab:not(.sd-sort) {
     background: #F5F5F5 !important;
     color: #888888 !important;
     border: 1px solid #DCDCDC !important;
@@ -150,11 +83,11 @@ html:not([data-sd-theme="dark"]) .sd-app button.sd-deep-tab:not(.sd-sort) {
     border-radius: 6px 6px 0 0;
     font-weight: bold;
 }
-html:not([data-sd-theme="dark"]) .sd-app button.sd-deep-tab:not(.sd-sort):hover:not([aria-pressed="true"]) {
+html:not([data-theme="dark"]) .sd-app button.sd-deep-tab:not(.sd-sort):hover:not([aria-pressed="true"]) {
     background: #EBEBEB !important;
     color: #333333 !important;
 }
-html:not([data-sd-theme="dark"]) .sd-app button.sd-deep-tab:not(.sd-sort)[aria-pressed="true"] {
+html:not([data-theme="dark"]) .sd-app button.sd-deep-tab:not(.sd-sort)[aria-pressed="true"] {
     background: #FFFFFF !important;
     color: #D35400 !important;
     border-top: 3px solid #D35400 !important;

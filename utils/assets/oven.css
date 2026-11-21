@@ -32,13 +32,11 @@
     color: #888888;
     margin-left: 4px;
 }
-/* Dig card: the trade table beside the monthly P&L heatmap. The trades page holds as many
-   rows as the heatmap has years, so the two stand the same height without scrolling. */
+/* Dig card: the trade table above the monthly P&L heatmap. */
 .oven-tight .oven-trades-months {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    display: flex;
+    flex-direction: column;
     gap: 16px;
-    align-items: start;
     margin-top: 14px;
 }
 /* relationship diagnostics: show every table whole rather than scrolling inside it */
@@ -46,23 +44,31 @@
     max-height: none !important;
     overflow-y: visible !important;
 }
-/* chart pairs, two to a row; .two-up-wide spans the row */
-.two-up {
+/* Bake: controls beside the bake's output. Results: the run / rank / min-trades pickers. */
+.oven-tight .oven-tab-body { padding: 16px 24px; }
+.oven-tight .oven-bake-grid {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    gap: 10px;
+    grid-template-columns: 300px minmax(0, 1fr);
+    gap: 26px;
     align-items: start;
 }
-.two-up > .two-up-wide {
-    grid-column: 1 / span 2;
+.oven-tight .oven-results-pickers {
+    display: grid;
+    grid-template-columns: minmax(0, 520px) 220px 120px;
+    gap: 14px;
 }
-/* phones: one chart per row, and the trades above the monthly P&L */
-@media (max-width: 800px) {
-    .two-up,
-    .oven-tight .oven-trades-months {
-        grid-template-columns: minmax(0, 1fr);
-    }
-    .two-up > .two-up-wide {
-        grid-column: auto;
-    }
+/* phones: controls above the output, the saved bake across the top of the pickers
+   and the pager wrapping */
+@media (max-width: 700px) {
+    .oven-tight .oven-tab-body { padding: 12px 10px; }
+    .oven-tight .oven-bake-grid { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+    .oven-tight .oven-results-pickers { grid-template-columns: minmax(0, 1fr) 96px; gap: 0 10px; }
+    .oven-tight .oven-results-pickers > :first-child { grid-column: 1 / -1; }
+    .oven-tight .oven-pager { flex-wrap: wrap; }
+}
+/* charts one to a row, full width, as the signal dashboard's deep dive */
+.oven-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
 }

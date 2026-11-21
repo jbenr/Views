@@ -280,7 +280,6 @@ def test_overview_snapshot_uses_exact_open_position(monkeypatch, tmp_path):
     assert snapshot["position"] == "LONG"
     # the live value and the threshold it is judged against share one cell
     assert snapshot["reading"] == "-1.20z / ±0.9z"
-    assert snapshot["gate_rule"] == "none"
     assert snapshot["live_pnl_bps"] == 5.5
     # Feature is gone: the Signal name already leads with it
     assert "feature" not in snapshot
@@ -369,19 +368,17 @@ def test_signal_column_reads_long_flat_or_short(monkeypatch, tmp_path):
     assert app._position_label(_state(float("nan")), None) == "FLAT"
 
 
-def test_gate_column_states_the_rule_and_its_percentile_basis(
-    monkeypatch, tmp_path
-):
-    """The gate cell has to say what is being tested, and against what -- the
+def test_gate_short_states_the_rule_and_its_percentile_basis():
+    """The gate summary has to say what is being tested, and against what -- the
     same condition and bucket mean different gates on different lookbacks."""
-    app = _load_app_module(monkeypatch, tmp_path)
+    from dashboard.params import gate_short
 
-    # compact, so the overview fits without a scrollbar, but the basis is never dropped
-    assert app._gate_rule({"gate": None}) == "none"
-    assert app._gate_rule(
+    # compact, but the basis is never dropped
+    assert gate_short({"gate": None}) == "none"
+    assert gate_short(
         {"gate": ("r2", "tails_25_75"), "gate_window": 1260}
     ) == "r2 tails_25_75 /1260d"
-    assert app._gate_rule(
+    assert gate_short(
         {"gate": ("resid_half_life", "below_50"), "gate_window": None}
     ) == "resid_half_life below_50 /exp"
 
