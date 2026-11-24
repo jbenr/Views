@@ -541,7 +541,7 @@ def _signal_row(snap: dict) -> html.Details:
         cell(detail.get("confidence", [])),
         html.Div([
             cell([("as of", snap["data_asof"]), *([("data", "stale · click Ref")] if stale else [])]),
-            html.Button("Deep Dive →", id=_pid("open-deep", snap["signal_id"]), className="ref-btn sd-btn"),
+            html.Button("Tape →", id=_pid("open-deep", snap["signal_id"]), className="ref-btn sd-btn"),
         ], className="sd-detail-cell"),
     ])
     sort_values = [snap["position"], snap["target"], snap.get("reading_value"), snap.get("exp_value"),
@@ -1493,7 +1493,7 @@ def _card(row: dict, phone: bool = False) -> html.Div:
                 html.Button(label, type="button", className="sd-deep-tab",
                             **{"data-deep-view": view, "aria-pressed": "true" if view == "signal" else "false"})
                 for view, label in (("signal", "Signal"), ("performance", "Performance"), ("details", "Details"))
-            ], className="sd-deep-tabs", role="group", **{"aria-label": "Deep Dive view"}),
+            ], className="sd-deep-tabs", role="group", **{"aria-label": "Tape view"}),
             html.Div(id=_pid("card-summary", signal_id), children=summary),
             html.Div(_heading("CHARTS"), className="sd-chart-tools"),
             html.Div(
@@ -1569,7 +1569,7 @@ def build_app() -> dash.Dash:
                             className="ref-btn",
                             style=_btn_style(primary=True),
                         ),
-                        html.Span(id="overview-loaded-text", className="sd-note", role="status",
+                        html.Div(id="overview-loaded-text", className="sd-note sd-stamps", role="status",
                                   title="loaded: when this page last pulled the signals' data from the database. "
                                         "market data: when the database last got new Bloomberg data for them "
                                         "(bar: the newest day it has); Ref cannot make it newer than that. Each is "
@@ -1600,7 +1600,7 @@ def build_app() -> dash.Dash:
                     html.Div(
                         className="sd-bar",
                         children=[
-                            html.Div("SIGNAL DEEP DIVE", className="sd-bar-title"),
+                            html.Div("TAPE", className="sd-bar-title"),
                             dcc.Dropdown(
                                 id="deep-dive-signal",
                                 options=_dropdown_options(rows),
@@ -1613,7 +1613,13 @@ def build_app() -> dash.Dash:
                     # only the selected signal's card is built on load; the others are added
                     # the first time they are picked (_add_deep_card) and kept after that
                     dcc.Store(id="deep-dive-built", data=[selected_signal]),
-                    html.Div(id="deep-dive-cards", children=[_deep_card(rows[0], phone)]),
+                    # the logo shows while a card's Ref (or a window change) recomputes it
+                    dcc.Loading(
+                        html.Div(id="deep-dive-cards", children=[_deep_card(rows[0], phone)]),
+                        custom_spinner=shimmer_loader(image="guy.png"),
+                        overlay_style={"visibility": "visible"},
+                        parent_className="dashboard-overview-loader",
+                    ),
                 ]
                 if rows
                 else [
@@ -1644,6 +1650,13 @@ def build_app() -> dash.Dash:
                     children=_overview_tab(rows),
                 ),
                 dcc.Tab(
+                    label="Tape",
+                    value="signal-deep-dive",
+                    style=tab_style,
+                    selected_style=selected_tab_style,
+                    children=_deep_dive_tab(rows, phone),
+                ),
+                dcc.Tab(
                     label="Market", value="market", style=tab_style, selected_style=selected_tab_style,
                     children=html.Div(className="sd-page", children=[
                         html.Div(className="sd-bar", children=[
@@ -1653,13 +1666,6 @@ def build_app() -> dash.Dash:
                         futures.layout(),
                         html.Div(id="market-content", children=_market_content()),
                     ]),
-                ),
-                dcc.Tab(
-                    label="Deep Dive",
-                    value="signal-deep-dive",
-                    style=tab_style,
-                    selected_style=selected_tab_style,
-                    children=_deep_dive_tab(rows, phone),
                 ),
                 dcc.Tab(
                     label="Portfolio", value="portfolio", style=tab_style, selected_style=selected_tab_style,
@@ -1807,19 +1813,19 @@ def build_app() -> dash.Dash:
                           : hours < 48 ? `${Math.floor(hours)}h ago` : `${Math.floor(hours / 24)}d ago`;
                 const color = hours >= 24 ? '#E74C3C' : hours >= 4 ? '#D35400' : '#27AE60';
                 return {props: {children: `${label} ${clock} · ${age}${tail || ''}`, style: {color: color}},
-                        type: 'Span', namespace: 'dash_html_components'};
+                        type: 'Div', namespace: 'dash_html_components'};
             }
             fresh = fresh || {};
+            // one stamp a line, stacked beside the Ref button
             const parts = [
                 fresh.loaded ? stamp('loaded', fresh.loaded)
                              : {props: {children: 'never loaded · click Ref', style: {color: '#E74C3C'}},
-                                type: 'Span', namespace: 'dash_html_components'},
-                ' | ',
+                                type: 'Div', namespace: 'dash_html_components'},
                 stamp('market data', fresh.live, fresh.bar ? ` (bar ${fresh.bar.slice(5)})` : ''),
             ];
             if (fresh.behind) {
-                parts.push(' | ', {props: {children: 'newer data in db · click Ref', style: {color: '#D35400'}},
-                                   type: 'Span', namespace: 'dash_html_components'});
+                parts.push({props: {children: 'newer data in db · click Ref', style: {color: '#D35400'}},
+                            type: 'Div', namespace: 'dash_html_components'});
             }
             return [parts, {fontWeight: 'bold'}];
         }""",

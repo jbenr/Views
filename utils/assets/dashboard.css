@@ -23,6 +23,8 @@
 .sd-bar .sd-close-all { margin-left: auto; margin-top: 0; }
 .sd-bar:has(.sd-close-all) { width: var(--sd-signal-width); max-width: 100%; }
 .sd-picker { width: 360px; max-width: 100%; font-size: 12px; }
+/* the freshness stamps beside Ref: one a line, two lines as tall as the button */
+.sd-stamps { display: flex; flex-direction: column; justify-content: center; line-height: 14px; }
 
 /* section heading: bold caps on a rule, a quiet note beside it */
 .sd-h {
